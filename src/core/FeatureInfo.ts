@@ -10,10 +10,45 @@
  * 避免使用者误以为是业务数据。
  */
 import type { BufferGeometry } from 'three';
-import type { FeatureAttributes, GeoPackageEntry, PickSegment, SegmentBox } from './types.js';
+import type { FeatureAttributes, GeoPackageEntry, PickEntry, PickSegment, SegmentBox } from './types.js';
 
 /** 楼层估算用的默认层高（米） */
 export const DEFAULT_FLOOR_HEIGHT = 3.2;
+
+/**
+ * 单体的控制位。
+ *
+ * 顶点区间型单体用 `batchId`（写进 `aBatchId`），实例化型用 `instanceBatchId`
+ * （写进 `aInstanceBatchId`）。两者都走「每网格一张状态纹理」，所以对上层是同一个概念。
+ */
+export function pickEntryId(entry?: PickEntry | null): number {
+  if (!entry) return -1;
+  if (entry.batchId != null) return entry.batchId;
+  if (entry.instanceBatchId != null) return entry.instanceBatchId;
+  return -1;
+}
+
+/** 实例化几何里「实例序号 → 单体」的反查表 */
+export interface InstanceFeature {
+  smid: number;
+  /** 控制位（状态纹理下标） */
+  batchId: number;
+}
+
+export function buildInstanceLookup(
+  pickInfo?: Record<number, PickEntry> | null
+): Map<number, InstanceFeature> {
+  const map = new Map<number, InstanceFeature>();
+  if (!pickInfo) return map;
+  for (const [key, entry] of Object.entries(pickInfo)) {
+    if (!entry?.instanceIds?.length) continue;
+    const smid = Number(key);
+    if (!Number.isFinite(smid)) continue;
+    const batchId = pickEntryId(entry);
+    for (const instanceIndex of entry.instanceIds) map.set(instanceIndex, { smid, batchId });
+  }
+  return map;
+}
 
 export function resolveFeature(
   geo: GeoPackageEntry | undefined,
@@ -23,7 +58,7 @@ export function resolveFeature(
   if (!pickInfo || batchId < 0) return { smid: null, segments: [] };
 
   for (const [id, entry] of Object.entries(pickInfo)) {
-    if (entry?.batchId === batchId) {
+    if (pickEntryId(entry) === batchId) {
       return { smid: Number(id), segments: entry.segments ?? [] };
     }
   }

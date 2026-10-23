@@ -120,6 +120,10 @@ export function createSharedUniforms(): StyleUniforms {
 const VERT_PARS = /* glsl */ `
   attribute float aBatchId;
   attribute vec3 aColor;
+  // 实例化几何没有逐顶点 batchId：顶点是 base mesh 的，单体粒度落在实例上
+  #ifdef USE_INSTANCING
+    attribute float aInstanceBatchId;
+  #endif
   uniform float uSelBatch;
   uniform float uSelWhole;
   uniform float uSelElevation;
@@ -131,12 +135,22 @@ const VERT_PARS = /* glsl */ `
   varying float vWorldZ;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
+
+  /** 当前图元所属单体的控制位：实例化取实例属性，其余取逐顶点属性 */
+  float s3mBatchRaw() {
+    #ifdef USE_INSTANCING
+      return aInstanceBatchId;
+    #else
+      return aBatchId;
+    #endif
+  }
 `;
 
 const VERT_ELEVATION = /* glsl */ `
+  float s3mBatch = s3mBatchRaw();
   float s3mCustomElev = 0.0;
-  if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
-    vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+  if ( uBatchTexActive > 0 && s3mBatch >= 0.0 ) {
+    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.5 ) );
     if ( bState.a < -0.5 ) {
       transformed = vec3( 0.0 );
     } else if ( bState.a > 0.0 ) {
@@ -144,7 +158,8 @@ const VERT_ELEVATION = /* glsl */ `
     }
   }
 
-  float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
+  float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( s3mBatch - uSelBatch ), 0.5 ), uSelWhole );
+  // 实例化时这是局部 z，实例矩阵只含平移 + 绕 z 旋转（白模摆位），所以抬起来仍是竖直方向
   transformed.z += s3mSelElev * uSelElevation + s3mCustomElev;
 `;
 
@@ -156,7 +171,7 @@ const VERT_WORLD = /* glsl */ `
   s3mWorld = modelMatrix * s3mWorld;
   vWorldZ = s3mWorld.z;
   vWorldPos = s3mWorld.xyz;
-  vBatchId = aBatchId;
+  vBatchId = s3mBatchRaw();
   vVertColor = aColor;
 
   #ifdef USE_INSTANCING

@@ -35,7 +35,15 @@ import {
   createThickLineMaterial,
 } from './EdgeLines.js';
 import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
-import { resolveFeature, measureSegments, buildAttributes, DEFAULT_FLOOR_HEIGHT } from '../core/FeatureInfo.js';
+import {
+  resolveFeature,
+  measureSegments,
+  buildAttributes,
+  buildInstanceLookup,
+  pickEntryId,
+  DEFAULT_FLOOR_HEIGHT,
+} from '../core/FeatureInfo.js';
+import type { InstanceFeature } from '../core/FeatureInfo.js';
 import { AttributeQuery } from '../core/AttributeQuery.js';
 import type { AttributeQueryOptions, AttributeRow } from '../core/AttributeQuery.js';
 import type {
@@ -43,6 +51,7 @@ import type {
   FeatureAttributes,
   GeoPackageEntry,
   ParsedTile,
+  SegmentBox,
   Stats,
   StyleUniforms,
 } from '../core/types.js';
@@ -230,8 +239,10 @@ export interface PickResult extends FeatureAttributes {
   datasetName: string;
   /** 网格编号 */
   objectId: number;
-  /** 单体编号，-1 表示该几何没有单体化信息 */
+  /** 单体控制位（顶点区间型 = batchId，实例化型 = 状态纹理下标），-1 表示没有单体化信息 */
   batchId: number;
+  /** 实例化几何命中的实例序号；非实例化为 undefined */
+  instanceIndex?: number;
   skeletonName: string;
   /** 单体中心经纬度，拿不到时为 null */
   centerLngLat: [number, number] | null;
@@ -285,6 +296,24 @@ export interface ColorByFieldOptions {
   transform?: (value: string) => string;
   /** 手动固定某些取值的颜色，key 是 transform 之后的值 */
   colorMap?: Record<string, string>;
+}
+
+/** 被多个 SMID 共用的一个 batch */
+export interface BatchConflict {
+  datasetId: string;
+  batchId: number;
+  smids: number[];
+}
+
+export interface BatchAudit {
+  /** 当前已加载的单体数（SMID 去重） */
+  smids: number;
+  /** 当前已加载的 batch 数（按网格累加） */
+  batches: number;
+  /** 被多个 SMID 共用的 batch（这些单体在渲染层无法再细分） */
+  conflicts: BatchConflict[];
+  /** 卷进冲突的单体数（去重） */
+  conflictingSmids: number;
 }
 
 export interface ThematicLegendEntry {
@@ -501,6 +530,8 @@ export class S3MLayer {
   private readonly _dirtyMeshes = new Set<THREE.Mesh>();
   private _dirtyAll = false;
   private _flushScheduled = false;
+  /** batch 冲突只在第一次告警，避免每帧刷屏 */
+  private _batchConflictWarned = false;
   /** 每块网格的世界高度范围，用来增量维护 uHeightMin / uHeightMax */
   private readonly _meshHeight = new Map<THREE.Mesh, { min: number; max: number }>();
   private _heightMin = Infinity;
@@ -840,6 +871,41 @@ export class S3MLayer {
   /** 当前场景里已经加载的单体 ID（按 SMID 去重），也是 colorByField 的默认范围 */
   getLoadedSmids(): number[] {
     return [...this._smidMeshes.keys()];
+  }
+
+  /**
+   * 盘一遍 batch 分配，列出被多个 SMID 共用的 batchId。
+   *
+   * S3M 的单体化粒度只到 batch：几个 SMID 落到同一个 batch 时，按单体隐藏 / 改色 /
+   * 抬高只能对这一批整体生效（内部规则：任一隐藏则整批隐藏，颜色 / 抬高取首个）。
+   * 拿这个结果可以判断手上的数据到底能把单体粒度用到哪一步。
+   */
+  auditBatches(): BatchAudit {
+    const conflicts: BatchConflict[] = [];
+    const involved = new Set<number>();
+    let batches = 0;
+
+    for (const p of this._pickables.values()) {
+      const pickInfo = (p.mesh.userData as MeshUserData).geoRef?.pickInfo;
+      if (!pickInfo) continue;
+      const byBatch = new Map<number, number[]>();
+      for (const [key, entry] of Object.entries(pickInfo)) {
+        const bId = pickEntryId(entry);
+        if (bId < 0) continue;
+        const smid = Number(key);
+        const list = byBatch.get(bId);
+        if (list) list.push(smid);
+        else byBatch.set(bId, [smid]);
+      }
+      batches += byBatch.size;
+      for (const [batchId, smids] of byBatch) {
+        if (smids.length < 2) continue;
+        for (const smid of smids) involved.add(smid);
+        conflicts.push({ datasetId: p.datasetId, batchId, smids });
+      }
+    }
+
+    return { smids: this._smidMeshes.size, batches, conflicts, conflictingSmids: involved.size };
   }
 
   /** 当前专题着色用的字段名 */
@@ -1232,7 +1298,8 @@ export class S3MLayer {
 
     let maxBatch = 0;
     for (const p of Object.values(pickInfo)) {
-      if (p.batchId != null && p.batchId > maxBatch) maxBatch = p.batchId;
+      const id = pickEntryId(p);
+      if (id > maxBatch) maxBatch = id;
     }
     const width = Math.max(maxBatch + 1, 1);
 
@@ -1255,11 +1322,21 @@ export class S3MLayer {
       data[i * 4 + 3] = 0;
     }
 
+    // 一个 batchId 可能被多个 SMID 共用（实测「邻店共 batchId」），
+    // 直接边遍历边写就是「后写的覆盖先写的」，谁生效取决于对象键的顺序。
+    // 所以先按 batchId 归并再落，规则：任一隐藏则整批隐藏，颜色 / 抬高取首个。
     let hasActive = false;
+    const hiddenBatches = new Set<number>();
+    const colorOfBatch = new Map<number, string>();
+    const elevOfBatch = new Map<number, number>();
+    /** batchId → 有几个 SMID 落在上面，用来判断「这个 batch 本来就没法单独控制」 */
+    const ownersOfBatch = new Map<number, number>();
+
     for (const [smidStr, entry] of Object.entries(pickInfo)) {
       const smid = Number(smidStr);
-      const bId = entry.batchId;
-      if (bId == null || bId < 0 || bId >= record.width) continue;
+      const bId = pickEntryId(entry);
+      if (bId < 0 || bId >= record.width) continue;
+      ownersOfBatch.set(bId, (ownersOfBatch.get(bId) ?? 0) + 1);
 
       let hidden = false;
       if (filter) {
@@ -1280,8 +1357,7 @@ export class S3MLayer {
       }
 
       if (hidden) {
-        data[bId * 4 + 3] = -1.0; // 标记隐藏
-        hasActive = true;
+        hiddenBatches.add(bId);
         continue;
       }
 
@@ -1289,8 +1365,7 @@ export class S3MLayer {
       if (this._fieldFilter) {
         const inSet = this._fieldFilter.matched.has(smid);
         if (this._fieldFilter.mode === 'keep' ? !inSet : inSet) {
-          data[bId * 4 + 3] = -1.0;
-          hasActive = true;
+          hiddenBatches.add(bId);
           continue;
         }
       }
@@ -1301,18 +1376,45 @@ export class S3MLayer {
       const colorHex = st?.color ?? thematicColor;
       // 手动拔高 > 按业务字段抬高
       const elevation = st?.elevation ?? this._thematicElevation.get(smid);
-      if (st || thematicColor || elevation != null) {
-        hasActive = true;
-        if (colorHex) {
-          const c = new THREE.Color(colorHex);
-          data[bId * 4 + 0] = c.r;
-          data[bId * 4 + 1] = c.g;
-          data[bId * 4 + 2] = c.b;
-        }
-        if (elevation != null && elevation > 0) {
-          data[bId * 4 + 3] = elevation;
-        }
-      }
+
+      if (colorHex && !colorOfBatch.has(bId)) colorOfBatch.set(bId, colorHex);
+      if (elevation != null && elevation > 0 && !elevOfBatch.has(bId)) elevOfBatch.set(bId, elevation);
+    }
+
+    for (const bId of hiddenBatches) {
+      data[bId * 4 + 3] = -1.0; // 标记隐藏
+      hasActive = true;
+    }
+    for (const [bId, colorHex] of colorOfBatch) {
+      const c = new THREE.Color(colorHex);
+      data[bId * 4 + 0] = c.r;
+      data[bId * 4 + 1] = c.g;
+      data[bId * 4 + 2] = c.b;
+      hasActive = true;
+    }
+    for (const [bId, elevation] of elevOfBatch) {
+      if (hiddenBatches.has(bId)) continue; // 抬高会写 alpha，别把隐藏标记覆盖掉
+      data[bId * 4 + 3] = elevation;
+      hasActive = true;
+    }
+
+    // 只有「共用 batch 且这一批确实有样式要写」才算真的控制不了，才值得告警
+    let conflicts = 0;
+    for (const [bId, owners] of ownersOfBatch) {
+      if (owners < 2) continue;
+      if (!hiddenBatches.has(bId) && !colorOfBatch.has(bId) && !elevOfBatch.has(bId)) continue;
+      conflicts++;
+    }
+
+    if (conflicts > 0 && !this._batchConflictWarned) {
+      // 只在第一次喊一声，别每次重写纹理都刷屏
+      this._batchConflictWarned = true;
+      console.warn(
+        `[s3m] 有 ${conflicts} 个单体状态写不进独立的 batch（多个 SMID 共用同一个 batchId，\n` +
+          '  S3M 的单体化粒度只到 batch，无法单独隐藏/改色其中一部分）。\n' +
+          '  当前规则：任一 SMID 需要隐藏则整批隐藏，颜色 / 抬高取首个。\n' +
+          '  用 layer.auditBatches() 可以列出具体是哪些 SMID 共用了 batchId。'
+      );
     }
 
     texture.needsUpdate = true;
@@ -1845,10 +1947,35 @@ export class S3MLayer {
     if (!ref) return null;
 
     const ud = ref.mesh.userData as MeshUserData;
-    const geoRef = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(hit.batchId) ?? ud.geoRef;
-    const { smid, segments } = resolveFeature(geoRef, hit.batchId);
-    if (this._isFeatureHidden(smid, hit.batchId)) return null;
-    const box = measureSegments(ref.mesh.geometry, segments);
+
+    // 两种单体化形态：
+    //   顶点区间型 —— 拾取编码 batchId，直接 resolveFeature 拿到 smid + 顶点区间
+    //   实例化型   —— 拾取编码实例序号，先反查实例属于哪个 SMID，控制位是状态纹理下标
+    let smid: number | null = null;
+    let batchId = hit.batchId;
+    let instanceIndex: number | undefined;
+    let geoRef = ud.geoRef;
+    let segments: Array<{ vertexOffset: number; vertexCount: number }> = [];
+
+    if (hit.instanceIndex != null) {
+      instanceIndex = hit.instanceIndex;
+      const feature = this._instanceFeature(ref.mesh, geoRef, instanceIndex);
+      if (!feature) return null;
+      smid = feature.smid;
+      batchId = feature.batchId;
+    } else {
+      geoRef = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(hit.batchId) ?? ud.geoRef;
+      const resolved = resolveFeature(geoRef, hit.batchId);
+      smid = resolved.smid;
+      segments = resolved.segments;
+    }
+
+    if (this._isFeatureHidden(smid, batchId)) return null;
+
+    const box =
+      instanceIndex != null
+        ? this._instanceBox(ref.mesh, instanceIndex)
+        : measureSegments(ref.mesh.geometry, segments);
     const geometry = ref.mesh.geometry;
     const triangles = geometry.index ? Math.round(geometry.index.count / 3) : 0;
     const attributes = buildAttributes({ smid, box, triangles, floorHeight: this.style.floorHeight });
@@ -1866,11 +1993,46 @@ export class S3MLayer {
       datasetId: ref.datasetId,
       datasetName: this.datasets.get(ref.datasetId)?.name ?? ref.datasetId,
       objectId: hit.objectId,
-      batchId: hit.batchId,
+      batchId,
+      instanceIndex,
       skeletonName: ref.skeletonName,
       centerLngLat,
       ...attributes,
       mesh: ref.mesh,
+    };
+  }
+
+  /** 实例序号 → 所属单体（按网格缓存反查表，实例多的数据不用每次重建） */
+  private _instanceFeature(
+    mesh: THREE.Mesh,
+    geoRef: GeoPackageEntry | undefined,
+    instanceIndex: number
+  ): InstanceFeature | null {
+    const ud = mesh.userData as MeshUserData & { instanceLookup?: Map<number, InstanceFeature> };
+    if (!ud.instanceLookup) ud.instanceLookup = buildInstanceLookup(geoRef?.pickInfo);
+    return ud.instanceLookup.get(instanceIndex) ?? null;
+  }
+
+  /** 实例化几何的单体包围盒：base mesh 的包围盒套上该实例的矩阵 */
+  private _instanceBox(mesh: THREE.Mesh, instanceIndex: number): SegmentBox | null {
+    const im = mesh as THREE.InstancedMesh;
+    if (!im.isInstancedMesh) return null;
+    const geometry = mesh.geometry;
+    if (!geometry.boundingBox) geometry.computeBoundingBox();
+    const bb = geometry.boundingBox;
+    if (!bb) return null;
+    const m = new THREE.Matrix4();
+    im.getMatrixAt(instanceIndex, m);
+    const box = bb.clone().applyMatrix4(m);
+    return {
+      minX: box.min.x,
+      minY: box.min.y,
+      minZ: box.min.z,
+      maxX: box.max.x,
+      maxY: box.max.y,
+      maxZ: box.max.z,
+      count: geometry.getAttribute('position')?.count ?? 0,
+      triangles: geometry.index ? Math.round(geometry.index.count / 3) : 0,
     };
   }
 
@@ -1926,7 +2088,11 @@ export class S3MLayer {
     const ud = result.mesh.userData as MeshUserData;
     const geoRef =
       (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(result.batchId) ?? ud.geoRef;
-    const { segments } = resolveFeature(geoRef, result.batchId);
+    // 实例化几何没有逐单体的顶点区间，整个 base mesh 就是这一栋的外形
+    const segments =
+      result.instanceIndex != null
+        ? [{ vertexOffset: 0, vertexCount: result.mesh.geometry.getAttribute('position')?.count ?? 0 }]
+        : resolveFeature(geoRef, result.batchId).segments;
     const pairs = buildFeatureEdgeSegments(result.mesh.geometry, segments);
     if (!pairs) {
       // 抽不出折边（退化几何 / 没有任何夹角）时退回外扩轮廓，至少保证选中可见
@@ -1941,15 +2107,31 @@ export class S3MLayer {
     lines.frustumCulled = false;
     lines.raycast = () => {};
     (lines.userData as MeshUserData).isSelectionEdge = true;
+    // 实例化的棱线是「整个 base mesh」，得套上该实例的矩阵才落到正确位置
+    this._applyInstanceTransform(lines, result);
     result.mesh.add(lines); // 作为子节点，直接继承世界变换
     this._selectionEdges = lines;
   }
 
+  /** 实例化几何：把某个实例的矩阵套到一个普通 Mesh/子节点上（子节点不参与父级的 instanceMatrix） */
+  private _applyInstanceTransform(obj: THREE.Object3D, result: PickResult): void {
+    const im = result.mesh as THREE.InstancedMesh;
+    if (result.instanceIndex == null || !im.isInstancedMesh) return;
+    const m = new THREE.Matrix4();
+    im.getMatrixAt(result.instanceIndex, m);
+    m.decompose(obj.position, obj.quaternion, obj.scale);
+  }
+
   /** 旧的描边画法：背面外扩法，整块几何一起上，靠 uSelBatch 只显示选中那栋 */
   private _addSelectionHull(result: PickResult, mat: StyledMaterial | null): void {
-    this.outlineMaterial.uniforms.uSelBatch.value = result.batchId;
-    this.outlineMaterial.uniforms.uSelWhole.value = result.batchId < 0 ? 1 : 0;
-    this.outlineMaterial.uniforms.uElevation.value = this.style.selectElevation ?? 0;
+    const instanced = result.instanceIndex != null;
+    // 实例化：轮廓是这个实例的单独一份副本（普通 Mesh），所以整份都画；
+    // 顶点区间型：整块几何一起画，靠 uSelBatch 只显示选中那栋。
+    this.outlineMaterial.uniforms.uSelBatch.value = instanced ? -1 : result.batchId;
+    this.outlineMaterial.uniforms.uSelWhole.value = instanced || result.batchId < 0 ? 1 : 0;
+    this.outlineMaterial.uniforms.uElevation.value = instanced
+      ? this._selectionElevation(result)
+      : this.style.selectElevation ?? 0;
     if (mat?.userData?.uBatchTex) {
       this.outlineMaterial.uniforms.uBatchTex.value = mat.userData.uBatchTex.value as THREE.Texture;
       this.outlineMaterial.uniforms.uBatchTexWidth.value = mat.userData.uBatchTexWidth.value as number;
@@ -1959,6 +2141,7 @@ export class S3MLayer {
     outline.renderOrder = 3;
     outline.frustumCulled = false;
     outline.raycast = () => {};
+    this._applyInstanceTransform(outline, result);
     result.mesh.add(outline); // 作为子节点，直接继承世界变换
     this._outlineMesh = outline;
   }

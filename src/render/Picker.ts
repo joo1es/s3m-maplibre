@@ -18,6 +18,11 @@ import * as THREE from 'three';
 
 const PICK_VERT = /* glsl */ `
   attribute float aBatchId;
+  #ifdef USE_INSTANCING
+    // 实例化：单体粒度在实例上，顶点属性里没有可用的 batchId
+    attribute float aInstanceBatchId;
+    attribute float aInstanceIndex;
+  #endif
   uniform float uObjectId;
   uniform sampler2D uBatchTex;
   uniform float uBatchTexWidth;
@@ -28,13 +33,21 @@ const PICK_VERT = /* glsl */ `
   varying float vBatch;
 
   void main() {
-    vBatch = aBatchId;
+    float s3mBatch;
+    #ifdef USE_INSTANCING
+      s3mBatch = aInstanceBatchId;
+      // 编码「实例序号」而不是控制位：CPU 侧要靠它拿到实例矩阵（描边 / 中心点）
+      vBatch = aInstanceIndex;
+    #else
+      s3mBatch = aBatchId;
+      vBatch = aBatchId;
+    #endif
 
     // 单体状态（抬高 / 隐藏）必须和主着色器用同一份数据、同一套算法：
     // 抬高只发生在顶点着色器里，拾取这一趟如果还按原始坐标画，抬起来的楼就点不中。
     vec3 p = position;
-    if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
-      vec4 state = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+    if ( uBatchTexActive > 0 && s3mBatch >= 0.0 ) {
+      vec4 state = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.5 ) );
       if ( state.a < -0.5 ) {
         p = vec3( 0.0 );
       } else if ( state.a > 0.0 ) {
@@ -43,7 +56,7 @@ const PICK_VERT = /* glsl */ `
     }
 
     // 选中单体自身的拔高（selectElevation）
-    float sel = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
+    float sel = max( step( 0.0, uSelBatch ) * step( abs( s3mBatch - uSelBatch ), 0.5 ), uSelWhole );
     p.z += sel * uSelElevation;
 
     #ifdef USE_INSTANCING
@@ -72,8 +85,10 @@ const PICK_FRAG = /* glsl */ `
 export interface PickHit {
   /** 由 S3MLayer 分配的网格编号 */
   objectId: number;
-  /** 单体编号，-1 表示该几何没有单体化信息 */
+  /** 非实例化几何：单体 batchId；实例化几何这里是 -1（改看 instanceIndex） */
   batchId: number;
+  /** 实例化几何命中到第几个实例（非实例化为 undefined） */
+  instanceIndex?: number;
 }
 
 /** S3MLayer 挂到 mesh.userData 上的字段，拾取时会读它 */
@@ -176,12 +191,15 @@ export class Picker {
 
     // ---- 换材质
     const swapped: Array<[THREE.Mesh, THREE.Material | THREE.Material[]]> = [];
+    /** 这次拾取里哪些网格是实例化的（它们的 vBatch 编码的是实例序号） */
+    const instancedPickIds = new Set<number>();
     scene.traverseVisible((o) => {
       const mesh = o as THREE.Mesh;
       if (!mesh.isMesh) return;
       const ud = mesh.userData as PickUserData;
       if (ud.pickId === undefined) return;
       if (!ud.pickMaterial) ud.pickMaterial = createPickMaterial(ud.pickId);
+      if ((mesh as THREE.InstancedMesh).isInstancedMesh) instancedPickIds.add(ud.pickId);
 
       // 把当前的「单体状态纹理」抄给拾取材质：抬高量是逐单体写在里面的，
       // 抄的是同一个纹理对象，主材质那边更新后这里自动跟着变。
@@ -243,8 +261,12 @@ export class Picker {
       const b = this.buf[2];
       const a = this.buf[3];
       const objectId = r + g * 256 - 1;
-      const batchId = b + a * 256 - 1;
-      if (objectId >= 0) hit = { objectId, batchId };
+      const rawId = b + a * 256 - 1;
+      if (objectId >= 0) {
+        hit = instancedPickIds.has(objectId)
+          ? { objectId, batchId: -1, instanceIndex: Math.max(0, rawId) }
+          : { objectId, batchId: rawId };
+      }
     } finally {
       for (const [mesh, mat] of swapped) mesh.material = mat;
       for (const o of hidden) o.visible = true;

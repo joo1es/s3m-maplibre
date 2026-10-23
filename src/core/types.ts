@@ -58,6 +58,11 @@ export interface VertexPackage {
   /** -1 表示非实例化 */
   instanceIndex: number;
   instanceBuffer?: Uint8Array;
+  /**
+   * 实例化几何的逐实例控制位（长度 = instanceCount），-1 表示该实例不属于任何单体。
+   * 注意顶点数 ≠ 实例数，所以它不能当逐顶点属性用，构建几何时要做成 InstancedBufferAttribute。
+   */
+  instanceBatchIds?: Float32Array;
   compressOptions?: number;
   customVertexAttribute?: unknown;
   textureCoordIsW?: boolean;
@@ -69,9 +74,13 @@ export interface PickSegment {
 }
 
 export interface PickEntry {
+  /** 顶点区间型单体：控制位（写进 `aBatchId`） */
   batchId?: number;
   segments?: PickSegment[];
+  /** 实例化单体：落在哪几个实例上（一个单体可能对应多个实例） */
   instanceIds?: number[];
+  /** 实例化单体：控制位（写进 `aInstanceBatchId`），等于 pickInfo 里的枚举序 */
+  instanceBatchId?: number;
 }
 
 export interface GeoPackageEntry {

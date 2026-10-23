@@ -501,20 +501,24 @@ function parsePickInfo(
       pushAttr(vp, 'batchId', new Uint8Array(batchIds.buffer), 1, 4, 0, undefined, 'f32');
     } else {
       const instanceCount = vp.instanceCount;
-      const instanceIds = new Float32Array(instanceCount);
+      const instanceBatchIds = new Float32Array(instanceCount).fill(-1);
       for (let j = 0; j < selectCount; j++) {
         const id = r.u32();
         const n = r.u32();
-        const entry: PickEntry = { instanceIds: [] };
+        const entry: PickEntry = { instanceIds: [], instanceBatchId: j };
         pickInfo[id] = entry;
         for (let k = 0; k < n; k++) {
           const instanceId = r.u32();
           if (version >= 3) r.u32();
-          entry.instanceIds!.push(instanceId);
-          instanceIds[instanceId] = j;
+          if (instanceId >= 0 && instanceId < instanceCount) {
+            entry.instanceIds!.push(instanceId);
+            instanceBatchIds[instanceId] = j;
+          }
         }
       }
-      pushAttr(vp, 'batchId', new Uint8Array(instanceIds.buffer), 1, 4, 0, 1, 'f32');
+      // 实例化的单体粒度是「逐实例」的，不能塞进逐顶点属性：
+      // 顶点数（base mesh）和实例数根本不是一个量级，长度对不上会被 three 当成坏 buffer。
+      vp.instanceBatchIds = instanceBatchIds;
     }
 
     geo.pickInfo = pickInfo;

@@ -657,6 +657,20 @@ export async function buildTileObjects(
     }
 
     if (info?.instanced && vp.instanceBuffer && vp.instanceCount > 0) {
+      // 逐实例的两条属性：
+      //   aInstanceBatchId —— 单体控制位，着色器靠它查状态纹理（改色 / 隐藏 / 抬高）
+      //   aInstanceIndex   —— 实例序号，拾取时编码进颜色，CPU 侧再映射回 SMID
+      // 逐顶点属性 aBatchId 在这里没用（顶点数 ≠ 实例数），gpu 上按实例取值只能靠 instanced attribute。
+      if (!geometry.getAttribute('aInstanceBatchId')) {
+        const ids = vp.instanceBatchIds;
+        const batchIds =
+          ids && ids.length === vp.instanceCount ? ids.slice() : new Float32Array(vp.instanceCount).fill(-1);
+        geometry.setAttribute('aInstanceBatchId', new THREE.InstancedBufferAttribute(batchIds, 1));
+        const index = new Float32Array(vp.instanceCount);
+        for (let i = 0; i < index.length; i++) index[i] = i;
+        geometry.setAttribute('aInstanceIndex', new THREE.InstancedBufferAttribute(index, 1));
+      }
+
       const instanced = new THREE.InstancedMesh(geometry, material, vp.instanceCount);
       instanced.instanceMatrix.setUsage(THREE.StaticDrawUsage);
       const m4 = new THREE.Matrix4();
