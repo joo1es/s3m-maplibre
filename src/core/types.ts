@@ -197,8 +197,14 @@ export interface StyleUniforms {
   uHeightMax: { value: number };
   uFloorHeight: { value: number };
   uDim: { value: number };
+  uDimFactor?: { value: number };
   uSelColor: { value: Color };
   uSelMix: { value: number };
+  uSelMode?: { value: number };
+  uSelOpacity?: { value: number };
+  uSelEmissive?: { value: number };
+  uSelElevation?: { value: number };
   uRoofThreshold?: { value: number };
   uTexMix?: { value: number };
+  [key: string]: { value: unknown } | undefined;
 }

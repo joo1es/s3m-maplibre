@@ -245,6 +245,8 @@ async function loadSource(rawUrl) {
 
   setStatus('正在解析数据源…', 'busy');
   layer.clearDatasets();
+  $('optHeightOffset').value = 0;
+  $('heightOffsetVal').textContent = '0m';
 
   currentDatasets = await resolveUrlToDatasets(url);
   renderDatasetUI();
@@ -442,6 +444,34 @@ for (const [id, key] of [['cA', 'colorA'], ['cB', 'colorB'], ['cC', 'colorC']]) 
 }
 
 // 控件事件绑定
+$('optHeightOffset').addEventListener('input', (e) => {
+  const v = Number(e.target.value);
+  $('heightOffsetVal').textContent = `${v > 0 ? '+' : ''}${v}m`;
+  layer.setDatasetHeight(v);
+});
+
+$('optSelMode').addEventListener('change', (e) => {
+  const mode = e.target.value;
+  layer.setStyle({ selectMode: mode });
+  $('wrapSelOpacity').style.display = mode === 'glowOnly' ? 'none' : '';
+});
+
+$('optSelColor').addEventListener('input', (e) => {
+  layer.setStyle({ selectColor: e.target.value });
+});
+
+$('optSelOpacity').addEventListener('input', (e) => {
+  const val = Number(e.target.value);
+  $('selOpacityVal').textContent = `${val}%`;
+  layer.setStyle({ selectOpacity: val / 100 });
+});
+
+$('optSelElevation').addEventListener('input', (e) => {
+  const val = Number(e.target.value);
+  $('selElevationVal').textContent = `${val}m`;
+  layer.setStyle({ selectElevation: val });
+});
+
 $('optOutline').addEventListener('change', (e) => {
   const on = e.target.checked;
   layer.setStyle({ outline: on });

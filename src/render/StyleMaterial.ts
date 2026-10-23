@@ -38,6 +38,27 @@ export const STYLE_LABELS: Record<StyleMode, string> = {
   [STYLE.CUSTOM]: '自定义',
 };
 
+/** 选中单体的高亮模式 */
+export const SELECT_MODE = {
+  /** 纯色覆盖（经典白模 / 纯色高亮） */
+  REPLACE: 'replace',
+  /** 叠加在原图上（半透明混合，保留原模型贴图与门窗细节） */
+  OVERLAY: 'overlay',
+  /** 叠乘模式（与原模型贴图乘算，明暗对比强烈） */
+  MULTIPLY: 'multiply',
+  /** 仅描边与自发光（原图本体不染色） */
+  GLOW_ONLY: 'glowOnly',
+} as const;
+
+export type SelectMode = (typeof SELECT_MODE)[keyof typeof SELECT_MODE];
+
+export const SELECT_MODE_LABELS: Record<SelectMode, string> = {
+  [SELECT_MODE.OVERLAY]: '叠加原图 (Overlay)',
+  [SELECT_MODE.REPLACE]: '纯色覆盖 (Replace)',
+  [SELECT_MODE.MULTIPLY]: '叠乘模式 (Multiply)',
+  [SELECT_MODE.GLOW_ONLY]: '仅描边发光 (Glow)',
+};
+
 export interface StyledMaterial extends THREE.MeshStandardMaterial {
   userData: {
     uSelBatch: { value: number };
@@ -58,12 +79,22 @@ export function createSharedUniforms(): StyleUniforms {
     uHeightMin: { value: 0 },
     uHeightMax: { value: 120 },
     uFloorHeight: { value: 3.2 },
-    /** 0 = 不压暗其他建筑；1 = 选中时其余建筑压到 42% */
+    /** 0 = 不压暗其他建筑；1 = 选中时其余建筑压暗 */
     uDim: { value: 0 },
+    /** 其余建筑压暗系数（默认 0.42） */
+    uDimFactor: { value: 0.42 },
     /** 选中单体的高亮色 */
     uSelColor: { value: new THREE.Color('#22d3ee') },
     /** 高亮强度，0 表示不做选中着色 */
     uSelMix: { value: 0 },
+    /** 选中高亮混合模式：0 = 纯色覆盖, 1 = 叠加原图(mix), 2 = 叠乘(multiply), 3 = 仅描边发光(glowOnly) */
+    uSelMode: { value: 1 },
+    /** 选中高亮叠色强度 / 透明度（0~1，默认 0.65） */
+    uSelOpacity: { value: 0.65 },
+    /** 选中自发光强度（0~1，默认 0.35） */
+    uSelEmissive: { value: 0.35 },
+    /** 选中单体垂直拔高高度（米，默认 0） */
+    uSelElevation: { value: 0 },
     /** 顶面法线判定阈值：Z 分量余弦大于该值判定为顶面 */
     uRoofThreshold: { value: 0.65 },
     /** 与模型原色贴图混合强度：0 = 纯色覆盖，1 = 叠乘原色贴图 */
@@ -74,6 +105,9 @@ export function createSharedUniforms(): StyleUniforms {
 const VERT_PARS = /* glsl */ `
   attribute float aBatchId;
   attribute vec3 aColor;
+  uniform float uSelBatch;
+  uniform float uSelWhole;
+  uniform float uSelElevation;
   varying float vBatchId;
   varying vec3 vVertColor;
   varying float vWorldZ;
@@ -82,6 +116,9 @@ const VERT_PARS = /* glsl */ `
 `;
 
 const VERT_WORLD = /* glsl */ `
+  float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
+  transformed.z += s3mSelElev * uSelElevation;
+
   vec4 s3mWorld = vec4( transformed, 1.0 );
   #ifdef USE_INSTANCING
     s3mWorld = instanceMatrix * s3mWorld;
@@ -106,6 +143,10 @@ const FRAG_PARS = /* glsl */ `
   uniform vec3 uColorB;
   uniform vec3 uColorC;
   uniform vec3 uSelColor;
+  uniform int uSelMode;
+  uniform float uSelOpacity;
+  uniform float uSelEmissive;
+  uniform float uDimFactor;
   uniform float uTime;
   uniform float uHeightMin;
   uniform float uHeightMax;
@@ -190,13 +231,27 @@ const FRAG_COLOR = /* glsl */ `
 
   // 选中单体高亮 + 其余压暗
   float s3mSel = max( step( 0.0, uSelBatch ) * step( abs( vBatchId - uSelBatch ), 0.5 ), uSelWhole );
-  diffuseColor.rgb = mix( diffuseColor.rgb, uSelColor, s3mSel * uSelMix );
-  diffuseColor.rgb *= mix( 1.0, 0.42, uDim * ( 1.0 - s3mSel ) );
+  if ( s3mSel > 0.5 && uSelMix > 0.001 ) {
+    if ( uSelMode == 0 ) {
+      // 纯色覆盖（白模科技感）
+      diffuseColor.rgb = uSelColor;
+    } else if ( uSelMode == 1 ) {
+      // 叠加原图（半透明混色，保留纹理贴图）
+      diffuseColor.rgb = mix( diffuseColor.rgb, uSelColor, uSelOpacity );
+    } else if ( uSelMode == 2 ) {
+      // 叠乘模式（明暗对比强）
+      diffuseColor.rgb = mix( diffuseColor.rgb, diffuseColor.rgb * uSelColor * 1.5, uSelOpacity );
+    }
+    // uSelMode == 3 为 glowOnly，保持 diffuseColor.rgb 不变
+  } else {
+    diffuseColor.rgb *= mix( 1.0, uDimFactor, uDim );
+  }
 `;
 
 const FRAG_EMISSIVE = /* glsl */ `
   float s3mSelE = max( step( 0.0, uSelBatch ) * step( abs( vBatchId - uSelBatch ), 0.5 ), uSelWhole );
-  totalEmissiveRadiance += uSelColor * s3mSelE * uSelMix * 0.45;
+  float s3mEm = ( uSelMode == 3 ) ? max( uSelEmissive, 0.45 ) : uSelEmissive;
+  totalEmissiveRadiance += uSelColor * s3mSelE * uSelMix * s3mEm;
 `;
 
 export interface StyledMaterialOptions {
@@ -264,12 +319,15 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
 const OUTLINE_VERT = /* glsl */ `
   attribute float aBatchId;
   uniform float uSelBatch;
+  uniform float uSelWhole;
   uniform float uWidth;
+  uniform float uElevation;
   varying float vSel;
   void main() {
-    vSel = step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 );
+    vSel = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
     // 沿法线外扩，背面渲染 → 形成一圈等宽描边
     vec3 p = position + normal * uWidth * vSel;
+    p.z += vSel * uElevation;
     gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
   }
 `;
@@ -286,7 +344,9 @@ const OUTLINE_FRAG = /* glsl */ `
 export interface OutlineMaterial extends THREE.ShaderMaterial {
   uniforms: {
     uSelBatch: { value: number };
+    uSelWhole: { value: number };
     uWidth: { value: number };
+    uElevation: { value: number };
     uColor: { value: THREE.Color };
   };
 }
@@ -296,7 +356,9 @@ export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9)
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uSelBatch: { value: -1 },
+      uSelWhole: { value: 0 },
       uWidth: { value: initialWidth },
+      uElevation: { value: 0 },
       uColor: { value: shared.uSelColor.value.clone() },
     },
     vertexShader: OUTLINE_VERT,

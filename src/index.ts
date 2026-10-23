@@ -43,10 +43,11 @@ export { S3MTileset } from './tileset/S3MTileset.js';
 export type { TileNode, BuildTileFn, S3MTilesetOptions } from './tileset/S3MTileset.js';
 
 // —— 渲染层
-export { S3MLayer, DEFAULT_STYLE, STYLE, STYLE_LABELS } from './render/S3MLayer.js';
+export { S3MLayer, DEFAULT_STYLE, STYLE, STYLE_LABELS, SELECT_MODE, SELECT_MODE_LABELS } from './render/S3MLayer.js';
 export type {
   S3MLayerOptions,
   S3MStyle,
+  SelectMode,
   S3MDatasetOptions,
   S3MDatasetEntry,
   PickResult,

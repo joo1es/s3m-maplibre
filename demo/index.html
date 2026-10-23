@@ -162,7 +162,12 @@
       </section>
 
       <section>
-        <h2>质感</h2>
+        <h2>质感与高程</h2>
+        <label class="rng">
+          <span>高程调整</span>
+          <input type="range" id="optHeightOffset" min="-50" max="50" step="0.5" value="0" />
+          <b id="heightOffsetVal">0m</b>
+        </label>
         <label class="rng">
           <span>不透明度</span>
           <input type="range" id="optOpacity" min="20" max="100" step="1" value="100" />
@@ -178,7 +183,30 @@
       </section>
 
       <section>
-        <h2>显示</h2>
+        <h2>选中与高亮</h2>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+          <span style="color:#7b8794; font-size:11.5px;">高亮模式</span>
+          <select id="optSelMode" style="padding: 3px 6px; font-size: 11.5px; border: 1px solid #d1d5db; border-radius: 5px; background: #fff; color: #111827; outline: none;">
+            <option value="overlay" selected>叠加原图 (Overlay)</option>
+            <option value="replace">纯色覆盖 (Replace)</option>
+            <option value="multiply">叠乘模式 (Multiply)</option>
+            <option value="glowOnly">仅描边发光 (Glow)</option>
+          </select>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+          <span style="color:#7b8794; font-size:11.5px;">高亮颜色</span>
+          <input type="color" id="optSelColor" value="#22d3ee" style="width:26px; height:20px; border:1px solid #dfe3e8; border-radius:4px; padding:0; cursor:pointer;" />
+        </div>
+        <label class="rng" id="wrapSelOpacity">
+          <span>叠色浓度</span>
+          <input type="range" id="optSelOpacity" min="10" max="100" step="5" value="65" />
+          <b id="selOpacityVal">65%</b>
+        </label>
+        <label class="rng">
+          <span>单体拔高</span>
+          <input type="range" id="optSelElevation" min="0" max="40" step="1" value="0" />
+          <b id="selElevationVal">0m</b>
+        </label>
         <label class="chk"><input type="checkbox" id="optOutline" checked /> 选中单体描边</label>
         <div id="wrapOutlineOpts" style="margin: 2px 0 6px 18px;">
           <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">

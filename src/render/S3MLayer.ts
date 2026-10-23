@@ -18,8 +18,15 @@ import * as THREE from 'three';
 import { S3MTileset } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import { setMaxAnisotropy } from './TextureFactory.js';
-import { STYLE, STYLE_LABELS, createSharedUniforms, createOutlineMaterial } from './StyleMaterial.js';
-import type { OutlineMaterial, StyledMaterial, StyleMode } from './StyleMaterial.js';
+import {
+  STYLE,
+  STYLE_LABELS,
+  SELECT_MODE,
+  SELECT_MODE_LABELS,
+  createSharedUniforms,
+  createOutlineMaterial,
+} from './StyleMaterial.js';
+import type { OutlineMaterial, StyledMaterial, StyleMode, SelectMode } from './StyleMaterial.js';
 import { Picker } from './Picker.js';
 import { resolveFeature, measureSegments, buildAttributes, DEFAULT_FLOOR_HEIGHT } from '../core/FeatureInfo.js';
 import type {
@@ -87,6 +94,14 @@ export interface S3MStyle {
   colorC: string;
   /** 选中单体的高亮色 */
   selectColor: string;
+  /** 选中单体的高亮模式：'overlay' 叠加原图 | 'replace' 纯色覆盖 | 'multiply' 叠乘 | 'glowOnly' 仅描边发光 */
+  selectMode?: SelectMode;
+  /** 选中高亮叠色强度 / 透明度（0~1，默认 0.65） */
+  selectOpacity?: number;
+  /** 选中自发光强度（0~1，默认 0.35） */
+  selectEmissive?: number;
+  /** 选中单体垂直拔高高度（米，默认 0） */
+  selectElevation?: number;
   /** 楼层估算层高（米） */
   floorHeight: number;
   /** 动态扫描速度倍率 */
@@ -97,6 +112,8 @@ export interface S3MStyle {
   shading: 'flat' | 'smooth';
   /** 选中单体时是否压暗其余建筑 */
   dimOthers: boolean;
+  /** 未选中建筑压暗系数（0~1，默认 0.42） */
+  dimFactor?: number;
   /** 是否给选中单体描边 */
   outline: boolean;
   /** 描边颜色（默认跟随 selectColor） */
@@ -120,11 +137,16 @@ export const DEFAULT_STYLE: S3MStyle = {
   colorB: '#1d4ed8',
   colorC: '#fbbf24',
   selectColor: '#22d3ee',
+  selectMode: SELECT_MODE.OVERLAY,
+  selectOpacity: 0.65,
+  selectEmissive: 0.35,
+  selectElevation: 0,
   floorHeight: DEFAULT_FLOOR_HEIGHT,
   speed: 1,
   opacity: 1,
   shading: 'flat',
   dimOthers: true,
+  dimFactor: 0.42,
   outline: true,
   outlineColor: '#22d3ee',
   outlineWidth: 0.9,
@@ -142,6 +164,8 @@ export interface S3MDatasetOptions {
   configUrl: string;
   visible?: boolean;
   maxTiles?: number;
+  /** 垂直高度偏移（米），正数抬升，负数下降，默认 0 */
+  heightOffset?: number;
 }
 
 export interface S3MDatasetEntry {
@@ -151,6 +175,8 @@ export interface S3MDatasetEntry {
   root: THREE.Group;
   tileset: S3MTileset | null;
   anchor: Anchor | null;
+  /** 垂直高度偏移（米） */
+  heightOffset: number;
   /** 相对场景锚点的偏移（米） */
   offset: [number, number, number];
   visible: boolean;
@@ -378,6 +404,7 @@ export class S3MLayer {
       root,
       tileset: null,
       anchor: null,
+      heightOffset: ds.heightOffset ?? 0,
       offset: [0, 0, 0],
       visible: ds.visible !== false,
       error: null,
@@ -423,7 +450,7 @@ export class S3MLayer {
     return entry;
   }
 
-  /** 数据集锚点对齐到场景锚点 */
+  /** 数据集锚点对齐到场景锚点，并应用垂直高程偏移 */
   private _layoutDataset(entry: S3MDatasetEntry): void {
     if (!entry.anchor) return;
     if (!this.sceneAnchor) {
@@ -434,10 +461,42 @@ export class S3MLayer {
     entry.offset = [
       (a.x - this.sceneAnchor.x) / s,
       -(a.y - this.sceneAnchor.y) / s,
-      (a.z - this.sceneAnchor.z) / s,
+      (a.z - this.sceneAnchor.z) / s + (entry.heightOffset ?? 0),
     ];
     entry.root.position.set(entry.offset[0], entry.offset[1], entry.offset[2]);
     entry.root.updateMatrixWorld(true);
+  }
+
+  /**
+   * 获取指定数据集的垂直高程偏移（米）。
+   * 若不传 id，默认获取第一个（或默认）数据集的高程偏移。
+   */
+  getDatasetHeight(id?: string): number {
+    const targetId = id ?? this.datasets.keys().next().value;
+    return targetId ? this.datasets.get(targetId)?.heightOffset ?? 0 : 0;
+  }
+
+  /**
+   * 设置指定数据集的垂直高程偏移（米），正数抬升，负数下降。
+   * 支持调用形式：
+   *   layer.setDatasetHeight(15.0)              // 针对当前第一个/默认数据集
+   *   layer.setDatasetHeight('datasetId', 15.0)  // 针对指定数据集
+   */
+  setDatasetHeight(idOrHeight: string | number, heightOffset?: number): void {
+    let id: string;
+    let h: number;
+    if (typeof idOrHeight === 'number') {
+      id = this.datasets.keys().next().value ?? '';
+      h = idOrHeight;
+    } else {
+      id = idOrHeight;
+      h = heightOffset ?? 0;
+    }
+    const entry = this.datasets.get(id);
+    if (!entry) return;
+    entry.heightOffset = h;
+    this._layoutDataset(entry);
+    this.map?.triggerRepaint();
   }
 
   removeDataset(id: string): void {
@@ -547,6 +606,23 @@ export class S3MLayer {
     u.uColorC.value.set(s.colorC);
     u.uSelColor.value.set(s.selectColor);
     u.uFloorHeight.value = s.floorHeight;
+
+    const selMode = s.selectMode ?? SELECT_MODE.OVERLAY;
+    if (u.uSelMode) {
+      u.uSelMode.value =
+        selMode === SELECT_MODE.REPLACE
+          ? 0
+          : selMode === SELECT_MODE.MULTIPLY
+            ? 2
+            : selMode === SELECT_MODE.GLOW_ONLY
+              ? 3
+              : 1;
+    }
+    if (u.uSelOpacity && s.selectOpacity != null) u.uSelOpacity.value = s.selectOpacity;
+    if (u.uSelEmissive && s.selectEmissive != null) u.uSelEmissive.value = s.selectEmissive;
+    if (u.uSelElevation && s.selectElevation != null) u.uSelElevation.value = s.selectElevation;
+    if (u.uDimFactor && s.dimFactor != null) u.uDimFactor.value = s.dimFactor;
+
     if (u.uRoofThreshold && s.roofThreshold != null) {
       u.uRoofThreshold.value = s.roofThreshold;
     }
@@ -554,6 +630,9 @@ export class S3MLayer {
       u.uTexMix.value = s.texMix;
     }
     if (this.outlineMaterial) {
+      if (this.outlineMaterial.uniforms.uElevation && s.selectElevation != null) {
+        this.outlineMaterial.uniforms.uElevation.value = s.selectElevation;
+      }
       if (s.outlineWidth != null) this.outlineMaterial.uniforms.uWidth.value = s.outlineWidth;
       if (s.outlineColor != null) {
         this.outlineMaterial.uniforms.uColor.value.set(s.outlineColor);
@@ -786,6 +865,8 @@ export class S3MLayer {
       this.uniforms.uSelMix.value = 0;
       this.uniforms.uDim.value = 0;
       this.outlineMaterial.uniforms.uSelBatch.value = -1;
+      this.outlineMaterial.uniforms.uSelWhole.value = 0;
+      this.outlineMaterial.uniforms.uElevation.value = 0;
       this.map?.triggerRepaint();
       if (!silent) this.onPick(null);
       return;
@@ -801,8 +882,10 @@ export class S3MLayer {
     this.uniforms.uSelMix.value = 1;
     this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
 
-    if (this.style.outline && result.batchId >= 0) {
+    if (this.style.outline) {
       this.outlineMaterial.uniforms.uSelBatch.value = result.batchId;
+      this.outlineMaterial.uniforms.uSelWhole.value = result.batchId < 0 ? 1 : 0;
+      this.outlineMaterial.uniforms.uElevation.value = this.style.selectElevation ?? 0;
       const outline = new THREE.Mesh(result.mesh.geometry, this.outlineMaterial);
       outline.renderOrder = 3;
       outline.frustumCulled = false;
@@ -958,4 +1041,5 @@ export class S3MLayer {
   }
 }
 
-export { STYLE, STYLE_LABELS };
+export { STYLE, STYLE_LABELS, SELECT_MODE, SELECT_MODE_LABELS };
+export type { SelectMode };
