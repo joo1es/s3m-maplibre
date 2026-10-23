@@ -48,6 +48,8 @@ export type {
   S3MLayerOptions,
   S3MStyle,
   SelectMode,
+  FeatureStyle,
+  S3MFilter,
   S3MDatasetOptions,
   S3MDatasetEntry,
   PickResult,

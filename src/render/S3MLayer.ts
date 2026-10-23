@@ -183,6 +183,28 @@ export interface S3MDatasetEntry {
   error: unknown;
 }
 
+export interface FeatureStyle {
+  /** 自定义单体颜色 */
+  color?: string;
+  /** 自定义单体独立拔高高度（米） */
+  elevation?: number;
+  /** 自定义单体不透明度（0~1） */
+  opacity?: number;
+}
+
+export interface S3MFilter {
+  /** 白名单：仅显示指定 SMID，其余全部隐藏 */
+  include?: number[];
+  /** 黑名单：隐藏指定 SMID */
+  exclude?: number[];
+  /** 最小高度（米，相对场景高程），低于此高度的建筑隐藏 */
+  minHeight?: number;
+  /** 最大高度（米，相对场景高程），高于此高度的建筑隐藏 */
+  maxHeight?: number;
+  /** 自定义谓词函数过滤（基于建筑属性） */
+  predicate?: (feature: FeatureAttributes & { smid: number | null }) => boolean;
+}
+
 export interface PickResult extends FeatureAttributes {
   datasetId: string;
   datasetName: string;
@@ -279,6 +301,13 @@ export class S3MLayer {
   private _selection: PickResult | null = null;
   private _outlineMesh: THREE.Mesh | null = null;
   private _edgesEnabled = false;
+
+  private readonly _featureStyles = new Map<number, FeatureStyle>();
+  private _filter: S3MFilter | null = null;
+  private readonly _meshBatchTextures = new WeakMap<
+    THREE.Mesh,
+    { texture: THREE.DataTexture; data: Float32Array; width: number }
+  >();
 
   private readonly _enuMatrix = new THREE.Matrix4();
   private _needsRepaint = true;
@@ -499,6 +528,202 @@ export class S3MLayer {
     this.map?.triggerRepaint();
   }
 
+  /* ---------------------------------------------------------------- 单体自定义样式 & 过滤 */
+
+  /**
+   * 为指定单体（SMID）设置独立自定义样式（颜色、拔高、透明度）。
+   * 即使点击选中其他建筑，此单体的独立样式依然持久保留。
+   */
+  setFeatureStyle(smid: number, style: FeatureStyle): void {
+    this._featureStyles.set(smid, style);
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
+  /** 批量为多个单体设置样式 */
+  setFeaturesStyle(smids: number[], style: FeatureStyle): void {
+    for (const smid of smids) {
+      this._featureStyles.set(smid, style);
+    }
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
+  /** 获取指定单体的自定义样式 */
+  getFeatureStyle(smid: number): FeatureStyle | null {
+    return this._featureStyles.get(smid) ?? null;
+  }
+
+  /** 获取所有自定义样式的单体映射表 */
+  getFeatureStyles(): Map<number, FeatureStyle> {
+    return new Map(this._featureStyles);
+  }
+
+  /** 移除指定单体的自定义样式，恢复为图层全局样式 */
+  removeFeatureStyle(smid: number): void {
+    if (this._featureStyles.delete(smid)) {
+      this._applyOverridesToAllMeshes();
+      this.map?.triggerRepaint();
+    }
+  }
+
+  /** 清空所有单体的自定义样式 */
+  clearFeatureStyles(): void {
+    if (this._featureStyles.size > 0) {
+      this._featureStyles.clear();
+      this._applyOverridesToAllMeshes();
+      this.map?.triggerRepaint();
+    }
+  }
+
+  /**
+   * 设置图层过滤规则。
+   * 支持按 SMID 白名单（include）、黑名单（exclude）、高度范围（minHeight/maxHeight）或谓词函数过滤。
+   * 被过滤隐藏的建筑不渲染、不参与深度测试、鼠标无法拾取。
+   */
+  setFilter(filter: S3MFilter | null): void {
+    this._filter = filter;
+    if (filter && (filter.minHeight != null || filter.maxHeight != null)) {
+      if (this.uniforms.uFilterMinZ) this.uniforms.uFilterMinZ.value = filter.minHeight ?? -99999;
+      if (this.uniforms.uFilterMaxZ) this.uniforms.uFilterMaxZ.value = filter.maxHeight ?? 99999;
+      if (this.uniforms.uFilterHeightActive) this.uniforms.uFilterHeightActive.value = 1;
+    } else if (this.uniforms.uFilterHeightActive) {
+      this.uniforms.uFilterHeightActive.value = 0;
+    }
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
+  /** 获取当前生效的过滤规则 */
+  getFilter(): S3MFilter | null {
+    return this._filter;
+  }
+
+  /** 清除过滤规则，恢复全量建筑显示 */
+  clearFilter(): void {
+    this.setFilter(null);
+  }
+
+  private _isFeatureHidden(smid: number | null, _batchId: number): boolean {
+    if (!this._filter) return false;
+    if (smid != null) {
+      if (this._filter.include && this._filter.include.length > 0 && !this._filter.include.includes(smid)) {
+        return true;
+      }
+      if (this._filter.exclude && this._filter.exclude.length > 0 && this._filter.exclude.includes(smid)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private _applyOverridesToMesh(mesh: THREE.Mesh): void {
+    const mat = styledMaterialOf(mesh);
+    if (!mat) return;
+
+    const ud = mesh.userData as MeshUserData;
+    const pickInfo = ud.geoRef?.pickInfo;
+
+    const hasStyles = this._featureStyles.size > 0;
+    const filter = this._filter;
+    const hasFilter =
+      filter != null &&
+      ((filter.include?.length ?? 0) > 0 || (filter.exclude?.length ?? 0) > 0 || filter.predicate != null);
+
+    if (!hasStyles && !hasFilter) {
+      if (mat.userData.uBatchTexActive) {
+        mat.userData.uBatchTexActive.value = 0;
+      }
+      return;
+    }
+
+    if (!pickInfo || Object.keys(pickInfo).length === 0) {
+      if (mat.userData.uBatchTexActive) {
+        mat.userData.uBatchTexActive.value = 0;
+      }
+      return;
+    }
+
+    let maxBatch = 0;
+    for (const p of Object.values(pickInfo)) {
+      if (p.batchId != null && p.batchId > maxBatch) maxBatch = p.batchId;
+    }
+    const width = Math.max(maxBatch + 1, 1);
+
+    let record = this._meshBatchTextures.get(mesh);
+    if (!record || record.width < width) {
+      const data = new Float32Array(width * 4);
+      const texture = new THREE.DataTexture(data, width, 1, THREE.RGBAFormat, THREE.FloatType);
+      texture.minFilter = THREE.NearestFilter;
+      texture.magFilter = THREE.NearestFilter;
+      record = { texture, data, width };
+      this._meshBatchTextures.set(mesh, record);
+      mat.userData.uBatchTex.value = texture;
+      mat.userData.uBatchTexWidth.value = width;
+    }
+
+    const { data, texture } = record;
+    // 默认值：[-1, -1, -1, 0]（无自定义色，无抬升，不隐藏）
+    data.fill(-1);
+    for (let i = 0; i < record.width; i++) {
+      data[i * 4 + 3] = 0;
+    }
+
+    let hasActive = false;
+    for (const [smidStr, entry] of Object.entries(pickInfo)) {
+      const smid = Number(smidStr);
+      const bId = entry.batchId;
+      if (bId == null || bId < 0 || bId >= record.width) continue;
+
+      let hidden = false;
+      if (filter) {
+        if (filter.include && filter.include.length > 0 && !filter.include.includes(smid)) {
+          hidden = true;
+        }
+        if (filter.exclude && filter.exclude.length > 0 && filter.exclude.includes(smid)) {
+          hidden = true;
+        }
+        if (filter.predicate) {
+          const { segments } = resolveFeature(ud.geoRef, bId);
+          const box = measureSegments(mesh.geometry, segments);
+          const attrs = buildAttributes({ smid, box, triangles: 0, floorHeight: this.style.floorHeight });
+          if (!filter.predicate({ ...attrs, smid })) {
+            hidden = true;
+          }
+        }
+      }
+
+      if (hidden) {
+        data[bId * 4 + 3] = -1.0; // 标记隐藏
+        hasActive = true;
+        continue;
+      }
+
+      const st = this._featureStyles.get(smid);
+      if (st) {
+        hasActive = true;
+        if (st.color) {
+          const c = new THREE.Color(st.color);
+          data[bId * 4 + 0] = c.r;
+          data[bId * 4 + 1] = c.g;
+          data[bId * 4 + 2] = c.b;
+        }
+        if (st.elevation != null && st.elevation > 0) {
+          data[bId * 4 + 3] = st.elevation;
+        }
+      }
+    }
+
+    texture.needsUpdate = true;
+    mat.userData.uBatchTexActive.value = hasActive ? 1 : 0;
+  }
+
+  private _applyOverridesToAllMeshes(): void {
+    for (const p of this._pickables.values()) {
+      this._applyOverridesToMesh(p.mesh);
+    }
+  }
+
   removeDataset(id: string): void {
     const entry = this.datasets.get(id);
     if (!entry) return;
@@ -574,6 +799,7 @@ export class S3MLayer {
         mat.depthWrite = o >= 0.999;
         mat.flatShading = this.style.shading !== 'smooth';
         mat.needsUpdate = true;
+        this._applyOverridesToMesh(mesh);
       }
     }
     this._refreshHeightRange();
@@ -822,6 +1048,7 @@ export class S3MLayer {
 
     const ud = ref.mesh.userData as MeshUserData;
     const { smid, segments } = resolveFeature(ud.geoRef, hit.batchId);
+    if (this._isFeatureHidden(smid, hit.batchId)) return null;
     const box = measureSegments(ref.mesh.geometry, segments);
     const geometry = ref.mesh.geometry;
     const triangles = geometry.index ? Math.round(geometry.index.count / 3) : 0;
@@ -886,6 +1113,11 @@ export class S3MLayer {
       this.outlineMaterial.uniforms.uSelBatch.value = result.batchId;
       this.outlineMaterial.uniforms.uSelWhole.value = result.batchId < 0 ? 1 : 0;
       this.outlineMaterial.uniforms.uElevation.value = this.style.selectElevation ?? 0;
+      if (mat?.userData?.uBatchTex) {
+        this.outlineMaterial.uniforms.uBatchTex.value = mat.userData.uBatchTex.value as THREE.Texture;
+        this.outlineMaterial.uniforms.uBatchTexWidth.value = mat.userData.uBatchTexWidth.value as number;
+        this.outlineMaterial.uniforms.uBatchTexActive.value = mat.userData.uBatchTexActive.value as number;
+      }
       const outline = new THREE.Mesh(result.mesh.geometry, this.outlineMaterial);
       outline.renderOrder = 3;
       outline.frustumCulled = false;

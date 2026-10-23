@@ -229,6 +229,21 @@
         <label class="chk"><input type="checkbox" id="optOccludeBack" checked /> 遮挡内部与背面线条 (深度防透)</label>
       </section>
 
+      <section>
+        <h2>单体过滤与筛选 (Filter)</h2>
+        <div style="display: flex; gap: 5px; margin-bottom: 6px;">
+          <button id="btnFilterIsolate" style="flex: 1; padding: 5px 4px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #f9fafb; color: #374151; cursor: pointer; transition: .12s;">仅看选中</button>
+          <button id="btnFilterHide" style="flex: 1; padding: 5px 4px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #f9fafb; color: #dc2626; cursor: pointer; transition: .12s;">隐藏选中</button>
+          <button id="btnFilterReset" style="flex: 1; padding: 5px 4px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #f9fafb; color: #374151; cursor: pointer; transition: .12s;">恢复全显</button>
+        </div>
+        <label class="rng">
+          <span>高度上限</span>
+          <input type="range" id="optFilterMaxH" min="10" max="250" step="5" value="250" />
+          <b id="filterMaxHVal">全部</b>
+        </label>
+        <div id="filterStatus" style="font-size: 11px; color: #6b7280; margin-top: 3px; min-height: 16px;"></div>
+      </section>
+
       <footer>
         <div>瓦片 <b id="stTiles">0</b></div>
         <div>网格 <b id="stMeshes">0</b></div>

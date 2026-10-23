@@ -524,11 +524,86 @@ $('optOccludeBack').addEventListener('change', (e) => {
   layer.setStyle({ depthWrite: e.target.checked });
 });
 
+/* ---------------------------------------------------------------- 过滤与单体定制 */
+
+let hiddenSmids = new Set();
+let isolateSmid = null;
+let maxHeightFilter = null;
+let currentFeature = null;
+
+function applyFilters() {
+  const filter = {};
+  if (isolateSmid != null) {
+    filter.include = [isolateSmid];
+  } else if (hiddenSmids.size > 0) {
+    filter.exclude = Array.from(hiddenSmids);
+  }
+  if (maxHeightFilter != null) {
+    filter.maxHeight = maxHeightFilter;
+  }
+  layer.setFilter(Object.keys(filter).length > 0 ? filter : null);
+  updateFilterStatus();
+}
+
+function updateFilterStatus() {
+  const el = $('filterStatus');
+  if (!el) return;
+  const parts = [];
+  const customCount = layer.getFeatureStyles().size;
+  if (customCount > 0) parts.push(`已定制 <b>${customCount}</b> 栋单体`);
+  if (isolateSmid != null) parts.push(`独显 SMID <b>${isolateSmid}</b>`);
+  else if (hiddenSmids.size > 0) parts.push(`已隐藏 <b>${hiddenSmids.size}</b> 栋`);
+  if (maxHeightFilter != null) parts.push(`限高 ≤ <b>${maxHeightFilter}m</b>`);
+  el.innerHTML = parts.length > 0 ? parts.join(' · ') : '显示全量模型';
+}
+
+$('btnFilterIsolate').addEventListener('click', () => {
+  if (currentFeature?.smid != null) {
+    isolateSmid = currentFeature.smid;
+    applyFilters();
+  } else {
+    alert('请先在地图上点击选中一栋建筑');
+  }
+});
+
+$('btnFilterHide').addEventListener('click', () => {
+  if (currentFeature?.smid != null) {
+    hiddenSmids.add(currentFeature.smid);
+    layer.select(null);
+    applyFilters();
+  } else {
+    alert('请先在地图上点击选中一栋建筑');
+  }
+});
+
+$('btnFilterReset').addEventListener('click', () => {
+  isolateSmid = null;
+  hiddenSmids.clear();
+  maxHeightFilter = null;
+  $('optFilterMaxH').value = 250;
+  $('filterMaxHVal').textContent = '全部';
+  layer.clearFilter();
+  updateFilterStatus();
+});
+
+$('optFilterMaxH').addEventListener('input', (e) => {
+  const val = Number(e.target.value);
+  if (val >= 250) {
+    maxHeightFilter = null;
+    $('filterMaxHVal').textContent = '全部';
+  } else {
+    maxHeightFilter = val;
+    $('filterMaxHVal').textContent = `≤${val}m`;
+  }
+  applyFilters();
+});
+
 syncSwatches();
 
 /* ---------------------------------------------------------------- 属性卡展示 */
 
 function renderFeature(f) {
+  currentFeature = f;
   const el = $('feature');
   if (!f) {
     el.classList.remove('on');
@@ -536,6 +611,33 @@ function renderFeature(f) {
   }
   const coord = f.centerLngLat ? `${f.centerLngLat[0].toFixed(6)}, ${f.centerLngLat[1].toFixed(6)}` : '—';
   const size = f.size ? `${num(f.size[0])} × ${num(f.size[1])} m` : '—';
+  const custom = f.smid != null ? layer.getFeatureStyle(f.smid) : null;
+
+  let customHtml = '';
+  if (f.smid != null) {
+    customHtml = `
+      <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #e5e7eb; display: flex; flex-direction: column; gap: 6px;">
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-weight: 600; font-size: 11px; color: #374151;">单体独立样式定制</span>
+          <span style="font-size: 10px; color: ${custom ? '#059669' : '#9ca3af'};">${custom ? '● 已固定' : '默认样式'}</span>
+        </div>
+        <div style="display: flex; gap: 6px; align-items: center;">
+          <span style="font-size: 11px; color: #6b7280;">颜色</span>
+          <input type="color" id="featColor" value="${custom?.color ?? '#ef4444'}" style="width: 26px; height: 20px; border: 1px solid #d1d5db; border-radius: 4px; padding: 0; cursor: pointer;" />
+          <label style="display: flex; align-items: center; gap: 4px; font-size: 11px; color: #6b7280; flex: 1; margin: 0;">
+            <span>拔高</span>
+            <input type="range" id="featElevation" min="0" max="40" step="1" value="${custom?.elevation ?? 0}" style="flex: 1; height: 14px;" />
+            <b id="featElevationVal" style="width: 26px; text-align: right; color: #111827;">${custom?.elevation ?? 0}m</b>
+          </label>
+        </div>
+        <div style="display: flex; gap: 4px; margin-top: 2px;">
+          <button id="btnPinFeature" style="flex: 1; padding: 4px 6px; font-size: 11px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 500;">固定此样式</button>
+          <button id="btnResetFeature" style="padding: 4px 6px; font-size: 11px; background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer;">重置</button>
+          <button id="btnHideFeature" style="padding: 4px 6px; font-size: 11px; background: #fee2e2; color: #dc2626; border: 1px solid #fecaca; border-radius: 4px; cursor: pointer;">隐藏/拆除</button>
+        </div>
+      </div>
+    `;
+  }
 
   el.innerHTML = `
     <div class="hd">
@@ -550,13 +652,38 @@ function renderFeature(f) {
     <div class="kv"><span>底面积（外接盒）</span><span>${fmt(f.bboxArea ?? 0)} ㎡</span></div>
     <div class="kv"><span>三角面 / 顶点</span><span>${fmt(f.triangles ?? 0)} / ${fmt(f.vertices ?? 0)}</span></div>
     <div class="kv"><span>中心坐标</span><span>${coord}</span></div>
-    <div class="note">SMID 取自 S3M 单体化信息（pickInfo）；高度 / 楼层 / 占地由几何实时计算，不是业务属性表。</div>`;
+    ${customHtml}
+    <div class="note">SMID 取自 S3M 单体化信息；独立定制后点击其他建筑仍持久保留。</div>`;
 
   el.classList.add('on');
   $('closeFeature').addEventListener('click', () => {
     layer.select(null);
     el.classList.remove('on');
   });
+
+  if (f.smid != null) {
+    $('featElevation').addEventListener('input', (e) => {
+      $('featElevationVal').textContent = `${e.target.value}m`;
+    });
+    $('btnPinFeature').addEventListener('click', () => {
+      layer.setFeatureStyle(f.smid, {
+        color: $('featColor').value,
+        elevation: Number($('featElevation').value),
+      });
+      updateFilterStatus();
+      renderFeature(f);
+    });
+    $('btnResetFeature').addEventListener('click', () => {
+      layer.removeFeatureStyle(f.smid);
+      updateFilterStatus();
+      renderFeature(f);
+    });
+    $('btnHideFeature').addEventListener('click', () => {
+      hiddenSmids.add(f.smid);
+      layer.select(null);
+      applyFilters();
+    });
+  }
 }
 
 layer.onPick = (f) => renderFeature(f);

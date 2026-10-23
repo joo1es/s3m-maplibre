@@ -63,10 +63,19 @@ export interface StyledMaterial extends THREE.MeshStandardMaterial {
   userData: {
     uSelBatch: { value: number };
     uSelWhole: { value: number };
+    uBatchTex: { value: THREE.Texture };
+    uBatchTexWidth: { value: number };
+    uBatchTexActive: { value: number };
     isStyled: true;
     [key: string]: unknown;
   };
 }
+
+const DUMMY_DATA = new Float32Array([-1, -1, -1, 0]);
+export const DUMMY_BATCH_TEX = new THREE.DataTexture(DUMMY_DATA, 1, 1, THREE.RGBAFormat, THREE.FloatType);
+DUMMY_BATCH_TEX.minFilter = THREE.NearestFilter;
+DUMMY_BATCH_TEX.magFilter = THREE.NearestFilter;
+DUMMY_BATCH_TEX.needsUpdate = true;
 
 /** 全局共享 uniform（所有材质引用同一批对象，改 .value 即全场景生效） */
 export function createSharedUniforms(): StyleUniforms {
@@ -95,6 +104,12 @@ export function createSharedUniforms(): StyleUniforms {
     uSelEmissive: { value: 0.35 },
     /** 选中单体垂直拔高高度（米，默认 0） */
     uSelElevation: { value: 0 },
+    /** 高度过滤下界 */
+    uFilterMinZ: { value: -99999 },
+    /** 高度过滤上界 */
+    uFilterMaxZ: { value: 99999 },
+    /** 是否启用高度过滤 */
+    uFilterHeightActive: { value: 0 },
     /** 顶面法线判定阈值：Z 分量余弦大于该值判定为顶面 */
     uRoofThreshold: { value: 0.65 },
     /** 与模型原色贴图混合强度：0 = 纯色覆盖，1 = 叠乘原色贴图 */
@@ -108,6 +123,9 @@ const VERT_PARS = /* glsl */ `
   uniform float uSelBatch;
   uniform float uSelWhole;
   uniform float uSelElevation;
+  uniform sampler2D uBatchTex;
+  uniform float uBatchTexWidth;
+  uniform int uBatchTexActive;
   varying float vBatchId;
   varying vec3 vVertColor;
   varying float vWorldZ;
@@ -116,8 +134,18 @@ const VERT_PARS = /* glsl */ `
 `;
 
 const VERT_WORLD = /* glsl */ `
+  float s3mCustomElev = 0.0;
+  if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
+    vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+    if ( bState.a < -0.5 ) {
+      transformed = vec3( 0.0 );
+    } else if ( bState.a > 0.0 ) {
+      s3mCustomElev = bState.a;
+    }
+  }
+
   float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
-  transformed.z += s3mSelElev * uSelElevation;
+  transformed.z += s3mSelElev * uSelElevation + s3mCustomElev;
 
   vec4 s3mWorld = vec4( transformed, 1.0 );
   #ifdef USE_INSTANCING
@@ -147,6 +175,12 @@ const FRAG_PARS = /* glsl */ `
   uniform float uSelOpacity;
   uniform float uSelEmissive;
   uniform float uDimFactor;
+  uniform sampler2D uBatchTex;
+  uniform float uBatchTexWidth;
+  uniform int uBatchTexActive;
+  uniform float uFilterMinZ;
+  uniform float uFilterMaxZ;
+  uniform int uFilterHeightActive;
   uniform float uTime;
   uniform float uHeightMin;
   uniform float uHeightMax;
@@ -229,7 +263,24 @@ const FRAG_COLOR = /* glsl */ `
     diffuseColor.rgb = mix( diffuseColor.rgb, overlay, uTexMix );
   }
 
-  // 选中单体高亮 + 其余压暗
+  // 1. 高度范围过滤
+  if ( uFilterHeightActive > 0 ) {
+    if ( vWorldZ < uFilterMinZ || vWorldZ > uFilterMaxZ ) discard;
+  }
+
+  // 2. 单体状态过滤（隐藏）与单体独立改色
+  if ( uBatchTexActive > 0 && vBatchId >= 0.0 ) {
+    vec4 bState = texture2D( uBatchTex, vec2( ( vBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+    if ( bState.a < -0.5 ) {
+      discard; // 属于被过滤隐藏的单体
+    }
+    if ( bState.r >= 0.0 ) {
+      // 单体独立自定义颜色
+      diffuseColor.rgb = bState.rgb;
+    }
+  }
+
+  // 3. 选中单体高亮 + 其余压暗
   float s3mSel = max( step( 0.0, uSelBatch ) * step( abs( vBatchId - uSelBatch ), 0.5 ), uSelWhole );
   if ( s3mSel > 0.5 && uSelMix > 0.001 ) {
     if ( uSelMode == 0 ) {
@@ -291,9 +342,18 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   const uSelBatch = { value: -1 };
   // 没有单体化信息的几何（batchId = -1）只能整块选中
   const uSelWhole = { value: 0 };
+  const uBatchTex = { value: DUMMY_BATCH_TEX };
+  const uBatchTexWidth = { value: 1.0 };
+  const uBatchTexActive = { value: 0 };
 
   mat.onBeforeCompile = (shader) => {
-    Object.assign(shader.uniforms, uniforms, { uSelBatch, uSelWhole });
+    Object.assign(shader.uniforms, uniforms, {
+      uSelBatch,
+      uSelWhole,
+      uBatchTex,
+      uBatchTexWidth,
+      uBatchTexActive,
+    });
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${VERT_PARS}`)
@@ -310,6 +370,9 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
 
   mat.userData.uSelBatch = uSelBatch;
   mat.userData.uSelWhole = uSelWhole;
+  mat.userData.uBatchTex = uBatchTex;
+  mat.userData.uBatchTexWidth = uBatchTexWidth;
+  mat.userData.uBatchTexActive = uBatchTexActive;
   mat.userData.isStyled = true;
   return mat;
 }
@@ -322,12 +385,23 @@ const OUTLINE_VERT = /* glsl */ `
   uniform float uSelWhole;
   uniform float uWidth;
   uniform float uElevation;
+  uniform sampler2D uBatchTex;
+  uniform float uBatchTexWidth;
+  uniform int uBatchTexActive;
   varying float vSel;
   void main() {
     vSel = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
-    // 沿法线外扩，背面渲染 → 形成一圈等宽描边
+    float s3mCustomElev = 0.0;
+    if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
+      vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+      if ( bState.a < -0.5 ) {
+        vSel = 0.0; // 过滤隐藏的单体不显示描边
+      } else if ( bState.a > 0.0 ) {
+        s3mCustomElev = bState.a;
+      }
+    }
     vec3 p = position + normal * uWidth * vSel;
-    p.z += vSel * uElevation;
+    p.z += vSel * ( uElevation + s3mCustomElev );
     gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
   }
 `;
@@ -347,6 +421,9 @@ export interface OutlineMaterial extends THREE.ShaderMaterial {
     uSelWhole: { value: number };
     uWidth: { value: number };
     uElevation: { value: number };
+    uBatchTex: { value: THREE.Texture };
+    uBatchTexWidth: { value: number };
+    uBatchTexActive: { value: number };
     uColor: { value: THREE.Color };
   };
 }
@@ -359,6 +436,9 @@ export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9)
       uSelWhole: { value: 0 },
       uWidth: { value: initialWidth },
       uElevation: { value: 0 },
+      uBatchTex: { value: DUMMY_BATCH_TEX },
+      uBatchTexWidth: { value: 1.0 },
+      uBatchTexActive: { value: 0 },
       uColor: { value: shared.uSelColor.value.clone() },
     },
     vertexShader: OUTLINE_VERT,

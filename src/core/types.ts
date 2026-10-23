@@ -204,6 +204,9 @@ export interface StyleUniforms {
   uSelOpacity?: { value: number };
   uSelEmissive?: { value: number };
   uSelElevation?: { value: number };
+  uFilterMinZ?: { value: number };
+  uFilterMaxZ?: { value: number };
+  uFilterHeightActive?: { value: number };
   uRoofThreshold?: { value: number };
   uTexMix?: { value: number };
   [key: string]: { value: unknown } | undefined;
