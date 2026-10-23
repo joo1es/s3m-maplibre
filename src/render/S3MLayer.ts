@@ -58,6 +58,7 @@ import type {
   FeatureAttributes,
   GeoPackageEntry,
   ParsedTile,
+  PickSegment,
   SegmentBox,
   Stats,
   StyleUniforms,
@@ -79,7 +80,52 @@ export interface MapLike {
   getBearing?(): number;
   getFreeCameraOptions?(): { position?: { x: number; y: number; z: number } | null } | null;
   /** 注意 fov 在 MapLibre v5 起是「度」，v4 / Mapbox 是「弧度」；弧度用 fovInRadians */
-  transform?: { fov?: number; fovInRadians?: number; cameraToCenterDistance?: number };
+  transform?: {
+    fov?: number;
+    fovInRadians?: number;
+    cameraToCenterDistance?: number;
+    worldCoordinateHelper?: unknown;
+    projection?: { worldCoordinateHelper?: unknown };
+  };
+  getProjection?(): unknown;
+}
+
+export interface WorldCoordinateHelperLike {
+  name?: string;
+  worldFromLngLat(lng: number, lat: number, altitude?: number): { x: number; y: number; z?: number };
+  lngLatFromWorld(x: number, y: number): { lng: number; lat: number } | [number, number];
+  metersPerWorldUnit?(x: number, y: number): number;
+}
+
+/**
+ * 从宿主地图中提取 WorldCoordinateHelper（自动适配 MapLibre v5+ CRS 体系与自定义投影）
+ */
+function extractWorldCoordinateHelper(map: unknown): WorldCoordinateHelperLike | null {
+  const m = map as {
+    transform?: {
+      worldCoordinateHelper?: unknown;
+      projection?: { worldCoordinateHelper?: unknown };
+    };
+    painter?: {
+      transform?: {
+        worldCoordinateHelper?: unknown;
+      };
+    };
+    getProjection?(): { worldCoordinateHelper?: unknown } | unknown;
+  };
+
+  const helper = (
+    m?.transform?.worldCoordinateHelper ??
+    m?.transform?.projection?.worldCoordinateHelper ??
+    m?.painter?.transform?.worldCoordinateHelper ??
+    (typeof m?.getProjection === 'function' ? (m.getProjection() as any)?.worldCoordinateHelper : null) ??
+    null
+  ) as WorldCoordinateHelperLike | null;
+
+  if (helper && typeof helper.worldFromLngLat === 'function' && typeof helper.lngLatFromWorld === 'function') {
+    return helper;
+  }
+  return null;
 }
 
 export interface MapMouseEventLike {
@@ -89,7 +135,7 @@ export interface MapMouseEventLike {
 
 /* ------------------------------------------------------------------ 数学 */
 
-/** 经纬度 → 墨卡托归一化坐标（世界为 1×1） */
+/** 经纬度 → 墨卡托归一化坐标（世界为 1×1）—— 默认墨卡托兜底 */
 function mercatorFromLngLat(
   lon: number,
   lat: number,
@@ -102,7 +148,7 @@ function mercatorFromLngLat(
   return { x, y, z: altitude * meterInMercator, meterInMercator, altitude };
 }
 
-/** 墨卡托归一化坐标 → 经纬度 */
+/** 墨卡托归一化坐标 → 经纬度 —— 默认墨卡托兜底 */
 function lngLatFromMercator(x: number, y: number): [number, number] {
   const lon = x * 360 - 180;
   const lat = (Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) * 180) / Math.PI;
@@ -566,8 +612,11 @@ export class S3MLayer {
   private _heightMax = -Infinity;
   private readonly _boxScratch = new THREE.Box3();
   private _selection: PickResult | null = null;
+  private _selectedMeshes: THREE.Mesh[] = [];
   private _outlineMesh: THREE.Mesh | null = null;
+  private _outlineMeshes: THREE.Mesh[] = [];
   private _selectionEdges: THREE.Mesh | null = null;
+  private _selectionEdgeMeshes: THREE.Mesh[] = [];
   private _edgesEnabled = false;
 
   private readonly _featureStyles = new Map<number, FeatureStyle>();
@@ -632,6 +681,10 @@ export class S3MLayer {
     if (options.attributes) this.attributeQuery = new AttributeQuery(options.attributes);
   }
 
+  private readonly _onProjectionChange = (): void => {
+    this._recomputeAnchors();
+  };
+
   /* ---------------------------------------------------------------- 生命周期 */
 
   onAdd(map: MapLike, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
@@ -660,11 +713,23 @@ export class S3MLayer {
     this._applyStyleUniforms();
     for (const ds of this._datasetQueue) void this.addDataset(ds).catch((e) => this.onError(e));
 
+    this._recomputeAnchors();
+
     map.on('click', this._onClick);
+    // MapLibre v6 起 setProjection() 会 fire 'projectiontransition'（style.ts 的
+    // _setProjectionInternal 里触发）。事件名必须是全称，写 'projection' 永远不会触发。
+    // v4 / v5 / Mapbox 没有这个事件，监听一个不存在的事件名是安全的（只是不 fire），
+    // 而 v4/v5 本来也不支持运行时切投影，初始投影在 onAdd 的 _recomputeAnchors 里已覆盖。
+    if (typeof map.on === 'function') {
+      map.on('projectiontransition', this._onProjectionChange);
+    }
   }
 
   onRemove(): void {
     this.map?.off('click', this._onClick);
+    if (typeof this.map?.off === 'function') {
+      this.map.off('projectiontransition', this._onProjectionChange);
+    }
     for (const id of [...this.datasets.keys()]) this.removeDataset(id);
     this.picker?.dispose();
     this.picker = null;
@@ -672,6 +737,11 @@ export class S3MLayer {
     this.edgeMaterial.dispose();
     this.selectionEdgeMaterial.dispose();
     this.scene?.clear();
+    this._selectedMeshes = [];
+    this._outlineMeshes = [];
+    this._selectionEdgeMeshes = [];
+    this._outlineMesh = null;
+    this._selectionEdges = null;
     this._smidMeshes.clear();
     this._meshHeight.clear();
     this._dirtyMeshes.clear();
@@ -792,14 +862,73 @@ export class S3MLayer {
     return entry;
   }
 
+  /**
+   * 经纬度 + 高程 → 归一化世界坐标与尺度换算。
+   * 优先使用宿主 map 的 WorldCoordinateHelper（自动适配 MapLibre v5+ 任意 CRS，如自定义投影、平面直角坐标系等），
+   * 若宿主未就绪或为老版本则平滑回退至标准 Web 墨卡托。
+   */
+  private _worldFromLngLat(
+    lon: number,
+    lat: number,
+    altitude = 0
+  ): { x: number; y: number; z: number; meterInMercator: number; altitude: number } {
+    const helper = extractWorldCoordinateHelper(this.map);
+    if (helper) {
+      const coord = helper.worldFromLngLat(lon, lat, altitude);
+      let s = 0;
+      if (typeof helper.metersPerWorldUnit === 'function') {
+        const mpw = helper.metersPerWorldUnit(coord.x, coord.y);
+        if (Number.isFinite(mpw) && mpw > 0) s = 1 / mpw;
+      }
+      if (s === 0) {
+        const c1 = helper.worldFromLngLat(lon, lat, altitude + 1);
+        const dz = Math.abs((c1.z ?? 0) - (coord.z ?? 0));
+        s = dz > 0 ? dz : mercatorFromLngLat(lon, lat, altitude).meterInMercator;
+      }
+      return {
+        x: coord.x,
+        y: coord.y,
+        z: coord.z ?? (altitude * s),
+        meterInMercator: s,
+        altitude,
+      };
+    }
+    return mercatorFromLngLat(lon, lat, altitude);
+  }
+
+  /**
+   * 归一化世界坐标 → 经纬度 [lng, lat]
+   */
+  private _lngLatFromWorld(x: number, y: number): [number, number] {
+    const helper = extractWorldCoordinateHelper(this.map);
+    if (helper) {
+      const res = helper.lngLatFromWorld(x, y);
+      if (Array.isArray(res)) return [res[0], res[1]];
+      if (res && typeof res.lng === 'number' && typeof res.lat === 'number') {
+        return [res.lng, res.lat];
+      }
+    }
+    return lngLatFromMercator(x, y);
+  }
+
+  /** 当地图 CRS 投影切换或宿主 map 挂载后，重新计算场景锚点与各数据集 offset */
+  private _recomputeAnchors(): void {
+    if (this.datasets.size === 0) return;
+    this.sceneAnchor = null;
+    for (const entry of this.datasets.values()) {
+      this._layoutDataset(entry);
+    }
+    this.map?.triggerRepaint();
+  }
+
   /** 数据集锚点对齐到场景锚点，并应用垂直高程偏移 */
   private _layoutDataset(entry: S3MDatasetEntry): void {
     if (!entry.anchor) return;
     if (!this.sceneAnchor) {
-      this.sceneAnchor = mercatorFromLngLat(entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
+      this.sceneAnchor = this._worldFromLngLat(entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     }
     const s = this.sceneAnchor.meterInMercator;
-    const a = mercatorFromLngLat(entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
+    const a = this._worldFromLngLat(entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     entry.offset = [
       (a.x - this.sceneAnchor.x) / s,
       -(a.y - this.sceneAnchor.y) / s,
@@ -1637,7 +1766,7 @@ export class S3MLayer {
       const mesh = child as THREE.Mesh;
       if (!mesh.isMesh) continue;
       const ud = mesh.userData as MeshUserData;
-      if (this._selection?.mesh === mesh) this.select(null);
+      if (this._selection?.mesh === mesh || this._selectedMeshes.includes(mesh)) this.select(null);
       if (ud.pickId != null) {
         this._pickables.delete(ud.pickId);
         this._releasePickId(ud.pickId);
@@ -2057,28 +2186,66 @@ export class S3MLayer {
 
     if (this._isFeatureHidden(smid, batchId)) return null;
 
-    let box =
-      instanceIndex != null
-        ? this._instanceBox(ref.mesh, instanceIndex)
-        : measureSegments(ref.mesh.geometry, segments);
-    if (!box && ref.mesh.geometry) {
-      if (!ref.mesh.geometry.boundingBox) ref.mesh.geometry.computeBoundingBox();
-      const bb = ref.mesh.geometry.boundingBox;
-      if (bb) {
-        box = {
-          minX: bb.min.x,
-          maxX: bb.max.x,
-          minY: bb.min.y,
-          maxY: bb.max.y,
-          minZ: bb.min.z,
-          maxZ: bb.max.z,
-          count: 0,
-          triangles: 0,
-        };
+    let box: SegmentBox | null = null;
+    let totalTriangles = 0;
+
+    if (instanceIndex != null) {
+      box = this._instanceBox(ref.mesh, instanceIndex);
+      totalTriangles = ref.mesh.geometry.index ? Math.round(ref.mesh.geometry.index.count / 3) : 0;
+    } else if (smid != null && this._smidMeshes.has(smid)) {
+      const meshes = this._smidMeshes.get(smid)!;
+      let minX = Infinity;
+      let minY = Infinity;
+      let minZ = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      let maxZ = -Infinity;
+      let count = 0;
+      for (const m of meshes) {
+        const mUd = m.userData as MeshUserData;
+        const mPick = mUd.geoRef?.pickInfo;
+        const entry = (mPick as Record<string | number, unknown> | undefined)?.[smid] ??
+          (mPick as Record<string | number, unknown> | undefined)?.[String(smid)];
+        const bId = entry ? pickEntryId(entry as any) : -1;
+        const mSegs = (entry as any)?.segments ?? (bId >= 0 ? resolveFeature(mUd.geoRef, bId).segments : []);
+        const mBox = measureSegments(m.geometry, mSegs);
+        if (mBox) {
+          if (mBox.minX < minX) minX = mBox.minX;
+          if (mBox.minY < minY) minY = mBox.minY;
+          if (mBox.minZ < minZ) minZ = mBox.minZ;
+          if (mBox.maxX > maxX) maxX = mBox.maxX;
+          if (mBox.maxY > maxY) maxY = mBox.maxY;
+          if (mBox.maxZ > maxZ) maxZ = mBox.maxZ;
+          count += mBox.count;
+          totalTriangles += mBox.triangles;
+        }
+      }
+      if (count > 0) {
+        box = { minX, minY, minZ, maxX, maxY, maxZ, count, triangles: totalTriangles };
+      }
+    }
+
+    if (!box) {
+      box = measureSegments(ref.mesh.geometry, segments);
+      if (!box && ref.mesh.geometry) {
+        if (!ref.mesh.geometry.boundingBox) ref.mesh.geometry.computeBoundingBox();
+        const bb = ref.mesh.geometry.boundingBox;
+        if (bb) {
+          box = {
+            minX: bb.min.x,
+            maxX: bb.max.x,
+            minY: bb.min.y,
+            maxY: bb.max.y,
+            minZ: bb.min.z,
+            maxZ: bb.max.z,
+            count: 0,
+            triangles: 0,
+          };
+        }
       }
     }
     const geometry = ref.mesh.geometry;
-    const triangles = geometry.index ? Math.round(geometry.index.count / 3) : 0;
+    const triangles = totalTriangles > 0 ? totalTriangles : (geometry.index ? Math.round(geometry.index.count / 3) : 0);
     const attributes = buildAttributes({ smid, box, triangles, floorHeight: this.style.floorHeight });
 
     let centerLngLat: [number, number] | null = null;
@@ -2086,7 +2253,7 @@ export class S3MLayer {
       const v = new THREE.Vector3((box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2, (box.minZ + box.maxZ) / 2);
       v.applyMatrix4(ref.mesh.matrixWorld);
       const s = this.sceneAnchor.meterInMercator;
-      centerLngLat = lngLatFromMercator(v.x * s + this.sceneAnchor.x, -v.y * s + this.sceneAnchor.y);
+      centerLngLat = this._lngLatFromWorld(v.x * s + this.sceneAnchor.x, -v.y * s + this.sceneAnchor.y);
     }
 
     // 精确命中点求交计算
@@ -2109,7 +2276,7 @@ export class S3MLayer {
 
       point = [finalPos.x, finalPos.y, finalPos.z];
       const s = this.sceneAnchor.meterInMercator;
-      lngLat = lngLatFromMercator(finalPos.x * s + this.sceneAnchor.x, -finalPos.y * s + this.sceneAnchor.y);
+      lngLat = this._lngLatFromWorld(finalPos.x * s + this.sceneAnchor.x, -finalPos.y * s + this.sceneAnchor.y);
       altitude = finalPos.z + (this.sceneAnchor.altitude ?? 0);
     } else if (centerLngLat && box && this.sceneAnchor) {
       lngLat = centerLngLat;
@@ -2169,7 +2336,7 @@ export class S3MLayer {
     const intersect = ray.intersectPlane(groundPlane, target);
     if (intersect) {
       const s = this.sceneAnchor.meterInMercator;
-      const lngLat = lngLatFromMercator(intersect.x * s + this.sceneAnchor.x, -intersect.y * s + this.sceneAnchor.y);
+      const lngLat = this._lngLatFromWorld(intersect.x * s + this.sceneAnchor.x, -intersect.y * s + this.sceneAnchor.y);
       const altitude = intersect.z + (this.sceneAnchor.altitude ?? 0);
       return {
         lngLat,
@@ -2340,7 +2507,7 @@ export class S3MLayer {
 
           c.applyMatrix4(mesh.matrixWorld);
           const s = this.sceneAnchor.meterInMercator;
-          const [lng, lat] = lngLatFromMercator(c.x * s + this.sceneAnchor.x, -c.y * s + this.sceneAnchor.y);
+          const [lng, lat] = this._lngLatFromWorld(c.x * s + this.sceneAnchor.x, -c.y * s + this.sceneAnchor.y);
           if (lng < minLng) minLng = lng;
           if (lng > maxLng) maxLng = lng;
           if (lat < minLat) minLat = lat;
@@ -2419,11 +2586,14 @@ export class S3MLayer {
   select(result: PickResult | null, { silent = false }: { silent?: boolean } = {}): void {
     // 清掉上一次
     if (this._selection) {
-      const prev = styledMaterialOf(this._selection.mesh);
-      if (prev) {
-        prev.userData.uSelBatch.value = -1;
-        prev.userData.uSelWhole.value = 0;
+      for (const mesh of this._selectedMeshes) {
+        const mat = styledMaterialOf(mesh);
+        if (mat) {
+          mat.userData.uSelBatch.value = -1;
+          mat.userData.uSelWhole.value = 0;
+        }
       }
+      this._selectedMeshes = [];
       this._clearSelectionDecoration();
       this._selection = null;
     }
@@ -2440,20 +2610,42 @@ export class S3MLayer {
     }
 
     this._selection = result;
-    const mat = styledMaterialOf(result.mesh);
-    if (mat) {
-      mat.userData.uSelBatch.value = result.batchId;
+    const targetMeshes = new Set<THREE.Mesh>();
+    if (result.smid != null) {
+      const smidSet = this._smidMeshes.get(result.smid);
+      if (smidSet) {
+        for (const m of smidSet) targetMeshes.add(m);
+      }
+    }
+    targetMeshes.add(result.mesh);
+
+    for (const mesh of targetMeshes) {
+      const mat = styledMaterialOf(mesh);
+      if (!mat) continue;
+      let batchId = result.batchId;
+      if (result.instanceIndex != null && mesh === result.mesh) {
+        batchId = result.batchId;
+      } else if (result.smid != null) {
+        const ud = mesh.userData as MeshUserData;
+        const pickInfo = ud.geoRef?.pickInfo;
+        const entry = (pickInfo as Record<string | number, unknown> | undefined)?.[result.smid] ??
+          (pickInfo as Record<string | number, unknown> | undefined)?.[String(result.smid)];
+        const bId = entry ? pickEntryId(entry as any) : -1;
+        batchId = bId >= 0 ? bId : (mesh === result.mesh ? result.batchId : -1);
+      }
+      mat.userData.uSelBatch.value = batchId;
       // 没有单体化信息时整块高亮，否则会出现「点中了但什么都没亮、其他全暗了」
-      mat.userData.uSelWhole.value = result.batchId < 0 ? 1 : 0;
+      mat.userData.uSelWhole.value = batchId < 0 ? 1 : 0;
+      this._selectedMeshes.push(mesh);
     }
     this.uniforms.uSelMix.value = 1;
     this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
 
     if (this.style.outline) {
       if ((this.style.outlineStyle ?? 'edges') === 'edges') {
-        this._addSelectionEdges(result);
+        this._addSelectionEdges(result, targetMeshes);
       } else {
-        this._addSelectionHull(result, mat);
+        this._addSelectionHull(result, targetMeshes);
       }
     }
     this.map?.triggerRepaint();
@@ -2463,33 +2655,48 @@ export class S3MLayer {
    * 选中单体的棱线：只挑这个单体自己的三角面算折边，再画成屏幕空间等宽线。
    * 抽出来的线段数很少（一栋楼通常几百到几千条），所以选中开销可以忽略。
    */
-  private _addSelectionEdges(result: PickResult): void {
-    const ud = result.mesh.userData as MeshUserData;
-    const geoRef =
-      (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(result.batchId) ?? ud.geoRef;
-    // 实例化几何没有逐单体的顶点区间，整个 base mesh 就是这一栋的外形
-    const segments =
-      result.instanceIndex != null
-        ? [{ vertexOffset: 0, vertexCount: result.mesh.geometry.getAttribute('position')?.count ?? 0 }]
-        : resolveFeature(geoRef, result.batchId).segments;
-    const pairs = buildFeatureEdgeSegments(result.mesh.geometry, segments);
-    if (!pairs) {
-      // 抽不出折边（退化几何 / 没有任何夹角）时退回外扩轮廓，至少保证选中可见
-      this._addSelectionHull(result, styledMaterialOf(result.mesh));
-      return;
+  private _addSelectionEdges(result: PickResult, meshes: Iterable<THREE.Mesh>): void {
+    this._syncSelectionStyle();
+    for (const mesh of meshes) {
+      const ud = mesh.userData as MeshUserData;
+      const geoRef = ud.geoRef;
+      let segments: PickSegment[] = [];
+      if (mesh === result.mesh && result.instanceIndex != null) {
+        // 实例化几何没有逐单体的顶点区间，整个 base mesh 就是这一栋的外形
+        segments = [{ vertexOffset: 0, vertexCount: mesh.geometry.getAttribute('position')?.count ?? 0 }];
+      } else if (result.smid != null) {
+        const pickInfo = geoRef?.pickInfo;
+        const entry = (pickInfo as Record<string | number, unknown> | undefined)?.[result.smid] ??
+          (pickInfo as Record<string | number, unknown> | undefined)?.[String(result.smid)];
+        const bId = entry ? pickEntryId(entry as any) : -1;
+        segments = (entry as any)?.segments ?? (bId >= 0 ? resolveFeature(geoRef, bId).segments : []);
+      } else if (mesh === result.mesh) {
+        const localGeo = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(result.batchId) ?? geoRef;
+        segments = resolveFeature(localGeo, result.batchId).segments;
+      }
+
+      const pairs = buildFeatureEdgeSegments(mesh.geometry, segments);
+      if (pairs && pairs.length > 0) {
+        const lines = new THREE.Mesh(buildThickLineGeometry(pairs), this.selectionEdgeMaterial);
+        lines.renderOrder = 4;
+        // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
+        lines.frustumCulled = false;
+        lines.raycast = () => {};
+        (lines.userData as MeshUserData).isSelectionEdge = true;
+        if (mesh === result.mesh && result.instanceIndex != null) {
+          this._applyInstanceTransform(lines, result);
+        }
+        mesh.add(lines); // 作为子节点，直接继承世界变换
+        this._selectionEdgeMeshes.push(lines);
+      }
     }
 
-    this._syncSelectionStyle();
-    const lines = new THREE.Mesh(buildThickLineGeometry(pairs), this.selectionEdgeMaterial);
-    lines.renderOrder = 4;
-    // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
-    lines.frustumCulled = false;
-    lines.raycast = () => {};
-    (lines.userData as MeshUserData).isSelectionEdge = true;
-    // 实例化的棱线是「整个 base mesh」，得套上该实例的矩阵才落到正确位置
-    this._applyInstanceTransform(lines, result);
-    result.mesh.add(lines); // 作为子节点，直接继承世界变换
-    this._selectionEdges = lines;
+    if (this._selectionEdgeMeshes.length === 0) {
+      // 抽不出折边（退化几何 / 没有任何夹角）时退回外扩轮廓，至少保证选中可见
+      this._addSelectionHull(result, meshes);
+      return;
+    }
+    this._selectionEdges = this._selectionEdgeMeshes[0] ?? null;
   }
 
   /** 实例化几何：把某个实例的矩阵套到一个普通 Mesh/子节点上（子节点不参与父级的 instanceMatrix） */
@@ -2502,7 +2709,7 @@ export class S3MLayer {
   }
 
   /** 旧的描边画法：背面外扩法，整块几何一起上，靠 uSelBatch 只显示选中那栋 */
-  private _addSelectionHull(result: PickResult, mat: StyledMaterial | null): void {
+  private _addSelectionHull(result: PickResult, meshes: Iterable<THREE.Mesh>): void {
     const instanced = result.instanceIndex != null;
     // 实例化：轮廓是这个实例的单独一份副本（普通 Mesh），所以整份都画；
     // 顶点区间型：整块几何一起画，靠 uSelBatch 只显示选中那栋。
@@ -2511,18 +2718,25 @@ export class S3MLayer {
     this.outlineMaterial.uniforms.uElevation.value = instanced
       ? this._selectionElevation(result)
       : this.style.selectElevation ?? 0;
-    if (mat?.userData?.uBatchTex) {
-      this.outlineMaterial.uniforms.uBatchTex.value = mat.userData.uBatchTex.value as THREE.Texture;
-      this.outlineMaterial.uniforms.uBatchTexWidth.value = mat.userData.uBatchTexWidth.value as number;
-      this.outlineMaterial.uniforms.uBatchTexActive.value = mat.userData.uBatchTexActive.value as number;
+
+    for (const mesh of meshes) {
+      const mat = styledMaterialOf(mesh);
+      if (mat?.userData?.uBatchTex) {
+        this.outlineMaterial.uniforms.uBatchTex.value = mat.userData.uBatchTex.value as THREE.Texture;
+        this.outlineMaterial.uniforms.uBatchTexWidth.value = mat.userData.uBatchTexWidth.value as number;
+        this.outlineMaterial.uniforms.uBatchTexActive.value = mat.userData.uBatchTexActive.value as number;
+      }
+      const outline = new THREE.Mesh(mesh.geometry, this.outlineMaterial);
+      outline.renderOrder = 3;
+      outline.frustumCulled = false;
+      outline.raycast = () => {};
+      if (mesh === result.mesh && result.instanceIndex != null) {
+        this._applyInstanceTransform(outline, result);
+      }
+      mesh.add(outline); // 作为子节点，直接继承世界变换
+      this._outlineMeshes.push(outline);
     }
-    const outline = new THREE.Mesh(result.mesh.geometry, this.outlineMaterial);
-    outline.renderOrder = 3;
-    outline.frustumCulled = false;
-    outline.raycast = () => {};
-    this._applyInstanceTransform(outline, result);
-    result.mesh.add(outline); // 作为子节点，直接继承世界变换
-    this._outlineMesh = outline;
+    this._outlineMesh = this._outlineMeshes[0] ?? null;
   }
 
   /** 只改 uniform：颜色 / 粗细 / 拔高，拖着滑块实时生效，不重建几何 */
@@ -2536,8 +2750,8 @@ export class S3MLayer {
 
     // 外扩描边是另一个材质实例，单体状态纹理的开关是建的时候抄过去的。
     // 先选中、再抬高（或反过来）时模板会停留在旧值，这里补一次同步。
-    if (this._outlineMesh) {
-      const parent = this._outlineMesh.parent as THREE.Mesh | null;
+    for (const outline of this._outlineMeshes) {
+      const parent = outline.parent as THREE.Mesh | null;
       const ud = parent ? styledMaterialOf(parent)?.userData : null;
       if (ud?.uBatchTex) {
         this.outlineMaterial.uniforms.uBatchTex.value = ud.uBatchTex.value;
@@ -2558,15 +2772,18 @@ export class S3MLayer {
   }
 
   private _clearSelectionDecoration(): void {
-    if (this._outlineMesh) {
-      this._outlineMesh.parent?.remove(this._outlineMesh);
-      this._outlineMesh = null;
+    for (const outline of this._outlineMeshes) {
+      outline.parent?.remove(outline);
     }
-    if (this._selectionEdges) {
-      this._selectionEdges.parent?.remove(this._selectionEdges);
-      this._selectionEdges.geometry.dispose();
-      this._selectionEdges = null;
+    this._outlineMeshes = [];
+    this._outlineMesh = null;
+
+    for (const edges of this._selectionEdgeMeshes) {
+      edges.parent?.remove(edges);
+      edges.geometry.dispose();
     }
+    this._selectionEdgeMeshes = [];
+    this._selectionEdges = null;
   }
 
   /* ---------------------------------------------------------------- 渲染 */

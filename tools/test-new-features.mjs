@@ -243,4 +243,123 @@ console.log('=== 测试新增功能集 ===');
   ok('穿透拾取: drillPick 正确穿透多个单体并按深度排序返回');
 }
 
+// ---- 6. CRS / worldCoordinateHelper 适配测试
+{
+  const customCRS = {
+    name: 'custom:planar',
+    worldFromLngLat(lng, lat, altitude = 0) {
+      // 模拟自定义平面 CRS：extent = 50000m
+      return {
+        x: (lng - 100) / 10,
+        y: (lat - 30) / 10,
+        z: altitude / 50000,
+      };
+    },
+    lngLatFromWorld(x, y) {
+      return {
+        lng: x * 10 + 100,
+        lat: y * 10 + 30,
+      };
+    },
+    metersPerWorldUnit(_x, _y) {
+      return 50000;
+    },
+  };
+
+  const listeners = {};
+  const mockMap = {
+    getCanvas: () => ({ width: 800, height: 600 }),
+    triggerRepaint: () => {},
+    on: (evt, fn) => { listeners[evt] = fn; },
+    off: (evt, fn) => { delete listeners[evt]; },
+    transform: {
+      worldCoordinateHelper: customCRS,
+    },
+  };
+
+  const layer = new S3MLayer();
+  layer.map = mockMap;
+  if (typeof mockMap.on === 'function') {
+    mockMap.on('projectiontransition', layer._onProjectionChange);
+  }
+
+  // 添加模拟数据集
+  layer.datasets.set('customDs', {
+    id: 'customDs',
+    name: 'Custom CRS Dataset',
+    anchor: { lon: 105, lat: 35, height: 100 },
+    root: new THREE.Group(),
+    tileset: null,
+  });
+
+  layer._recomputeAnchors();
+
+  assert.ok(layer.sceneAnchor, 'sceneAnchor 应当被初始化');
+  assert.strictEqual(layer.sceneAnchor.x, 0.5, '自定义 CRS 下 x 应为 0.5');
+  assert.strictEqual(layer.sceneAnchor.y, 0.5, '自定义 CRS 下 y 应为 0.5');
+  assert.strictEqual(layer.sceneAnchor.meterInMercator, 1 / 50000, '尺度应当为 1 / 50000');
+  assert.strictEqual(layer.sceneAnchor.z, 100 / 50000, 'z 应当按 100 / 50000 计算');
+
+  // 坐标反查经纬度
+  const [lng, lat] = layer._lngLatFromWorld(0.5, 0.5);
+  assert.strictEqual(lng, 105, '归一化世界坐标反查经度应为 105');
+  assert.strictEqual(lat, 35, '归一化世界坐标反查纬度应为 35');
+
+  // 投影切换动态响应
+  customCRS.metersPerWorldUnit = () => 20000;
+  listeners['projectiontransition']?.();
+  assert.strictEqual(layer.sceneAnchor.meterInMercator, 1 / 20000, '触发 projectiontransition 事件后尺度应自动更新');
+
+  ok('CRS 适配: 通过 worldCoordinateHelper 适配任意投影与平面 CRS，尺度与逆反查均正确');
+}
+
+// ---- 7. 多 Mesh 共享同一 SMID 时的联动选中测试 (CBD 模型场景)
+{
+  const { createStyledMaterial } = await import('../dist/render/StyleMaterial.js');
+  const layer = new S3MLayer();
+
+  const g1 = new THREE.BufferGeometry();
+  g1.setAttribute('position', new THREE.BufferAttribute(new Float32Array([0, 0, 0, 1, 0, 0, 0, 1, 0]), 3));
+  const m1 = new THREE.Mesh(g1, createStyledMaterial(layer.uniforms));
+  m1.userData = {
+    geoRef: { pickInfo: { 20: { batchId: 0, segments: [{ vertexOffset: 0, vertexCount: 3 }] } } },
+  };
+
+  const g2 = new THREE.BufferGeometry();
+  g2.setAttribute('position', new THREE.BufferAttribute(new Float32Array([1, 1, 0, 2, 1, 0, 1, 2, 0]), 3));
+  const m2 = new THREE.Mesh(g2, createStyledMaterial(layer.uniforms));
+  m2.userData = {
+    geoRef: { pickInfo: { 20: { batchId: 0, segments: [{ vertexOffset: 0, vertexCount: 3 }] } } },
+  };
+
+  layer._indexMeshSmids(m1);
+  layer._indexMeshSmids(m2);
+
+  // 拾取命中 m1
+  const pickResult = {
+    datasetId: 'cbd',
+    datasetName: 'CBD',
+    objectId: 1,
+    batchId: 0,
+    smid: 20,
+    mesh: m1,
+  };
+
+  layer.select(pickResult);
+
+  // 验证：虽然只点击了 m1，但共享 SMID 20 的 m1 和 m2 都被高亮选中了
+  assert.strictEqual(m1.material.userData.uSelBatch.value, 0, '网格 1 应当被选中');
+  assert.strictEqual(m2.material.userData.uSelBatch.value, 0, '网格 2 (不同材质骨架) 应当联动被选中');
+  assert.strictEqual(layer._selectedMeshes.length, 2, '两块网格都进入了选中集合');
+
+  // 取消选中
+  layer.select(null);
+  assert.strictEqual(m1.material.userData.uSelBatch.value, -1, '取消选中后网格 1 恢复 -1');
+  assert.strictEqual(m2.material.userData.uSelBatch.value, -1, '取消选中后网格 2 恢复 -1');
+  assert.strictEqual(layer._selectedMeshes.length, 0, '选中集合清空');
+
+  ok('多 Mesh 共享 SMID: 点击单面时联动选中同 SMID 的所有材质网格');
+}
+
 console.log('\n全部新增能力测试通过！');
+
