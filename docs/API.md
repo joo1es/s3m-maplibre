@@ -216,9 +216,9 @@ interface S3MStats {
 ```ts
 interface S3MStyle {
   mode: S3MStyleMode;
-  colorA: string;       // 白膜 / 单色基色，也是高度渐变低端色
-  colorB: string;       // 高度 / 楼层 / 动态扫描的渐变高端色
-  colorC: string;       // 动态扫描的扫描线颜色
+  colorA: string;       // 白膜基色；顶/侧分色中的顶面色；高度渐变低端色
+  colorB: string;       // 顶/侧分色中的侧立面色；高度/楼层渐变高端色
+  colorC: string;       // 动态扫描色 / 复合渐变高端色
   selectColor: string;  // 选中单体高亮色
   floorHeight: number;  // 楼层估算层高，默认 3.2
   speed: number;        // 动态扫描速度倍率
@@ -227,7 +227,9 @@ interface S3MStyle {
   dimOthers: boolean;   // 选中时压暗其他建筑
   outline: boolean;     // 选中单体描边
   edges: boolean;       // 全局棱线
-  edgeColor: string;
+  edgeColor: string;    // 棱线颜色
+  edgeOpacity?: number; // 棱线透明度（0.1 ~ 1.0），默认 0.45，能显著消除 1px 细线的高对比度走样锯齿
+  roofThreshold?: number; // 顶面法线判定阈值，默认 0.65
 }
 ```
 
@@ -242,6 +244,8 @@ interface S3MStyle {
 | `STYLE.FLOORS` | 4 | 按楼层离散分层，层高取 `floorHeight` |
 | `STYLE.BATCH` | 5 | 按单体自动分配色相 |
 | `STYLE.DYNAMIC` | 6 | 动态扫描：底色按高度渐变 + 扫描线自下而上循环 |
+| `STYLE.TOP_SIDE` | 7 | 顶面/侧面分色：顶面（`colorA`）与立面/侧面（`colorB`）智能分色 |
+| `STYLE.CUSTOM` | 8 | 自定义复合模式：顶面分色 + 侧立面高度渐变 |
 
 所有模式都在同一个 `MeshStandardMaterial` 的片元着色器里用 `uMode` 分支实现，切换不重建几何、不重建材质。
 

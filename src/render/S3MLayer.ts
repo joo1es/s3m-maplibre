@@ -99,9 +99,19 @@ export interface S3MStyle {
   dimOthers: boolean;
   /** 是否给选中单体描边 */
   outline: boolean;
+  /** 描边颜色（默认跟随 selectColor） */
+  outlineColor?: string;
+  /** 描边粗细（米，默认 0.9） */
+  outlineWidth?: number;
   /** 是否显示几何棱线（CPU 端生成，有开销） */
   edges: boolean;
   edgeColor: string;
+  edgeOpacity?: number;
+  roofThreshold?: number;
+  /** 是否与模型原色贴图叠加混合（0 = 纯色覆盖，1 = 叠乘原色贴图） */
+  texMix?: number;
+  /** 半透明时是否保持深度写入（默认 true，保持写入可彻底遮挡背面与内部棱线，避免背面透出） */
+  depthWrite?: boolean;
 }
 
 export const DEFAULT_STYLE: S3MStyle = {
@@ -116,8 +126,14 @@ export const DEFAULT_STYLE: S3MStyle = {
   shading: 'flat',
   dimOthers: true,
   outline: true,
+  outlineColor: '#22d3ee',
+  outlineWidth: 0.9,
   edges: false,
   edgeColor: '#334155',
+  edgeOpacity: 0.45,
+  roofThreshold: 0.65,
+  texMix: 0,
+  depthWrite: true,
 };
 
 export interface S3MDatasetOptions {
@@ -437,8 +453,17 @@ export class S3MLayer {
     this.scene?.remove(entry.root);
     for (const [pickId, p] of this._pickables) if (p.datasetId === id) this._pickables.delete(pickId);
     this.datasets.delete(id);
+    if (this.datasets.size === 0) {
+      this.sceneAnchor = null;
+    }
     this.onStats(this.stats);
     this.map?.triggerRepaint();
+  }
+
+  /** 清空当前所有数据集 */
+  clearDatasets(): void {
+    for (const id of [...this.datasets.keys()]) this.removeDataset(id);
+    this.sceneAnchor = null;
   }
 
   setDatasetVisible(id: string, visible: boolean): void {
@@ -500,10 +525,10 @@ export class S3MLayer {
   setStyle(patch: Partial<S3MStyle> = {}): void {
     this.style = { ...this.style, ...patch };
     this._applyStyleUniforms();
-    if ('opacity' in patch) this._applyOpacity();
+    if ('opacity' in patch || 'depthWrite' in patch) this._applyOpacity();
     if ('shading' in patch) this._applyShading();
     if ('edges' in patch) this.setEdges(!!this.style.edges);
-    else if ('edgeColor' in patch || 'opacity' in patch) this._refreshEdgeLines();
+    else if ('edgeColor' in patch || 'opacity' in patch || 'edgeOpacity' in patch) this._refreshEdgeLines();
     if (this._selection) this.select(this._selection, { silent: true });
     this.map?.triggerRepaint();
   }
@@ -521,19 +546,34 @@ export class S3MLayer {
     u.uColorC.value.set(s.colorC);
     u.uSelColor.value.set(s.selectColor);
     u.uFloorHeight.value = s.floorHeight;
+    if (u.uRoofThreshold && s.roofThreshold != null) {
+      u.uRoofThreshold.value = s.roofThreshold;
+    }
+    if (u.uTexMix && s.texMix != null) {
+      u.uTexMix.value = s.texMix;
+    }
+    if (this.outlineMaterial) {
+      if (s.outlineWidth != null) this.outlineMaterial.uniforms.uWidth.value = s.outlineWidth;
+      if (s.outlineColor != null) {
+        this.outlineMaterial.uniforms.uColor.value.set(s.outlineColor);
+      } else {
+        this.outlineMaterial.uniforms.uColor.value.set(s.selectColor);
+      }
+    }
   }
 
   /** 透明度：只改材质状态，不触发着色器重编译，所以可以跟着滑块实时拖 */
   private _applyOpacity(): void {
     const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
     const transparent = o < 0.999;
+    // 关键：若 depthWrite 开启（默认开启），即使半透明也保持深度写入，完美遮挡背面棱线，防止背面线条透出
+    const keepDepth = this.style.depthWrite !== false;
     for (const p of this._pickables.values()) {
       const m = styledMaterialOf(p.mesh);
       if (!m) continue;
       m.opacity = o;
       m.transparent = transparent;
-      // 半透明时关深度写入，否则被挡在后面的建筑整块消失
-      m.depthWrite = !transparent;
+      m.depthWrite = transparent ? keepDepth : true;
     }
     this.map?.triggerRepaint();
   }
@@ -617,8 +657,12 @@ export class S3MLayer {
     const mat = lines.material as THREE.LineBasicMaterial;
     if (!mat || !mat.color) return;
     mat.color.set(this.style.edgeColor);
-    mat.opacity = 0.75 * Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
+    const baseOpacity = this.style.edgeOpacity ?? 0.45;
+    mat.opacity = baseOpacity * Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
     mat.transparent = true;
+    mat.polygonOffset = true;
+    mat.polygonOffsetFactor = -1;
+    mat.polygonOffsetUnits = -1;
     mat.needsUpdate = true;
   }
 
@@ -642,8 +686,11 @@ export class S3MLayer {
       new THREE.LineBasicMaterial({
         color: new THREE.Color(this.style.edgeColor),
         transparent: true,
-        opacity: 0.7,
+        opacity: this.style.edgeOpacity ?? 0.45,
         depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -1,
+        polygonOffsetUnits: -1,
       })
     );
     lines.renderOrder = 2;

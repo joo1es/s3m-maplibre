@@ -40,6 +40,39 @@ function resolveUrl(base: string, rel: string | null | undefined): string | null
   }
 }
 
+/** 兼容解析 JSON 与 XML 格式的 SuperMap .scp / config 配置文件 */
+function parseConfigText(text: string): Record<string, unknown> {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('<')) {
+    const tagVal = (tag: string): string | null => {
+      const m = new RegExp(`<(?:[a-zA-Z0-9_-]+:)?${tag}[^>]*>([^<]+)<\\/`, 'i').exec(trimmed);
+      return m ? m[1].trim() : null;
+    };
+    const posX = parseFloat(tagVal('X') ?? '0');
+    const posY = parseFloat(tagVal('Y') ?? '0');
+    const posZ = parseFloat(tagVal('Z') ?? '0');
+
+    const left = parseFloat(tagVal('Left') ?? '0');
+    const right = parseFloat(tagVal('Right') ?? '0');
+    const top = parseFloat(tagVal('Top') ?? '0');
+    const bottom = parseFloat(tagVal('Bottom') ?? '0');
+
+    const fileMatches = trimmed.matchAll(/<(?:[a-zA-Z0-9_-]+:)?FileName[^>]*>([^<]+)<\//gi);
+    const tiles: Array<{ url: string }> = [];
+    for (const m of fileMatches) {
+      tiles.push({ url: m[1].trim() });
+    }
+
+    return {
+      position: { x: posX, y: posY, z: posZ, units: 'Degree' },
+      geoBounds: { left, right, top, bottom },
+      rootTiles: tiles,
+      tiles,
+    };
+  }
+  return JSON.parse(trimmed) as Record<string, unknown>;
+}
+
 export interface TileNode {
   url: string;
   tile: ParsedTile;
@@ -111,7 +144,7 @@ export class S3MTileset {
     const res = await fetch(this.configUrl);
     if (!res.ok) throw new Error(`配置读取失败 ${res.status} ${this.configUrl}`);
     const text = await res.text();
-    const config = JSON.parse(text) as Record<string, unknown>;
+    const config = parseConfigText(text);
     this.config = config;
     this.anchor = this._resolveAnchor(config);
 

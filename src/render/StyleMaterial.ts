@@ -20,6 +20,8 @@ export const STYLE = {
   FLOORS: 4, // 按楼层离散分层（高度 / 3.2m 取整）
   BATCH: 5, // 按单体随机色，便于区分建筑
   DYNAMIC: 6, // 动态扫描：扫描线沿高度循环
+  TOP_SIDE: 7, // 顶面/侧面分色：顶面一种颜色，侧面另一种颜色
+  CUSTOM: 8, // 自定义/复合着色：顶面分色 + 侧面高度渐变
 } as const;
 
 export type StyleMode = (typeof STYLE)[keyof typeof STYLE];
@@ -32,6 +34,8 @@ export const STYLE_LABELS: Record<StyleMode, string> = {
   [STYLE.FLOORS]: '按楼层',
   [STYLE.BATCH]: '按单体',
   [STYLE.DYNAMIC]: '动态扫描',
+  [STYLE.TOP_SIDE]: '顶/侧分色',
+  [STYLE.CUSTOM]: '自定义',
 };
 
 export interface StyledMaterial extends THREE.MeshStandardMaterial {
@@ -60,6 +64,10 @@ export function createSharedUniforms(): StyleUniforms {
     uSelColor: { value: new THREE.Color('#22d3ee') },
     /** 高亮强度，0 表示不做选中着色 */
     uSelMix: { value: 0 },
+    /** 顶面法线判定阈值：Z 分量余弦大于该值判定为顶面 */
+    uRoofThreshold: { value: 0.65 },
+    /** 与模型原色贴图混合强度：0 = 纯色覆盖，1 = 叠乘原色贴图 */
+    uTexMix: { value: 0 },
   };
 }
 
@@ -69,6 +77,8 @@ const VERT_PARS = /* glsl */ `
   varying float vBatchId;
   varying vec3 vVertColor;
   varying float vWorldZ;
+  varying vec3 vWorldNormal;
+  varying vec3 vWorldPos;
 `;
 
 const VERT_WORLD = /* glsl */ `
@@ -78,8 +88,16 @@ const VERT_WORLD = /* glsl */ `
   #endif
   s3mWorld = modelMatrix * s3mWorld;
   vWorldZ = s3mWorld.z;
+  vWorldPos = s3mWorld.xyz;
   vBatchId = aBatchId;
   vVertColor = aColor;
+
+  #ifdef USE_INSTANCING
+    mat3 s3mNormMat = mat3( modelMatrix ) * mat3( instanceMatrix );
+  #else
+    mat3 s3mNormMat = mat3( modelMatrix );
+  #endif
+  vWorldNormal = normalize( s3mNormMat * normal );
 `;
 
 const FRAG_PARS = /* glsl */ `
@@ -96,9 +114,13 @@ const FRAG_PARS = /* glsl */ `
   uniform float uSelMix;
   uniform float uSelBatch;
   uniform float uSelWhole;
+  uniform float uRoofThreshold;
+  uniform float uTexMix;
   varying float vBatchId;
   varying vec3 vVertColor;
   varying float vWorldZ;
+  varying vec3 vWorldNormal;
+  varying vec3 vWorldPos;
 
   float s3mHash( float p ) {
     p = fract( p * 0.1031 );
@@ -117,6 +139,9 @@ const FRAG_PARS = /* glsl */ `
 const FRAG_COLOR = /* glsl */ `
   float s3mH = clamp( ( vWorldZ - uHeightMin ) / max( uHeightMax - uHeightMin, 0.001 ), 0.0, 1.0 );
   vec3 s3mBase = diffuseColor.rgb;   // 已含 diffuse × map
+
+  // 法线：优先使用顶点插值法线；若退化或为平面着色，使用屏幕导数精确计算真实几何法线
+  vec3 s3mNorm = length( vWorldNormal ) > 0.1 ? normalize( vWorldNormal ) : normalize( cross( dFdx( vWorldPos ), dFdy( vWorldPos ) ) );
 
   if ( uMode == 0 ) {
     // 白膜：丢掉贴图，只留光照
@@ -137,11 +162,30 @@ const FRAG_COLOR = /* glsl */ `
   } else if ( uMode == 5 ) {
     // 按单体：同一个 batchId 同色，相邻单体色相拉开
     diffuseColor.rgb = s3mHsv( s3mHash( vBatchId * 7.31 + 1.0 ), 0.52, 0.95 );
-  } else {
+  } else if ( uMode == 6 ) {
     // 动态扫描：底色按高度渐变，一条亮带自下而上循环
     float scan = fract( uTime * 0.18 );
     float glow = smoothstep( 0.10, 0.0, abs( s3mH - scan ) );
     diffuseColor.rgb = mix( uColorA, uColorB, s3mH ) + uColorC * glow * 1.2;
+  } else if ( uMode == 7 ) {
+    // 顶面/侧面分色：uColorA 为顶面（屋顶），uColorB 为侧面（立面）
+    // 局部 ENU 坐标系以 Z 为朝天方向，abs(s3mNorm.z) 接近 1 为顶面/底面，接近 0 为立面
+    float th = uRoofThreshold > 0.0 ? uRoofThreshold : 0.65;
+    float isRoof = smoothstep( th - 0.08, th + 0.08, abs( s3mNorm.z ) );
+    diffuseColor.rgb = mix( uColorB, uColorA, isRoof );
+  } else {
+    // 自定义复合模式：顶面使用 uColorA，侧面叠加高度渐变（uColorB 到 uColorC）
+    float th = uRoofThreshold > 0.0 ? uRoofThreshold : 0.65;
+    float isRoof = smoothstep( th - 0.08, th + 0.08, abs( s3mNorm.z ) );
+    vec3 sideGrad = mix( uColorB, uColorC, s3mH );
+    diffuseColor.rgb = mix( sideGrad, uColorA, isRoof );
+  }
+
+  // 叠加在原色贴图上：保留窗框、玻璃幕墙、材质纹理与顶点色
+  if ( uMode != 1 && uTexMix > 0.001 ) {
+    vec3 origTex = s3mBase * vVertColor;
+    vec3 overlay = origTex * diffuseColor.rgb * 1.35;
+    diffuseColor.rgb = mix( diffuseColor.rgb, overlay, uTexMix );
   }
 
   // 选中单体高亮 + 其余压暗
@@ -248,12 +292,12 @@ export interface OutlineMaterial extends THREE.ShaderMaterial {
 }
 
 /** 选中单体的描边材质（背面外扩法） */
-export function createOutlineMaterial(shared: StyleUniforms): OutlineMaterial {
+export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9): OutlineMaterial {
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uSelBatch: { value: -1 },
-      uWidth: { value: 0.9 },
-      uColor: shared.uSelColor,
+      uWidth: { value: initialWidth },
+      uColor: { value: shared.uSelColor.value.clone() },
     },
     vertexShader: OUTLINE_VERT,
     fragmentShader: OUTLINE_FRAG,

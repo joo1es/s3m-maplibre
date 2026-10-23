@@ -199,4 +199,6 @@ export interface StyleUniforms {
   uDim: { value: number };
   uSelColor: { value: Color };
   uSelMix: { value: number };
+  uRoofThreshold?: { value: number };
+  uTexMix?: { value: number };
 }
