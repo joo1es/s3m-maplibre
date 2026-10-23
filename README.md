@@ -45,6 +45,8 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 全局棱线 | ✅ | 优先用数据自带棱线包，没有才 CPU 现算 |
 | 单体级点选 + 属性 | ✅ | GPU 拾取，代价与面数无关 |
 | 实例化几何 | ✅ | `instanceMode` 16 / 17 |
+| 瓦片同材质合批 | ✅ | 倾斜摄影大瓦片自动合批，大幅降低 DrawCall |
+| 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
 | DXT / WebP 纹理 | ✅ | |
 | Draco 压缩几何 | ❌ | 遇到会抛明确错误 |
 | KTX2 / CRN | ❌ | |
@@ -228,8 +230,6 @@ S3M 顶点（数据集局部 ENU，米）
 
 - **Draco 压缩几何**未实现。MeshOpt 已支持；遇到 Draco 会抛带说明的错误。
 - **地形遮挡**未实现：MapLibre 的地形深度没进 custom layer 的深度缓冲，建筑不会被地形裁掉。
-- 每个 `indexPackage` 一个 `Mesh`，倾斜摄影大瓦片需要合批。
-- `texmodmatrix`（纹理变换）未应用。
 - 跨城市量级的数据集叠加会重新引入 float32 精度问题。
 
 ---

@@ -1047,7 +1047,8 @@ export class S3MLayer {
     if (!ref) return null;
 
     const ud = ref.mesh.userData as MeshUserData;
-    const { smid, segments } = resolveFeature(ud.geoRef, hit.batchId);
+    const geoRef = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(hit.batchId) ?? ud.geoRef;
+    const { smid, segments } = resolveFeature(geoRef, hit.batchId);
     if (this._isFeatureHidden(smid, hit.batchId)) return null;
     const box = measureSegments(ref.mesh.geometry, segments);
     const geometry = ref.mesh.geometry;

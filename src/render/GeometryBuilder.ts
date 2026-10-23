@@ -73,23 +73,26 @@ function typedArrayOf(dtype: AttrDType, length: number): Float32Array | Uint8Arr
 }
 
 function toBufferAttribute(attr: VertexAttribute): THREE.BufferAttribute {
-  const { data, components, stride, offsetInBytes, dtype = 'f32' } = attr;
+  const { data, stride, offsetInBytes, dtype = 'f32' } = attr;
+  const components = attr.components ?? (attr as unknown as { comp?: number }).comp ?? 3;
   const bpe = bytesPerElement(dtype);
   const itemBytes = components * bpe;
+  const actualStride = stride ?? itemBytes;
+  const actualOffset = offsetInBytes ?? 0;
   const normalized = dtype === 'u8';
 
   // 非交错：整段直接铺开
-  if (stride === itemBytes && offsetInBytes === 0) {
+  if (actualStride === itemBytes && actualOffset === 0) {
     const view = typedArray(dtype, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
     return new THREE.BufferAttribute(view, components, normalized);
   }
 
   // 交错：逐元素抽取
-  const count = Math.floor(data.byteLength / stride);
+  const count = Math.floor(data.byteLength / actualStride);
   const out = typedArrayOf(dtype, count * components);
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   for (let i = 0; i < count; i++) {
-    const base = i * stride + offsetInBytes;
+    const base = i * actualStride + actualOffset;
     for (let c = 0; c < components; c++) {
       const o = base + c * bpe;
       out[i * components + c] =
@@ -143,6 +146,9 @@ interface RawMaterialUnit {
   name?: string;
   id?: string;
   textureunitstate?: RawMaterialUnit;
+  texmodmatrix?: number[];
+  matrix?: number[];
+  addressmode?: { u?: number; v?: number; w?: number };
 }
 
 interface RawMaterialDef {
@@ -181,6 +187,17 @@ function materialUnits(m: RawMaterialDef | undefined): RawMaterialUnit[] {
   return raw.map((u) => u?.textureunitstate ?? u).filter((u): u is RawMaterialUnit => !!u);
 }
 
+/** 判断 4x4 矩阵是否为标准单位矩阵 */
+function isIdentityMatrix4(m: number[]): boolean {
+  if (m.length !== 16) return false;
+  return (
+    m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 0 &&
+    m[4] === 0 && m[5] === 1 && m[6] === 0 && m[7] === 0 &&
+    m[8] === 0 && m[9] === 0 && m[10] === 1 && m[11] === 0 &&
+    m[12] === 0 && m[13] === 0 && m[14] === 0 && m[15] === 1
+  );
+}
+
 /** cullMode：1.x 用 none/clockwise/backward，3.x 用 CULL_NONE / CULL_BACK / CULL_FRONT */
 function resolveSide(m: RawMaterialDef | undefined): THREE.Side {
   const cull = String(m?.cullMode ?? '').toUpperCase();
@@ -199,6 +216,8 @@ export interface TileBuildStats {
   instanced: number;
   /** 数据自带的棱线包（primitiveType 13）数量 */
   edgeLines: number;
+  /** 合批前原有独立网格数 */
+  originalMeshes?: number;
   /** 被跳过的东西，加载完可以直接在控制台看 */
   skipped: string[];
 }
@@ -210,6 +229,11 @@ export interface BuildTileOptions {
   /** 是否显示数据自带的棱线包 */
   edges?: boolean;
   edgeColor?: THREE.ColorRepresentation;
+  /**
+   * 是否开启瓦片内同材质网格合批（默认 true）。
+   * 对倾斜摄影、大网格切片瓦片可减少 90%+ DrawCall，显著提高渲染帧率。
+   */
+  batching?: boolean;
 }
 
 export interface BuildTileResult {
@@ -267,16 +291,51 @@ export async function buildTileObjects(
     }
   }
 
-  // 2) 材质描述表
+  // 2) 材质描述表与材质池缓存
   const materialList = resolveMaterialList(tile.materials);
+  const materialCache = new Map<string, StyledMaterial>();
 
   const makeMaterial = (code?: string): StyledMaterial => {
+    const cacheKey = code ?? '__default__';
+    const cached = materialCache.get(cacheKey);
+    if (cached) return cached;
+
     const entry = materialList.find((e) => materialName(unwrapMaterial(e)) === code);
     const m = unwrapMaterial(entry);
     const units = materialUnits(m);
-    const map = units[0] ? (textureByCode.get(materialName(units[0]) ?? units[0].id ?? '') ?? null) : null;
-    const diffuse = m?.diffuse ?? { r: 1, g: 1, b: 1, a: 1 };
+    const unit0 = units[0];
+    let map = unit0 ? (textureByCode.get(materialName(unit0) ?? unit0.id ?? '') ?? null) : null;
 
+    // 检查并应用 texmodmatrix 纹理变换矩阵
+    const texMod = unit0?.texmodmatrix ?? unit0?.matrix;
+    if (map && Array.isArray(texMod) && texMod.length === 16 && !isIdentityMatrix4(texMod)) {
+      map = map.clone();
+      map.matrixAutoUpdate = false;
+      // S3M texmodmatrix 为 4x4 列主序矩阵 [m0..m15]，对应 2D 仿射变换:
+      // u' = m[0]*u + m[4]*v + m[12]
+      // v' = m[1]*u + m[5]*v + m[13]
+      // Three.js Matrix3.set 按行主序接收参数
+      map.matrix.set(
+        texMod[0], texMod[4], texMod[12],
+        texMod[1], texMod[5], texMod[13],
+        0,         0,         1
+      );
+    }
+
+    // 纹理寻址模式（addressmode）
+    if (map && unit0?.addressmode) {
+      const u = unit0.addressmode.u;
+      const v = unit0.addressmode.v;
+      if (u !== undefined || v !== undefined) {
+        if (map.matrixAutoUpdate) {
+          map = map.clone();
+        }
+        if (u !== undefined) map.wrapS = u === 0 ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+        if (v !== undefined) map.wrapT = v === 0 ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
+      }
+    }
+
+    const diffuse = m?.diffuse ?? { r: 1, g: 1, b: 1, a: 1 };
     const alphaMode = m?.alphaMode;
     const transparent = alphaMode === 'AM_BLEND' || (diffuse.a ?? 1) < 0.999 || m?.transparentsorting === true;
 
@@ -284,7 +343,7 @@ export async function buildTileObjects(
     const roughness =
       typeof m?.shininess === 'number' && m.shininess > 0 ? Math.max(0.15, 1 - m.shininess / 128) : 0.95;
 
-    return createStyledMaterial({
+    const mat = createStyledMaterial({
       uniforms,
       map,
       color: new THREE.Color(diffuse.r ?? 1, diffuse.g ?? 1, diffuse.b ?? 1),
@@ -293,6 +352,8 @@ export async function buildTileObjects(
       opacity: diffuse.a ?? 1,
       roughness,
     });
+    materialCache.set(cacheKey, mat);
+    return mat;
   };
 
   // 3) 骨架 → 几何。顶点是「骨架局部坐标」，真正位置由引用它的 Geode 矩阵决定。
@@ -353,6 +414,217 @@ export async function buildTileObjects(
   }
 
   const IDENTITY = new THREE.Matrix4();
+
+  interface CandidateMesh {
+    cached: CachedGeometry;
+    name: string;
+    geo: GeoPackageEntry;
+    matrix: THREE.Matrix4 | null;
+  }
+
+  const batchGroups = new Map<string, CandidateMesh[]>();
+
+  const mergeBatchGeometries = (
+    candidates: CandidateMesh[],
+    material: StyledMaterial,
+    tileRef: ParsedTile
+  ): THREE.Mesh => {
+    let totalVertices = 0;
+    let totalIndices = 0;
+    let hasNormal = false;
+    let hasUv = false;
+    let hasUv1 = false;
+    let hasAColor = false;
+    let hasABatchId = false;
+
+    for (const c of candidates) {
+      const g = c.cached.geometry;
+      const vCount = g.attributes.position?.count ?? 0;
+      totalVertices += vCount;
+      totalIndices += g.index ? g.index.count : vCount;
+      if (g.attributes.normal) hasNormal = true;
+      if (g.attributes.uv) hasUv = true;
+      if (g.attributes.uv1) hasUv1 = true;
+      if (g.attributes.aColor) hasAColor = true;
+      if (g.attributes.aBatchId) hasABatchId = true;
+    }
+
+    const mergedPos = new Float32Array(totalVertices * 3);
+    const mergedNorm = hasNormal ? new Float32Array(totalVertices * 3) : null;
+    const mergedUv = hasUv ? new Float32Array(totalVertices * 2) : null;
+    const mergedUv1 = hasUv1 ? new Float32Array(totalVertices * 2) : null;
+    const mergedColor = hasAColor ? new Float32Array(totalVertices * 3) : null;
+    const mergedBatchId = hasABatchId ? new Float32Array(totalVertices) : null;
+
+    const IndexArrayType = totalVertices > 65535 ? Uint32Array : Uint16Array;
+    const mergedIndices = new IndexArrayType(totalIndices);
+
+    let vertexOffset = 0;
+    let indexOffset = 0;
+
+    const tmpVec = new THREE.Vector3();
+    const normalMatrix = new THREE.Matrix3();
+    const geoByBatchId = new Map<number, GeoPackageEntry>();
+
+    for (const c of candidates) {
+      const g = c.cached.geometry;
+      const vCount = g.attributes.position.count;
+      const m = c.matrix;
+      const hasTransform = m && !m.equals(IDENTITY);
+      if (hasTransform && hasNormal) {
+        normalMatrix.getNormalMatrix(m);
+      }
+
+      if (c.geo.pickInfo) {
+        for (const entry of Object.values(c.geo.pickInfo)) {
+          if (typeof entry.batchId === 'number' && entry.batchId >= 0) {
+            geoByBatchId.set(entry.batchId, c.geo);
+          }
+        }
+      }
+
+      // 1. Position
+      const posArr = g.attributes.position.array as ArrayLike<number>;
+      for (let i = 0; i < vCount; i++) {
+        const srcIdx = i * 3;
+        const dstIdx = (vertexOffset + i) * 3;
+        if (hasTransform) {
+          tmpVec.set(posArr[srcIdx], posArr[srcIdx + 1], posArr[srcIdx + 2]).applyMatrix4(m);
+          mergedPos[dstIdx] = tmpVec.x;
+          mergedPos[dstIdx + 1] = tmpVec.y;
+          mergedPos[dstIdx + 2] = tmpVec.z;
+        } else {
+          mergedPos[dstIdx] = posArr[srcIdx];
+          mergedPos[dstIdx + 1] = posArr[srcIdx + 1];
+          mergedPos[dstIdx + 2] = posArr[srcIdx + 2];
+        }
+      }
+
+      // 2. Normal
+      if (mergedNorm) {
+        const normAttr = g.attributes.normal;
+        if (normAttr) {
+          const normArr = normAttr.array as ArrayLike<number>;
+          for (let i = 0; i < vCount; i++) {
+            const srcIdx = i * 3;
+            const dstIdx = (vertexOffset + i) * 3;
+            if (hasTransform) {
+              tmpVec
+                .set(normArr[srcIdx], normArr[srcIdx + 1], normArr[srcIdx + 2])
+                .applyMatrix3(normalMatrix)
+                .normalize();
+              mergedNorm[dstIdx] = tmpVec.x;
+              mergedNorm[dstIdx + 1] = tmpVec.y;
+              mergedNorm[dstIdx + 2] = tmpVec.z;
+            } else {
+              mergedNorm[dstIdx] = normArr[srcIdx];
+              mergedNorm[dstIdx + 1] = normArr[srcIdx + 1];
+              mergedNorm[dstIdx + 2] = normArr[srcIdx + 2];
+            }
+          }
+        }
+      }
+
+      // 3. UV
+      if (mergedUv) {
+        const uvAttr = g.attributes.uv;
+        if (uvAttr) {
+          const uvArr = uvAttr.array as ArrayLike<number>;
+          for (let i = 0; i < vCount; i++) {
+            mergedUv[(vertexOffset + i) * 2] = uvArr[i * 2];
+            mergedUv[(vertexOffset + i) * 2 + 1] = uvArr[i * 2 + 1];
+          }
+        }
+      }
+
+      // 4. UV1
+      if (mergedUv1) {
+        const uv1Attr = g.attributes.uv1;
+        if (uv1Attr) {
+          const uvArr = uv1Attr.array as ArrayLike<number>;
+          for (let i = 0; i < vCount; i++) {
+            mergedUv1[(vertexOffset + i) * 2] = uvArr[i * 2];
+            mergedUv1[(vertexOffset + i) * 2 + 1] = uvArr[i * 2 + 1];
+          }
+        }
+      }
+
+      // 5. aColor
+      if (mergedColor) {
+        const colAttr = g.attributes.aColor;
+        if (colAttr) {
+          const colArr = colAttr.array as ArrayLike<number>;
+          for (let i = 0; i < vCount; i++) {
+            mergedColor[(vertexOffset + i) * 3] = colArr[i * 3];
+            mergedColor[(vertexOffset + i) * 3 + 1] = colArr[i * 3 + 1];
+            mergedColor[(vertexOffset + i) * 3 + 2] = colArr[i * 3 + 2];
+          }
+        } else {
+          for (let i = 0; i < vCount; i++) {
+            mergedColor[(vertexOffset + i) * 3] = 1;
+            mergedColor[(vertexOffset + i) * 3 + 1] = 1;
+            mergedColor[(vertexOffset + i) * 3 + 2] = 1;
+          }
+        }
+      }
+
+      // 6. aBatchId
+      if (mergedBatchId) {
+        const bAttr = g.attributes.aBatchId;
+        if (bAttr) {
+          const bArr = bAttr.array as ArrayLike<number>;
+          for (let i = 0; i < vCount; i++) {
+            mergedBatchId[vertexOffset + i] = bArr[i];
+          }
+        } else {
+          for (let i = 0; i < vCount; i++) {
+            mergedBatchId[vertexOffset + i] = -1;
+          }
+        }
+      }
+
+      // 7. Indices
+      if (g.index) {
+        const idxArr = g.index.array as ArrayLike<number>;
+        const iCount = g.index.count;
+        for (let k = 0; k < iCount; k++) {
+          mergedIndices[indexOffset + k] = idxArr[k] + vertexOffset;
+        }
+        indexOffset += iCount;
+      } else {
+        for (let k = 0; k < vCount; k++) {
+          mergedIndices[indexOffset + k] = k + vertexOffset;
+        }
+        indexOffset += vCount;
+      }
+
+      vertexOffset += vCount;
+    }
+
+    const mergedGeo = new THREE.BufferGeometry();
+    mergedGeo.setAttribute('position', new THREE.BufferAttribute(mergedPos, 3));
+    if (mergedNorm) mergedGeo.setAttribute('normal', new THREE.BufferAttribute(mergedNorm, 3));
+    if (mergedUv) mergedGeo.setAttribute('uv', new THREE.BufferAttribute(mergedUv, 2));
+    if (mergedUv1) mergedGeo.setAttribute('uv1', new THREE.BufferAttribute(mergedUv1, 2));
+    if (mergedColor) mergedGeo.setAttribute('aColor', new THREE.BufferAttribute(mergedColor, 3));
+    if (mergedBatchId) mergedGeo.setAttribute('aBatchId', new THREE.BufferAttribute(mergedBatchId, 1));
+    mergedGeo.setIndex(new THREE.BufferAttribute(mergedIndices, 1));
+    mergedGeo.computeBoundingBox();
+    mergedGeo.computeBoundingSphere();
+
+    const mesh = new THREE.Mesh(mergedGeo, material);
+    mesh.userData.skeletonName = candidates[0].name;
+    mesh.userData.geoRef = candidates[0].geo;
+    mesh.userData.tileRef = tileRef;
+    mesh.userData.primitiveType = 4;
+    mesh.userData.isBatched = true;
+    mesh.userData.batchedCount = candidates.length;
+    if (geoByBatchId.size > 0) {
+      mesh.userData.geoByBatchId = geoByBatchId;
+    }
+
+    return mesh;
+  };
 
   const placeObject = (
     cached: CachedGeometry,
@@ -446,12 +718,36 @@ export async function buildTileObjects(
         if (!info) continue;
         const geo = tile.geoPackage[name];
         if (!geo) continue;
+        const vp = geo.vertexPackage;
         for (let pi = 0; pi < info.indexPackages.length; pi++) {
           const cached = geoCache.get(`${name}|${pi}`);
-          if (cached) {
+          if (!cached) continue;
+
+          // 棱线包或实例化网格：保持单独摆放
+          if (
+            isLinePrimitive(cached.pack.primitiveType) ||
+            (info.instanced && vp.instanceBuffer && vp.instanceCount > 0)
+          ) {
             placeObject(cached, name, geo, matrix);
             placed++;
+            continue;
           }
+
+          // 普通三角面网格：若开启合批，按材质进行分组收集
+          if (options.batching !== false && cached.pack.primitiveType === 4) {
+            const matKey = cached.pack.passNames?.[0] ?? '__default__';
+            let list = batchGroups.get(matKey);
+            if (!list) {
+              list = [];
+              batchGroups.set(matKey, list);
+            }
+            list.push({ cached, name, geo, matrix });
+            placed++;
+            continue;
+          }
+
+          placeObject(cached, name, geo, matrix);
+          placed++;
         }
       }
     }
@@ -462,9 +758,50 @@ export async function buildTileObjects(
     for (const [name, info] of skeletonInfo) {
       const geo = tile.geoPackage[name];
       if (!geo) continue;
+      const vp = geo.vertexPackage;
       for (let pi = 0; pi < info.indexPackages.length; pi++) {
         const cached = geoCache.get(`${name}|${pi}`);
-        if (cached) placeObject(cached, name, geo, null);
+        if (!cached) continue;
+
+        if (
+          isLinePrimitive(cached.pack.primitiveType) ||
+          (info.instanced && vp.instanceBuffer && vp.instanceCount > 0)
+        ) {
+          placeObject(cached, name, geo, null);
+          continue;
+        }
+
+        if (options.batching !== false && cached.pack.primitiveType === 4) {
+          const matKey = cached.pack.passNames?.[0] ?? '__default__';
+          let list = batchGroups.get(matKey);
+          if (!list) {
+            list = [];
+            batchGroups.set(matKey, list);
+          }
+          list.push({ cached, name, geo, matrix: null });
+          continue;
+        }
+
+        placeObject(cached, name, geo, null);
+      }
+    }
+  }
+
+  // 执行同材质几何合批
+  if (batchGroups.size > 0) {
+    for (const [matKey, list] of batchGroups) {
+      stats.originalMeshes = (stats.originalMeshes ?? 0) + list.length;
+      if (list.length === 1) {
+        placeObject(list[0].cached, list[0].name, list[0].geo, list[0].matrix);
+      } else {
+        const material = makeMaterial(matKey === '__default__' ? undefined : matKey);
+        const batchedMesh = mergeBatchGeometries(list, material, tile);
+        group.add(batchedMesh);
+        objects.push(batchedMesh);
+        stats.meshes++;
+        for (const item of list) {
+          stats.triangles += (item.cached.pack.indexCount || 0) / 3;
+        }
       }
     }
   }

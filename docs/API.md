@@ -384,8 +384,6 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 - **KTX2 / CRN / ETC** 纹理未实现；DXT1/3/5 与 WebP 可用。
 - **骨骼动画**解析了但未驱动。
 - **地形遮挡**未实现：MapLibre 的地形深度没有写进 custom layer 的深度缓冲，建筑不会被地形裁掉。
-- 每个 `indexPackage` 一个 `Mesh`，倾斜摄影大瓦片需要合批。
-- `texmodmatrix`（纹理变换）未应用。
 - 跨城市量级的数据集叠加会有 float32 精度问题。
 
 ---
