@@ -16,7 +16,12 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup Node.js (for npm publish & OIDC provenance)
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -25,8 +30,8 @@ jobs:
       - name: Ensure latest npm (for Trusted Publishing OIDC)
         run: npm install -g npm@latest
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install dependencies via Bun
+        run: bun install --frozen-lockfile
 
       - name: Verify tag matches package.json version
         if: startsWith(github.ref, 'refs/tags/v')
