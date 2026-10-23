@@ -10,9 +10,9 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
-// 读取 package.json 获取版本号
+// 读取 package.json 获取唯一真实版本号
 const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
-const version = pkg.version || '0.2.9';
+const version = pkg.version;
 
 // 读取 docs/API.md
 const apiMdPath = path.join(rootDir, 'docs', 'API.md');
@@ -509,7 +509,7 @@ const htmlTemplate = `<!doctype html>
             <span>s3m-maplibre</span>
           </a>
           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-            v\${version}
+            v${version}
           </span>
         </div>
 
