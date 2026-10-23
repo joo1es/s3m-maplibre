@@ -1,0 +1,78 @@
+{
+  "name": "s3m-maplibre",
+  "version": "0.1.0",
+  "description": "SuperMap S3M 三维模型格式的 MapLibre / Mapbox 原生渲染图层：浏览器内直接解析 .s3mb 瓦片，无需转 3D Tiles，支持多数据集叠加、白膜/按高度/按单体/动态扫描着色、单体级 GPU 拾取与属性查询。",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core/S3MBParser.d.ts",
+      "import": "./dist/core/S3MBParser.js",
+      "default": "./dist/core/S3MBParser.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "serve": "node tools/serve.mjs",
+    "demo": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/serve.mjs",
+    "test:parse": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/parse-sample.mjs",
+    "test:meshopt": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/meshopt-check.mjs --preset shenyin",
+    "test:oracle": "node tools/official-oracle.mjs",
+    "test:e2e": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/e2e.mjs",
+    "test": "tsc --noEmit -p tsconfig.json && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/parse-sample.mjs",
+    "prepublishOnly": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [
+    "s3m",
+    "s3mb",
+    "supermap",
+    "iserver",
+    "maplibre",
+    "maplibre-gl",
+    "mapbox",
+    "mapbox-gl",
+    "webgl",
+    "three",
+    "3d-tiles",
+    "gis",
+    "bim",
+    "photogrammetry"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "peerDependencies": {
+    "three": ">=0.168.0"
+  },
+  "peerDependenciesMeta": {
+    "three": {
+      "optional": false
+    }
+  },
+  "devDependencies": {
+    "@types/three": "^0.169.0",
+    "maplibre-gl": ">=4.0.0",
+    "three": "^0.169.0",
+    "typescript": "^5.6.3"
+  }
+}
