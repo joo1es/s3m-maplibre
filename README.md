@@ -54,7 +54,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 骨骼动画 | ❌ | 已解析未驱动 |
 | 地形遮挡 | ❌ | |
 | Draco 压缩几何 | ❌ | 能识别、不能解码，遇到抛明确错误；接法见[未支持的格式](#未支持的格式draco--crn--ktx2) |
-| CRN 纹理（pixelFormat 26 / 27） | ❌ | 官方 SDK 是 crunch.js 转 DXT5 再解码，接口位置已留好 |
+| CRN 纹理（`compressType` 26 / 27 / 38001 / 50000） | ✅ | 内联 crunch wasm 转 DXT 后走同一套解码，只在遇到时懒加载；已在 SuperMap Online 公有服务实测 |
 | KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
 
 ---
@@ -154,7 +154,7 @@ npm run demo     # 一次性编译后起静态服务（不做监听）
 
 两个命令都指向 http://localhost:8123/s3m-maplibre/demo/index.html ，`demo/three.html` 是同一台服务器上的纯 three 版。
 
-演示自带两份样例数据（北京 CBD 的 CCTV、comModel），也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并默认勾选第一个。
+演示自带两份本地样例数据（北京 CBD 的 CCTV、comModel，离线可用），另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并默认勾选第一个。
 
 演示包含：数据集叠加开关、着色模式、透明度、平面/平滑着色、选中描边（棱线 / 外扩两种画法，粗细可调）、全局棱线、点击属性卡；右侧面板还能填 iServer 数据服务地址，按业务字段（KEYID / SmMaxZ…）上色出图例、按区间过滤、按字段值抬高。
 
@@ -208,20 +208,39 @@ function tick() {
 
 ---
 
-## 未支持的格式：Draco / CRN / KTX2
+## 未支持的格式：Draco / KTX2
 
 这三个常被问到，结论分别不同：
 
 **Draco 压缩几何 —— 能解决，缺的是样本。**
 官方 SDK 里有 `S3MParser/S3MDracoDecode.js` + `draco_decode.module.js`（对 `DecodeBufferToPointCloud` 的封装，POSITION / NORMAL / TEX_COORD 三个属性，再按 `compressOptions` 分支处理）。接法与本项目的 MeshOpt 完全一致：内联 wasm 解码器、只在遇到 `VertexTag.DRACO` 时动态 `import`、解码后走同一套 attribute 组装 + 量化还原。真正的成本不在写代码，而在**标定容器**——MeshOpt 当时就是靠 60 个真实瓦片逐字节对齐才做对的，Draco 的 attribute 映射、`compressOptions` 与实际数据是否一致也必须拿样例验。仓库里没有 Draco 瓦片，所以现在是「识别到就抛明确错误」。
 
-**CRN 纹理（`pixelFormat` 26 / 27）—— 能解决，纯接解码器。**
-SuperMap 自己的做法是 `crunch.js` 把 CRN 转码成 DXT5 字节，再走普通 DXT 上传。本项目的 `TextureFactory` 在 DXT 那条路上已经完整（DXT1/3/4/5 都解到 RGBA8），所以只要在 `decodeTexture` 里加一个 CRN 分支：crunch 转 DXT5 → 复用现成解码。工作量约一个解码器文件 + 一个分支，同样需要一份 CRN 纹理样例来验字节。
+**CRN 纹理 —— 已支持，并在真实服务上验过。**
+`src/vendor/crunch_decoder.module.js`（crunch 的 emscripten 胶水，wasm 内联成 base64，只在真的遇到 CRN 时动态 import）把 CRN 转回 DXT 块，再走现成的 DXT1/3/4/5 解码；具体是 DXT1 还是 DXT5 由 CRN 头部给出。判定逻辑收敛在 `src/core/TextureFormat.ts`，单测钉死 25 条断言。
+
+**关键点：「是不是 CRN」看 `compressType`，不能看 `pixelFormat`。** 实测到的三组组合（SuperMap Online 公有服务）：
+
+| 数据版本 | compressType | pixelFormat | 实际内容 |
+|:---|:---|:---|:---|
+| v3.00 | `26`（CRN_DXT5） | `13`（ABGR，无意义） | CRN，数据以 `Hx` 开头 |
+| v3.00 | `14`（噪声） | `21` | DXT5 裸块 |
+| v3.01（行标） | `50000`（TC_CRN_DXT5） | `32856`（GL_RGBA8） | CRN，数据以 `Hx` 开头 |
+
+早期版本按 `pixelFormat === 26 / 27` 判断，真实服务里的 CRN 纹理会被当成未知格式整包丢掉——表现就是**模型能出来，但全是灰模**。现在先看 `compressType`（`26 / 27 / 38001 / 50000`），认不出来才退回 `pixelFormat`；另外 `transcodeCRN` 会先验 `Hx` 魔数，避免把误标的 DXT 数据喂进 crunch 解出一个「尺寸看着合理」的垃圾块。
+
+验证方式：
+
+```bash
+npm run probe:crn -- --crn https://host/iserver/services/svc/rest/realspace/datas/<数据集>/config --limit 3
+# 也可以先摸底：--service <realspace 根地址> 列出每个数据集的 s3m:TextureCompressionType
+```
+
+探针会对每张 CRN 纹理报告「尺寸是否与纹理头一致 / 解出的色数 / 邻域粗糙度」，并打一张 ASCII 灰度预览，用来判断熵解码是否真的解对了（解错会是一屏噪声）。已跑过的数据：`3D-BianDianZhan3`（512²，v3.00）、`3D-BIMTreeModel` / `3D-local3DCache-SubwayStationCombined`（32² / 64²，v3.01）、`3D-scyx`（1024²），除「数据本身标错」外全部尺寸吻合、预览有真实结构。
 
 **KTX2 —— 不是「不支持」，是 S3M 里基本不会出现。**
 官方 `S3MPixelFormat` 枚举（`1/2/3/4/5/6/7/10/11/12/13/14/17…21/25/26/27/28`）里没有 KTX2 / Basis 的条目，iServer 也不会发。真要支持，得自己引入 `basis_transcoder.wasm` 并把 KTX2 容器转成 RGBA32 或 DXT，但那是给「别人转成 KTX2 再塞进 S3M」的场景准备的，没有数据样本可测。
 
-两者的共同前提：**要有样例数据**。手头有 Draco 压缩的瓦片或带 CRN 纹理的服务地址，把 `.s3mb` 或服务地址给我，就能按 MeshOpt 那套方式标定 + 实现 + 回归。
+共同前提：**要有样例数据**。手头有 Draco 压缩的瓦片，把 `.s3mb` 给我，就能按 MeshOpt 那套方式标定 + 实现 + 回归（CRN 的代码已经接好，只差真样本验一遍熵解码）。
 
 ---
 
@@ -313,10 +332,13 @@ S3M 顶点（数据集局部 ENU，米）
 
 ## 已知限制
 
-- **Draco 压缩几何 / CRN 纹理**未实现（可解，缺样例数据），见[未支持的格式](#未支持的格式draco--crn--ktx2)。
+- **Draco 压缩几何**未实现（可解，缺样例数据），见[未支持的格式](#未支持的格式draco--ktx2)。
+- **纹理分包（`s3m:TextureSharing`）未支持**：这类数据集的 `tiles` 全是 `.s3mblock`（纹理块文件），不是 `.s3mb` 瓦片，加载会直接失败，例如 SuperMap Online 的 `3D-CBD/Xiaopin@CBD`。目前会如实报错，不做静默降级。
+- **多块 MeshOpt 骨架尚未对齐**：`3D-WorkSpace_pbr1/pbrmodel` 里有根瓦片是 `blockCount=2`，第二块的头按现有布局读会错位。单个属性流尺寸会先拦一道、给出可定位的报错，不会抛「Invalid typed array length」。
 - **地形遮挡**未实现：MapLibre 的地形深度没进 custom layer 的深度缓冲，建筑不会被地形裁掉。
 - 跨城市量级的数据集叠加会重新引入 float32 精度问题。
 - 卸载只做了「超上限淘汰」：`maxTiles` 满了会淘汰最久没用的瓦片，但没有做预算式（按显存占用）的主动回收。
+- **切线（TANGENT）顶点流不参与渲染**：没有法线贴图通道，所以这条流只跳过不解码；但带它的数据（PBR 一类）不会因此失败。
 
 ---
 
@@ -330,6 +352,8 @@ src/
     MeshOpt.ts           MeshOpt 几何压缩解码（量化还原 + 八面体法线）
     FeatureInfo.ts       单体属性反推
     DXTTextureDecode.ts  DXT 解码（来自 SuperMap/s3m-spec）
+    TextureFormat.ts     纹理格式判定（compressType / pixelFormat → 解码路径）
+    CRNDecode.ts         CRN → DXT 转码（crunch wasm，按需加载）
   tileset/   瓦片树 + LOD + 加载调度
   render/    three 渲染
     S3MLayer.ts          图层主体（多数据集 / 样式 / 拾取）
@@ -342,7 +366,7 @@ src/
 demo/
   index.html / main.js   MapLibre 完整示例（控制面板 + 属性卡）
   three.html / three.js  纯 three.js 示例（无地图）
-tools/       自检脚本（解析校验、MeshOpt 回归、带热更新的静态服务）
+tools/       自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
 ```
 
 ---
@@ -351,5 +375,6 @@ tools/       自检脚本（解析校验、MeshOpt 回归、带热更新的静�
 
 - 本项目 [Apache-2.0](./LICENSE)。
 - `src/core/DXTTextureDecode.ts` 来自 [SuperMap/s3m-spec](https://github.com/supermap/s3m-spec)（Apache-2.0）。
+- `src/vendor/crunch_decoder.module.js` 是 [crunch](https://github.com/BinomialLLC/crunch) 的 emscripten 构建（经 SuperMap SDK 转发，Apache-2.0）；只改了两处：wasm 改为内联字节、Node ESM 下 `__dirname` 兜底。
 - `src/vendor/meshopt_decoder.module.js` 是 [meshoptimizer](https://github.com/zeux/meshoptimizer) 官方解码器（MIT，© Arseny Kapoulkine），未做修改。
 - S3M 规范文本遵循 CC BY-ND 4.0，不得修改规范文本后再发布。

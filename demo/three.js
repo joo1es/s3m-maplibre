@@ -17,6 +17,13 @@ import { S3MTileset, createSharedUniforms, STYLE, setMaxAnisotropy } from '../di
 const DATASETS = {
   cbd: { url: './data/CBD/cbd.scp', name: '北京CBD (CCTV)' },
   comModel: { url: './data/comModel/comModel.scp', name: 'comModel' },
+  // 纹理全走 CRN（v3.01），用来验证 crunch 转码 → DXT 解码这条链
+  subwayCrn: {
+    url:
+      'https://www.supermapol.com/realspace/services/3D-local3DCache-SubwayStationCombined' +
+      '/rest/realspace/datas/SubwayStationCombined/config',
+    name: '地铁站 (CRN 纹理)',
+  },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -222,4 +229,12 @@ function tick(now) {
 
 applyOrbit();
 requestAnimationFrame(tick);
-load('cbd');
+
+// ?ds=subwayCrn 可直接指定数据集（截图 / 分享用），默认还是 CBD
+const initial = new URLSearchParams(location.search).get('ds');
+if (initial && DATASETS[initial]) {
+  $('ds').value = initial;
+  load(initial);
+} else {
+  load('cbd');
+}

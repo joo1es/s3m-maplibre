@@ -112,6 +112,25 @@ three 场景原点固定在**场景锚点**（第一个成功加载的数据集�
 
 S3M 瓦片里可能带 `pickInfo`：`SMID → batchId + 顶点区间`。解析时会把它展开成逐顶点的 `aBatchId` 属性，于是 GPU 可以按单体着色、按单体拾取。没有单体化信息的几何 `batchId = -1`，只能整块拾取。
 
+#### batch 粒度：多个 SMID 共用一个 batch
+
+单体化的分辨率只到 **batch**，不是 SMID。实测有数据会把若干相邻铺面合并成一个 batch（白模里甚至 81 个 mesh 共用一个材质码），于是「给 3 号楼单独上色」这件事在几何层面就不成立。
+
+内部规则（确定性的，不再「最后写的说了算」）：
+
+- **任一 SMID 需要隐藏 → 整批隐藏**；
+- **颜色 / 抬高取 SMID 最小的那一个**；
+- 真的发生时只 `console.warn` 一次，不会每次重写纹理都刷屏。
+
+先摸清数据能细到什么程度：
+
+```ts
+const audit = layer.auditBatches();
+// { smids, batches, conflicts: [{ datasetId, batchId, smids }], conflictingSmids }
+```
+
+`conflicts` 为空说明这批数据可以放心按单体操作；不为空时，这些单体对应「按 batch 罩层」之类的做法，靠本库的单体化通道做不到。
+
 ---
 
 ## `S3MLayer`
@@ -610,7 +629,11 @@ layer.flushOverrides();
 ## 已知限制
 
 - **Draco 压缩几何**能识别、不能解码，遇到会抛明确错误。接法与 MeshOpt 相同（内联 wasm、按需 `import`、解码后走同一套 attribute 组装），但必须先拿 Draco 瓦片标定容器结构。MeshOpt 已支持，且是逐字节对过 60 个真实瓦片才做对的。
-- **CRN 纹理**（`pixelFormat` 26 / 27）未实现。官方 SDK 的做法是 `crunch.js` 转码成 DXT5 再走普通 DXT 上传，本项目 DXT 解码链路已完整，缺的是一个 CRN 分支 + 样例。
+- **实例化单体**（`pickInfo` 里给的是 `instanceIds` 而不是 `batchId`，白模常见）只做了渲染，没做按单体控制：`setFeatureStyle` / `filterByField` / `elevateByField` / GPU 拾取走的都是 `aBatchId`，这条路径对实例化几何不生效。要支持得把每个实例单独上色，得改 InstancedMesh 的 instanceColor + 拾取编码。
+- **CRN 纹理**已支持，且已在真实服务上验证：内联的 crunch wasm 转回 DXT 后走现成解码，DXT 具体格式看 CRN 头，wasm 约 76KB、只有真遇到 CRN 时才动态加载。**判定看 `compressType` 而不是 `pixelFormat`**——实测 v3.00 是 `ct=26 / pf=13`、行标是 `ct=50000 / pf=32856`，按 `pixelFormat` 26 / 27 判断会把真实 CRN 整包丢掉（模型变灰模）。判定收敛在 `src/core/TextureFormat.ts`（`resolveTextureKind` / `TextureCompress` / `dxtPixelFormatOf`，已从包入口导出）。用 `npm run probe:crn -- --crn <数据集 config 地址>` 可以对任意服务跑「尺寸吻合 / 色数 / 粗糙度 / ASCII 预览」的实测。
+- **纹理分包（`s3m:TextureSharing`）未支持**：这类数据集的 `tiles` 全是 `.s3mblock`，不是 `.s3mb`，加载会失败（例：SuperMap Online `3D-CBD/Xiaopin@CBD`）。
+- **多块 MeshOpt 骨架**（`blockCount > 1`）暂未对齐：例 `3D-WorkSpace_pbr1/pbrmodel`，第二块头部按现有布局读会错位，会给出「流尺寸异常」的可定位报错而不是底层 RangeError。
+- **切线顶点流**只跳过不解码（渲染没有法线贴图通道），带 TANGENT 的数据不会被判失败。
 - **KTX2** 不在 S3M 的 `pixelFormat` 枚举里，iServer 也不会发；要支持需自行引入 `basis_transcoder.wasm` 并解析容器，属于「换数据源才需要考虑」的项。
 - **骨骼动画**解析了但未驱动。
 - **地形遮挡**未实现：MapLibre 的地形深度没有写进 custom layer 的深度缓冲，建筑不会被地形裁掉。
@@ -622,5 +645,6 @@ layer.flushOverrides();
 
 - 本库代码 Apache-2.0。
 - `src/core/DXTTextureDecode.ts` 来自 [SuperMap/s3m-spec](https://github.com/supermap/s3m-spec)（Apache-2.0）。
+- `src/vendor/crunch_decoder.module.js` 是 crunch 的 emscripten 构建（Apache-2.0），wasm 内联、仅改动加载方式。
 - `src/vendor/meshopt_decoder.module.js` 是 [meshoptimizer](https://github.com/zeux/meshoptimizer) 官方解码器（MIT，© Arseny Kapoulkine），未做修改。
 - S3M 规范文本遵循 CC BY-ND 4.0，不得修改规范文本后再发布。

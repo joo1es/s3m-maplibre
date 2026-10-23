@@ -16,6 +16,16 @@ const PRESETS = [
     color: '#d97706',
     tip: '单体建筑样例模型',
   },
+  {
+    id: 'subwayCrn',
+    // 这份数据的纹理全走 CRN（v3.01，compressType=50000），用来肉眼验证 CRN 解码链路
+    name: '地铁站 (CRN 纹理)',
+    url:
+      'https://www.supermapol.com/realspace/services/3D-local3DCache-SubwayStationCombined' +
+      '/rest/realspace/datas/SubwayStationCombined/config',
+    color: '#16a34a',
+    tip: 'SuperMap Online 公有服务 · 纹理为 CRN 压缩，转码后才能出贴图',
+  },
 ];
 
 const DEFAULT_URL = PRESETS[0].url; // 默认使用 CCTV CBD 模型
