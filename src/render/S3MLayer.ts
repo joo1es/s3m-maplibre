@@ -325,11 +325,12 @@ export class S3MLayer {
 
   private _addLights(): void {
     if (!this.scene) return;
-    // 天光打底，保证背光面不死黑
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xb6c0cb, 1.0));
+    // 环境光与天光打底，保证背光面和折叠处不死黑
+    this.scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xb6c0cb, 0.8));
     // 主光 / 补光的方向每帧按地图朝向重算（见 _updateLights），
     // 这样旋转视角时白模始终是亮的，不会转到背光面就一片死灰。
-    this._keyLight = new THREE.DirectionalLight(0xffffff, 1.15);
+    this._keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
     this._fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
     this.scene.add(this._keyLight, this._fillLight);
   }

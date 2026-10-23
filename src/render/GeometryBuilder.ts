@@ -328,15 +328,6 @@ export async function buildTileObjects(
       ? toBufferAttribute(batchAttr)
       : new THREE.BufferAttribute(new Float32Array(vertexCount).fill(-1), 1);
 
-    if (!attributes.normal) {
-      const tmp = new THREE.BufferGeometry();
-      tmp.setAttribute('position', attributes.position);
-      tmp.computeVertexNormals();
-      const normal = tmp.getAttribute('normal');
-      if (normal) attributes.normal = normal as THREE.BufferAttribute;
-      tmp.dispose();
-    }
-
     const instanced = vp.instanceIndex !== -1 && (vp.instanceMode === 16 || vp.instanceMode === 17);
     // 注意：indexPackages 属于 Skeleton（geoPackage[name]），不在 vertexPackage 里
     skeletonInfo.set(name, { indexPackages: geo.indexPackages ?? [], instanced });
@@ -348,6 +339,13 @@ export async function buildTileObjects(
       const idx = toIndex(pack);
       if (idx) geometry.setIndex(idx);
       else geometry.setDrawRange(0, vertexCount);
+
+      // 如果数据本身没有法线且是三角网格，必须在绑定了 index 之后计算法线
+      // 绝不能在未索引的 attributes.position 上算，否则非连续顶点会导致法线朝向错乱甚至越界 NaN 导致死黑面
+      if (!isLinePrimitive(pack.primitiveType) && !geometry.getAttribute('normal')) {
+        geometry.computeVertexNormals();
+      }
+
       geometry.computeBoundingBox();
       geometry.computeBoundingSphere();
       geoCache.set(`${name}|${pi}`, { geometry, pack });
