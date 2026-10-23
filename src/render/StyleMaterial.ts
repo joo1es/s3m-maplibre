@@ -71,8 +71,8 @@ export interface StyledMaterial extends THREE.MeshStandardMaterial {
   };
 }
 
-const DUMMY_DATA = new Float32Array([-1, -1, -1, 0]);
-export const DUMMY_BATCH_TEX = new THREE.DataTexture(DUMMY_DATA, 1, 1, THREE.RGBAFormat, THREE.FloatType);
+const DUMMY_DATA = new Float32Array([-1, -1, -1, 0, 0, 0, 0, 0]);
+export const DUMMY_BATCH_TEX = new THREE.DataTexture(DUMMY_DATA, 1, 2, THREE.RGBAFormat, THREE.FloatType);
 DUMMY_BATCH_TEX.minFilter = THREE.NearestFilter;
 DUMMY_BATCH_TEX.magFilter = THREE.NearestFilter;
 DUMMY_BATCH_TEX.needsUpdate = true;
@@ -148,19 +148,24 @@ const VERT_PARS = /* glsl */ `
 
 const VERT_ELEVATION = /* glsl */ `
   float s3mBatch = s3mBatchRaw();
-  float s3mCustomElev = 0.0;
+  vec3 s3mCustomOffset = vec3( 0.0 );
   if ( uBatchTexActive > 0 && s3mBatch >= 0.0 ) {
-    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.5 ) );
+    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.25 ) );
     if ( bState.a < -0.5 ) {
       transformed = vec3( 0.0 );
-    } else if ( bState.a > 0.0 ) {
-      s3mCustomElev = bState.a;
+    } else {
+      vec4 bOffset = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.75 ) );
+      s3mCustomOffset = bOffset.xyz;
+      if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
+        s3mCustomOffset.z = bState.a;
+      }
     }
   }
 
   float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( s3mBatch - uSelBatch ), 0.5 ), uSelWhole );
-  // 实例化时这是局部 z，实例矩阵只含平移 + 绕 z 旋转（白模摆位），所以抬起来仍是竖直方向
-  transformed.z += s3mSelElev * uSelElevation + s3mCustomElev;
+  // 实例化时这是局部坐标，实例矩阵只含平移 + 绕 z 旋转（白模摆位），所以偏移仍沿局部轴生效
+  transformed += s3mCustomOffset;
+  transformed.z += s3mSelElev * uSelElevation;
 `;
 
 const VERT_WORLD = /* glsl */ `
@@ -307,7 +312,7 @@ const FRAG_COLOR = /* glsl */ `
   bool hasCustomColor = false;
   if ( uBatchTexActive > 0 && s3mBid >= 0.0 ) {
     // 用取整后的 id 采样：否则逐像素的插值误差会让纹素在边界上来回跳，同样出彩色噪点
-    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBid + 0.5 ) / uBatchTexWidth, 0.5 ) );
+    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBid + 0.5 ) / uBatchTexWidth, 0.25 ) );
     if ( bState.a < -0.5 ) {
       discard; // 属于被过滤隐藏的单体
     }
@@ -439,17 +444,22 @@ const OUTLINE_VERT = /* glsl */ `
   varying float vSel;
   void main() {
     vSel = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
-    float s3mCustomElev = 0.0;
+    vec3 s3mCustomOffset = vec3( 0.0 );
     if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
-      vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+      vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.25 ) );
       if ( bState.a < -0.5 ) {
         vSel = 0.0; // 过滤隐藏的单体不显示描边
-      } else if ( bState.a > 0.0 ) {
-        s3mCustomElev = bState.a;
+      } else {
+        vec4 bOffset = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.75 ) );
+        s3mCustomOffset = bOffset.xyz;
+        if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
+          s3mCustomOffset.z = bState.a;
+        }
       }
     }
     vec3 p = position + normal * uWidth * vSel;
-    p.z += vSel * ( uElevation + s3mCustomElev );
+    p += s3mCustomOffset;
+    p.z += vSel * uElevation;
     gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
   }
 `;

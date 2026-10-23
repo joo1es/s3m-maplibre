@@ -45,11 +45,13 @@ const VERT = /* glsl */ `
   uniform float uDpr;
   uniform float uWidth;
   uniform float uElevation;
+  uniform vec3 uTranslation;
 
   void main() {
-    // 选中单体拔高：与着色器里 transformed.z += uSelElevation 保持同一口径（物体空间）
-    vec4 clipA = projectionMatrix * modelViewMatrix * vec4( position + vec3( 0.0, 0.0, uElevation ), 1.0 );
-    vec4 clipB = projectionMatrix * modelViewMatrix * vec4( aOther + vec3( 0.0, 0.0, uElevation ), 1.0 );
+    // 选中单体平移/拔高：与着色器里 transformed += uTranslation 保持同一口径（物体空间）
+    vec3 offset = uTranslation + vec3( 0.0, 0.0, uElevation );
+    vec4 clipA = projectionMatrix * modelViewMatrix * vec4( position + offset, 1.0 );
+    vec4 clipB = projectionMatrix * modelViewMatrix * vec4( aOther + offset, 1.0 );
 
     if ( clipA.w <= 0.0 || clipB.w <= 0.0 ) {
       // 端点跑到相机后面，整段丢弃（裁到近平面的线段会有轻微截断，可接受）
@@ -97,6 +99,7 @@ export function createThickLineMaterial(
       uOpacity: { value: opts.opacity ?? 1 },
       uWidth: { value: opts.width ?? 1.5 },
       uElevation: { value: opts.elevation ?? 0 },
+      uTranslation: { value: new THREE.Vector3(0, 0, 0) },
     },
     vertexShader: VERT,
     fragmentShader: FRAG,

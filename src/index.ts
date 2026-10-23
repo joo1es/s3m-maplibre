@@ -88,6 +88,14 @@ export { Picker } from './render/Picker.js';
 export type { PickHit } from './render/Picker.js';
 
 export {
+  buildOrthoMVP,
+  extractProjectionMatrix,
+  extractNearFar,
+  extractFovRadians,
+} from './render/OrthoProjection.js';
+export type { ProjectionMode, OrthoInput, OrthoParams, OrthoMVP } from './render/OrthoProjection.js';
+
+export {
   createThickLineMaterial,
   createLineSharedUniforms,
   buildThickLineGeometry,

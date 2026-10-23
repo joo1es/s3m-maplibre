@@ -109,6 +109,8 @@ export interface S3MTilesetOptions {
   onError?: (error: unknown) => void;
   /** 单块瓦片加载失败后的重试次数，默认 2（退避 0.8s / 1.6s） */
   maxRetries?: number;
+  /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
+  lodRangeScale?: number;
 }
 
 export class S3MTileset {
@@ -124,6 +126,7 @@ export class S3MTileset {
 
   maxConcurrent: number;
   maxTiles: number;
+  lodRangeScale: number;
 
   private readonly _onTile: (node: TileNode) => void;
   private readonly _onTileRemoved: (node: TileNode) => void;
@@ -143,6 +146,7 @@ export class S3MTileset {
 
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
+    this.lodRangeScale = options.lodRangeScale ?? 1.0;
     this._onTile = options.onTile ?? (() => {});
     this._onTileRemoved = options.onTileRemoved ?? (() => {});
     this._onError = options.onError ?? ((e) => console.warn(e));
@@ -394,11 +398,13 @@ export class S3MTileset {
       }
 
       // 在有效范围内（留一倍余量）的算「正在用」，淘汰时按这个帧号排优先级
-      const inRange = node.rangeMode === 0 ? dist < node.rangeValue * 2 : metric > node.rangeValue * 0.5;
+      const scale = this.lodRangeScale > 0 ? this.lodRangeScale : 1.0;
+      const threshold = node.rangeValue * scale;
+      const inRange = node.rangeMode === 0 ? dist < threshold * 2 : metric > threshold * 0.5;
       if (inRange) node.lastSeen = this._frame;
 
       if (!node.childUrl || this.failed.has(node.childUrl)) continue;
-      const needRefine = node.rangeMode === 0 ? metric < node.rangeValue : metric > node.rangeValue;
+      const needRefine = node.rangeMode === 0 ? metric < threshold : metric > threshold;
       if (needRefine) this._enqueue(node.childUrl, node.url);
     }
   }

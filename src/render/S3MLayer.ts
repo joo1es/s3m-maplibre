@@ -36,6 +36,13 @@ import {
 } from './EdgeLines.js';
 import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
 import {
+  buildOrthoMVP,
+  extractFovRadians,
+  extractNearFar,
+  extractProjectionMatrix,
+  type ProjectionMode,
+} from './OrthoProjection.js';
+import {
   resolveFeature,
   measureSegments,
   buildAttributes,
@@ -71,7 +78,8 @@ export interface MapLike {
   off(type: string, listener: (e: MapMouseEventLike) => void): unknown;
   getBearing?(): number;
   getFreeCameraOptions?(): { position?: { x: number; y: number; z: number } | null } | null;
-  transform?: { fov?: number };
+  /** 注意 fov 在 MapLibre v5 起是「度」，v4 / Mapbox 是「弧度」；弧度用 fovInRadians */
+  transform?: { fov?: number; fovInRadians?: number; cameraToCenterDistance?: number };
 }
 
 export interface MapMouseEventLike {
@@ -86,12 +94,12 @@ function mercatorFromLngLat(
   lon: number,
   lat: number,
   altitude = 0
-): { x: number; y: number; z: number; meterInMercator: number } {
+): { x: number; y: number; z: number; meterInMercator: number; altitude: number } {
   const sinLat = Math.sin((lat * Math.PI) / 180);
   const x = (180 + lon) / 360;
   const y = 0.5 - (0.25 * Math.log((1 + sinLat) / (1 - sinLat))) / Math.PI;
   const meterInMercator = 1 / (2 * Math.PI * EARTH_RADIUS) / Math.cos((lat * Math.PI) / 180);
-  return { x, y, z: altitude * meterInMercator, meterInMercator };
+  return { x, y, z: altitude * meterInMercator, meterInMercator, altitude };
 }
 
 /** 墨卡托归一化坐标 → 经纬度 */
@@ -193,6 +201,8 @@ export interface S3MDatasetOptions {
   configUrl: string;
   visible?: boolean;
   maxTiles?: number;
+  /** LOD 切换范围缩放系数（默认 1.0） */
+  lodRangeScale?: number;
   /** 垂直高度偏移（米），正数抬升，负数下降，默认 0 */
   heightOffset?: number;
 }
@@ -215,8 +225,10 @@ export interface S3MDatasetEntry {
 export interface FeatureStyle {
   /** 自定义单体颜色 */
   color?: string;
-  /** 自定义单体独立拔高高度（米） */
+  /** 自定义单体独立拔高高度（米，垂直方向） */
   elevation?: number;
+  /** 自定义单体三维平移偏移量 [dx, dy, dz]（米，S3M 本地坐标/ENU） */
+  translation?: [number, number, number];
   /** 自定义单体不透明度（0~1） */
   opacity?: number;
 }
@@ -246,6 +258,12 @@ export interface PickResult extends FeatureAttributes {
   skeletonName: string;
   /** 单体中心经纬度，拿不到时为 null */
   centerLngLat: [number, number] | null;
+  /** 命中点三维场景坐标 [x, y, z]（米，场景 ENU） */
+  point?: [number, number, number] | null;
+  /** 命中点经纬度 [lng, lat] */
+  lngLat?: [number, number] | null;
+  /** 命中点高程（米） */
+  altitude?: number | null;
   mesh: THREE.Mesh;
 }
 
@@ -261,6 +279,8 @@ export interface S3MLayerOptions {
   maxTiles?: number;
   /** 每个数据集并发请求数 */
   maxConcurrent?: number;
+  /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
+  lodRangeScale?: number;
   /** 自定义瓦片构建器（测试 / 服务端渲染时注入） */
   buildTile?: BuildTileFn | null;
   /**
@@ -268,6 +288,14 @@ export interface S3MLayerOptions {
    * 配上之后才能用 `colorByField()` 按业务字段着色 —— 属性值不在 S3M 瓦片里，只能去数据服务查。
    */
   attributes?: AttributeQueryOptions;
+  /**
+   * 投影模式，默认 `'perspective'`（跟随 MapLibre，与底图严格对齐）。
+   * `'orthographic'` 让本层按正交投影重画：视图矩阵从 MapLibre 每帧输入反推，
+   * pan / zoom / pitch / rotate 与拾取、选中描边全部照常。
+   * 注意正交只覆盖本层——底图、地形、DOM Marker 仍走 MapLibre 的透视投影，
+   * 会与本层对不齐，需要 App 自行退出，详见 README「正交投影」。
+   */
+  projection?: ProjectionMode;
   onStats?: (stats: Stats) => void;
   onReady?: (entry: S3MDatasetEntry) => void;
   onPick?: (result: PickResult | null) => void;
@@ -505,7 +533,7 @@ export class S3MLayer {
   renderer: THREE.WebGLRenderer | null = null;
   scene: THREE.Scene | null = null;
   camera: THREE.Camera | null = null;
-  sceneAnchor: { x: number; y: number; z: number; meterInMercator: number } | null = null;
+  sceneAnchor: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null = null;
   picker: Picker | null = null;
 
   readonly uniforms: StyleUniforms;
@@ -567,10 +595,17 @@ export class S3MLayer {
 
   private readonly _datasetQueue: S3MDatasetOptions[];
 
+  /** 投影模式；正交不可用时（老版本 MapLibre）自动退回透视并告警一次 */
+  private _projection: ProjectionMode = 'perspective';
+  private _orthoWarned = false;
+  private _lodRangeScale = 1.0;
+
   constructor(options: S3MLayerOptions = {}) {
     this.id = options.id ?? 's3m';
     this.options = options;
     this.pickable = options.pickable !== false;
+    this._lodRangeScale = options.lodRangeScale ?? 1.0;
+    this._projection = options.projection === 'orthographic' ? 'orthographic' : 'perspective';
     this.onStats = options.onStats ?? (() => {});
     this.onReady = options.onReady ?? (() => {});
     this.onPick = options.onPick ?? (() => {});
@@ -715,6 +750,7 @@ export class S3MLayer {
       configUrl: ds.configUrl,
       maxTiles: ds.maxTiles ?? this.options.maxTiles ?? 64,
       maxConcurrent: this.options.maxConcurrent ?? 4,
+      lodRangeScale: ds.lodRangeScale ?? this._lodRangeScale,
       buildTile: this.options.buildTile ?? null,
       uniforms: this.uniforms,
       onTile: (node) => {
@@ -1305,8 +1341,8 @@ export class S3MLayer {
 
     let record = this._meshBatchTextures.get(mesh);
     if (!record || record.width < width) {
-      const data = new Float32Array(width * 4);
-      const texture = new THREE.DataTexture(data, width, 1, THREE.RGBAFormat, THREE.FloatType);
+      const data = new Float32Array(width * 2 * 4);
+      const texture = new THREE.DataTexture(data, width, 2, THREE.RGBAFormat, THREE.FloatType);
       texture.minFilter = THREE.NearestFilter;
       texture.magFilter = THREE.NearestFilter;
       record = { texture, data, width };
@@ -1316,10 +1352,20 @@ export class S3MLayer {
     }
 
     const { data, texture } = record;
-    // 默认值：[-1, -1, -1, 0]（无自定义色，无抬升，不隐藏）
-    data.fill(-1);
-    for (let i = 0; i < record.width; i++) {
+    const w = record.width;
+    // Row 0 默认值：[-1, -1, -1, 0]（无自定义色，不隐藏）
+    // Row 1 默认值：[0, 0, 0, 0]（无平移）
+    for (let i = 0; i < w; i++) {
+      data[i * 4 + 0] = -1;
+      data[i * 4 + 1] = -1;
+      data[i * 4 + 2] = -1;
       data[i * 4 + 3] = 0;
+
+      const r1 = (w + i) * 4;
+      data[r1 + 0] = 0;
+      data[r1 + 1] = 0;
+      data[r1 + 2] = 0;
+      data[r1 + 3] = 0;
     }
 
     // 一个 batchId 可能被多个 SMID 共用（实测「邻店共 batchId」），
@@ -1329,6 +1375,7 @@ export class S3MLayer {
     const hiddenBatches = new Set<number>();
     const colorOfBatch = new Map<number, string>();
     const elevOfBatch = new Map<number, number>();
+    const translationOfBatch = new Map<number, [number, number, number]>();
     /** batchId → 有几个 SMID 落在上面，用来判断「这个 batch 本来就没法单独控制」 */
     const ownersOfBatch = new Map<number, number>();
 
@@ -1376,9 +1423,11 @@ export class S3MLayer {
       const colorHex = st?.color ?? thematicColor;
       // 手动拔高 > 按业务字段抬高
       const elevation = st?.elevation ?? this._thematicElevation.get(smid);
+      const translation = st?.translation;
 
       if (colorHex && !colorOfBatch.has(bId)) colorOfBatch.set(bId, colorHex);
-      if (elevation != null && elevation > 0 && !elevOfBatch.has(bId)) elevOfBatch.set(bId, elevation);
+      if (elevation != null && !elevOfBatch.has(bId)) elevOfBatch.set(bId, elevation);
+      if (translation && !translationOfBatch.has(bId)) translationOfBatch.set(bId, translation);
     }
 
     for (const bId of hiddenBatches) {
@@ -1395,6 +1444,16 @@ export class S3MLayer {
     for (const [bId, elevation] of elevOfBatch) {
       if (hiddenBatches.has(bId)) continue; // 抬高会写 alpha，别把隐藏标记覆盖掉
       data[bId * 4 + 3] = elevation;
+      const r1 = (w + bId) * 4;
+      data[r1 + 2] = elevation;
+      hasActive = true;
+    }
+    for (const [bId, trans] of translationOfBatch) {
+      if (hiddenBatches.has(bId)) continue;
+      const r1 = (w + bId) * 4;
+      data[r1 + 0] = trans[0];
+      data[r1 + 1] = trans[1];
+      data[r1 + 2] = (trans[2] ?? 0) + (elevOfBatch.get(bId) ?? 0);
       hasActive = true;
     }
 
@@ -1937,28 +1996,49 @@ export class S3MLayer {
     return this.pick(oe.clientX - rect.left, oe.clientY - rect.top);
   }
 
-  /** 按 canvas 左上角的 CSS 像素坐标拾取。 */
-  pick(x: number, y: number): PickResult | null {
-    if (!this.picker || !this.scene || !this.camera || !this.sceneAnchor) return null;
-    const hit = this.picker.pick(this.scene, this.camera, x, y);
-    if (!hit) return null;
+  /** 获取指定屏幕像素对应的场景射线（用于高精度求交与穿透拾取） */
+  getRayAt(x: number, y: number): THREE.Ray | null {
+    if (!this.camera || !this.map) return null;
+    const canvas = this.map.getCanvas();
+    const w = canvas.clientWidth || canvas.width;
+    const h = canvas.clientHeight || canvas.height;
+    if (!w || !h) return null;
 
-    const ref = this._pickables.get(hit.objectId);
-    if (!ref) return null;
+    const ndcX = (x / w) * 2 - 1;
+    const ndcY = -(y / h) * 2 + 1;
 
+    const near = new THREE.Vector3(ndcX, ndcY, -1).unproject(this.camera);
+    const far = new THREE.Vector3(ndcX, ndcY, 1).unproject(this.camera);
+    const dir = far.clone().sub(near).normalize();
+    return new THREE.Ray(near, dir);
+  }
+
+  private _intersectMeshAtRay(mesh: THREE.Mesh, ray: THREE.Ray, instanceIndex?: number): THREE.Vector3 | null {
+    const raycaster = new THREE.Raycaster();
+    raycaster.ray.copy(ray);
+    const hits = raycaster.intersectObject(mesh, false);
+    if (!hits.length) return null;
+    if (instanceIndex != null) {
+      const match = hits.find((h) => h.instanceId === instanceIndex);
+      return match ? match.point : hits[0].point;
+    }
+    return hits[0].point;
+  }
+
+  private _buildPickResult(
+    hit: { objectId: number; batchId: number; instanceIndex?: number },
+    ref: PickableRef,
+    exactPoint?: THREE.Vector3,
+    ray?: THREE.Ray
+  ): PickResult | null {
     const ud = ref.mesh.userData as MeshUserData;
-
-    // 两种单体化形态：
-    //   顶点区间型 —— 拾取编码 batchId，直接 resolveFeature 拿到 smid + 顶点区间
-    //   实例化型   —— 拾取编码实例序号，先反查实例属于哪个 SMID，控制位是状态纹理下标
     let smid: number | null = null;
     let batchId = hit.batchId;
-    let instanceIndex: number | undefined;
+    let instanceIndex = hit.instanceIndex;
     let geoRef = ud.geoRef;
     let segments: Array<{ vertexOffset: number; vertexCount: number }> = [];
 
-    if (hit.instanceIndex != null) {
-      instanceIndex = hit.instanceIndex;
+    if (instanceIndex != null) {
       const feature = this._instanceFeature(ref.mesh, geoRef, instanceIndex);
       if (!feature) return null;
       smid = feature.smid;
@@ -1972,21 +2052,63 @@ export class S3MLayer {
 
     if (this._isFeatureHidden(smid, batchId)) return null;
 
-    const box =
+    let box =
       instanceIndex != null
         ? this._instanceBox(ref.mesh, instanceIndex)
         : measureSegments(ref.mesh.geometry, segments);
+    if (!box && ref.mesh.geometry) {
+      if (!ref.mesh.geometry.boundingBox) ref.mesh.geometry.computeBoundingBox();
+      const bb = ref.mesh.geometry.boundingBox;
+      if (bb) {
+        box = {
+          minX: bb.min.x,
+          maxX: bb.max.x,
+          minY: bb.min.y,
+          maxY: bb.max.y,
+          minZ: bb.min.z,
+          maxZ: bb.max.z,
+          count: 0,
+          triangles: 0,
+        };
+      }
+    }
     const geometry = ref.mesh.geometry;
     const triangles = geometry.index ? Math.round(geometry.index.count / 3) : 0;
     const attributes = buildAttributes({ smid, box, triangles, floorHeight: this.style.floorHeight });
 
-    // 单体中心（场景 ENU 米）→ 经纬度
     let centerLngLat: [number, number] | null = null;
-    if (box) {
+    if (box && this.sceneAnchor) {
       const v = new THREE.Vector3((box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2, (box.minZ + box.maxZ) / 2);
       v.applyMatrix4(ref.mesh.matrixWorld);
       const s = this.sceneAnchor.meterInMercator;
       centerLngLat = lngLatFromMercator(v.x * s + this.sceneAnchor.x, -v.y * s + this.sceneAnchor.y);
+    }
+
+    // 精确命中点求交计算
+    let hitPoint: THREE.Vector3 | null = exactPoint ?? null;
+    if (!hitPoint && ray) {
+      hitPoint = this._intersectMeshAtRay(ref.mesh, ray, instanceIndex);
+    }
+
+    let point: [number, number, number] | null = null;
+    let lngLat: [number, number] | null = null;
+    let altitude: number | null = null;
+
+    if (hitPoint && this.sceneAnchor) {
+      const st = smid != null ? this._featureStyles.get(smid) : undefined;
+      const trans = st?.translation;
+      const elev = st?.elevation ?? (smid != null ? this._thematicElevation.get(smid) : undefined);
+      const finalPos = hitPoint.clone();
+      if (trans) finalPos.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
+      else if (elev) finalPos.z += elev;
+
+      point = [finalPos.x, finalPos.y, finalPos.z];
+      const s = this.sceneAnchor.meterInMercator;
+      lngLat = lngLatFromMercator(finalPos.x * s + this.sceneAnchor.x, -finalPos.y * s + this.sceneAnchor.y);
+      altitude = finalPos.z + (this.sceneAnchor.altitude ?? 0);
+    } else if (centerLngLat && box && this.sceneAnchor) {
+      lngLat = centerLngLat;
+      altitude = (box.minZ + box.maxZ) / 2 + (this.sceneAnchor.altitude ?? 0);
     }
 
     return {
@@ -1997,9 +2119,252 @@ export class S3MLayer {
       instanceIndex,
       skeletonName: ref.skeletonName,
       centerLngLat,
+      point,
+      lngLat,
+      altitude,
       ...attributes,
       mesh: ref.mesh,
     };
+  }
+
+  /** 按 canvas 左上角的 CSS 像素坐标拾取。 */
+  pick(x: number, y: number): PickResult | null {
+    if (!this.picker || !this.scene || !this.camera || !this.sceneAnchor) return null;
+    const hit = this.picker.pick(this.scene, this.camera, x, y);
+    if (!hit) return null;
+
+    const ref = this._pickables.get(hit.objectId);
+    if (!ref) return null;
+
+    const ray = this.getRayAt(x, y);
+    return this._buildPickResult(hit, ref, undefined, ray ?? undefined);
+  }
+
+  /**
+   * 拾取指定屏幕像素对应的世界坐标与场景位置。
+   * 优先与命中的建筑网格精确求交；未命中建筑时若视线与地表相交则返回地面交点。
+   */
+  pickPosition(x: number, y: number): { lngLat: [number, number]; altitude: number; point: [number, number, number] } | null {
+    if (!this.camera || !this.sceneAnchor || !this.map) return null;
+
+    const hit = this.pick(x, y);
+    if (hit?.point && hit?.lngLat && hit.altitude != null) {
+      return {
+        lngLat: hit.lngLat,
+        altitude: hit.altitude,
+        point: hit.point,
+      };
+    }
+
+    const ray = this.getRayAt(x, y);
+    if (!ray) return null;
+
+    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
+    const target = new THREE.Vector3();
+    const intersect = ray.intersectPlane(groundPlane, target);
+    if (intersect) {
+      const s = this.sceneAnchor.meterInMercator;
+      const lngLat = lngLatFromMercator(intersect.x * s + this.sceneAnchor.x, -intersect.y * s + this.sceneAnchor.y);
+      const altitude = intersect.z + (this.sceneAnchor.altitude ?? 0);
+      return {
+        lngLat,
+        altitude,
+        point: [intersect.x, intersect.y, intersect.z],
+      };
+    }
+    return null;
+  }
+
+  /**
+   * 沿视线方向穿透拾取多个单体，按由近至远排序返回。
+   */
+  drillPick(x: number, y: number, limit = 10): PickResult[] {
+    if (!this.sceneAnchor || !this.camera || !this.map) return [];
+    const ray = this.getRayAt(x, y);
+    if (!ray) return [];
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.ray.copy(ray);
+
+    const meshes = [...this._pickables.values()].map((p) => p.mesh).filter((m) => m.visible);
+    const hits = raycaster.intersectObjects(meshes, false);
+    if (!hits.length) return [];
+
+    const results: PickResult[] = [];
+    const seenSmids = new Set<number>();
+    const seenBatches = new Set<string>();
+
+    for (const hit of hits) {
+      if (results.length >= limit) break;
+      const mesh = hit.object as THREE.Mesh;
+      const ud = mesh.userData as MeshUserData & { pickId?: number };
+      if (ud.pickId == null) continue;
+      const ref = this._pickables.get(ud.pickId);
+      if (!ref) continue;
+
+      let smid: number | null = null;
+      let batchId = -1;
+      let instanceIndex = hit.instanceId;
+
+      if (instanceIndex != null) {
+        const feature = this._instanceFeature(mesh, ud.geoRef, instanceIndex);
+        if (!feature) continue;
+        smid = feature.smid;
+        batchId = feature.batchId;
+      } else if (hit.faceIndex != null) {
+        const batchAttr = mesh.geometry.attributes.aBatchId;
+        if (batchAttr) {
+          const idx = mesh.geometry.index ? mesh.geometry.index.getX(hit.faceIndex * 3) : hit.faceIndex * 3;
+          batchId = Math.round(batchAttr.getX(idx));
+          const geoRef = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(batchId) ?? ud.geoRef;
+          const resolved = resolveFeature(geoRef, batchId);
+          smid = resolved.smid;
+        }
+      }
+
+      if (smid != null) {
+        if (seenSmids.has(smid)) continue;
+        seenSmids.add(smid);
+      } else {
+        const key = `${ud.pickId}:${batchId}:${instanceIndex ?? -1}`;
+        if (seenBatches.has(key)) continue;
+        seenBatches.add(key);
+      }
+
+      if (this._isFeatureHidden(smid, batchId)) continue;
+
+      const pickHit = {
+        objectId: ud.pickId,
+        batchId,
+        instanceIndex,
+      };
+      const res = this._buildPickResult(pickHit, ref, hit.point);
+      if (res) results.push(res);
+    }
+
+    return results;
+  }
+
+  /**
+   * 获取指定 SMID 单体的经纬度包围盒 [[minLng, minLat], [maxLng, maxLat]]。
+   * 若模型尚未加载到场景中或无此单体则返回 null。
+   */
+  getFeatureBounds(smid: number): [[number, number], [number, number]] | null {
+    if (!this.sceneAnchor) return null;
+    let minLng = Infinity;
+    let maxLng = -Infinity;
+    let minLat = Infinity;
+    let maxLat = -Infinity;
+    let found = false;
+
+    for (const ref of this._pickables.values()) {
+      const mesh = ref.mesh;
+      const ud = mesh.userData as MeshUserData;
+      const geoRef = ud.geoRef;
+      const pickInfo = geoRef?.pickInfo;
+      if (!pickInfo) continue;
+
+      let box: SegmentBox | null = null;
+      if ((mesh as THREE.InstancedMesh).isInstancedMesh) {
+        let lookup = ud.instanceLookup as Map<number, InstanceFeature> | undefined;
+        if (!lookup) {
+          lookup = buildInstanceLookup(pickInfo);
+          ud.instanceLookup = lookup;
+        }
+        for (const [instIdx, feat] of lookup) {
+          if (feat.smid === smid) {
+            box = this._instanceBox(mesh, instIdx);
+            break;
+          }
+        }
+      } else {
+        const infoMap = pickInfo as Record<string | number, unknown>;
+        const entry = infoMap[smid] ?? infoMap[String(smid)];
+        if (entry) {
+          const bId = pickEntryId(entry);
+          const resolved = resolveFeature(geoRef, bId);
+          box = measureSegments(mesh.geometry, resolved.segments);
+          if (!box && mesh.geometry) {
+            if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+            const bb = mesh.geometry.boundingBox;
+            if (bb) {
+              box = {
+                minX: bb.min.x,
+                maxX: bb.max.x,
+                minY: bb.min.y,
+                maxY: bb.max.y,
+                minZ: bb.min.z,
+                maxZ: bb.max.z,
+                count: 0,
+                triangles: 0,
+              };
+            }
+          }
+        }
+      }
+
+      if (box) {
+        found = true;
+        const corners = [
+          new THREE.Vector3(box.minX, box.minY, box.minZ),
+          new THREE.Vector3(box.maxX, box.minY, box.minZ),
+          new THREE.Vector3(box.minX, box.maxY, box.minZ),
+          new THREE.Vector3(box.maxX, box.maxY, box.minZ),
+          new THREE.Vector3(box.minX, box.minY, box.maxZ),
+          new THREE.Vector3(box.maxX, box.minY, box.maxZ),
+          new THREE.Vector3(box.minX, box.maxY, box.maxZ),
+          new THREE.Vector3(box.maxX, box.maxY, box.maxZ),
+        ];
+
+        const st = this._featureStyles.get(smid);
+        const trans = st?.translation;
+        const elev = st?.elevation ?? this._thematicElevation.get(smid);
+
+        for (const c of corners) {
+          if (trans) c.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
+          else if (elev) c.z += elev;
+
+          c.applyMatrix4(mesh.matrixWorld);
+          const s = this.sceneAnchor.meterInMercator;
+          const [lng, lat] = lngLatFromMercator(c.x * s + this.sceneAnchor.x, -c.y * s + this.sceneAnchor.y);
+          if (lng < minLng) minLng = lng;
+          if (lng > maxLng) maxLng = lng;
+          if (lat < minLat) minLat = lat;
+          if (lat > maxLat) maxLat = lat;
+        }
+      }
+    }
+
+    if (!found) return null;
+    return [
+      [minLng, minLat],
+      [maxLng, maxLat],
+    ];
+  }
+
+  /**
+   * 视角聚焦飞向指定 SMID 单体。
+   * @param smid 单体 SMID
+   * @param options 传给宿主 map.fitBounds 的参数（如 padding, maxZoom, duration 等）
+   * @returns 是否成功找到并触发飞向
+   */
+  flyToFeature(smid: number, options?: Record<string, unknown>): boolean {
+    const bounds = this.getFeatureBounds(smid);
+    if (!bounds || !this.map) return false;
+
+    const mapAny = this.map as unknown as {
+      fitBounds?: (bounds: [[number, number], [number, number]], opts?: Record<string, unknown>) => void;
+    };
+    if (typeof mapAny.fitBounds === 'function') {
+      mapAny.fitBounds(bounds, {
+        padding: 50,
+        maxZoom: 19,
+        duration: 1200,
+        ...options,
+      });
+      return true;
+    }
+    return false;
   }
 
   /** 实例序号 → 所属单体（按网格缓存反查表，实例多的数据不用每次重建） */
@@ -2212,6 +2577,96 @@ export class S3MLayer {
     return o?.defaultProjectionData?.mainMatrix ?? o?.modelViewProjectionMatrix ?? null;
   }
 
+  /**
+   * 正交模式：把透视 MVP 换成同视角正交 MVP。
+   * 返回 null = 本帧保持透视（拿不到独立投影矩阵 / 矩阵不同源），只告警一次。
+   */
+  private _applyOrtho(arg: unknown, mvp: THREE.Matrix4): THREE.Matrix4 | null {
+    const { nearZ, farZ } = extractNearFar(arg);
+    const projectionMatrix = extractProjectionMatrix(arg);
+    if (!projectionMatrix) {
+      this._warnOrtho('render() 输入里没有独立的投影矩阵（需要 MapLibre ≥ 5）');
+      return null;
+    }
+    const built = buildOrthoMVP(
+      { projectionMatrix, mvp: mvp.elements, nearZ, farZ },
+      {
+        distance: this.map?.transform?.cameraToCenterDistance ?? 0,
+        fov: this._frameFov(arg),
+        aspect: this._canvasAspect(),
+      }
+    );
+    if (!built) {
+      this._warnOrtho('拿到的投影矩阵与 MVP 不同源（反推结果不是仿射变换）');
+      return null;
+    }
+    return built.matrix;
+  }
+
+  /** 正交不可用只告警一次，不每帧刷屏 */
+  private _warnOrtho(reason: string): void {
+    if (this._orthoWarned) return;
+    this._orthoWarned = true;
+    console.warn(`[s3m] 正交模式不可用：${reason}，本帧保持透视`);
+  }
+
+  /**
+   * 本帧垂直视场角（弧度）。取 render() 入参的 fov（≥5 直接给弧度），
+   * 退回 transform.fovInRadians。**不用 transform.fov**：v5 起它是「度」。
+   */
+  private _frameFov(arg: unknown): number {
+    return extractFovRadians(arg, this.map?.transform?.fovInRadians) ?? DEFAULT_FOV;
+  }
+
+  private _canvasAspect(): number {
+    const canvas = this.map?.getCanvas?.();
+    if (!canvas || !canvas.height) return 1;
+    return canvas.width / canvas.height;
+  }
+
+  /**
+   * 切换投影模式，下一帧生效。
+   *
+   * 正交只影响本层：底图瓦片、地形、DOM Marker / 弹窗仍走 MapLibre 的透视
+   * 投影，和正交层差 ≈ 楼高 / 相机距（城市尺度几十到上百像素），App 需要
+   * 自行把这些层退出。拾取、选中描边、按单体着色/隐藏/抬高不受影响。
+   */
+  setProjection(mode: ProjectionMode): void {
+    const next = mode === 'orthographic' ? 'orthographic' : 'perspective';
+    if (this._projection === next) return;
+    this._projection = next;
+    this._orthoWarned = false;
+    this.map?.triggerRepaint();
+  }
+
+  /** 当前 LOD 切换距离缩放系数 */
+  get lodRangeScale(): number {
+    return this._lodRangeScale;
+  }
+
+  /**
+   * 动态调整 LOD 切换范围缩放系数。
+   * scale > 1 时倾向保留粗模（降低瓦片请求与面数）；scale < 1 时提前细化加载高精瓦片。
+   */
+  setLodRangeScale(scale: number, datasetId?: string): void {
+    if (scale <= 0) return;
+    if (datasetId) {
+      const entry = this.datasets.get(datasetId);
+      if (entry?.tileset) entry.tileset.lodRangeScale = scale;
+    } else {
+      this._lodRangeScale = scale;
+      for (const entry of this.datasets.values()) {
+        if (entry.tileset) entry.tileset.lodRangeScale = scale;
+      }
+    }
+    this.map?.triggerRepaint();
+  }
+
+  /** 当前投影模式 */
+  get projection(): ProjectionMode {
+    return this._projection;
+  }
+
   render(gl: WebGLRenderingContext | WebGL2RenderingContext, arg: unknown): void {
     if (!this.renderer || !this.scene || !this.camera || !this.sceneAnchor || !this.map) return;
 
@@ -2232,7 +2687,11 @@ export class S3MLayer {
       0, 0, 0, 1
     );
 
-    const mvp = new THREE.Matrix4().fromArray(matrix).multiply(this._enuMatrix);
+    // 正交模式：把本帧的透视投影换成同视角正交投影。视图矩阵从 MapLibre 输入
+    // 反推（P⁻¹×MVP），不是自建相机，所以不会和宿主的 pan/zoom/pitch 错位。
+    let mvp = new THREE.Matrix4().fromArray(matrix);
+    if (this._projection === 'orthographic') mvp = this._applyOrtho(arg, mvp) ?? mvp;
+    mvp.multiply(this._enuMatrix);
     this.camera.projectionMatrix.copy(mvp);
     this.camera.projectionMatrixInverse.copy(mvp).invert();
 
@@ -2251,7 +2710,14 @@ export class S3MLayer {
       /* FreeCamera 不可用时退回原点，只影响 LOD 精度 */
     }
 
-    const fov = this.map.transform?.fov ?? DEFAULT_FOV;
+    // 补齐相机的真实场景坐标与世界矩阵逆矩阵，确保依赖 matrixWorldInverse 的场景正常运作
+    this.camera.position.set(camEnu[0], camEnu[1], camEnu[2]);
+    this.camera.matrixWorld.setPosition(camEnu[0], camEnu[1], camEnu[2]);
+    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+
+    // 同上：弧度视场角。MapLibre v5 起 transform.fov 是「度」，当弧度用会让
+    // LOD 屏幕误差算大 20% 以上（提前加载更细的瓦片）
+    const fov = this._frameFov(arg);
     for (const entry of this.datasets.values()) {
       if (!entry.visible || !entry.tileset) continue;
       const local: [number, number, number] = [

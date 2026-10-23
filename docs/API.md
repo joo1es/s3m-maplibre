@@ -12,6 +12,7 @@
 - [`S3MLayer`](#s3mlayer)
 - [样式（S3MStyle）](#样式s3mstyle)
 - [拾取与属性](#拾取与属性)
+- [投影](#投影)
 - [按业务字段着色](#按业务字段着色)
 - [纯 three.js 使用](#纯-threejs-使用)
 - [底层 API](#底层-api)
@@ -152,6 +153,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `pickable` | `boolean` | `true` | 是否响应点击 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
+| `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
 | `onStats` | `(s: S3MStats) => void` | — | 统计更新 |
 | `onReady` | `(entry) => void` | — | 某个数据集就绪 |
 | `onPick` | `(f: S3MPickResult \| null) => void` | — | 点击拾取结果 |
@@ -206,15 +208,24 @@ setEdges(enabled: boolean): void
 
 > 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺，整片模型变成放射状三角面。
 
-### 拾取
+### 拾取与空间查询
 
 ```ts
 pick(x: number, y: number): S3MPickResult | null
 pickFromEvent(e): S3MPickResult | null
+pickPosition(x: number, y: number): { lngLat: [number, number]; altitude: number; point: [number, number, number] } | null
+drillPick(x: number, y: number, limit?: number): S3MPickResult[]
 select(result: S3MPickResult | null, opts?: { silent?: boolean }): void
+getFeatureBounds(smid: number): [[number, number], [number, number]] | null
+flyToFeature(smid: number, options?: Record<string, unknown>): boolean
 ```
 
-`pick` 的坐标是**相对 canvas 左上角的 CSS 像素**。`pickFromEvent` 接受 MapLibre 的 `MouseEvent` 或原生事件，自动换算。
+`pick` 的坐标是**相对 canvas 左上角的 CSS 像素**。`pickFromEvent` 接受 MapLibre 的 `MouseEvent` 或原生事件，自动换算。返回值包含单体属性、中心经纬度、以及精确交点世界坐标（`point: [x,y,z]`, `lngLat: [lng,lat]`, `altitude: number`）。
+
+- `pickPosition(x, y)`：拾取指定屏幕像素对应的精确三维世界坐标。优先对命中的建筑网格精确表面求交；未命中建筑时与地表面（z=0）求交。
+- `drillPick(x, y, limit?)`：视线穿透拾取，沿射线命中所有单体，按由近至远距离排序返回。
+- `getFeatureBounds(smid)`：获取指定 SMID 单体的经纬度包围盒 `[[minLng, minLat], [maxLng, maxLat]]`（自动叠加单体平移/拔高）。
+- `flyToFeature(smid, options?)`：聚焦飞向单体，内部自动调用宿主地图的 `map.fitBounds`。
 
 拾取走 GPU：把「物体编号 + batchId」编码成 RGBA 渲染到离屏目标，再读那一个像素。代价与三角面数无关，且天然只命中最前面的可见面。
 
@@ -226,6 +237,9 @@ select(result: S3MPickResult | null, opts?: { silent?: boolean }): void
 
 ```ts
 getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
+setProjection(mode: 'perspective' | 'orthographic'): void  // 投影模式，见[投影](#投影)
+setLodRangeScale(scale: number, datasetId?: string): void  // 缩放 LOD 切换距离阈值（>1 更倾向粗模，<1 提前细化）
+readonly lodRangeScale: number
 readonly stats: S3MStats
 readonly fps: number
 dispose(): void
@@ -343,6 +357,33 @@ new S3MLayer({
   },
 });
 ```
+
+---
+
+## 投影
+
+```ts
+new S3MLayer({ projection: 'orthographic' })   // 构造时指定
+layer.setProjection('orthographic' | 'perspective')  // 运行时切换，下一帧生效
+layer.projection  // 当前模式
+```
+
+MapLibre 没有正交相机，custom layer 每帧拿到的是透视 MVP。但 MapLibre ≥ 5 的 `render()` 入参会把 `projectionMatrix`（view→clip）和 `modelViewProjectionMatrix`（world→clip）分开给，视图矩阵可以精确解出来：
+
+```
+V = P⁻¹ × MVP
+正交 MVP = P_ortho · V ，P_ortho 半高 = 相机距 × tan(fov/2)
+```
+
+半高取「目标深度处透视视锥的半高」，于是正交与透视在目标平面上逐点重合；zoom 改的是相机距离，距离减半 = 半高减半 = 放大一倍，pan / pitch / rotate 与透视手感一致。拾取、选中描边、按单体着色 / 隐藏 / 抬高都读同一个相机，自动跟随，不需要额外适配。
+
+**边界**：
+
+- 正交只覆盖本层。底图瓦片、地形、DOM Marker / 弹窗仍走 MapLibre 的透视投影，和正交层差 ≈ 楼高 / 相机距（城市尺度几十到上百像素，俯视时屋顶线就能差出 ~90px）。要用正交，App 需自行把这些层退出。
+- 需要 MapLibre ≥ 5（要拿到独立的投影矩阵）。v4 只给合并矩阵，会 `console.warn` 一次并保持透视，不会静默画错。
+- 解出的视图矩阵会做刚体校验（3×3 正交、底行 `[0,0,0,1]`）；校验不过说明两个输入矩阵不同源，同样退回透视并告警。
+
+底层数学在 `src/render/OrthoProjection.ts`，`npm test` 里的 `tools/test-ortho.mjs` 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。
 
 ---
 

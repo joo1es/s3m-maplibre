@@ -43,15 +43,19 @@ const PICK_VERT = /* glsl */ `
       vBatch = aBatchId;
     #endif
 
-    // 单体状态（抬高 / 隐藏）必须和主着色器用同一份数据、同一套算法：
-    // 抬高只发生在顶点着色器里，拾取这一趟如果还按原始坐标画，抬起来的楼就点不中。
+    // 单体状态（平移 / 隐藏）必须和主着色器用同一份数据、同一套算法：
+    // 平移只发生在顶点着色器里，拾取这一趟如果还按原始坐标画，移位的楼就点不中。
     vec3 p = position;
     if ( uBatchTexActive > 0 && s3mBatch >= 0.0 ) {
-      vec4 state = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.5 ) );
+      vec4 state = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.25 ) );
       if ( state.a < -0.5 ) {
         p = vec3( 0.0 );
-      } else if ( state.a > 0.0 ) {
-        p.z += state.a;
+      } else {
+        vec4 offset = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.75 ) );
+        p += offset.xyz;
+        if ( offset.z == 0.0 && state.a > 0.0 ) {
+          p.z += state.a;
+        }
       }
     }
 
@@ -98,9 +102,9 @@ interface PickUserData {
   [key: string]: unknown;
 }
 
-/** 没有单体状态纹理时用的占位（全 0 = 不隐藏、不抬高） */
+/** 没有单体状态纹理时用的占位（全 0 = 不隐藏、不平移） */
 const DUMMY_STATE_TEX = (() => {
-  const tex = new THREE.DataTexture(new Float32Array([-1, -1, -1, 0]), 1, 1, THREE.RGBAFormat, THREE.FloatType);
+  const tex = new THREE.DataTexture(new Float32Array([-1, -1, -1, 0, 0, 0, 0, 0]), 1, 2, THREE.RGBAFormat, THREE.FloatType);
   tex.minFilter = THREE.NearestFilter;
   tex.magFilter = THREE.NearestFilter;
   tex.needsUpdate = true;

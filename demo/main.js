@@ -379,6 +379,19 @@ function initSourceControls() {
   });
 }
 
+/* ---------------------------------------------------------------- 正交投影 */
+
+$('optOrtho').addEventListener('change', (e) => {
+  const on = e.target.checked;
+  layer.setProjection(on ? 'orthographic' : 'perspective');
+  // 正交只覆盖 S3M 层：底图走 MapLibre 自己的透视投影，会与本层对不齐，整体退出。
+  // 拾取、选中描边、按单体着色/隐藏/抬高不受影响（都走同一个相机）。
+  for (const id of ['bg', 'osm']) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', on ? 'none' : 'visible');
+  }
+  setStatus(on ? '正交投影已开启：底图退出' : '已切回透视投影');
+});
+
 /* ---------------------------------------------------------------- 着色 UI */
 
 let currentMode = 'texture';
@@ -974,6 +987,12 @@ layer.onPick = (f) => renderFeature(f);
 map.on('load', async () => {
   map.addLayer(layer);
   initSourceControls();
+
+  // ?ortho=1 直接以正交模式打开（勾选框同步，底图自动退出）
+  if (new URLSearchParams(window.location.search).get('ortho') === '1') {
+    $('optOrtho').checked = true;
+    $('optOrtho').dispatchEvent(new Event('change'));
+  }
 
   // 从 URL query ?url= 获取，若无则使用默认的 CCTV CBD 模型
   const initialUrl = getQueryUrl() || DEFAULT_URL;
