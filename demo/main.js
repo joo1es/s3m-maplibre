@@ -663,7 +663,22 @@ function renderFeature(f) {
 
   if (f.smid != null) {
     $('featElevation').addEventListener('input', (e) => {
-      $('featElevationVal').textContent = `${e.target.value}m`;
+      const val = Number(e.target.value);
+      $('featElevationVal').textContent = `${val}m`;
+      if (layer.getFeatureStyle(f.smid)) {
+        layer.setFeatureStyle(f.smid, {
+          color: $('featColor').value,
+          elevation: val,
+        });
+      }
+    });
+    $('featColor').addEventListener('input', (e) => {
+      if (layer.getFeatureStyle(f.smid)) {
+        layer.setFeatureStyle(f.smid, {
+          color: e.target.value,
+          elevation: Number($('featElevation').value),
+        });
+      }
     });
     $('btnPinFeature').addEventListener('click', () => {
       layer.setFeatureStyle(f.smid, {

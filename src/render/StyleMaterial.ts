@@ -133,7 +133,7 @@ const VERT_PARS = /* glsl */ `
   varying vec3 vWorldPos;
 `;
 
-const VERT_WORLD = /* glsl */ `
+const VERT_ELEVATION = /* glsl */ `
   float s3mCustomElev = 0.0;
   if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
     vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
@@ -146,7 +146,9 @@ const VERT_WORLD = /* glsl */ `
 
   float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
   transformed.z += s3mSelElev * uSelElevation + s3mCustomElev;
+`;
 
+const VERT_WORLD = /* glsl */ `
   vec4 s3mWorld = vec4( transformed, 1.0 );
   #ifdef USE_INSTANCING
     s3mWorld = instanceMatrix * s3mWorld;
@@ -269,6 +271,7 @@ const FRAG_COLOR = /* glsl */ `
   }
 
   // 2. 单体状态过滤（隐藏）与单体独立改色
+  bool hasCustomColor = false;
   if ( uBatchTexActive > 0 && vBatchId >= 0.0 ) {
     vec4 bState = texture2D( uBatchTex, vec2( ( vBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
     if ( bState.a < -0.5 ) {
@@ -277,21 +280,29 @@ const FRAG_COLOR = /* glsl */ `
     if ( bState.r >= 0.0 ) {
       // 单体独立自定义颜色
       diffuseColor.rgb = bState.rgb;
+      hasCustomColor = true;
     }
   }
 
   // 3. 选中单体高亮 + 其余压暗
   float s3mSel = max( step( 0.0, uSelBatch ) * step( abs( vBatchId - uSelBatch ), 0.5 ), uSelWhole );
   if ( s3mSel > 0.5 && uSelMix > 0.001 ) {
-    if ( uSelMode == 0 ) {
-      // 纯色覆盖（白模科技感）
-      diffuseColor.rgb = uSelColor;
-    } else if ( uSelMode == 1 ) {
-      // 叠加原图（半透明混色，保留纹理贴图）
-      diffuseColor.rgb = mix( diffuseColor.rgb, uSelColor, uSelOpacity );
-    } else if ( uSelMode == 2 ) {
-      // 叠乘模式（明暗对比强）
-      diffuseColor.rgb = mix( diffuseColor.rgb, diffuseColor.rgb * uSelColor * 1.5, uSelOpacity );
+    if ( hasCustomColor ) {
+      // 若当前建筑已有用户固定的独立颜色，选中时保留该颜色，仅做轻微高亮叠色提示
+      if ( uSelMode == 0 || uSelMode == 1 ) {
+        diffuseColor.rgb = mix( diffuseColor.rgb, uSelColor, uSelOpacity * 0.35 );
+      }
+    } else {
+      if ( uSelMode == 0 ) {
+        // 纯色覆盖（经典纯高亮色）
+        diffuseColor.rgb = uSelColor;
+      } else if ( uSelMode == 1 ) {
+        // 叠加原图（半透明混色，保留纹理贴图）
+        diffuseColor.rgb = mix( diffuseColor.rgb, uSelColor, uSelOpacity );
+      } else if ( uSelMode == 2 ) {
+        // 叠乘模式（明暗对比强）
+        diffuseColor.rgb = mix( diffuseColor.rgb, diffuseColor.rgb * uSelColor * 1.5, uSelOpacity );
+      }
     }
     // uSelMode == 3 为 glowOnly，保持 diffuseColor.rgb 不变
   } else {
@@ -301,8 +312,10 @@ const FRAG_COLOR = /* glsl */ `
 
 const FRAG_EMISSIVE = /* glsl */ `
   float s3mSelE = max( step( 0.0, uSelBatch ) * step( abs( vBatchId - uSelBatch ), 0.5 ), uSelWhole );
-  float s3mEm = ( uSelMode == 3 ) ? max( uSelEmissive, 0.45 ) : uSelEmissive;
-  totalEmissiveRadiance += uSelColor * s3mSelE * uSelMix * s3mEm;
+  // glowOnly 模式下表面不自发光，只保留描边边框；其他模式下适度发光
+  if ( uSelMode != 3 ) {
+    totalEmissiveRadiance += uSelColor * s3mSelE * uSelMix * ( uSelEmissive * 0.4 );
+  }
 `;
 
 export interface StyledMaterialOptions {
@@ -357,6 +370,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${VERT_PARS}`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>\n${VERT_ELEVATION}`)
       .replace('#include <worldpos_vertex>', VERT_WORLD);
 
     shader.fragmentShader = shader.fragmentShader
