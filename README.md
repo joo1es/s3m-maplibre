@@ -2,7 +2,8 @@
 
 **在 MapLibre GL JS 里原生渲染 SuperMap S3M 三维模型** —— 浏览器直接解析 `.s3mb` 瓦片，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端。
 
-[![npm](https://img.shields.io/badge/npm-0.1.0-blue)](https://www.npmjs.com/)
+[![npm](https://img.shields.io/npm/v/s3m-maplibre?color=blue&label=npm)](https://www.npmjs.com/package/s3m-maplibre)
+[![demo](https://img.shields.io/badge/demo-online-2ea44f)](https://joo1es.github.io/s3m-maplibre/demo/index.html)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
 [![types](https://img.shields.io/badge/types-included-blue)](./src/index.ts)
 
@@ -48,10 +49,11 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 瓦片同材质合批 | ✅ | 倾斜摄影大瓦片自动合批，大幅降低 DrawCall |
 | 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
 | DXT / WebP 纹理 | ✅ | |
-| Draco 压缩几何 | ❌ | 遇到会抛明确错误 |
-| KTX2 / CRN | ❌ | |
 | 骨骼动画 | ❌ | 已解析未驱动 |
 | 地形遮挡 | ❌ | |
+| Draco 压缩几何 | ❌ | 能识别、不能解码，遇到抛明确错误；接法见[未支持的格式](#未支持的格式draco--crn--ktx2) |
+| CRN 纹理（pixelFormat 26 / 27） | ❌ | 官方 SDK 是 crunch.js 转 DXT5 再解码，接口位置已留好 |
+| KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
 
 ---
 
@@ -61,7 +63,9 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 npm install s3m-maplibre three
 ```
 
-`three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂。
+包在 npm 上是 [s3m-maplibre](https://www.npmjs.com/package/s3m-maplibre)，当前 `0.2.4`。
+
+`three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂；不用地图时也能只用解析和瓦片层（见「纯 three.js 使用」）。
 
 类型随包发布（`dist/index.d.ts`，由源码直接生成）。three `>=0.168` 自带类型，更老的版本需要自己装 `@types/three`。
 
@@ -132,13 +136,90 @@ map.on('click', (e) => {
 
 ## 演示
 
-仓库内 `demo/` 是一个完整示例，接了上海某区的真实 iServer 服务（5 个数据集叠加，45 万三角面）：
+在线跑（GitHub Pages，数据随仓库一起发布）：
+
+- **MapLibre 版** — <https://joo1es.github.io/s3m-maplibre/demo/index.html>
+- **纯 three.js 版** — <https://joo1es.github.io/s3m-maplibre/demo/three.html>
+
+（<https://joo1es.github.io/s3m-maplibre/> 是入口页，两个示例都能进）
+
+本地跑：
 
 ```bash
-npm run demo     # http://localhost:8123/s3m-maplibre/demo/index.html
+npm run dev      # 开发模式：tsc -w + 静态服务，保存源码后浏览器自动刷新
+npm run demo     # 一次性编译后起静态服务（不做监听）
 ```
 
-演示包含：数据集叠加开关、7 种着色模式、透明度、平面/平滑着色、选中描边、全局棱线、点击属性卡。
+两个命令都指向 http://localhost:8123/s3m-maplibre/demo/index.html ，`demo/three.html` 是同一台服务器上的纯 three 版。
+
+演示自带两份样例数据（北京 CBD 的 CCTV、comModel），也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并默认勾选第一个。
+
+演示包含：数据集叠加开关、着色模式、透明度、平面/平滑着色、选中描边（棱线 / 外扩两种画法，粗细可调）、全局棱线、点击属性卡。
+
+---
+
+## 纯 three.js 使用（不用 MapLibre）
+
+可以。图层本身只是把三层粘到地图上，这三层都是宿主无关的：
+
+| 层 | 需要什么 | 与地图的关系 |
+|---|---|---|
+| `core/` 解析 | 一个 `ArrayBuffer` | 完全无关，Node 里也能跑 |
+| `tileset/` 瓦片树 | `fetch` + 一个 `three.Group` 当容器 | 只要喂相机位置算 LOD |
+| `render/` 几何 | WebGL 上下文 | 只产出 `THREE.Group` / `Mesh` |
+
+```js
+import * as THREE from 'three';
+import { S3MTileset, createSharedUniforms, STYLE } from 's3m-maplibre';
+
+const uniforms = createSharedUniforms();       // 材质 uniform 全局共享
+uniforms.uMode.value = STYLE.TEXTURE;          // 改这一行就是切样式
+
+const root = new THREE.Group();
+root.rotation.x = -Math.PI / 2;                // S3M 顶点是 ENU（z 朝上），three 是 y 朝上
+scene.add(root);
+
+const tileset = new S3MTileset({
+  configUrl: '.../jingmo.scp',
+  uniforms,
+  onTile: (node) => root.add(node.group),      // node.group 就是这片瓦片拼好的 Group（米制局部坐标）
+});
+await tileset.init();                          // 返回时首棵瓦片已就绪
+
+// 每帧：把相机位置换算回 ENU 喂给 LOD 调度，父子瓦片自己按需细分
+function tick() {
+  const p = camera.position;
+  tileset.update([p.x, -p.z, p.y], THREE.MathUtils.degToRad(camera.fov), renderer.domElement.height);
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+```
+
+完整可运行版本见 [`demo/three.js`](./demo/three.js)（一个文件，含轨道控制、切片统计、样式切换）。
+
+自己搭宿主时需要补的几件事，`S3MLayer` 不会代劳：
+
+- **光照**：`MeshStandardMaterial` 的标准光照，自己加 `HemisphereLight` + `DirectionalLight`；
+- **多数据集对齐**：每份数据有各自的锚点，`S3MLayer` 会按墨卡托算锚点差、写进数据集 `Group.position`（米），纯 three 里需要自己算一次；
+- **贴地 / 经纬度**：不接地图就没有「贴在地球上」这一步，只有局部米制坐标；
+- **拾取 / 选中描边 / 样式切换 UI**：`Picker`、等宽棱线、`setStyle` 都是 `S3MLayer` 上的，纯 three 用法需要直接操作 `uniforms` 与 Mesh。
+
+---
+
+## 未支持的格式：Draco / CRN / KTX2
+
+这三个常被问到，结论分别不同：
+
+**Draco 压缩几何 —— 能解决，缺的是样本。**
+官方 SDK 里有 `S3MParser/S3MDracoDecode.js` + `draco_decode.module.js`（对 `DecodeBufferToPointCloud` 的封装，POSITION / NORMAL / TEX_COORD 三个属性，再按 `compressOptions` 分支处理）。接法与本项目的 MeshOpt 完全一致：内联 wasm 解码器、只在遇到 `VertexTag.DRACO` 时动态 `import`、解码后走同一套 attribute 组装 + 量化还原。真正的成本不在写代码，而在**标定容器**——MeshOpt 当时就是靠 60 个真实瓦片逐字节对齐才做对的，Draco 的 attribute 映射、`compressOptions` 与实际数据是否一致也必须拿样例验。仓库里没有 Draco 瓦片，所以现在是「识别到就抛明确错误」。
+
+**CRN 纹理（`pixelFormat` 26 / 27）—— 能解决，纯接解码器。**
+SuperMap 自己的做法是 `crunch.js` 把 CRN 转码成 DXT5 字节，再走普通 DXT 上传。本项目的 `TextureFactory` 在 DXT 那条路上已经完整（DXT1/3/4/5 都解到 RGBA8），所以只要在 `decodeTexture` 里加一个 CRN 分支：crunch 转 DXT5 → 复用现成解码。工作量约一个解码器文件 + 一个分支，同样需要一份 CRN 纹理样例来验字节。
+
+**KTX2 —— 不是「不支持」，是 S3M 里基本不会出现。**
+官方 `S3MPixelFormat` 枚举（`1/2/3/4/5/6/7/10/11/12/13/14/17…21/25/26/27/28`）里没有 KTX2 / Basis 的条目，iServer 也不会发。真要支持，得自己引入 `basis_transcoder.wasm` 并把 KTX2 容器转成 RGBA32 或 DXT，但那是给「别人转成 KTX2 再塞进 S3M」的场景准备的，没有数据样本可测。
+
+两者的共同前提：**要有样例数据**。手头有 Draco 压缩的瓦片或带 CRN 纹理的服务地址，把 `.s3mb` 或服务地址给我，就能按 MeshOpt 那套方式标定 + 实现 + 回归。
 
 ---
 
@@ -228,9 +309,10 @@ S3M 顶点（数据集局部 ENU，米）
 
 ## 已知限制
 
-- **Draco 压缩几何**未实现。MeshOpt 已支持；遇到 Draco 会抛带说明的错误。
+- **Draco 压缩几何 / CRN 纹理**未实现（可解，缺样例数据），见[未支持的格式](#未支持的格式draco--crn--ktx2)。
 - **地形遮挡**未实现：MapLibre 的地形深度没进 custom layer 的深度缓冲，建筑不会被地形裁掉。
 - 跨城市量级的数据集叠加会重新引入 float32 精度问题。
+- MVT 式的「按需懒加载 + 卸载」没有做：已加载的瓦片常驻，只受 `maxTiles` 限制。
 
 ---
 
@@ -249,11 +331,14 @@ src/
     S3MLayer.ts          图层主体（多数据集 / 样式 / 拾取）
     GeometryBuilder.ts   几何与材质组装
     StyleMaterial.ts     着色器注入的着色系统
+    EdgeLines.ts         屏幕空间等宽棱线（选中描边 / 全局棱线）
     Picker.ts            GPU 拾取
     TextureFactory.ts    纹理解码
   vendor/    meshoptimizer 解码器（wasm 内联，原样保留）
-demo/        演示
-tools/       自检脚本（解析校验、MeshOpt 回归、静态服务）
+demo/
+  index.html / main.js   MapLibre 完整示例（控制面板 + 属性卡）
+  three.html / three.js  纯 three.js 示例（无地图）
+tools/       自检脚本（解析校验、MeshOpt 回归、带热更新的静态服务）
 ```
 
 ---

@@ -12,6 +12,7 @@
 - [`S3MLayer`](#s3mlayer)
 - [样式（S3MStyle）](#样式s3mstyle)
 - [拾取与属性](#拾取与属性)
+- [纯 three.js 使用](#纯-threejs-使用)
 - [底层 API](#底层-api)
 - [性能调优](#性能调优)
 - [已知限制](#已知限制)
@@ -177,6 +178,12 @@ setEdges(enabled: boolean): void
 
 数据里没有棱线包时才用 `EdgesGeometry` 在 CPU 端现算。几十万面一次性建会卡住主线程（实测 20 个网格 1.9s），所以内部按 8ms 一帧切片执行，超过 12 万索引的几何直接跳过。
 
+棱线本身画成**屏幕空间等宽线**（`src/render/EdgeLines.ts`）：WebGL 的 `lineWidth` 在绝大多数平台被忽略、恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。因此：
+
+- `edgeWidth`（像素）控全局棱线粗细，缩放时线宽恒定；
+- 选中单体的描边默认也走同一套画法（`outlineStyle: 'edges'`），只挑这个单体自己的三角面算折边，`outlineWidthPx` 控粗细；
+- 数据自带的棱线包是原始线段，仍是 1px，只受颜色 / 透明度控制。
+
 > 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺，整片模型变成放射状三角面。
 
 ### 拾取
@@ -226,9 +233,14 @@ interface S3MStyle {
   shading: 'flat' | 'smooth';
   dimOthers: boolean;   // 选中时压暗其他建筑
   outline: boolean;     // 选中单体描边
+  outlineStyle?: 'edges' | 'hull'; // 描边画法：'edges' 单体棱线（默认）| 'hull' 背面外扩轮廓
+  outlineColor?: string;  // 描边颜色，默认跟随 selectColor
+  outlineWidthPx?: number; // 选中棱线粗细（像素，默认 3），仅 outlineStyle: 'edges'
+  outlineWidth?: number;   // 外扩轮廓粗细（米，默认 0.9），仅 outlineStyle: 'hull'
   edges: boolean;       // 全局棱线
   edgeColor: string;    // 棱线颜色
-  edgeOpacity?: number; // 棱线透明度（0.1 ~ 1.0），默认 0.45，能显著消除 1px 细线的高对比度走样锯齿
+  edgeWidth?: number;   // 全局棱线粗细（像素，默认 1.2）
+  edgeOpacity?: number; // 棱线透明度（0.1 ~ 1.0），默认 0.45
   roofThreshold?: number; // 顶面法线判定阈值，默认 0.65
 }
 ```
@@ -248,6 +260,14 @@ interface S3MStyle {
 | `STYLE.CUSTOM` | 8 | 自定义复合模式：顶面分色 + 侧立面高度渐变 |
 
 所有模式都在同一个 `MeshStandardMaterial` 的片元着色器里用 `uMode` 分支实现，切换不重建几何、不重建材质。
+
+### 关于「按单体」配色
+
+`STYLE.BATCH` 的色相是对 `batchId` 做哈希（`s3mHash`）得到的。这里有个很容易踩的坑：**`batchId` 在着色器里是 varying**。GPU 逐像素做透视校正插值时，即使一个三角形三个顶点的 `aBatchId` 完全相等，三次乘加的舍入误差也不会正好抵消，结果会带 `1e-7` 量级的相对误差，而且逐像素不同（不同 GPU / 驱动还不一样）。
+
+这个误差本身无害，但哈希是混沌放大器：`fract(p*0.1031)` → `p*(p+33.33)` → `p*2p`，每级放大几十倍。实测 `batchId≈4.2 万` 时，`1e-7` 的抖动就能把哈希输出从单一值扩散到 `0.20~0.78` 整个区间 —— 表现就是**整屏彩色噪点**，而且只在部分机器上出现。
+
+所以凡是「按 id 取值」的地方都先取整（`s3mBatchId()` = `floor(vBatchId + 0.5)`）：按单体配色、单体状态纹理（隐藏 / 独立改色）采样、选中判定统一走它。同一个单体在所有像素上得到完全相同的颜色，跨 GPU 一致。
 
 ### 关于 `shading`
 
@@ -301,6 +321,53 @@ new S3MLayer({
   },
 });
 ```
+
+---
+
+## 纯 three.js 使用
+
+`S3MLayer` 是给地图用的，但下面的三层都是宿主无关的，可以直接塞进任意 three 场景（`demo/three.js` 是一个 150 行的完整例子）：
+
+```ts
+import * as THREE from 'three';
+import { S3MTileset, createSharedUniforms, STYLE, setMaxAnisotropy } from 's3m-maplibre';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+setMaxAnisotropy(renderer.capabilities.getMaxAnisotropy()); // 纹理各向异性，越早越好
+
+const uniforms = createSharedUniforms();
+uniforms.uMode.value = STYLE.TEXTURE;  // 切样式就是改这个 int
+
+// S3M 顶点是局部 ENU（x 东 / y 北 / z 天），three 是 y 朝上
+const root = new THREE.Group();
+root.rotation.x = -Math.PI / 2;
+scene.add(root);
+
+const tileset = new S3MTileset({
+  configUrl: '.../jingmo.scp',
+  maxTiles: 64,
+  uniforms,
+  onTile: (node) => root.add(node.group),  // 每个瓦片一个 Group，坐标是米制局部 ENU
+});
+await tileset.init();  // 返回时首棵瓦片已构建完成
+
+// 每帧驱动 LOD：相机位置要反算回 ENU（world x,y,z ← ENU x,-z,y）
+tileset.update(
+  [camera.position.x, -camera.position.z, camera.position.y],
+  THREE.MathUtils.degToRad(camera.fov),
+  renderer.domElement.height
+);
+```
+
+需要自己补的部分（`S3MLayer` 不代劳）：
+
+| 事项 | 说明 |
+|---|---|
+| 光照 | 渲染用的是 `MeshStandardMaterial`，自己加 `HemisphereLight` + `DirectionalLight` |
+| 多数据集对齐 | 每份数据各有锚点，`S3MLayer` 会把锚点差写进数据集的 `Group.position`（米），纯 three 需要自己算一次 |
+| 贴地与经纬度 | 没有地图就没有墨卡托那一步，只有局部米制坐标 |
+| 拾取 / 描边 / 样式 UI | `Picker`、等宽棱线、`setStyle` 都在 `S3MLayer` 上，纯 three 用法要直接操作 `uniforms` 和 Mesh |
+| 瓦片卸载 | 瓦片只增不减，靠 `maxTiles` 卡住总量 |
 
 ---
 
@@ -370,7 +437,7 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 |---|---|
 | `maxTiles` | 每个数据集驻留瓦片上限，默认 64。叠加 5 个数据集时建议 40~48 |
 | `maxConcurrent` | 每数据集并发，默认 4。公开服务建议 2~3 |
-| 关闭 `edges` | 棱线是 CPU 端构建 + 每网格一个 drawcall，大场景慎用 |
+| 关闭 `edges` | 棱线是 CPU 端构建的等宽线几何（每段线段 4 个顶点），内存和 drawcall 都随网格数增长，大场景慎用 |
 | `shading: 'flat'` | 与 `'smooth'` 性能相当，但视觉更干净 |
 | 不透明度 < 1 | 会开启混合并关闭深度写入，overdraw 明显上升，仅用于演示 |
 
@@ -380,8 +447,9 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 
 ## 已知限制
 
-- **Draco 压缩几何**未实现，遇到会抛明确错误。MeshOpt 已支持。
-- **KTX2 / CRN / ETC** 纹理未实现；DXT1/3/5 与 WebP 可用。
+- **Draco 压缩几何**能识别、不能解码，遇到会抛明确错误。接法与 MeshOpt 相同（内联 wasm、按需 `import`、解码后走同一套 attribute 组装），但必须先拿 Draco 瓦片标定容器结构。MeshOpt 已支持，且是逐字节对过 60 个真实瓦片才做对的。
+- **CRN 纹理**（`pixelFormat` 26 / 27）未实现。官方 SDK 的做法是 `crunch.js` 转码成 DXT5 再走普通 DXT 上传，本项目 DXT 解码链路已完整，缺的是一个 CRN 分支 + 样例。
+- **KTX2** 不在 S3M 的 `pixelFormat` 枚举里，iServer 也不会发；要支持需自行引入 `basis_transcoder.wasm` 并解析容器，属于「换数据源才需要考虑」的项。
 - **骨骼动画**解析了但未驱动。
 - **地形遮挡**未实现：MapLibre 的地形深度没有写进 custom layer 的深度缓冲，建筑不会被地形裁掉。
 - 跨城市量级的数据集叠加会有 float32 精度问题。
