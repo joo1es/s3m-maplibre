@@ -31,7 +31,7 @@ jobs:
           npm run typecheck
 
       - name: Publish package to npm
-        run: npm publish --access public
+        run: npm publish --access public --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
