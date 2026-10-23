@@ -1,10 +1,10 @@
 /**
- * 编译 docs/API.md 生成精美独立的现代文档网页 docs/index.html
+ * 零依赖编译 docs/API.md 生成精美独立的现代文档网页 docs/index.html
+ * 不依赖任何外部 npm 包，CI/CD 环境 100% 绿色通过
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { marked } from 'marked';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -18,87 +18,216 @@ const version = pkg.version || '0.2.9';
 const apiMdPath = path.join(rootDir, 'docs', 'API.md');
 const mdContent = fs.readFileSync(apiMdPath, 'utf8');
 
-// 自定义标题与锚点提取
+// 提取所有标题（用于生成左侧目录和大纲）
 const headings = [];
-const renderer = new marked.Renderer();
+const lines = mdContent.split(/\r?\n/);
 
-// 标题渲染器：自动生成 ID、提取目录
-renderer.heading = function ({ tokens, depth }) {
-  const text = this.parser.parseInline(tokens);
-  // 提取纯文本作为 ID
-  const plainText = text.replace(/<[^>]+>/g, '').trim();
-  const id = plainText
-    .toLowerCase()
-    .replace(/[^\w\u4e00-\u9fa5]+/g, '-')
-    .replace(/^-|-$/g, '');
-
-  if (depth <= 3) {
-    headings.push({ id, text: plainText, depth });
-  }
-
-  return `
-    <h${depth} id="${id}" class="doc-heading group">
-      <span class="heading-anchor-link">#</span>
-      <a href="#${id}" class="heading-text">${text}</a>
-    </h${depth}>
-  `;
-};
-
-// 代码块渲染器：增加头部语言标识与一键复制按钮
-renderer.code = function ({ text, lang }) {
-  const displayLang = (lang || 'code').toUpperCase();
-  const escaped = text
+function escapeHtml(str) {
+  return str
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
 
-  return `
-    <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
-      <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
-        <span class="font-semibold text-cyan-400 tracking-wider">${displayLang}</span>
-        <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="${encodeURIComponent(text)}">
-          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-          <span class="copy-status">复制</span>
-        </button>
+function inlineParse(str) {
+  return str
+    // 行内代码
+    .replace(/`([^`]+)`/g, (_, code) => `<code>${escapeHtml(code)}</code>`)
+    // 粗体
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    // 斜体
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    // 链接
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
+}
+
+// 轻量原生 Markdown 解析为 HTML
+function parseMarkdown(src) {
+  const lines = src.split(/\r?\n/);
+  const out = [];
+  let inCode = false;
+  let codeLang = '';
+  let codeBuffer = [];
+  let inTable = false;
+  let tableHeader = '';
+  let tableRows = [];
+  let inList = false;
+  let listType = 'ul';
+
+  const flushTable = () => {
+    if (!inTable) return;
+    out.push(`
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            ${tableHeader}
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            ${tableRows.join('\n')}
+          </tbody>
+        </table>
       </div>
-      <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>${escaped}</code></pre>
-    </div>
-  `;
-};
+    `);
+    inTable = false;
+    tableHeader = '';
+    tableRows = [];
+  };
 
-// 表格渲染器：外层包裹响应式容器
-renderer.table = function ({ header, rows }) {
-  return `
-    <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
-      <table class="w-full text-left text-sm text-slate-300">
-        <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
-          ${header}
-        </thead>
-        <tbody class="divide-y divide-white/5">
-          ${rows}
-        </tbody>
-      </table>
-    </div>
-  `;
-};
+  const flushList = () => {
+    if (!inList) return;
+    out.push(`</${listType}>`);
+    inList = false;
+  };
 
-// 引用块提醒渲染器
-renderer.blockquote = function ({ tokens }) {
-  const body = this.parser.parse(tokens);
-  return `
-    <div class="callout my-5 rounded-xl border-l-4 border-cyan-400 bg-cyan-950/20 px-5 py-3 text-slate-300 shadow-sm">
-      <div class="text-sm leading-relaxed">${body}</div>
-    </div>
-  `;
-};
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
 
-// 编译 Markdown 为 HTML
-marked.use({ renderer });
-const mainHtml = marked.parse(mdContent);
+    // 1. 代码块
+    if (line.trim().startsWith('```')) {
+      if (inCode) {
+        const rawCode = codeBuffer.join('\n');
+        const escaped = escapeHtml(rawCode);
+        const displayLang = (codeLang || 'CODE').toUpperCase();
+        out.push(`
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">${displayLang}</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="${encodeURIComponent(rawCode)}">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>${escaped}</code></pre>
+          </div>
+        `);
+        inCode = false;
+        codeBuffer = [];
+      } else {
+        flushTable();
+        flushList();
+        inCode = true;
+        codeLang = line.trim().slice(3).trim();
+      }
+      continue;
+    }
 
-// 生成左侧主要目录（H2 为大类，H3 为子类）
+    if (inCode) {
+      codeBuffer.push(line);
+      continue;
+    }
+
+    // 2. 表格
+    if (line.trim().startsWith('|') && line.trim().endsWith('|')) {
+      flushList();
+      const cells = line
+        .trim()
+        .slice(1, -1)
+        .split('|')
+        .map((c) => c.trim());
+      // 检查分隔线
+      if (cells.every((c) => /^:?-+:?$/.test(c))) {
+        // 这是表头分隔线，忽略
+        continue;
+      }
+      if (!inTable) {
+        inTable = true;
+        tableHeader = `<tr>${cells.map((c) => `<th>${inlineParse(c)}</th>`).join('')}</tr>`;
+      } else {
+        tableRows.push(`<tr>${cells.map((c) => `<td>${inlineParse(c)}</td>`).join('')}</tr>`);
+      }
+      continue;
+    } else {
+      flushTable();
+    }
+
+    // 3. 引用块
+    if (line.trim().startsWith('>')) {
+      flushList();
+      const text = line.trim().slice(1).trim();
+      out.push(`
+        <div class="callout my-4 rounded-xl border-l-4 border-cyan-400 bg-cyan-950/20 px-5 py-3 text-slate-300 shadow-sm">
+          <div class="text-sm leading-relaxed">${inlineParse(text)}</div>
+        </div>
+      `);
+      continue;
+    }
+
+    // 4. 标题 (#, ##, ###)
+    const mHead = line.match(/^(#{1,6})\s+(.+)$/);
+    if (mHead) {
+      flushList();
+      const depth = mHead[1].length;
+      const rawText = mHead[2].trim();
+      const plainText = rawText.replace(/<[^>]+>/g, '').trim();
+      const id = plainText
+        .toLowerCase()
+        .replace(/[^\w\u4e00-\u9fa5]+/g, '-')
+        .replace(/^-|-$/g, '');
+
+      if (depth <= 3) {
+        headings.push({ id, text: plainText, depth });
+      }
+
+      out.push(`
+        <h${depth} id="${id}" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#${id}" class="heading-text">${inlineParse(rawText)}</a>
+        </h${depth}>
+      `);
+      continue;
+    }
+
+    // 5. 分割线
+    if (/^(\*\*\*|---|___)$/.test(line.trim())) {
+      flushList();
+      out.push('<hr />');
+      continue;
+    }
+
+    // 6. 无序列表
+    const mList = line.match(/^(\s*)[-*+]\s+(.+)$/);
+    if (mList) {
+      if (!inList || listType !== 'ul') {
+        flushList();
+        inList = true;
+        listType = 'ul';
+        out.push('<ul>');
+      }
+      out.push(`<li>${inlineParse(mList[2])}</li>`);
+      continue;
+    }
+
+    // 7. 有序列表
+    const mNumList = line.match(/^(\s*)\d+\.\s+(.+)$/);
+    if (mNumList) {
+      if (!inList || listType !== 'ol') {
+        flushList();
+        inList = true;
+        listType = 'ol';
+        out.push('<ol>');
+      }
+      out.push(`<li>${inlineParse(mNumList[2])}</li>`);
+      continue;
+    }
+
+    flushList();
+
+    // 8. 普通段落
+    if (line.trim().length > 0) {
+      out.push(`<p>${inlineParse(line)}</p>`);
+    }
+  }
+
+  flushTable();
+  flushList();
+  return out.join('\n');
+}
+
+const mainHtml = parseMarkdown(mdContent);
+
+// 生成左侧目录
 let sidebarHtml = '';
 for (const h of headings) {
   if (h.depth === 2) {
@@ -108,7 +237,7 @@ for (const h of headings) {
   }
 }
 
-// 生成右侧大纲（页面快速导航）
+// 生成右侧大纲
 let tocHtml = '';
 for (const h of headings) {
   if (h.depth === 2 || h.depth === 3) {
@@ -117,7 +246,7 @@ for (const h of headings) {
   }
 }
 
-// 组装精美的完整 HTML 模板
+// 组装完整 HTML
 const htmlTemplate = `<!doctype html>
 <html lang="zh-CN" class="dark scroll-smooth">
   <head>
@@ -126,7 +255,6 @@ const htmlTemplate = `<!doctype html>
     <title>S3M for MapLibre - 完整开发指南与 API 参考</title>
     <meta name="description" content="SuperMap S3M/S3MB 三维瓦片格式原生 MapLibre / Mapbox 图层核心架构、API 文档与使用手册" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏢</text></svg>" />
-    <!-- Tailwind CSS CDN -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -146,13 +274,11 @@ const htmlTemplate = `<!doctype html>
       }
     </script>
     <style>
-      /* 滚动条美化 */
       ::-webkit-scrollbar { width: 6px; height: 6px; }
       ::-webkit-scrollbar-track { background: transparent; }
       ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
       ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.28); }
 
-      /* 排版细节 */
       body {
         background-color: #0b101b;
         color: #cbd5e1;
@@ -183,13 +309,6 @@ const htmlTemplate = `<!doctype html>
         color: #e2e8f0;
         margin-top: 2rem;
         margin-bottom: 0.75rem;
-      }
-      .doc-content h4 {
-        font-size: 1.05rem;
-        font-weight: 600;
-        color: #cbd5e1;
-        margin-top: 1.5rem;
-        margin-bottom: 0.5rem;
       }
       .doc-content p {
         margin-top: 0.85rem;
@@ -236,7 +355,6 @@ const htmlTemplate = `<!doctype html>
       }
       .doc-content strong { color: #f8fafc; font-weight: 600; }
 
-      /* 锚点小图标 */
       .doc-heading { position: relative; }
       .heading-anchor-link {
         position: absolute;
@@ -251,7 +369,6 @@ const htmlTemplate = `<!doctype html>
       .doc-heading:hover .heading-anchor-link { opacity: 1; }
       .doc-heading a.heading-text { text-decoration: none; color: inherit; }
 
-      /* 侧边栏链接高亮 */
       .sidebar-link {
         display: block;
         padding: 0.35rem 0.75rem;
@@ -278,7 +395,6 @@ const htmlTemplate = `<!doctype html>
         padding-left: 0.5rem;
       }
 
-      /* 表格内单元格内边距 */
       .table-responsive th, .table-responsive td {
         padding: 0.75rem 1rem;
         vertical-align: top;
@@ -287,11 +403,9 @@ const htmlTemplate = `<!doctype html>
   </head>
   <body class="min-h-screen flex flex-col">
 
-    <!-- 顶部导航 Header -->
     <header class="sticky top-0 z-40 w-full border-b border-white/10 bg-[#0b101b]/90 backdrop-blur-md">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
         
-        <!-- Logo -->
         <div class="flex items-center gap-3">
           <a href="../demo/index.html" class="flex items-center gap-2.5 text-white font-bold text-lg tracking-tight hover:opacity-90 transition">
             <span class="w-8 h-8 rounded-lg bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center text-white shadow-lg shadow-cyan-500/20">
@@ -304,9 +418,7 @@ const htmlTemplate = `<!doctype html>
           </span>
         </div>
 
-        <!-- 搜索与快捷跳转 -->
         <div class="flex items-center gap-4">
-          <!-- 实时过滤搜索框 -->
           <div class="relative hidden sm:block w-64 lg:w-80">
             <input 
               id="searchInput" 
@@ -329,10 +441,8 @@ const htmlTemplate = `<!doctype html>
       </div>
     </header>
 
-    <!-- 主体容器：左中右三栏布局 -->
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 w-full flex-1 flex gap-8">
       
-      <!-- 左侧吸顶目录 (Sidebar) -->
       <aside id="sidebar" class="hidden md:block w-64 shrink-0 py-8 border-r border-white/5 pr-4 h-[calc(100vh-4rem)] sticky top-16 overflow-y-auto">
         <div class="text-xs font-semibold text-slate-400 tracking-wider uppercase mb-3 px-2 select-none">
           文档导航
@@ -342,11 +452,9 @@ const htmlTemplate = `<!doctype html>
         </nav>
       </aside>
 
-      <!-- 中间正文主体 (Content) -->
       <main class="flex-1 min-w-0 py-8 lg:py-10 max-w-4xl doc-content">
         ${mainHtml}
         
-        <!-- 页脚 -->
         <footer class="mt-16 pt-8 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-4">
           <p>© 2026 s3m-maplibre 项目组 · Apache-2.0 开源协议</p>
           <div class="flex items-center gap-4">
@@ -357,7 +465,6 @@ const htmlTemplate = `<!doctype html>
         </footer>
       </main>
 
-      <!-- 右侧大纲 (On this page) -->
       <aside class="hidden xl:block w-56 shrink-0 py-8 pl-4 h-[calc(100vh-4rem)] sticky top-16 overflow-y-auto">
         <div class="text-xs font-semibold text-slate-400 tracking-wider uppercase mb-3 select-none">
           本页大纲
@@ -368,9 +475,7 @@ const htmlTemplate = `<!doctype html>
       </aside>
     </div>
 
-    <!-- 交互脚本：代码复制、滚动监听、搜索高亮 -->
     <script>
-      // 1. 代码一键复制
       document.querySelectorAll('.copy-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
           const raw = decodeURIComponent(btn.dataset.code || '');
@@ -390,7 +495,6 @@ const htmlTemplate = `<!doctype html>
         });
       });
 
-      // 2. 标题滚动监听激活 (Scrollspy)
       const headings = Array.from(document.querySelectorAll('.doc-heading'));
       const tocLinks = Array.from(document.querySelectorAll('.toc-link'));
       const sidebarLinks = Array.from(document.querySelectorAll('.sidebar-link'));
@@ -418,7 +522,6 @@ const htmlTemplate = `<!doctype html>
       window.addEventListener('scroll', onScroll, { passive: true });
       onScroll();
 
-      // 3. 快速过滤搜索
       const searchInput = document.getElementById('searchInput');
       if (searchInput) {
         searchInput.addEventListener('input', (e) => {
@@ -444,7 +547,7 @@ const htmlTemplate = `<!doctype html>
 const outputHtmlPath = path.join(rootDir, 'docs', 'index.html');
 fs.writeFileSync(outputHtmlPath, htmlTemplate, 'utf8');
 
-console.log(`\n🎉 精美文档编译完成！`);
+console.log(`\n🎉 零依赖精美文档编译完成！`);
 console.log(`输出路径: ${outputHtmlPath}`);
 console.log(`提取标题: ${headings.length} 个节节点`);
-console.log(`页面特性: Tailwind 暗夜高科技主题 / 3栏自适应 / 代码一键复制 / 实时大纲追踪 / 快速过滤搜索`);
+console.log(`100% 纯 Node 原生，无需任何第三方 npm 依赖包`);
