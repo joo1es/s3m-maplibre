@@ -262,7 +262,7 @@
       </section>
 
       <section>
-        <h2>按业务字段着色 (Thematic)</h2>
+        <h2>按业务字段（着色 / 过滤 / 抬高）</h2>
         <input id="optAttrUrl" type="text" placeholder="数据服务地址 .../rest/data"
           style="width: 100%; padding: 4px 6px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; margin-bottom: 5px;" />
         <div style="display: flex; gap: 5px; margin-bottom: 5px;">
@@ -286,6 +286,31 @@
         </div>
         <div id="attrLegend" style="margin-top: 6px; font-size: 11px; color: #374151; max-height: 132px; overflow-y: auto;"></div>
         <div id="attrStatus" style="font-size: 11px; color: #6b7280; margin-top: 3px; min-height: 16px;"></div>
+
+        <div style="margin-top: 7px; padding-top: 6px; border-top: 1px dashed #e5e7eb;">
+          <div style="font-size: 11px; color: #6b7280; margin-bottom: 4px;">过滤区间（数值字段，留空为不限）</div>
+          <div style="display: flex; gap: 5px; margin-bottom: 5px;">
+            <input id="optAttrMin" type="number" placeholder="min"
+              style="flex: 1; min-width: 0; padding: 4px 6px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px;" />
+            <input id="optAttrMax" type="number" placeholder="max"
+              style="flex: 1; min-width: 0; padding: 4px 6px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px;" />
+            <select id="optAttrFilterMode" style="padding: 3px 5px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #fff; color: #111827; outline: none;">
+              <option value="keep" selected>保留匹配</option>
+              <option value="hide">隐藏匹配</option>
+            </select>
+          </div>
+          <div style="display: flex; gap: 5px; margin-bottom: 7px;">
+            <button id="btnAttrFilter" style="flex: 1; padding: 5px 4px; font-size: 11px; border: 1px solid #bfdbfe; border-radius: 5px; background: #eff6ff; color: #1d4ed8; cursor: pointer; font-weight: 500;">按字段过滤</button>
+            <button id="btnAttrFilterClear" style="padding: 5px 8px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #f9fafb; color: #374151; cursor: pointer;">全部显示</button>
+          </div>
+          <div style="font-size: 11px; color: #6b7280; margin-bottom: 4px;">抬高倍率（米 / 字段单位）</div>
+          <div style="display: flex; gap: 5px;">
+            <input id="optAttrElev" type="number" step="0.5" value="1"
+              style="width: 70px; padding: 4px 6px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px;" />
+            <button id="btnAttrElevate" style="flex: 1; padding: 5px 4px; font-size: 11px; border: 1px solid #bbf7d0; border-radius: 5px; background: #f0fdf4; color: #15803d; cursor: pointer; font-weight: 500;">按字段抬高</button>
+            <button id="btnAttrElevReset" style="padding: 5px 8px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #f9fafb; color: #374151; cursor: pointer;">复位</button>
+          </div>
+        </div>
       </section>
 
       <footer>

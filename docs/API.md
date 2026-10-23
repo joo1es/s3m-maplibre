@@ -352,8 +352,8 @@ result.matched;   // 真正上了色的单体数
 
 几个要点：
 
-- **默认范围是「当前已加载的单体」**（`getLoadedSmids()`），不是整个数据集。实测每条要素的响应约 10KB（`queryOption: ATTRIBUTE` 对模型数据集不生效，服务端仍会带 `geometry.model` 的 base64，`fromIndex/toIndex` 分页也被忽略），全量几千栋会变成几十 MB，所以只查加载进来的那部分，按 200 个一批分片；
-- 查询结果按 SMID 缓存（`AttributeQuery`），换字段只是重算颜色、重写一张一维纹理，不重建几何、不重编译着色器；
+- **默认范围是「当前已加载的单体」**（`getLoadedSmids()`），不是整个数据集。实测每条要素的响应约 5KB（模型数据集每条都挂着 `geometry.model`，见下面的「为什么这么重」），全量几千栋会变成几十 MB，所以只查加载进来的那部分，按 200 个一批分片；
+- 查询结果按 SMID 缓存**整行**（`AttributeQuery`），换字段只是重算颜色、重写一张一维纹理，不重建几何、不重编译着色器，也不再发一次请求；
 - 手动 `setFeatureStyle()` 的颜色优先级高于专题色；
 - `transform` 用来归并取值：`KEYID` / `ENTITYID` 这种基本一栋一个值的字段直接上分类色，着出来就是「随机色」，要么改用 `ramp` / `breaks`，要么用 `transform` 把编码截到能分组的层级，比如 `(v) => v.slice(0, 6)`;
 - `breaks` 不给就用色带档数等分；`colors` 不给就用内置 12 色板。
@@ -377,6 +377,87 @@ const rows = await query.queryBySmids([423, 424]); // Map<smid, { SmID, ENTITYID
 ```
 
 拾取结果里的 `attributes` 不在 `PickResult` 上：`pick()` 只负责拿 SMID，业务字段要按 SMID 再查一次。demo 里的属性卡就是这么补的（点楼 → 查 `featureResults` → 追加字段行）。
+
+### 过滤 / 抬高
+
+同一份属性除了上色，还能直接拿来过滤和抬高——都是「查一次字段 → 写进每网格的单体状态纹理」，不重建几何、不重编译着色器。
+
+```ts
+// 只显示 30~80 米之间的建筑
+await layer.filterByField({ field: 'SmMaxZ', min: 30, max: 80 });
+
+// 按编码精确匹配（values 按 String(value) 比）
+await layer.filterByField({ field: 'KEYID', values: ['C10100SVK57YDUALQHRR00'] });
+
+// 反过来：隐藏 20 米以下的
+await layer.filterByField({ field: 'SmMaxZ', max: 20, mode: 'hide' });
+
+// 自定义条件
+await layer.filterByField({ field: 'SmMaxZ', keep: (v) => Number(v) > 100 });
+
+layer.clearFieldFilter();   // 恢复全量，不影响 setFilter() 的规则
+
+// 抬高：字段值 × 倍率（米）
+await layer.elevateByField({ field: 'SmMaxZ', scale: 0.5 });
+
+// 或者自己映射，第二个参数是数据分布
+await layer.elevateByField({
+  field: 'SmMaxZ',
+  map: (v, r) => ((v - r.min) / (r.max - r.min)) * 200,
+  max: 120, // 封顶
+});
+layer.clearThematicElevation();
+```
+
+返回值够用：`filterByField` 给 `{ total, matched, missing, hidden }`，`elevateByField` 给 `{ matched, missing, min, max, appliedMax }`。
+
+几个约定：
+
+- `filterByField` 与 `setFilter()` 是**叠加**关系（两个都放行才显示）；被隐藏的单体不渲染、也不参与拾取；`onMissing` 控制查不到属性的单体怎么算（默认保留）；
+- `keep` 模式记的是「命中集合」，之后才加载进来的单体不在集合里，同样隐藏——符合「只显示命中的」，也不会漏出新瓦片里的建筑；
+- `elevateByField` 的抬高量写在单体状态纹理的第四通道，顶点着色器加到 z 上；手动 `setFeatureStyle(smid, { elevation })` 优先级更高；
+- 上色 / 过滤 / 抬高共用同一个 `AttributeQuery` 缓存，切字段不会重复查；
+- 不想走网络时，用 `setThematicElevation(new Map([[423, 20]]))` 直接塞 SMID → 抬高米数。
+
+### 为什么这么重，以及怎么减
+
+数据服务没有「只取属性」的接口。iServer 2026 上逐项试过，结论如下（数据集 `DataSource:zhoubian`，4461 条）：
+
+| 尝试 | 结果 |
+|---|---|
+| `queryOption: 'ATTRIBUTE'`（body / query string / 大小写） | **完全被忽略**，几何照返回 |
+| `hasGeometry` / `returnGeometry` / `withGeometry`（顶层与 `queryParameter` 内） | 全被忽略 |
+| `fromIndex` / `toIndex` | 被忽略，不能翻页 |
+| `maxFeatures` | ✅ 生效，但只能「取前 N 条」 |
+| `.fastjson` 替代 `.json` | ✅ 模型数据集 −40~50% |
+| 逐条 `GET /rest/data/feature/{a}-{b}-{idx}.json` | 957B/条（`model` 为 null），但 300 条并发 16 要 2~14s，反而不如一次 POST |
+| 二维数据源 `DataSource_erwei` | ✅ 若同名数据集存在，体积只有 1/2.5（`REGION` 而非 `GEOMODEL3D`） |
+
+体积的 90% 是 `geometry.model`：每条要素都带着自己那栋楼的 S3M 模型字节（deflate 压缩后约 2.5KB），而我们要的只是几个字段。所以策略是「一次把全部字段捞回来，尽量少发请求」：
+
+- 响应格式按数据集自动选（`format: 'auto'`）。模型数据集的 `model` 是 byte[]，`.fastjson` 用 hex 表示只要 2 字符/字节，`.json` 是十进制数字数组（3~4 字符/字节），所以走 fastjson；二维数据集的几何是坐标 double，hex 反而更胖（实测 3.9KB vs 2.4KB/条），那种就留在 json。判断依据是 `features.json` 返回的 `geometryType`，一次几十字节。
+  fastjson **不是严格 JSON**（`0.0D`、`423L`、`x'D7A34040…'` 都是 Java 字面量），`AttributeQuery` 会先在字符串上把 `x'…'` 抹成 `null` 再 `JSON.parse`——顺便省掉了整个模型的解析开销；解析失败自动回退 `.json`。
+- 默认取字段表里除 `SmGeometry` / `SmIndexKey` 外的**全部字段**（字段名本身很便宜，模型才是大头），这样换专题字段、看属性卡都命中缓存。
+- 需要压到极限时，如果同一份数据还发布了二维数据源，把 `datasetName` 指过去即可：
+
+```ts
+attributes: {
+  dataServiceUrl: '.../rest/data',
+  datasetName: 'DataSource_erwei:cheng',   // 二维版本，同样的属性、没有模型
+}
+```
+
+实测同一批 100 栋：
+
+| 数据集 | 格式 | 体积 |
+|---|---|---|
+| `DataSource:zhoubian`（模型） | json | 9.2 KB/条 |
+| `DataSource:zhoubian`（模型） | fastjson（自动） | 6.3 KB/条 |
+| `DataSource:cheng`（模型） | json | 10.8 KB/条 |
+| `DataSource:cheng`（模型） | fastjson（自动） | 5.5 KB/条 |
+| `DataSource_erwei:cheng`（二维） | json（自动） | 2.1 KB/条 |
+
+`AttributeQuery` 还提供 `format`、`chunkSize`、`fields` 三个开关，以及 `query.stats`（`{ requests, bytes, ms }`）用来观察实际开销。
 
 ---
 

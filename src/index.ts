@@ -64,6 +64,10 @@ export type {
   ColorByFieldOptions,
   ThematicLegendEntry,
   ThematicResult,
+  FieldFilterOptions,
+  FieldFilterResult,
+  FieldElevationOptions,
+  FieldElevationResult,
 } from './render/S3MLayer.js';
 
 export { buildTileObjects } from './render/GeometryBuilder.js';

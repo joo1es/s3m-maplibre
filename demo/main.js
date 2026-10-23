@@ -626,6 +626,18 @@ syncSwatches();
 
 /* ---------------------------------------------------------------- 按业务字段着色 */
 
+/** 当前 AttributeQuery 对应的数据源，变了才重建（重建会丢整行缓存） */
+let attrSourceKey = '';
+
+/** 数据源没变就别重建 —— 否则换字段时整行缓存白丢，又得重新查一遍 */
+function applyAttrSource(source) {
+  const key = `${source.dataServiceUrl}|${source.datasetName}`;
+  if (key === attrSourceKey) return layer.attributeQuery;
+  layer.setAttributeSource(source);
+  attrSourceKey = key;
+  return layer.attributeQuery;
+}
+
 function setAttrStatus(text) {
   $('attrStatus').textContent = text;
 }
@@ -670,7 +682,7 @@ $('btnAttrFields').addEventListener('click', async () => {
   }
   setAttrStatus('读取字段表…');
   try {
-    const query = new AttributeQuery(source);
+    const query = applyAttrSource(source) ?? new AttributeQuery(source);
     const schema = await query.loadSchema();
     const select = $('optAttrField');
     select.innerHTML = '';
@@ -685,7 +697,6 @@ $('btnAttrFields').addEventListener('click', async () => {
     const preferred = ['KEYID', 'ENTITYID', 'NOTE', 'SmMaxZ', 'SmMinZ'];
     const hit = preferred.find((name) => schema.some((f) => f.name === name));
     if (hit) select.value = hit;
-    layer.setAttributeSource(source);
     setAttrStatus(`共 ${schema.length} 个字段`);
   } catch (e) {
     setAttrStatus(String(e?.message ?? e));
@@ -705,16 +716,22 @@ $('btnAttrApply').addEventListener('click', async () => {
     return;
   }
   const type = $('optAttrType').value;
-  layer.setAttributeSource(source);
+  applyAttrSource(source);
   setAttrStatus(`查询 ${field}…`);
   try {
+    const query = layer.attributeQuery;
+    const before = query ? { ...query.stats } : null;
     const t0 = performance.now();
     const result = await layer.colorByField({ field, type });
     renderAttrLegend(result);
     const cost = Math.round(performance.now() - t0);
+    const after = query ? query.stats : null;
+    const reqs = before && after ? after.requests - before.requests : 0;
+    const kb = before && after ? Math.round((after.bytes - before.bytes) / 1024) : 0;
     const many = type === 'category' && result.legend.length > 20;
     setAttrStatus(
-      `${result.field} · 上色 ${result.matched} 栋 · 缺属性 ${result.missing} · ${cost}ms` +
+      `${result.field} · 上色 ${result.matched} 栋 · 缺属性 ${result.missing} · ${cost}ms · ` +
+        (reqs ? `${reqs} 次请求 ${kb}KB` : '缓存命中，0 请求') +
         (many ? ` · 该字段有 ${result.legend.length} 个取值，建议改用「渐变 / 分级」` : '')
     );
   } catch (e) {
@@ -727,6 +744,87 @@ $('btnAttrClear').addEventListener('click', () => {
   layer.clearThematic();
   $('attrLegend').innerHTML = '';
   setAttrStatus('已清除专题色');
+});
+
+/** 过滤 / 抬高共用：取当前字段，没有就提示 */
+function currentAttrField() {
+  const field = $('optAttrField').value;
+  if (!field) setAttrStatus('先点「读字段」选择字段');
+  return field;
+}
+
+$('btnAttrFilter').addEventListener('click', async () => {
+  const source = readAttrSource();
+  if (!source) return setAttrStatus('先填数据服务地址和数据集');
+  const field = currentAttrField();
+  if (!field) return;
+  applyAttrSource(source);
+
+  const minText = $('optAttrMin').value.trim();
+  const maxText = $('optAttrMax').value.trim();
+  setAttrStatus(`按 ${field} 过滤…`);
+  try {
+    const t0 = performance.now();
+    const result = await layer.filterByField({
+      field,
+      mode: $('optAttrFilterMode').value,
+      min: minText === '' ? undefined : Number(minText),
+      max: maxText === '' ? undefined : Number(maxText),
+    });
+    const cost = Math.round(performance.now() - t0);
+    if (result.matched === 0) {
+      // 分类字段没有区间可言，命中 0 栋时不要把所有楼都藏掉
+      layer.clearFieldFilter();
+      setAttrStatus(`${field} 没有单体命中（区间过滤只对数值字段有效），已保持原样`);
+      return;
+    }
+    setAttrStatus(
+      `过滤 ${result.field} · 命中 ${result.matched}/${result.total} · 隐藏 ${result.hidden.length} 栋` +
+        (result.missing ? ` · 缺属性 ${result.missing}` : '') +
+        ` · ${cost}ms`
+    );
+  } catch (e) {
+    setAttrStatus(String(e?.message ?? e));
+    console.error(e);
+  }
+});
+
+$('btnAttrFilterClear').addEventListener('click', () => {
+  layer.clearFieldFilter();
+  setAttrStatus('已清除字段过滤');
+});
+
+$('btnAttrElevate').addEventListener('click', async () => {
+  const source = readAttrSource();
+  if (!source) return setAttrStatus('先填数据服务地址和数据集');
+  const field = currentAttrField();
+  if (!field) return;
+  applyAttrSource(source);
+
+  const scale = Number($('optAttrElev').value);
+  if (!Number.isFinite(scale) || scale === 0) return setAttrStatus('抬高倍率填个非 0 数字');
+  setAttrStatus(`按 ${field} 抬高…`);
+  try {
+    const t0 = performance.now();
+    const result = await layer.elevateByField({ field, scale });
+    const cost = Math.round(performance.now() - t0);
+    if (result.matched === 0) {
+      setAttrStatus(`${field} 不是数值字段或全为 0，没有单体被抬高`);
+      return;
+    }
+    setAttrStatus(
+      `抬高 ${result.field} ×${scale} · ${result.matched} 栋 · 最大 ${result.appliedMax.toFixed(1)}m` +
+        ` · 字段范围 ${result.min.toFixed(1)}~${result.max.toFixed(1)} · ${cost}ms`
+    );
+  } catch (e) {
+    setAttrStatus(String(e?.message ?? e));
+    console.error(e);
+  }
+});
+
+$('btnAttrElevReset').addEventListener('click', () => {
+  layer.clearThematicElevation();
+  setAttrStatus('已复位抬高');
 });
 
 /* ---------------------------------------------------------------- 属性卡展示 */

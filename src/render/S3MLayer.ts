@@ -291,6 +291,68 @@ export interface ThematicLegendEntry {
   count: number;
 }
 
+/** 按业务字段过滤：条件之间是「与」，一个条件都不给就按「字段非空」算命中 */
+export interface FieldFilterOptions {
+  /** 字段名 */
+  field: string;
+  /** 数值区间（含端点），只对能转成数字的取值生效 */
+  min?: number;
+  /** 数值区间上界 */
+  max?: number;
+  /** 取值白名单，按 `String(value)` 比较（编码类字段用它做精确匹配） */
+  values?: Array<string | number>;
+  /** 自定义判断，返回 true 表示命中 */
+  keep?: (value: string | number | null, row: AttributeRow) => boolean;
+  /** `keep`（默认）只显示命中的单体；`hide` 隐藏命中的单体 */
+  mode?: 'keep' | 'hide';
+  /** 查询范围，默认取「当前已加载的全部单体」 */
+  smids?: number[];
+  /** 查不到属性值的单体：`keep`（默认，保留）或 `hide` */
+  onMissing?: 'keep' | 'hide';
+}
+
+export interface FieldFilterResult {
+  field: string;
+  mode: 'keep' | 'hide';
+  /** 参与判断的单体数 */
+  total: number;
+  /** 命中条件的单体数 */
+  matched: number;
+  /** 查不到属性值的单体数 */
+  missing: number;
+  /** 最终被隐藏的单体 ID */
+  hidden: number[];
+}
+
+/** 按业务字段抬高：抬高 = 字段值 × scale + offset（米），也可用 map 自定义 */
+export interface FieldElevationOptions {
+  /** 数值字段名 */
+  field: string;
+  /** 米 / 字段单位，默认 1（即字段值直接当米） */
+  scale?: number;
+  /** 基础偏移（米），默认 0 */
+  offset?: number;
+  /** 抬高上限（米），超出按上限算 */
+  max?: number;
+  /** 自定义映射，第二参数是该字段在当前范围内的 min / max */
+  map?: (value: number, range: { min: number; max: number }) => number;
+  /** 只抬这些单体，默认取「当前已加载的全部单体」 */
+  smids?: number[];
+}
+
+export interface FieldElevationResult {
+  field: string;
+  /** 真正抬起来的单体数 */
+  matched: number;
+  /** 字段值不是数字、跳过的单体数 */
+  missing: number;
+  /** 该字段在当前范围内的最小 / 最大值 */
+  min: number;
+  max: number;
+  /** 实际最大抬高（米） */
+  appliedMax: number;
+}
+
 export interface ThematicResult {
   field: string;
   /** 真正上了色的单体数 */
@@ -361,6 +423,30 @@ function sampleRamp(stops: THREE.Color[], t: number): THREE.Color {
   return stops[i].clone().lerp(stops[i + 1], scaled - i);
 }
 
+/** 按字段值判断是否命中过滤条件（各条件之间是「与」） */
+function matchFieldValue(
+  value: string | number | null,
+  row: AttributeRow,
+  options: FieldFilterOptions
+): boolean {
+  if (options.keep && !options.keep(value, row)) return false;
+  if (options.values?.length) {
+    const text = value == null ? '' : String(value);
+    if (!options.values.some((v) => String(v) === text)) return false;
+  }
+  if (options.min != null || options.max != null) {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return false;
+    if (options.min != null && num < options.min) return false;
+    if (options.max != null && num > options.max) return false;
+  }
+  // 一个条件都没给：字段非空就算命中
+  if (!options.keep && !options.values?.length && options.min == null && options.max == null) {
+    return value != null && String(value) !== '';
+  }
+  return true;
+}
+
 /** 图例上的数值：够用就好，别出现 60.390098571777344 */
 function formatNumber(v: number): string {
   if (!Number.isFinite(v)) return '—';
@@ -418,6 +504,9 @@ export class S3MLayer {
   /** 专题着色：SMID → 颜色（手动 featureStyle 的颜色优先级更高） */
   private _thematic = new Map<number, string>();
   private _thematicField: string | null = null;
+  private _thematicElevation = new Map<number, number>();
+  private _elevationField: string | null = null;
+  private _fieldFilter: { field: string; mode: 'keep' | 'hide'; matched: Set<number> } | null = null;
   private _filter: S3MFilter | null = null;
   private readonly _meshBatchTextures = new WeakMap<
     THREE.Mesh,
@@ -758,6 +847,170 @@ export class S3MLayer {
     this.map?.triggerRepaint();
   }
 
+  /* ---------------------------------------------------------------- 按业务字段过滤 / 抬高 */
+
+  /** 当前过滤用的业务字段 */
+  getFilterField(): string | null {
+    return this._fieldFilter?.field ?? null;
+  }
+
+  /**
+   * 按业务字段过滤单体。
+   *
+   * 命中的单体集合会记下来参与渲染：`keep` 模式下不在集合里的单体直接不画（顶点被压到原点，
+   * 也不参与拾取）；`hide` 模式反之。和 `setFilter()` 是叠加关系（两个都满足才显示）。
+   */
+  async filterByField(options: FieldFilterOptions): Promise<FieldFilterResult> {
+    const query = this.attributeQuery;
+    if (!query) {
+      throw new Error('[s3m] 未配置业务属性数据源，先调用 setAttributeSource() 或构造时传 attributes');
+    }
+
+    const all = options.smids?.length ? [...new Set(options.smids)] : this.getLoadedSmids();
+    const mode = options.mode ?? 'keep';
+    const onMissing = options.onMissing ?? 'keep';
+    const result: FieldFilterResult = {
+      field: options.field,
+      mode,
+      total: all.length,
+      matched: 0,
+      missing: 0,
+      hidden: [],
+    };
+    if (!all.length) {
+      this._fieldFilter = null;
+      return result;
+    }
+
+    const rows: Map<number, AttributeRow> = await query.queryBySmids(all);
+    const matched = new Set<number>();
+    for (const smid of all) {
+      const row = rows.get(smid);
+      if (!row) {
+        result.missing++;
+        if (onMissing === 'keep') matched.add(smid);
+        continue;
+      }
+      if (matchFieldValue(row[options.field] ?? null, row, options)) matched.add(smid);
+    }
+    result.matched = matched.size;
+
+    this._fieldFilter = matched.size || mode === 'keep' ? { field: options.field, mode, matched } : null;
+    result.hidden = all.filter((smid) => (mode === 'keep' ? !matched.has(smid) : matched.has(smid)));
+
+    this._applyOverridesToAllMeshes();
+    if (this._selection) this._syncSelectionStyle();
+    this.map?.triggerRepaint();
+    return result;
+  }
+
+  /** 清除业务字段过滤（不影响 setFilter 的规则） */
+  clearFieldFilter(): void {
+    if (!this._fieldFilter) return;
+    this._fieldFilter = null;
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
+  /** 当前抬高用的业务字段 */
+  getElevationField(): string | null {
+    return this._elevationField;
+  }
+
+  /**
+   * 按业务字段抬高单体。
+   *
+   * 抬高量写进每网格的单体状态纹理（第四通道），顶点着色器里加到 z 上，
+   * 所以只影响显示、不改几何：换字段/改系数都是重写一张一维纹理。
+   */
+  async elevateByField(options: FieldElevationOptions): Promise<FieldElevationResult> {
+    const query = this.attributeQuery;
+    if (!query) {
+      throw new Error('[s3m] 未配置业务属性数据源，先调用 setAttributeSource() 或构造时传 attributes');
+    }
+
+    const all = options.smids?.length ? [...new Set(options.smids)] : this.getLoadedSmids();
+    const empty: FieldElevationResult = {
+      field: options.field,
+      matched: 0,
+      missing: all.length,
+      min: 0,
+      max: 0,
+      appliedMax: 0,
+    };
+    if (!all.length) {
+      this._thematicElevation = new Map();
+      this._elevationField = null;
+      this._applyOverridesToAllMeshes();
+      return empty;
+    }
+
+    const rows: Map<number, AttributeRow> = await query.queryBySmids(all);
+    const numeric = new Map<number, number>();
+    for (const smid of all) {
+      const value = Number(rows.get(smid)?.[options.field]);
+      if (Number.isFinite(value)) numeric.set(smid, value);
+    }
+    if (numeric.size === 0) {
+      this._thematicElevation = new Map();
+      this._elevationField = null;
+      this._applyOverridesToAllMeshes();
+      this.map?.triggerRepaint();
+      return empty;
+    }
+
+    const values = [...numeric.values()];
+    const min = Math.min(...values);
+    const max = Math.max(...values);
+    const scale = options.scale ?? 1;
+    const offset = options.offset ?? 0;
+    const next = new Map<number, number>();
+    let appliedMax = 0;
+    for (const [smid, value] of numeric) {
+      let height = options.map ? options.map(value, { min, max }) : value * scale + offset;
+      if (!Number.isFinite(height)) continue;
+      if (options.max != null && height > options.max) height = options.max;
+      // 负值等于往下压，没有实际意义，当没抬高处理
+      if (height <= 0) continue;
+      next.set(smid, height);
+      if (height > appliedMax) appliedMax = height;
+    }
+
+    this._thematicElevation = next;
+    this._elevationField = options.field;
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+
+    return {
+      field: options.field,
+      matched: next.size,
+      missing: all.length - numeric.size,
+      min,
+      max,
+      appliedMax,
+    };
+  }
+
+  /**
+   * 直接塞一份 SMID → 抬高米数（已经算好、或不走网络时用这个）。
+   * 传 null 复位。
+   */
+  setThematicElevation(elevations: Map<number, number> | null, field = 'custom'): void {
+    this._thematicElevation =
+      elevations && elevations.size > 0 ? new Map([...elevations].filter(([, h]) => Number.isFinite(h) && h > 0)) : new Map();
+    this._elevationField = this._thematicElevation.size > 0 ? field : null;
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
+  clearThematicElevation(): void {
+    if (this._thematicElevation.size === 0) return;
+    this._thematicElevation = new Map();
+    this._elevationField = null;
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
   /**
    * 按业务字段给单体上色。
    *
@@ -907,6 +1160,10 @@ export class S3MLayer {
   }
 
   private _isFeatureHidden(smid: number | null, _batchId: number): boolean {
+    if (smid != null && this._fieldFilter) {
+      const inSet = this._fieldFilter.matched.has(smid);
+      if (this._fieldFilter.mode === 'keep' ? !inSet : inSet) return true;
+    }
     if (!this._filter) return false;
     if (smid != null) {
       if (this._filter.include && this._filter.include.length > 0 && !this._filter.include.includes(smid)) {
@@ -926,11 +1183,15 @@ export class S3MLayer {
     const ud = mesh.userData as MeshUserData;
     const pickInfo = ud.geoRef?.pickInfo;
 
-    const hasStyles = this._featureStyles.size > 0 || this._thematic.size > 0;
+    const hasStyles =
+      this._featureStyles.size > 0 || this._thematic.size > 0 || this._thematicElevation.size > 0;
     const filter = this._filter;
     const hasFilter =
-      filter != null &&
-      ((filter.include?.length ?? 0) > 0 || (filter.exclude?.length ?? 0) > 0 || filter.predicate != null);
+      this._fieldFilter != null ||
+      (filter != null &&
+        ((filter.include?.length ?? 0) > 0 ||
+          (filter.exclude?.length ?? 0) > 0 ||
+          filter.predicate != null));
 
     if (!hasStyles && !hasFilter) {
       if (mat.userData.uBatchTexActive) {
@@ -1001,11 +1262,23 @@ export class S3MLayer {
         continue;
       }
 
+      // 业务字段过滤：和 setFilter 叠加，两个都放行才显示
+      if (this._fieldFilter) {
+        const inSet = this._fieldFilter.matched.has(smid);
+        if (this._fieldFilter.mode === 'keep' ? !inSet : inSet) {
+          data[bId * 4 + 3] = -1.0;
+          hasActive = true;
+          continue;
+        }
+      }
+
       const st = this._featureStyles.get(smid);
       const thematicColor = this._thematic.get(smid);
       // 手动固定色 > 专题色（按业务字段）
       const colorHex = st?.color ?? thematicColor;
-      if (st || thematicColor) {
+      // 手动拔高 > 按业务字段抬高
+      const elevation = st?.elevation ?? this._thematicElevation.get(smid);
+      if (st || thematicColor || elevation != null) {
         hasActive = true;
         if (colorHex) {
           const c = new THREE.Color(colorHex);
@@ -1013,8 +1286,8 @@ export class S3MLayer {
           data[bId * 4 + 1] = c.g;
           data[bId * 4 + 2] = c.b;
         }
-        if (st?.elevation != null && st.elevation > 0) {
-          data[bId * 4 + 3] = st.elevation;
+        if (elevation != null && elevation > 0) {
+          data[bId * 4 + 3] = elevation;
         }
       }
     }
