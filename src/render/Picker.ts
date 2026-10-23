@@ -14,13 +14,37 @@ import * as THREE from 'three';
 const PICK_VERT = /* glsl */ `
   attribute float aBatchId;
   uniform float uObjectId;
+  uniform sampler2D uBatchTex;
+  uniform float uBatchTexWidth;
+  uniform int uBatchTexActive;
+  uniform float uSelBatch;
+  uniform float uSelWhole;
+  uniform float uSelElevation;
   varying float vBatch;
+
   void main() {
     vBatch = aBatchId;
+
+    // 单体状态（抬高 / 隐藏）必须和主着色器用同一份数据、同一套算法：
+    // 抬高只发生在顶点着色器里，拾取这一趟如果还按原始坐标画，抬起来的楼就点不中。
+    vec3 p = position;
+    if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
+      vec4 state = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+      if ( state.a < -0.5 ) {
+        p = vec3( 0.0 );
+      } else if ( state.a > 0.0 ) {
+        p.z += state.a;
+      }
+    }
+
+    // 选中单体自身的拔高（selectElevation）
+    float sel = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
+    p.z += sel * uSelElevation;
+
     #ifdef USE_INSTANCING
-      gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4( position, 1.0 );
+      gl_Position = projectionMatrix * modelViewMatrix * instanceMatrix * vec4( p, 1.0 );
     #else
-      gl_Position = projectionMatrix * modelViewMatrix * vec4( position, 1.0 );
+      gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
     #endif
   }
 `;
@@ -54,9 +78,26 @@ interface PickUserData {
   [key: string]: unknown;
 }
 
+/** 没有单体状态纹理时用的占位（全 0 = 不隐藏、不抬高） */
+const DUMMY_STATE_TEX = (() => {
+  const tex = new THREE.DataTexture(new Float32Array([-1, -1, -1, 0]), 1, 1, THREE.RGBAFormat, THREE.FloatType);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.needsUpdate = true;
+  return tex;
+})();
+
 function createPickMaterial(objectId: number): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
-    uniforms: { uObjectId: { value: objectId } },
+    uniforms: {
+      uObjectId: { value: objectId },
+      uBatchTex: { value: DUMMY_STATE_TEX },
+      uBatchTexWidth: { value: 1 },
+      uBatchTexActive: { value: 0 },
+      uSelBatch: { value: -1 },
+      uSelWhole: { value: 0 },
+      uSelElevation: { value: 0 },
+    },
     vertexShader: PICK_VERT,
     fragmentShader: PICK_FRAG,
     side: THREE.DoubleSide,
@@ -124,8 +165,33 @@ export class Picker {
       const ud = mesh.userData as PickUserData;
       if (ud.pickId === undefined) return;
       if (!ud.pickMaterial) ud.pickMaterial = createPickMaterial(ud.pickId);
-      swapped.push([mesh, mesh.material]);
-      mesh.material = ud.pickMaterial;
+
+      // 把当前的「单体状态纹理」抄给拾取材质：抬高量是逐单体写在里面的，
+      // 抄的是同一个纹理对象，主材质那边更新后这里自动跟着变。
+      const prev = mesh.material;
+      const pm = ud.pickMaterial as THREE.ShaderMaterial;
+      const src = (Array.isArray(prev) ? prev[0] : prev) as THREE.Material & {
+        userData?: Record<string, THREE.IUniform>;
+      };
+      const batchTex = src?.userData?.uBatchTex;
+      if (batchTex) {
+        pm.uniforms.uBatchTex.value = batchTex.value;
+        pm.uniforms.uBatchTexWidth.value = (src?.userData?.uBatchTexWidth?.value as number) ?? 1;
+        pm.uniforms.uBatchTexActive.value = (src?.userData?.uBatchTexActive?.value as number) ?? 0;
+      } else {
+        pm.uniforms.uBatchTex.value = DUMMY_STATE_TEX;
+        pm.uniforms.uBatchTexWidth.value = 1;
+        pm.uniforms.uBatchTexActive.value = 0;
+      }
+      // 选中那栋自身的拔高也要算，否则选中后再点它会点空
+      pm.uniforms.uSelBatch.value = (src?.userData?.uSelBatch?.value as number) ?? -1;
+      pm.uniforms.uSelWhole.value = (src?.userData?.uSelWhole?.value as number) ?? 0;
+      // uSelElevation 是共享 uniform，挂在材质 uniforms 上而不是 userData
+      pm.uniforms.uSelElevation.value =
+        ((src as THREE.ShaderMaterial | undefined)?.uniforms?.uSelElevation?.value as number) ?? 0;
+
+      swapped.push([mesh, prev]);
+      mesh.material = pm;
     });
     // 描边 / 棱线不参与拾取
     const hidden: THREE.Object3D[] = [];

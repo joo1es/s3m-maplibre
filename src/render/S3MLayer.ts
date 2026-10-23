@@ -955,6 +955,7 @@ export class S3MLayer {
       this._thematicElevation = new Map();
       this._elevationField = null;
       this._applyOverridesToAllMeshes();
+      if (this._selection) this._syncSelectionStyle();
       this.map?.triggerRepaint();
       return empty;
     }
@@ -979,6 +980,7 @@ export class S3MLayer {
     this._thematicElevation = next;
     this._elevationField = options.field;
     this._applyOverridesToAllMeshes();
+    if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
 
     return {
@@ -1000,6 +1002,7 @@ export class S3MLayer {
       elevations && elevations.size > 0 ? new Map([...elevations].filter(([, h]) => Number.isFinite(h) && h > 0)) : new Map();
     this._elevationField = this._thematicElevation.size > 0 ? field : null;
     this._applyOverridesToAllMeshes();
+    if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
 
@@ -1008,6 +1011,7 @@ export class S3MLayer {
     this._thematicElevation = new Map();
     this._elevationField = null;
     this._applyOverridesToAllMeshes();
+    if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
 
@@ -1769,12 +1773,27 @@ export class S3MLayer {
     u.uWidth.value = Math.max(0.1, s.outlineWidthPx ?? 3);
     u.uOpacity.value = Math.min(1, Math.max(0.05, s.opacity ?? 1));
     u.uElevation.value = this._selection ? this._selectionElevation(this._selection) : 0;
+
+    // 外扩描边是另一个材质实例，单体状态纹理的开关是建的时候抄过去的。
+    // 先选中、再抬高（或反过来）时模板会停留在旧值，这里补一次同步。
+    if (this._outlineMesh) {
+      const parent = this._outlineMesh.parent as THREE.Mesh | null;
+      const ud = parent ? styledMaterialOf(parent)?.userData : null;
+      if (ud?.uBatchTex) {
+        this.outlineMaterial.uniforms.uBatchTex.value = ud.uBatchTex.value;
+        this.outlineMaterial.uniforms.uBatchTexWidth.value = ud.uBatchTexWidth.value;
+        this.outlineMaterial.uniforms.uBatchTexActive.value = ud.uBatchTexActive.value;
+      }
+    }
   }
 
   /** 选中单体的实际拔高 = 全局选中拔高 + 该单体的独立拔高（与着色器口径一致） */
   private _selectionElevation(result: PickResult): number {
     let elev = this.style.selectElevation ?? 0;
-    if (result.smid != null) elev += this._featureStyles.get(result.smid)?.elevation ?? 0;
+    if (result.smid != null) {
+      // 手动拔高优先，否则用按业务字段抬高的值
+      elev += this._featureStyles.get(result.smid)?.elevation ?? this._thematicElevation.get(result.smid) ?? 0;
+    }
     return elev;
   }
 
