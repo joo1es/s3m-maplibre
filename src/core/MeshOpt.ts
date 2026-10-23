@@ -129,7 +129,12 @@ function decode(
   stride: number,
   source: Uint8Array
 ): Uint8Array {
-  const out = new Uint8Array(vertexCount * stride);
+  const size = vertexCount * stride;
+  // 头读错时 vertexCount 会是天文数字，这里先拦一道，免得报「Invalid typed array length」这种没法定位的错
+  if (!Number.isSafeInteger(size) || size > 64 * 1024 * 1024) {
+    throw new Error(`[s3m] MeshOpt 流尺寸异常：${vertexCount} 顶点 × ${stride}B = ${size}B`);
+  }
+  const out = new Uint8Array(size);
   decoder.decodeVertexBuffer(out, vertexCount, stride, source, source.length);
   return out;
 }
@@ -256,6 +261,13 @@ export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): 
       r.align4();
 
       if (!decodeThisBlock) continue;
+
+      // 切线流我们不用（渲染里没有法线贴图通道），解不出来也不该拖垮整个瓦片：
+      // 真实服务里带 PBR 的数据（如 SubwayStationCombined）都带这条流，之前直接抛错导致整套数据不可见
+      if (semantic === MeshOptSemantic.TANGENT) {
+        info.streams.push({ semantic: 'tangent', bytes: compressedSize, stride: 0 });
+        continue;
+      }
 
       const stride = strideFor(semantic, compressOptions, customId);
       let out: Uint8Array;

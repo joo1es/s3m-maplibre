@@ -339,4 +339,145 @@ console.log('\n=== 7. 拾取渲染目标缩到 1×1，靠平移 viewport 定位 
   console.log('  √ 1×1 渲染目标 + 平移 viewport，读回单像素；命中解析不变');
 }
 
+
+/* ------------------------------------------------- 8. 多 SMID 共用 batchId */
+
+console.log('\n=== 8. 多个 SMID 共用 batchId 时不互相覆盖 ===');
+{
+  const { createSharedUniforms, createStyledMaterial } = await import('../dist/render/StyleMaterial.js');
+
+  const layer = new S3MLayer({});
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, 1, 0, 0, 0, 0, 1], 3));
+  geo.setAttribute('aBatchId', new THREE.Float32BufferAttribute([0, 0, 0], 1));
+  geo.computeBoundingBox();
+  const mesh = new THREE.Mesh(geo, createStyledMaterial({ uniforms: createSharedUniforms() }));
+  // SMID 1 与 2 共用一个 batch（实测「邻店共 batchId」），3 独立
+  mesh.userData.geoRef = {
+    pickInfo: { 1: { batchId: 0 }, 2: { batchId: 0 }, 3: { batchId: 1 } },
+    entities: [],
+  };
+  layer._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' });
+  layer._indexMeshSmids(mesh);
+
+  const data = () => mesh.material.userData.uBatchTex.value.image.data;
+
+  // 两个 SMID 给同一个 batch 上不同颜色：不能出现「后写的说了算」
+  const realWarn = console.warn;
+  let warned = 0;
+  console.warn = () => {
+    warned++;
+  };
+  layer.setFeatureStyle(1, { color: '#ff0000' });
+  layer.setFeatureStyle(2, { color: '#00ff00' });
+  layer.flushOverrides();
+  console.warn = realWarn;
+
+  assert.ok(data()[0] > 0.9 && data()[1] < 0.05, '共用 batch 应取首个 SMID 的颜色（红），而不是被后写的绿覆盖');
+  assert.strictEqual(warned, 1, '冲突只告警一次，不刷屏');
+
+  // 任一隐藏则整批隐藏（batch 粒度没法定点藏其中一间）
+  layer.setFilter({ include: [3] });
+  layer.flushOverrides();
+  assert.strictEqual(data()[0 * 4 + 3], -1, 'SMID 1 被过滤后，共用的 batch 0 整批隐藏');
+  assert.strictEqual(data()[1 * 4 + 3], 0, 'batch 1 不受影响');
+
+  // 同一个 batch 既要隐藏又要抬高时，抬高不能把隐藏标记写回去
+  layer.setFeatureStyle(1, { color: '#ff0000', elevation: 30 });
+  layer.setThematicElevation(new Map([[1, 30]]));
+  layer.setFilter({ include: [3] });
+  layer.flushOverrides();
+  assert.strictEqual(data()[0 * 4 + 3], -1, '隐藏必须压过抬高，否则整批又被显示出来');
+
+  const audit = layer.auditBatches();
+  assert.strictEqual(audit.conflicts.length, 1, `应报出 1 个冲突 batch，实际 ${audit.conflicts.length}`);
+  assert.deepStrictEqual(audit.conflicts[0].smids, [1, 2], '冲突里应列出共用的两个 SMID');
+  assert.strictEqual(audit.batches, 2, '总共 2 个 batch');
+  assert.strictEqual(audit.conflictingSmids, 2, '卷进冲突的单体 2 个');
+  console.log('  √ 冲突取值确定（首个）、任一隐藏整批隐藏、auditBatches 能列出来');
+}
+
+
+/* ------------------------------------------------------ 9. CRN 解码器链路 */
+
+console.log('\n=== 9. CRN 解码器：魔数先拦、非法数据能明确拒绝 ===');
+{
+  const { transcodeCRN } = await import('../dist/core/CRNDecode.js');
+
+  // 空数据和非 CRN 数据在进 wasm 之前就该被拦掉（省一次 76KB wasm 的实例化）
+  await assert.rejects(() => transcodeCRN(new Uint8Array(0)), /为空/, '空数据应直接拒绝');
+  await assert.rejects(() => transcodeCRN(new Uint8Array([1, 2, 3, 4])), /CRN 头/, '非 CRN 数据应被魔数挡住');
+  await assert.rejects(() => transcodeCRN(new Uint8Array(64)), /CRN 头/, '全零数据应被魔数挡住');
+
+  // 带 Hx 头但内容非法：这条路才真正进 wasm，必须抛错而不是崩掉或挂住
+  const fake = new Uint8Array(64);
+  fake.set([0x48, 0x78, 0x00, 0x6e]);
+  const t0 = performance.now();
+  await assert.rejects(() => transcodeCRN(fake), /CRN|crunch/, '坏 CRN 数据应抛明确错误');
+  const first = performance.now() - t0;
+  console.log(
+    `  √ 魔数先行拦截；首次真正进 wasm（含实例化）${first.toFixed(1)}ms；` +
+      '真实 CRN 瓦片的熵解码已用 tools/crn-probe.mjs 在公有服务上验过'
+  );
+}
+
+
+/* ------------------------------------- 10. 没有叶子可淘汰时不能永久卡死 */
+
+console.log('\n=== 10. 叶子优先；脏数据（childTile 指回自己）时不会永久卡住 ===');
+{
+  const mkNode = (url, childUrl, lastSeen, distance) => ({
+    url,
+    tile: {},
+    group: new THREE.Group(),
+    sphere: null,
+    rangeValue: 100,
+    rangeMode: 1,
+    childUrl,
+    state: 'done',
+    lastSeen,
+    distance,
+  });
+
+  const makeSet = (removed) =>
+    new S3MTileset({
+      configUrl: 'http://example.com/a.scp',
+      maxTiles: 2,
+      buildTile: async () => ({ group: new THREE.Group(), stats: {} }),
+      onTileRemoved: (node) => removed.push(node.url),
+    });
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = () => new Promise(() => {});
+  try {
+    // A. 正常父子：父瓦片已细化，子瓦片是叶子 → 优先淘汰叶子，父瓦片留着兜底
+    {
+      const removed = [];
+      const ts = makeSet(removed);
+      ts.nodes.set('parent', mkNode('parent', 'child', 1, 900));
+      ts.nodes.set('child', mkNode('child', null, 9, 10));
+      ts._enqueue('http://example.com/new1.s3mb');
+      assert.deepStrictEqual(removed, ['child'], '有叶子时仍优先淘汰叶子，不动父瓦片');
+      assert.ok(ts.nodes.has('parent'), '父瓦片保留，视觉上不留洞');
+      assert.strictEqual(ts.nodes.size + ts.pending.size, 2, '总量回到 maxTiles');
+    }
+
+    // B. 脏数据：childTile 指回自己，谁都「不是叶子」——曾经会在这里永久拒绝加载
+    {
+      const removed = [];
+      const ts = makeSet(removed);
+      ts.nodes.set('self', mkNode('self', 'self', 1, 900));
+      ts.nodes.set('other', mkNode('other', 'other', 5, 500));
+      ts._enqueue('http://example.com/new2.s3mb');
+      assert.strictEqual(removed.length, 1, '应淘汰一块，而不是拒绝加载');
+      assert.strictEqual(ts.nodes.size + ts.pending.size, 2, '总量回到 maxTiles');
+      assert.ok(ts.pending.size === 1, '新瓦片进入了加载队列');
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  console.log('  √ 叶子优先；无叶子可挑时退一步淘汰已细化的父瓦片，不会卡死');
+}
+
 console.log('\n全部通过');
