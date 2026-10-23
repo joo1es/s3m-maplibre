@@ -1,6 +1,6 @@
 # API 参考
 
-> 版本 0.1.0 · 对应 `s3m-maplibre` 的 `src/index.ts` 导出面
+> 版本 0.2.6 · 对应 `s3m-maplibre` 的 `src/index.ts` 导出面
 
 ---
 
@@ -131,7 +131,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `datasets` | `S3MDatasetOptions[]` | `[]` | 多数据集叠加 |
 | `style` | `Partial<S3MStyle>` | 见[样式](#样式s3mstyle) | 初始样式 |
 | `pickable` | `boolean` | `true` | 是否响应点击 |
-| `maxTiles` | `number` | `64` | 每个数据集最多驻留瓦片 |
+| `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
 | `onStats` | `(s: S3MStats) => void` | — | 统计更新 |
 | `onReady` | `(entry) => void` | — | 某个数据集就绪 |
@@ -198,6 +198,8 @@ select(result: S3MPickResult | null, opts?: { silent?: boolean }): void
 `pick` 的坐标是**相对 canvas 左上角的 CSS 像素**。`pickFromEvent` 接受 MapLibre 的 `MouseEvent` 或原生事件，自动换算。
 
 拾取走 GPU：把「物体编号 + batchId」编码成 RGBA 渲染到离屏目标，再读那一个像素。代价与三角面数无关，且天然只命中最前面的可见面。
+
+离屏目标只有 **1×1**：viewport 尺寸仍是整块画布、原点平移到 `(-px, -(h-1-py))`，于是整幅画面按原样光栅化，只有点击点那一格落在目标上。着色器、矩阵、深度测试全都不变，但每点一次不再渲染一整屏（移动端收益最明显）。
 
 `select` 负责高亮与描边，传 `null` 清除选中。
 
@@ -505,7 +507,7 @@ tileset.update(
 | 多数据集对齐 | 每份数据各有锚点，`S3MLayer` 会把锚点差写进数据集的 `Group.position`（米），纯 three 需要自己算一次 |
 | 贴地与经纬度 | 没有地图就没有墨卡托那一步，只有局部米制坐标 |
 | 拾取 / 描边 / 样式 UI | `Picker`、等宽棱线、`setStyle` 都在 `S3MLayer` 上，纯 three 用法要直接操作 `uniforms` 和 Mesh |
-| 瓦片卸载 | 瓦片只增不减，靠 `maxTiles` 卡住总量 |
+| 瓦片卸载 | 超出 `maxTiles` 时按「最久没进有效范围」淘汰，同帧再比距离 |
 
 ---
 
@@ -578,8 +580,30 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 | 关闭 `edges` | 棱线是 CPU 端构建的等宽线几何（每段线段 4 个顶点），内存和 drawcall 都随网格数增长，大场景慎用 |
 | `shading: 'flat'` | 与 `'smooth'` 性能相当，但视觉更干净 |
 | 不透明度 < 1 | 会开启混合并关闭深度写入，overdraw 明显上升，仅用于演示 |
+| 批量改单体样式 | 同一同步块里的多次 `setFeatureStyle` 会合并成一次状态纹理重写，见下 |
+| `pick` 只渲染 1 个像素 | 已内置；hover 高亮、框选这类高频拾取不再有整屏开销 |
 
 实测（上海某区，5 数据集叠加，45 万三角面，1440×900）：**85~90 fps**。
+
+### 批量改单体样式
+
+单体状态（颜色 / 抬高 / 隐藏）写在**每个网格各自一张一维纹理**里，改一个单体就是重写这张纹理。
+逐个高亮时最贵的就是这里：一块白模网格常有几千个 batch，每改一个单体就全量重算一遍，500 个门店 × 6848 个 batch 就是 340 万次迭代。
+
+所以内部做了两层合并：
+
+- **按 SMID 定位网格**：维护 `SMID → 网格` 反查表，改一个只重算包含它的那几块；
+- **脏标记 + 微任务合并**：同一个同步块里的多次调用只重算一次。微任务一定在下一帧 `render()` 之前跑完，画面不会看到中间状态。
+
+```ts
+// 300 次调用 → 1 次纹理重写
+for (const smid of hits) layer.setFeatureStyle(smid, { color: '#ef4444' });
+
+// 需要同步拿到结果（紧接着读纹理、截图、导出）时手动刷
+layer.flushOverrides();
+```
+
+`filterByField` / `colorByField` / `elevateByField` / `setThematicColors` 这类**全局**改动会重算所有网格，但同样被合并成一次。
 
 ---
 

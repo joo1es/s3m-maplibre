@@ -8,6 +8,11 @@
  * 编码约定（每个通道一个字节）：
  *   R,G = 物体编号 + 1
  *   B,A = batchId + 1        （+1 是为了让「什么都没点到」全 0）
+ *
+ * 渲染目标只有 size×size 个像素，靠平移 viewport 把「点击点那一格」挪到目标里：
+ * viewport 原点设成 (0 - px, 0 - (h-1-py))、尺寸仍是整块画布，于是光栅化结果和全屏
+ * 那一趟逐像素一致，只是只有一个像素落在目标上。原来那句「每次点击全屏渲染一趟」
+ * 的代价（移动端尤其明显）就没了。
  */
 import * as THREE from 'three';
 
@@ -109,17 +114,20 @@ function createPickMaterial(objectId: number): THREE.ShaderMaterial {
 
 export class Picker {
   readonly renderer: THREE.WebGLRenderer;
+  /** 拾取用的渲染目标边长（像素），默认 1 —— 只要点击点那一格 */
+  readonly size: number;
   private target: THREE.WebGLRenderTarget | null = null;
   private readonly buf = new Uint8Array(4);
 
-  constructor(renderer: THREE.WebGLRenderer) {
+  constructor(renderer: THREE.WebGLRenderer, options: { size?: number } = {}) {
     this.renderer = renderer;
+    this.size = Math.max(1, Math.floor(options.size ?? 1));
   }
 
-  private _ensureTarget(w: number, h: number): THREE.WebGLRenderTarget {
-    if (this.target && this.target.width === w && this.target.height === h) return this.target;
+  private _ensureTarget(size: number): THREE.WebGLRenderTarget {
+    if (this.target && this.target.width === size && this.target.height === size) return this.target;
     this.target?.dispose();
-    this.target = new THREE.WebGLRenderTarget(w, h, {
+    this.target = new THREE.WebGLRenderTarget(size, size, {
       minFilter: THREE.NearestFilter,
       magFilter: THREE.NearestFilter,
       format: THREE.RGBAFormat,
@@ -147,10 +155,19 @@ export class Picker {
     const py = Math.floor((clientY / canvas.clientHeight) * h);
     if (px < 0 || py < 0 || px >= w || py >= h) return null;
 
-    const target = this._ensureTarget(w, h);
+    const target = this._ensureTarget(this.size);
+
+    // 点击点落在整块画布的第几行（WebGL 的 y 轴朝上）
+    const ygl = h - 1 - py;
+    // 目标里我们读的那一格（size 为偶数时取偏左上那格）
+    const cx = Math.floor(this.size / 2);
+    const cy = Math.floor(this.size / 2);
+    // viewport 尺寸仍是整块画布、原点平移，把 (px, ygl) 挪到目标的 (cx, cy)
+    target.viewport.set(cx - px, cy - ygl, w, h);
 
     // ---- 保存渲染器状态
     const prevTarget = renderer.getRenderTarget();
+    const prevViewport = renderer.getViewport(new THREE.Vector4());
     const prevTone = renderer.toneMapping;
     const prevColorSpace = renderer.outputColorSpace;
     const prevAutoClear = renderer.autoClear;
@@ -219,8 +236,7 @@ export class Picker {
       renderer.clear();
       renderer.render(scene, camera);
 
-      // WebGL 的 y 轴朝上，读取时要翻过来
-      renderer.readRenderTargetPixels(target, px, h - 1 - py, 1, 1, this.buf);
+      renderer.readRenderTargetPixels(target, cx, cy, 1, 1, this.buf);
 
       const r = this.buf[0];
       const g = this.buf[1];
@@ -233,6 +249,7 @@ export class Picker {
       for (const [mesh, mat] of swapped) mesh.material = mat;
       for (const o of hidden) o.visible = true;
       renderer.setRenderTarget(prevTarget);
+      renderer.setViewport(prevViewport);
       renderer.toneMapping = prevTone;
       renderer.outputColorSpace = prevColorSpace;
       renderer.autoClear = prevAutoClear;

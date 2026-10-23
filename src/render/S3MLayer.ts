@@ -495,6 +495,17 @@ export class S3MLayer {
   private readonly _pickables = new Map<number, PickableRef>();
   private _pickSeq = 0;
   private readonly _freePickIds: number[] = [];
+  /** SMID → 包含它的网格。改单个单体样式时只重算这几块，不用全量扫 */
+  private readonly _smidMeshes = new Map<number, Set<THREE.Mesh>>();
+  /** 待重写单体状态纹理的网格；_dirtyAll 为 true 时忽略这个集合 */
+  private readonly _dirtyMeshes = new Set<THREE.Mesh>();
+  private _dirtyAll = false;
+  private _flushScheduled = false;
+  /** 每块网格的世界高度范围，用来增量维护 uHeightMin / uHeightMax */
+  private readonly _meshHeight = new Map<THREE.Mesh, { min: number; max: number }>();
+  private _heightMin = Infinity;
+  private _heightMax = -Infinity;
+  private readonly _boxScratch = new THREE.Box3();
   private _selection: PickResult | null = null;
   private _outlineMesh: THREE.Mesh | null = null;
   private _selectionEdges: THREE.Mesh | null = null;
@@ -595,6 +606,13 @@ export class S3MLayer {
     this.edgeMaterial.dispose();
     this.selectionEdgeMaterial.dispose();
     this.scene?.clear();
+    this._smidMeshes.clear();
+    this._meshHeight.clear();
+    this._dirtyMeshes.clear();
+    this._dirtyAll = false;
+    this._flushScheduled = false;
+    this._heightMin = Infinity;
+    this._heightMax = -Infinity;
     this.renderer?.dispose();
     this.renderer = null;
     this.map = null;
@@ -722,6 +740,7 @@ export class S3MLayer {
     ];
     entry.root.position.set(entry.offset[0], entry.offset[1], entry.offset[2]);
     entry.root.updateMatrixWorld(true);
+    this._refreshAllHeights();
   }
 
   /**
@@ -764,7 +783,7 @@ export class S3MLayer {
    */
   setFeatureStyle(smid: number, style: FeatureStyle): void {
     this._featureStyles.set(smid, style);
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty(this._meshesOf([smid]));
     if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
@@ -774,7 +793,7 @@ export class S3MLayer {
     for (const smid of smids) {
       this._featureStyles.set(smid, style);
     }
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty(this._meshesOf(smids));
     if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
@@ -792,7 +811,7 @@ export class S3MLayer {
   /** 移除指定单体的自定义样式，恢复为图层全局样式 */
   removeFeatureStyle(smid: number): void {
     if (this._featureStyles.delete(smid)) {
-      this._applyOverridesToAllMeshes();
+      this._markOverridesDirty(this._meshesOf([smid]));
       if (this._selection) this._syncSelectionStyle();
       this.map?.triggerRepaint();
     }
@@ -802,7 +821,7 @@ export class S3MLayer {
   clearFeatureStyles(): void {
     if (this._featureStyles.size > 0) {
       this._featureStyles.clear();
-      this._applyOverridesToAllMeshes();
+      this._markOverridesDirty();
       if (this._selection) this._syncSelectionStyle();
       this.map?.triggerRepaint();
     }
@@ -820,16 +839,7 @@ export class S3MLayer {
 
   /** 当前场景里已经加载的单体 ID（按 SMID 去重），也是 colorByField 的默认范围 */
   getLoadedSmids(): number[] {
-    const out = new Set<number>();
-    for (const p of this._pickables.values()) {
-      const pickInfo = (p.mesh.userData as MeshUserData).geoRef?.pickInfo;
-      if (!pickInfo) continue;
-      for (const key of Object.keys(pickInfo)) {
-        const smid = Number(key);
-        if (Number.isFinite(smid) && smid >= 0) out.add(smid);
-      }
-    }
-    return [...out];
+    return [...this._smidMeshes.keys()];
   }
 
   /** 当前专题着色用的字段名 */
@@ -844,7 +854,7 @@ export class S3MLayer {
   setThematicColors(colors: Map<number, string> | null, field = 'custom'): void {
     this._thematic = colors && colors.size > 0 ? new Map(colors) : new Map();
     this._thematicField = this._thematic.size > 0 ? field : null;
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     this.map?.triggerRepaint();
   }
 
@@ -852,7 +862,7 @@ export class S3MLayer {
     if (this._thematic.size === 0 && !this._thematicField) return;
     this._thematic = new Map();
     this._thematicField = null;
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     this.map?.triggerRepaint();
   }
 
@@ -907,7 +917,7 @@ export class S3MLayer {
     this._fieldFilter = matched.size || mode === 'keep' ? { field: options.field, mode, matched } : null;
     result.hidden = all.filter((smid) => (mode === 'keep' ? !matched.has(smid) : matched.has(smid)));
 
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
     return result;
@@ -917,7 +927,7 @@ export class S3MLayer {
   clearFieldFilter(): void {
     if (!this._fieldFilter) return;
     this._fieldFilter = null;
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     this.map?.triggerRepaint();
   }
 
@@ -950,7 +960,7 @@ export class S3MLayer {
     if (!all.length) {
       this._thematicElevation = new Map();
       this._elevationField = null;
-      this._applyOverridesToAllMeshes();
+      this._markOverridesDirty();
       return empty;
     }
 
@@ -963,7 +973,7 @@ export class S3MLayer {
     if (numeric.size === 0) {
       this._thematicElevation = new Map();
       this._elevationField = null;
-      this._applyOverridesToAllMeshes();
+      this._markOverridesDirty();
       if (this._selection) this._syncSelectionStyle();
       this.map?.triggerRepaint();
       return empty;
@@ -988,7 +998,7 @@ export class S3MLayer {
 
     this._thematicElevation = next;
     this._elevationField = options.field;
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
 
@@ -1010,7 +1020,7 @@ export class S3MLayer {
     this._thematicElevation =
       elevations && elevations.size > 0 ? new Map([...elevations].filter(([, h]) => Number.isFinite(h) && h > 0)) : new Map();
     this._elevationField = this._thematicElevation.size > 0 ? field : null;
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
@@ -1019,7 +1029,7 @@ export class S3MLayer {
     if (this._thematicElevation.size === 0) return;
     this._thematicElevation = new Map();
     this._elevationField = null;
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
@@ -1081,7 +1091,7 @@ export class S3MLayer {
       if (numeric.size === 0) {
         this._thematic = new Map();
         this._thematicField = null;
-        this._applyOverridesToAllMeshes();
+        this._markOverridesDirty();
         this.map?.triggerRepaint();
         return { field: options.field, matched: 0, missing: smids.length, legend: [] };
       }
@@ -1132,7 +1142,7 @@ export class S3MLayer {
 
     this._thematic = colors;
     this._thematicField = options.field;
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     this.map?.triggerRepaint();
 
     return {
@@ -1157,7 +1167,7 @@ export class S3MLayer {
     } else if (this.uniforms.uFilterHeightActive) {
       this.uniforms.uFilterHeightActive.value = 0;
     }
-    this._applyOverridesToAllMeshes();
+    this._markOverridesDirty();
     if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
@@ -1309,8 +1319,58 @@ export class S3MLayer {
     mat.userData.uBatchTexActive.value = hasActive ? 1 : 0;
   }
 
-  private _applyOverridesToAllMeshes(): void {
+  private _applyOverridesToAllMeshes(meshes?: Iterable<THREE.Mesh>): void {
+    if (meshes) {
+      for (const mesh of meshes) this._applyOverridesToMesh(mesh);
+      return;
+    }
     for (const p of this._pickables.values()) this._applyOverridesToMesh(p.mesh);
+  }
+
+  /** 哪些网格装了这些单体（查 SMID → 网格 反查表） */
+  private _meshesOf(smids: Iterable<number>): Set<THREE.Mesh> {
+    const out = new Set<THREE.Mesh>();
+    for (const smid of smids) {
+      const set = this._smidMeshes.get(smid);
+      if (set) for (const mesh of set) out.add(mesh);
+    }
+    return out;
+  }
+
+  /**
+   * 标记「单体状态纹理需要重写」。
+   *
+   * 逐个高亮时最贵的是这里：一个网格有几千个 batch，每改一个单体就全量重算一遍，
+   * 500 个门店 × 6848 个 batch 就是 340 万次迭代。所以只记脏，攒到微任务里合并成一次；
+   * 微任务一定在下一帧 render 之前跑完，画面不会看到中间状态。
+   */
+  private _markOverridesDirty(scope: Iterable<THREE.Mesh> | 'all' = 'all'): void {
+    if (scope === 'all') {
+      this._dirtyAll = true;
+      this._dirtyMeshes.clear();
+    } else if (!this._dirtyAll) {
+      for (const mesh of scope) this._dirtyMeshes.add(mesh);
+    }
+    if (!this._flushScheduled) {
+      this._flushScheduled = true;
+      queueMicrotask(() => this.flushOverrides());
+    }
+    this.map?.triggerRepaint();
+  }
+
+  /** 立刻把待写的单体状态纹理刷出去（同步改完就要读纹理的场景用得上） */
+  flushOverrides(): void {
+    if (!this._flushScheduled && !this._dirtyAll && this._dirtyMeshes.size === 0) return;
+    this._flushScheduled = false;
+    if (this._dirtyAll) {
+      this._dirtyAll = false;
+      this._dirtyMeshes.clear();
+      this._applyOverridesToAllMeshes();
+      return;
+    }
+    const meshes = [...this._dirtyMeshes];
+    this._dirtyMeshes.clear();
+    this._applyOverridesToAllMeshes(meshes);
   }
 
   removeDataset(id: string): void {
@@ -1325,6 +1385,9 @@ export class S3MLayer {
         this._releasePickId(ud.pickId);
         ud.pickId = undefined;
       }
+      this._unindexMeshSmids(mesh);
+      this._removeMeshHeight(mesh);
+      this._dirtyMeshes.delete(mesh);
       // batch 状态纹理是 DataTexture，WeakMap 不会替 GPU 释放，必须显式 dispose
       const record = this._meshBatchTextures.get(mesh);
       if (record) {
@@ -1389,6 +1452,8 @@ export class S3MLayer {
         tile: node.tile,
         skeletonName: ud.skeletonName ?? '',
       });
+      this._indexMeshSmids(mesh);
+      this._addMeshHeight(mesh);
       if (this._edgesEnabled && !hasNativeEdges) this._ensureEdges(mesh);
 
       // 新瓦片要继承当前的不透明度与着色方式
@@ -1403,7 +1468,6 @@ export class S3MLayer {
         this._applyOverridesToMesh(mesh);
       }
     }
-    this._refreshHeightRange();
   }
 
   /** 瓦片被淘汰：从拾取表和场景里摘掉，并释放它自己的 GPU 资源 */
@@ -1418,6 +1482,9 @@ export class S3MLayer {
         this._releasePickId(ud.pickId);
         ud.pickId = undefined;
       }
+      this._unindexMeshSmids(mesh);
+      this._removeMeshHeight(mesh);
+      this._dirtyMeshes.delete(mesh);
       const record = this._meshBatchTextures.get(mesh);
       if (record) {
         record.texture.dispose();
@@ -1428,7 +1495,6 @@ export class S3MLayer {
       mesh.geometry?.dispose?.();
     }
     entry.root.remove(node.group);
-    this._refreshHeightRange();
   }
 
   /**
@@ -1546,22 +1612,92 @@ export class S3MLayer {
     this.map?.triggerRepaint();
   }
 
-  private _refreshHeightRange(): void {
+  /**
+   * 高度范围增量维护。
+   *
+   * 原来每注册一块瓦片都要把所有网格重新遍历一遍、每个都 clone 一个 Box3 再乘矩阵，
+   * 加载 n 块瓦片就是 O(n²) 次矩阵乘 + n² 个垃圾对象。现在只在网格进出的记一次，
+   * 全局值从缓存里滚：只有被移除的那块正好卡在边界上时，才回退到一次 O(n) 重算。
+   */
+  private _addMeshHeight(mesh: THREE.Mesh): void {
+    const bb = mesh.geometry?.boundingBox;
+    if (!bb) return;
+    this._boxScratch.copy(bb).applyMatrix4(mesh.matrixWorld);
+    const min = this._boxScratch.min.z;
+    const max = this._boxScratch.max.z;
+    if (!Number.isFinite(min) || !Number.isFinite(max)) return;
+    this._meshHeight.set(mesh, { min, max });
+    if (min < this._heightMin) this._heightMin = min;
+    if (max > this._heightMax) this._heightMax = max;
+    this._pushHeightRange();
+  }
+
+  private _removeMeshHeight(mesh: THREE.Mesh): void {
+    const rec = this._meshHeight.get(mesh);
+    if (!rec) return;
+    this._meshHeight.delete(mesh);
+    // 只有正好卡在边界上才需要重算，否则滚动的 min/max 依然成立
+    if (rec.min === this._heightMin || rec.max === this._heightMax) this._recomputeHeightRange();
+    else this._pushHeightRange();
+  }
+
+  /** 数据集整体位移（换高程偏移 / 重新布局）后，缓存的世界高度全部失效 */
+  private _refreshAllHeights(): void {
+    if (this._meshHeight.size === 0) return;
+    const meshes = [...this._meshHeight.keys()];
+    this._meshHeight.clear();
+    this._heightMin = Infinity;
+    this._heightMax = -Infinity;
+    for (const mesh of meshes) this._addMeshHeight(mesh);
+    this._pushHeightRange();
+  }
+
+  private _recomputeHeightRange(): void {
     let min = Infinity;
     let max = -Infinity;
-    for (const p of this._pickables.values()) {
-      const bb = p.mesh.geometry?.boundingBox;
-      if (!bb) continue;
-      const box = bb.clone().applyMatrix4(p.mesh.matrixWorld);
-      if (box.min.z < min) min = box.min.z;
-      if (box.max.z > max) max = box.max.z;
+    for (const h of this._meshHeight.values()) {
+      if (h.min < min) min = h.min;
+      if (h.max > max) max = h.max;
     }
-    if (!isFinite(min) || !isFinite(max) || max <= min) {
+    this._heightMin = min;
+    this._heightMax = max;
+    this._pushHeightRange();
+  }
+
+  private _pushHeightRange(): void {
+    let min = this._heightMin;
+    let max = this._heightMax;
+    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
       min = 0;
       max = 100;
     }
     this.uniforms.uHeightMin.value = min;
     this.uniforms.uHeightMax.value = max;
+  }
+
+  /** 建 SMID → 网格 反查表，逐单体改样式时才知道该重算哪几块 */
+  private _indexMeshSmids(mesh: THREE.Mesh): void {
+    const pickInfo = (mesh.userData as MeshUserData).geoRef?.pickInfo;
+    if (!pickInfo) return;
+    for (const key of Object.keys(pickInfo)) {
+      const smid = Number(key);
+      if (!Number.isFinite(smid) || smid < 0) continue;
+      let set = this._smidMeshes.get(smid);
+      if (!set) this._smidMeshes.set(smid, (set = new Set()));
+      set.add(mesh);
+    }
+  }
+
+  private _unindexMeshSmids(mesh: THREE.Mesh): void {
+    const pickInfo = (mesh.userData as MeshUserData).geoRef?.pickInfo;
+    if (!pickInfo) return;
+    for (const key of Object.keys(pickInfo)) {
+      const smid = Number(key);
+      const set = this._smidMeshes.get(smid);
+      if (!set) continue;
+      set.delete(mesh);
+      if (set.size === 0) this._smidMeshes.delete(smid);
+    }
   }
 
   /**
@@ -1895,6 +2031,9 @@ export class S3MLayer {
 
   render(gl: WebGLRenderingContext | WebGL2RenderingContext, arg: unknown): void {
     if (!this.renderer || !this.scene || !this.camera || !this.sceneAnchor || !this.map) return;
+
+    // 脏标记正常由微任务刷掉；这里再兜一次底，保证「本帧画出来的」一定是最新样式
+    if (this._flushScheduled) this.flushOverrides();
 
     const matrix = this._extractMatrix(arg);
     if (!matrix) return;
