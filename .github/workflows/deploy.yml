@@ -41,6 +41,7 @@ jobs:
           mkdir -p _site
           cp -r demo _site/demo
           cp -r dist _site/dist
+          cp -r docs _site/docs
           cat << 'EOF' > _site/index.html
           <!doctype html>
           <html lang="zh-CN">
@@ -53,20 +54,27 @@ jobs:
                        font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
                        background: #0d1420; color: #e6edf7; }
                 .wrap { width: 460px; padding: 28px; }
-                h1 { margin: 0 0 6px; font-size: 19px; }
+                h1 { margin: 0 0 6px; font-size: 20px; font-weight: 700; }
                 p { margin: 0 0 20px; color: #8fa1b8; font-size: 13px; line-height: 1.7; }
-                a.card { display: block; margin-bottom: 10px; padding: 14px 16px; text-decoration: none;
+                a.card { display: block; margin-bottom: 12px; padding: 14px 16px; text-decoration: none;
                          color: inherit; border: 1px solid rgba(255,255,255,.12); border-radius: 10px;
                          background: rgba(255,255,255,.04); transition: .15s; }
                 a.card:hover { background: rgba(59,130,246,.16); border-color: #3b82f6; }
                 a.card b { font-size: 14px; }
                 a.card span { display: block; margin-top: 3px; color: #8fa1b8; font-size: 12px; }
+                a.card.primary { border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.08); }
+                a.card.primary:hover { border-color: #38bdf8; background: rgba(56, 189, 248, 0.16); }
+                a.card.primary b { color: #38bdf8; }
               </style>
             </head>
             <body>
               <div class="wrap">
                 <h1>S3M for MapLibre</h1>
-                <p>浏览器里直接解析 .s3mb 瓦片，用 three.js 渲染。下面两个示例跑的是同一份样例数据。</p>
+                <p>浏览器里直接解析 .s3mb 瓦片，用 three.js 渲染。提供开箱即用的原生图层与完整文档。</p>
+                <a class="card primary" href="docs/index.html">
+                  <b>📚 完整开发指南 & API 文档 →</b>
+                  <span>生命周期 · 着色模式 · 单体拾取 · 空间计算 · 正交投影</span>
+                </a>
                 <a class="card" href="demo/index.html">
                   <b>MapLibre 完整示例 →</b>
                   <span>数据集叠加 · 着色模式 · 单体拾取 · 选中棱线</span>

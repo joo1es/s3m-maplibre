@@ -40,7 +40,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs",
+    "build": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/build-docs.mjs",
+    "build:docs": "node tools/build-docs.mjs",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "serve": "node tools/serve.mjs",
@@ -86,6 +87,7 @@
   "devDependencies": {
     "@types/three": "^0.169.0",
     "maplibre-gl": ">=4.0.0",
+    "marked": "^18.1.1",
     "three": "^0.169.0",
     "typescript": "^5.6.3"
   }
