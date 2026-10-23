@@ -63,6 +63,8 @@ export type {
   MapMouseEventLike,
   ColorByFieldOptions,
   ThematicLegendEntry,
+  BatchConflict,
+  BatchAudit,
   ThematicResult,
   FieldFilterOptions,
   FieldFilterResult,
@@ -75,6 +77,9 @@ export type { BuildTileOptions, BuildTileResult, TileBuildStats } from './render
 
 export { createTexture, PixelFormat, setMaxAnisotropy } from './render/TextureFactory.js';
 export type { DecodedTexture } from './render/TextureFactory.js';
+
+export { resolveTextureKind, dxtPixelFormatOf, TextureCompress } from './core/TextureFormat.js';
+export type { TextureKind } from './core/TextureFormat.js';
 
 export { createSharedUniforms, createStyledMaterial, createOutlineMaterial } from './render/StyleMaterial.js';
 export type { StyleMode, StyledMaterial, StyledMaterialOptions, OutlineMaterial } from './render/StyleMaterial.js';
