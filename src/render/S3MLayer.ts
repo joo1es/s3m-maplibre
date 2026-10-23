@@ -49,6 +49,8 @@ import type {
 
 const EARTH_RADIUS = 6378137;
 const DEFAULT_FOV = 0.6435011087932844; // MapLibre 默认垂直视场角
+/** 拾取 ID 用 RG 两个通道编码（都存 id+1），所以上限是 65535 个网格 */
+const MAX_PICK_ID = 65534;
 
 /* ------------------------------------------------------------------ 宿主适配 */
 
@@ -492,6 +494,7 @@ export class S3MLayer {
 
   private readonly _pickables = new Map<number, PickableRef>();
   private _pickSeq = 0;
+  private readonly _freePickIds: number[] = [];
   private _selection: PickResult | null = null;
   private _outlineMesh: THREE.Mesh | null = null;
   private _selectionEdges: THREE.Mesh | null = null;
@@ -667,6 +670,12 @@ export class S3MLayer {
       uniforms: this.uniforms,
       onTile: (node) => {
         this._registerTile(node, entry);
+        this.onStats(this.stats);
+        this._needsRepaint = true;
+        this.map?.triggerRepaint();
+      },
+      onTileRemoved: (node) => {
+        this._unregisterTile(node, entry);
         this.onStats(this.stats);
         this._needsRepaint = true;
         this.map?.triggerRepaint();
@@ -1301,9 +1310,7 @@ export class S3MLayer {
   }
 
   private _applyOverridesToAllMeshes(): void {
-    for (const p of this._pickables.values()) {
-      this._applyOverridesToMesh(p.mesh);
-    }
+    for (const p of this._pickables.values()) this._applyOverridesToMesh(p.mesh);
   }
 
   removeDataset(id: string): void {
@@ -1312,6 +1319,18 @@ export class S3MLayer {
     if (this._selection?.datasetId === id) this.select(null);
     entry.root.traverse((o) => {
       const mesh = o as THREE.Mesh;
+      const ud = mesh.userData as MeshUserData;
+      if (ud.pickId != null) {
+        this._pickables.delete(ud.pickId);
+        this._releasePickId(ud.pickId);
+        ud.pickId = undefined;
+      }
+      // batch 状态纹理是 DataTexture，WeakMap 不会替 GPU 释放，必须显式 dispose
+      const record = this._meshBatchTextures.get(mesh);
+      if (record) {
+        record.texture.dispose();
+        this._meshBatchTextures.delete(mesh);
+      }
       mesh.geometry?.dispose?.();
       const styled = styledMaterialOf(mesh);
       if (styled) styled.dispose();
@@ -1361,7 +1380,7 @@ export class S3MLayer {
       const mesh = child as THREE.Mesh;
       if (!mesh.isMesh) continue;
       const ud = mesh.userData as MeshUserData;
-      ud.pickId = this._pickSeq++;
+      ud.pickId = this._allocPickId();
       ud.datasetId = entry.id;
       ud.nativeEdges = hasNativeEdges;
       this._pickables.set(ud.pickId, {
@@ -1385,6 +1404,49 @@ export class S3MLayer {
       }
     }
     this._refreshHeightRange();
+  }
+
+  /** 瓦片被淘汰：从拾取表和场景里摘掉，并释放它自己的 GPU 资源 */
+  private _unregisterTile(node: TileNode, entry: S3MDatasetEntry): void {
+    for (const child of [...node.group.children]) {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh) continue;
+      const ud = mesh.userData as MeshUserData;
+      if (this._selection?.mesh === mesh) this.select(null);
+      if (ud.pickId != null) {
+        this._pickables.delete(ud.pickId);
+        this._releasePickId(ud.pickId);
+        ud.pickId = undefined;
+      }
+      const record = this._meshBatchTextures.get(mesh);
+      if (record) {
+        record.texture.dispose();
+        this._meshBatchTextures.delete(mesh);
+      }
+      const styled = styledMaterialOf(mesh);
+      styled?.dispose?.();
+      mesh.geometry?.dispose?.();
+    }
+    entry.root.remove(node.group);
+    this._refreshHeightRange();
+  }
+
+  /**
+   * 拾取 ID 只有 2 个字节（RG 两个通道），65535 个网格就到头了，
+   * 所以必须回收：瓦片淘汰 / 数据集移除时把 id 还回池子。
+   */
+  private _allocPickId(): number {
+    const reused = this._freePickIds.pop();
+    if (reused !== undefined) return reused;
+    if (this._pickSeq > MAX_PICK_ID) {
+      for (let id = 0; id <= MAX_PICK_ID; id++) if (!this._pickables.has(id)) return id;
+      throw new Error(`[s3m] 可拾取网格超过 ${MAX_PICK_ID + 1} 个，2 字节 ID 编码不够用`);
+    }
+    return this._pickSeq++;
+  }
+
+  private _releasePickId(id: number): void {
+    this._freePickIds.push(id);
   }
 
   /* ---------------------------------------------------------------- 样式 */

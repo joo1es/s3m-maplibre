@@ -1,13 +1,21 @@
 /**
  * 用官方样例数据验证解析器：node tools/parse-sample.mjs
  */
-import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
 import { parseS3MB } from '../dist/core/S3MBParser.js';
 
-const ROOT = fileURLToPath(new URL('../../s3m-spec/S3M_SDK/S3M_JS/data/', import.meta.url));
+// 官方样例仓库是可选依赖：本地没克隆（或在 CI 里）就跳过，不要因此让整条测试链挂掉
+const DEFAULT_ROOT = fileURLToPath(new URL('../../s3m-spec/S3M_SDK/S3M_JS/data/', import.meta.url));
+const ROOT = process.env.S3M_SAMPLE_DIR ?? DEFAULT_ROOT;
+
+if (!existsSync(ROOT)) {
+  console.log(`跳过解析样例：没有找到 ${ROOT}
+（克隆 SuperMap/s3m-spec 到同级目录，或用 S3M_SAMPLE_DIR 指定）`);
+  process.exit(0);
+}
 
 function toArrayBuffer(buf) {
   return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);

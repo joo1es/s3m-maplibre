@@ -291,15 +291,15 @@ export async function buildTileObjects(
     }
   }
 
-  // 2) 材质描述表与材质池缓存
+  // 2) 材质描述表
+  //
+  // 注意：这里**不做**材质池化。单体状态（隐藏 / 改色 / 抬高 / 选中）是按 mesh 写在
+  // 材质自己的 uniform 上的（uBatchTex / uSelBatch），一旦多个 mesh 共用同一个材质实例，
+  // 就是「81 个 mesh 抢一份 uniform，最后写的赢」——白模瓦片里按单体操作会大面积失效。
+  // 材质对象本身很轻（program 由 customProgramCacheKey 复用），一栋一个不心疼。
   const materialList = resolveMaterialList(tile.materials);
-  const materialCache = new Map<string, StyledMaterial>();
 
   const makeMaterial = (code?: string): StyledMaterial => {
-    const cacheKey = code ?? '__default__';
-    const cached = materialCache.get(cacheKey);
-    if (cached) return cached;
-
     const entry = materialList.find((e) => materialName(unwrapMaterial(e)) === code);
     const m = unwrapMaterial(entry);
     const units = materialUnits(m);
@@ -352,7 +352,6 @@ export async function buildTileObjects(
       opacity: diffuse.a ?? 1,
       roughness,
     });
-    materialCache.set(cacheKey, mat);
     return mat;
   };
 

@@ -82,6 +82,10 @@ export interface TileNode {
   rangeMode: number;
   childUrl: string | null;
   state: string;
+  /** 最近一次 update() 到相机的距离（米），淘汰时按它排序 */
+  distance?: number;
+  /** 最近一次「在有效范围内」的帧号，越小越该被淘汰 */
+  lastSeen?: number;
 }
 
 /** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
@@ -97,8 +101,12 @@ export interface S3MTilesetOptions {
   buildTile?: BuildTileFn | null;
   uniforms?: StyleUniforms | null;
   onTile?: (node: TileNode) => void;
+  /** 超过 maxTiles 被淘汰时回调，调用方要自己把场景里的对象和拾取表清掉 */
+  onTileRemoved?: (node: TileNode) => void;
   onProgress?: (stats: Stats) => void;
   onError?: (error: unknown) => void;
+  /** 单块瓦片加载失败后的重试次数，默认 2（退避 0.8s / 1.6s） */
+  maxRetries?: number;
 }
 
 export class S3MTileset {
@@ -116,8 +124,14 @@ export class S3MTileset {
   maxTiles: number;
 
   private readonly _onTile: (node: TileNode) => void;
+  private readonly _onTileRemoved: (node: TileNode) => void;
   private readonly _onError: (error: unknown) => void;
   private readonly _onProgress: (stats: Stats) => void;
+  private readonly _maxRetries: number;
+  /** 失败重试计数与下次可用时间，退避期间 _enqueue 会直接跳过 */
+  private readonly _retryCount = new Map<string, number>();
+  private readonly _retryAt = new Map<string, number>();
+  private _frame = 0;
   private _buildTile: BuildTileFn | null;
   private readonly _uniforms: StyleUniforms | null;
   private _queue: string[] = [];
@@ -126,8 +140,10 @@ export class S3MTileset {
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
     this._onTile = options.onTile ?? (() => {});
+    this._onTileRemoved = options.onTileRemoved ?? (() => {});
     this._onError = options.onError ?? ((e) => console.warn(e));
     this._onProgress = options.onProgress ?? (() => {});
+    this._maxRetries = Math.max(0, options.maxRetries ?? 2);
 
     // 渲染层可注入：Node 环境下不需要 three，也能跑 URL / 解析链路
     this._buildTile = options.buildTile ?? null;
@@ -163,9 +179,49 @@ export class S3MTileset {
     if (!url) return;
     if (this.nodes.has(url) || this.pending.has(url) || this.failed.has(url)) return;
     if (this._queue.includes(url)) return;
-    if (this.nodes.size + this.pending.size >= this.maxTiles) return;
+    // 失败退避期间不重入队，等 update() 下一轮再来
+    const retryAt = this._retryAt.get(url);
+    if (retryAt !== undefined && performance.now() < retryAt) return;
+    // 满了就淘汰最久没被用到的，而不是干等着永远不再出图
+    while (this.nodes.size + this.pending.size >= this.maxTiles) {
+      if (!this._evictOne()) return;
+    }
     this._queue.push(url);
     this._pump();
+  }
+
+  /**
+   * 淘汰一块瓦片给新瓦片腾位置。
+   *
+   * 规则：只在「没有已加载子瓦片」的叶子上挑（删父瓦片容易露洞），
+   * 优先淘汰最久没进过有效范围的，同帧内再挑最远的。
+   */
+  private _evictOne(): boolean {
+    let victim: TileNode | null = null;
+    for (const node of this.nodes.values()) {
+      if (node.childUrl && this.nodes.has(node.childUrl)) continue;
+      if (!victim) {
+        victim = node;
+        continue;
+      }
+      const a = node.lastSeen ?? -1;
+      const b = victim.lastSeen ?? -1;
+      if (a < b || (a === b && (node.distance ?? 0) > (victim.distance ?? 0))) victim = node;
+    }
+    if (!victim) return false;
+    this.nodes.delete(victim.url);
+    victim.group.parent?.remove(victim.group);
+    this._onTileRemoved(victim);
+    return true;
+  }
+
+  /** 把之前彻底失败的瓦片全部放回队列（网络恢复后手动调一次） */
+  retryFailed(): number {
+    const count = this.failed.size;
+    this.failed.clear();
+    this._retryCount.clear();
+    this._retryAt.clear();
+    return count;
   }
 
   private _pump(): void {
@@ -263,7 +319,15 @@ export class S3MTileset {
       this._onTile(node);
     } catch (e) {
       this.stats.failed++;
-      this.failed.add(url);
+      const attempts = (this._retryCount.get(url) ?? 0) + 1;
+      this._retryCount.set(url, attempts);
+      if (attempts <= this._maxRetries) {
+        // 退避重试：不进 failed，下一帧 update() 会重新入队，避免网络抖一下就留个永久空洞
+        this._retryAt.set(url, performance.now() + 800 * attempts);
+      } else {
+        this.failed.add(url);
+        this._retryAt.delete(url);
+      }
       this._onError(e);
     } finally {
       this.pending.delete(url);
@@ -278,15 +342,16 @@ export class S3MTileset {
    * @param screenHeight 视口像素高度
    */
   update(camEnu: [number, number, number], fovRad: number, screenHeight: number): void {
+    this._frame++;
     for (const node of this.nodes.values()) {
-      if (!node.childUrl || !node.sphere) continue;
-      if (this.failed.has(node.childUrl)) continue;
+      if (!node.sphere) continue;
 
       const c = node.sphere.center;
       const dx = c.x - camEnu[0];
       const dy = c.y - camEnu[1];
       const dz = c.z - camEnu[2];
       const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-6;
+      node.distance = dist;
 
       let metric: number;
       if (node.rangeMode === 0) {
@@ -296,6 +361,11 @@ export class S3MTileset {
         metric = ((node.sphere.radius / dist) / Math.tan(fovRad / 2)) * screenHeight * 0.5;
       }
 
+      // 在有效范围内（留一倍余量）的算「正在用」，淘汰时按这个帧号排优先级
+      const inRange = node.rangeMode === 0 ? dist < node.rangeValue * 2 : metric > node.rangeValue * 0.5;
+      if (inRange) node.lastSeen = this._frame;
+
+      if (!node.childUrl || this.failed.has(node.childUrl)) continue;
       const needRefine = node.rangeMode === 0 ? metric < node.rangeValue : metric > node.rangeValue;
       if (needRefine) this._enqueue(node.childUrl);
     }
@@ -304,7 +374,13 @@ export class S3MTileset {
   dispose(): void {
     for (const node of this.nodes.values()) {
       node.group.traverse((o) => {
-        (o as { geometry?: { dispose?: () => void } }).geometry?.dispose?.();
+        const mesh = o as {
+          geometry?: { dispose?: () => void };
+          material?: { dispose?: () => void } | Array<{ dispose?: () => void }>;
+        };
+        mesh.geometry?.dispose?.();
+        if (Array.isArray(mesh.material)) mesh.material.forEach((m) => m.dispose?.());
+        else mesh.material?.dispose?.();
       });
     }
     for (const tex of this.textureCache.values()) tex.dispose?.();

@@ -50,8 +50,9 @@
     "test:meshopt": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/meshopt-check.mjs --preset shenyin",
     "test:oracle": "node tools/official-oracle.mjs",
     "test:e2e": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/e2e.mjs",
-    "test": "tsc --noEmit -p tsconfig.json && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/parse-sample.mjs && node tools/test-batch-texmatrix.mjs",
-    "prepublishOnly": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && tsc --noEmit -p tsconfig.json"
+    "test": "tsc --noEmit -p tsconfig.json && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/parse-sample.mjs && node tools/test-batch-texmatrix.mjs && node tools/test-regressions.mjs",
+    "prepublishOnly": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && tsc --noEmit -p tsconfig.json",
+    "test:regress": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/test-regressions.mjs"
   },
   "keywords": [
     "s3m",
