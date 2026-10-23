@@ -44,6 +44,7 @@
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "serve": "node tools/serve.mjs",
+    "dev": "node tools/serve.mjs --watch",
     "demo": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/serve.mjs",
     "test:parse": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/parse-sample.mjs",
     "test:meshopt": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/meshopt-check.mjs --preset shenyin",
