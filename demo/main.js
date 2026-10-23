@@ -91,9 +91,12 @@ const layer = new S3MLayer({
     colorC: '#fbbf24', // 扫描金黄
     selectColor: '#22d3ee',
     outline: true,
+    outlineStyle: 'edges', // 'edges' 单体棱线 | 'hull' 外扩轮廓
     outlineColor: '#22d3ee',
-    outlineWidth: 0.9,
+    outlineWidthPx: 3, // 选中棱线粗细（像素）
+    outlineWidth: 0.9, // 外扩轮廓粗细（米）
     dimOthers: true,
+    edgeWidth: 1.2, // 全局棱线粗细（像素）
     edgeOpacity: 0.45,
   },
   onStats: (s) => {
@@ -478,8 +481,22 @@ $('optOutline').addEventListener('change', (e) => {
   $('wrapOutlineOpts').style.display = on ? '' : 'none';
 });
 
+$('optOutlineStyle').addEventListener('change', (e) => {
+  const style = e.target.value;
+  layer.setStyle({ outlineStyle: style });
+  // 棱线按像素算粗细，外扩轮廓按米算，两种画法各给一个滑块
+  $('wrapOutlineWidthPx').style.display = style === 'edges' ? '' : 'none';
+  $('wrapOutlineWidth').style.display = style === 'hull' ? '' : 'none';
+});
+
 $('optOutlineColor').addEventListener('input', (e) => {
   layer.setStyle({ outlineColor: e.target.value });
+});
+
+$('optOutlineWidthPx').addEventListener('input', (e) => {
+  const v = Number(e.target.value) / 10;
+  $('outlineWidthPxVal').textContent = `${v.toFixed(1)}px`;
+  layer.setStyle({ outlineWidthPx: v });
 });
 
 $('optOutlineWidth').addEventListener('input', (e) => {
@@ -492,6 +509,13 @@ $('optEdges').addEventListener('change', (e) => {
   const on = e.target.checked;
   layer.setEdges(on);
   $('wrapEdgeOpacity').style.display = on ? '' : 'none';
+  $('wrapEdgeWidth').style.display = on ? '' : 'none';
+});
+
+$('optEdgeWidth').addEventListener('input', (e) => {
+  const v = Number(e.target.value) / 10;
+  $('edgeWidthVal').textContent = `${v.toFixed(1)}px`;
+  layer.setStyle({ edgeWidth: v });
 });
 
 $('optEdgeOpacity').addEventListener('input', (e) => {

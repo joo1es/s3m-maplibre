@@ -28,6 +28,13 @@ import {
 } from './StyleMaterial.js';
 import type { OutlineMaterial, StyledMaterial, StyleMode, SelectMode } from './StyleMaterial.js';
 import { Picker } from './Picker.js';
+import {
+  buildFeatureEdgeSegments,
+  buildThickLineGeometry,
+  createLineSharedUniforms,
+  createThickLineMaterial,
+} from './EdgeLines.js';
+import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
 import { resolveFeature, measureSegments, buildAttributes, DEFAULT_FLOOR_HEIGHT } from '../core/FeatureInfo.js';
 import type {
   Anchor,
@@ -116,12 +123,18 @@ export interface S3MStyle {
   dimFactor?: number;
   /** 是否给选中单体描边 */
   outline: boolean;
+  /** 选中描边的画法：'edges' 单体棱线（默认）| 'hull' 背面外扩轮廓 */
+  outlineStyle?: 'edges' | 'hull';
   /** 描边颜色（默认跟随 selectColor） */
   outlineColor?: string;
-  /** 描边粗细（米，默认 0.9） */
+  /** 外扩轮廓的粗细（米，默认 0.9，仅 outlineStyle: 'hull' 生效） */
   outlineWidth?: number;
+  /** 选中棱线的粗细（像素，默认 3，仅 outlineStyle: 'edges' 生效，缩放时保持恒定） */
+  outlineWidthPx?: number;
   /** 是否显示几何棱线（CPU 端生成，有开销） */
   edges: boolean;
+  /** 全局棱线粗细（像素，默认 1.2） */
+  edgeWidth?: number;
   edgeColor: string;
   edgeOpacity?: number;
   roofThreshold?: number;
@@ -148,9 +161,12 @@ export const DEFAULT_STYLE: S3MStyle = {
   dimOthers: true,
   dimFactor: 0.42,
   outline: true,
+  outlineStyle: 'edges',
   outlineColor: '#22d3ee',
   outlineWidth: 0.9,
+  outlineWidthPx: 3,
   edges: false,
+  edgeWidth: 1.2,
   edgeColor: '#334155',
   edgeOpacity: 0.45,
   roofThreshold: 0.65,
@@ -254,11 +270,16 @@ interface MeshUserData {
   geoRef?: GeoPackageEntry;
   tileRef?: ParsedTile;
   primitiveType?: number;
-  edges?: THREE.LineSegments | null;
+  /** CPU 端现算的棱线对象（等宽线 Mesh） */
+  edges?: THREE.Object3D | null;
   /** 数据自带棱线包（此时不再用 EdgesGeometry 现算） */
   nativeEdges?: boolean;
   /** 数据自带的棱线对象本身 */
   isEdgeLines?: boolean;
+  /** CPU 现算的等宽棱线（与 isEdgeLines 区分，便于刷新样式） */
+  isThickEdge?: boolean;
+  /** 选中单体的棱线对象 */
+  isSelectionEdge?: boolean;
   pickMaterial?: THREE.Material;
   [key: string]: unknown;
 }
@@ -294,12 +315,20 @@ export class S3MLayer {
   style: S3MStyle;
   readonly outlineMaterial: OutlineMaterial;
 
+  /** 等宽线共享的分辨率 uniform（全局棱线 + 选中棱线共用） */
+  readonly lineShared: LineSharedUniforms;
+  /** 全局棱线材质 */
+  readonly edgeMaterial: ThickLineMaterial;
+  /** 选中棱线材质 */
+  readonly selectionEdgeMaterial: ThickLineMaterial;
+
   readonly datasets = new Map<string, S3MDatasetEntry>();
 
   private readonly _pickables = new Map<number, PickableRef>();
   private _pickSeq = 0;
   private _selection: PickResult | null = null;
   private _outlineMesh: THREE.Mesh | null = null;
+  private _selectionEdges: THREE.Mesh | null = null;
   private _edgesEnabled = false;
 
   private readonly _featureStyles = new Map<number, FeatureStyle>();
@@ -330,6 +359,18 @@ export class S3MLayer {
     this.uniforms = createSharedUniforms();
     this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
     this.outlineMaterial = createOutlineMaterial(this.uniforms);
+
+    this.lineShared = createLineSharedUniforms();
+    this.edgeMaterial = createThickLineMaterial(this.lineShared, {
+      color: this.style.edgeColor,
+      opacity: this.style.edgeOpacity ?? 0.45,
+      width: this.style.edgeWidth ?? 1.2,
+    });
+    this.selectionEdgeMaterial = createThickLineMaterial(this.lineShared, {
+      color: this.style.outlineColor ?? this.style.selectColor,
+      opacity: 1,
+      width: this.style.outlineWidthPx ?? 3,
+    });
 
     this._fps.last = performance.now();
     this._datasetQueue = this._normalizeDatasets(options);
@@ -372,6 +413,8 @@ export class S3MLayer {
     this.picker?.dispose();
     this.picker = null;
     this.outlineMaterial.dispose();
+    this.edgeMaterial.dispose();
+    this.selectionEdgeMaterial.dispose();
     this.scene?.clear();
     this.renderer?.dispose();
     this.renderer = null;
@@ -537,6 +580,7 @@ export class S3MLayer {
   setFeatureStyle(smid: number, style: FeatureStyle): void {
     this._featureStyles.set(smid, style);
     this._applyOverridesToAllMeshes();
+    if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
 
@@ -546,6 +590,7 @@ export class S3MLayer {
       this._featureStyles.set(smid, style);
     }
     this._applyOverridesToAllMeshes();
+    if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
 
@@ -563,6 +608,7 @@ export class S3MLayer {
   removeFeatureStyle(smid: number): void {
     if (this._featureStyles.delete(smid)) {
       this._applyOverridesToAllMeshes();
+      if (this._selection) this._syncSelectionStyle();
       this.map?.triggerRepaint();
     }
   }
@@ -572,6 +618,7 @@ export class S3MLayer {
     if (this._featureStyles.size > 0) {
       this._featureStyles.clear();
       this._applyOverridesToAllMeshes();
+      if (this._selection) this._syncSelectionStyle();
       this.map?.triggerRepaint();
     }
   }
@@ -591,6 +638,7 @@ export class S3MLayer {
       this.uniforms.uFilterHeightActive.value = 0;
     }
     this._applyOverridesToAllMeshes();
+    if (this._selection) this._syncSelectionStyle();
     this.map?.triggerRepaint();
   }
 
@@ -814,8 +862,14 @@ export class S3MLayer {
     if ('opacity' in patch || 'depthWrite' in patch) this._applyOpacity();
     if ('shading' in patch) this._applyShading();
     if ('edges' in patch) this.setEdges(!!this.style.edges);
-    else if ('edgeColor' in patch || 'opacity' in patch || 'edgeOpacity' in patch) this._refreshEdgeLines();
-    if (this._selection) this.select(this._selection, { silent: true });
+    else if ('edgeColor' in patch || 'edgeWidth' in patch || 'opacity' in patch || 'edgeOpacity' in patch) {
+      this._refreshEdgeLines();
+    }
+    if (this._selection) {
+      // 换描边画法要重建几何；颜色 / 粗细 / 拔高只是 uniform，拖着滑块也不卡
+      if ('outline' in patch || 'outlineStyle' in patch) this.select(this._selection, { silent: true });
+      else this._syncSelectionStyle();
+    }
     this.map?.triggerRepaint();
   }
 
@@ -920,6 +974,9 @@ export class S3MLayer {
    * 数据自带棱线包（primitiveType 13）时直接用，成本为零；
    * 没有的话才用 EdgesGeometry 现算 —— 那是 CPU 端的活，几十万面一次性建会卡住主线程
    * （实测 20 个网格 1.9s），所以按 8ms 一帧切片，边建边出。
+   *
+   * 棱线本身用「屏幕空间等宽线」画（见 EdgeLines.ts）：WebGL 的 lineWidth 基本无效，
+   * 只有摊成面向屏幕的四边形，`edgeWidth` 才能真正调粗。
    */
   setEdges(enabled: boolean): void {
     this._edgesEnabled = enabled;
@@ -935,6 +992,7 @@ export class S3MLayer {
         }
       });
     }
+    this._syncEdgeStyle();
 
     if (!enabled) {
       for (const p of this._pickables.values()) this._removeEdges(p.mesh);
@@ -958,7 +1016,17 @@ export class S3MLayer {
     step();
   }
 
-  /** 让数据自带的棱线跟着 style.edgeColor / opacity 走 */
+  /** 让全局棱线材质跟上 style.edgeColor / edgeWidth / edgeOpacity */
+  private _syncEdgeStyle(): void {
+    const s = this.style;
+    const u = this.edgeMaterial.uniforms;
+    u.uColor.value.set(s.edgeColor);
+    u.uWidth.value = Math.max(0.1, s.edgeWidth ?? 1.2);
+    u.uOpacity.value =
+      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.45)) * Math.min(1, Math.max(0.05, s.opacity ?? 1));
+  }
+
+  /** 让数据自带的棱线跟着 style.edgeColor / opacity 走（这些是 LineBasicMaterial，改不了粗细） */
   private _styleEdgeLine(lines: THREE.LineSegments): void {
     const mat = lines.material as THREE.LineBasicMaterial;
     if (!mat || !mat.color) return;
@@ -973,6 +1041,7 @@ export class S3MLayer {
   }
 
   private _refreshEdgeLines(): void {
+    this._syncEdgeStyle();
     for (const entry of this.datasets.values()) {
       entry.root.traverse((o) => {
         if ((o.userData as MeshUserData).isEdgeLines) this._styleEdgeLine(o as THREE.LineSegments);
@@ -986,21 +1055,19 @@ export class S3MLayer {
     const indexCount = mesh.geometry.index?.count ?? 0;
     // 棱线是 CPU 端建的，超大几何直接跳过，避免拖慢加载
     if (indexCount > 120000) return;
-    const edges = new THREE.EdgesGeometry(mesh.geometry, 40);
-    const lines = new THREE.LineSegments(
-      edges,
-      new THREE.LineBasicMaterial({
-        color: new THREE.Color(this.style.edgeColor),
-        transparent: true,
-        opacity: this.style.edgeOpacity ?? 0.45,
-        depthWrite: false,
-        polygonOffset: true,
-        polygonOffsetFactor: -1,
-        polygonOffsetUnits: -1,
-      })
-    );
+
+    const source = new THREE.EdgesGeometry(mesh.geometry, 40);
+    const attr = source.getAttribute('position') as THREE.BufferAttribute | undefined;
+    const segments = attr ? (attr.array as Float32Array) : null;
+    source.dispose();
+    if (!segments || segments.length < 6) return;
+
+    const lines = new THREE.Mesh(buildThickLineGeometry(segments), this.edgeMaterial);
     lines.renderOrder = 2;
+    // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
+    lines.frustumCulled = false;
     lines.raycast = () => {};
+    (lines.userData as MeshUserData).isThickEdge = true;
     ud.edges = lines;
     mesh.add(lines); // 作为子节点，自动继承 mesh 的世界变换
   }
@@ -1010,8 +1077,7 @@ export class S3MLayer {
     const lines = ud.edges;
     if (!lines) return;
     mesh.remove(lines);
-    lines.geometry.dispose();
-    (lines.material as THREE.Material).dispose();
+    (lines as THREE.Mesh).geometry?.dispose();
     ud.edges = null;
   }
 
@@ -1085,7 +1151,7 @@ export class S3MLayer {
         prev.userData.uSelBatch.value = -1;
         prev.userData.uSelWhole.value = 0;
       }
-      this._removeOutline();
+      this._clearSelectionDecoration();
       this._selection = null;
     }
 
@@ -1111,31 +1177,99 @@ export class S3MLayer {
     this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
 
     if (this.style.outline) {
-      this.outlineMaterial.uniforms.uSelBatch.value = result.batchId;
-      this.outlineMaterial.uniforms.uSelWhole.value = result.batchId < 0 ? 1 : 0;
-      this.outlineMaterial.uniforms.uElevation.value = this.style.selectElevation ?? 0;
-      if (mat?.userData?.uBatchTex) {
-        this.outlineMaterial.uniforms.uBatchTex.value = mat.userData.uBatchTex.value as THREE.Texture;
-        this.outlineMaterial.uniforms.uBatchTexWidth.value = mat.userData.uBatchTexWidth.value as number;
-        this.outlineMaterial.uniforms.uBatchTexActive.value = mat.userData.uBatchTexActive.value as number;
+      if ((this.style.outlineStyle ?? 'edges') === 'edges') {
+        this._addSelectionEdges(result);
+      } else {
+        this._addSelectionHull(result, mat);
       }
-      const outline = new THREE.Mesh(result.mesh.geometry, this.outlineMaterial);
-      outline.renderOrder = 3;
-      outline.frustumCulled = false;
-      outline.raycast = () => {};
-      result.mesh.add(outline); // 作为子节点，直接继承世界变换
-      this._outlineMesh = outline;
     }
     this.map?.triggerRepaint();
   }
 
-  private _removeOutline(): void {
-    if (!this._outlineMesh) return;
-    this._outlineMesh.parent?.remove(this._outlineMesh);
-    this._outlineMesh = null;
+  /**
+   * 选中单体的棱线：只挑这个单体自己的三角面算折边，再画成屏幕空间等宽线。
+   * 抽出来的线段数很少（一栋楼通常几百到几千条），所以选中开销可以忽略。
+   */
+  private _addSelectionEdges(result: PickResult): void {
+    const ud = result.mesh.userData as MeshUserData;
+    const geoRef =
+      (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(result.batchId) ?? ud.geoRef;
+    const { segments } = resolveFeature(geoRef, result.batchId);
+    const pairs = buildFeatureEdgeSegments(result.mesh.geometry, segments);
+    if (!pairs) {
+      // 抽不出折边（退化几何 / 没有任何夹角）时退回外扩轮廓，至少保证选中可见
+      this._addSelectionHull(result, styledMaterialOf(result.mesh));
+      return;
+    }
+
+    this._syncSelectionStyle();
+    const lines = new THREE.Mesh(buildThickLineGeometry(pairs), this.selectionEdgeMaterial);
+    lines.renderOrder = 4;
+    // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
+    lines.frustumCulled = false;
+    lines.raycast = () => {};
+    (lines.userData as MeshUserData).isSelectionEdge = true;
+    result.mesh.add(lines); // 作为子节点，直接继承世界变换
+    this._selectionEdges = lines;
+  }
+
+  /** 旧的描边画法：背面外扩法，整块几何一起上，靠 uSelBatch 只显示选中那栋 */
+  private _addSelectionHull(result: PickResult, mat: StyledMaterial | null): void {
+    this.outlineMaterial.uniforms.uSelBatch.value = result.batchId;
+    this.outlineMaterial.uniforms.uSelWhole.value = result.batchId < 0 ? 1 : 0;
+    this.outlineMaterial.uniforms.uElevation.value = this.style.selectElevation ?? 0;
+    if (mat?.userData?.uBatchTex) {
+      this.outlineMaterial.uniforms.uBatchTex.value = mat.userData.uBatchTex.value as THREE.Texture;
+      this.outlineMaterial.uniforms.uBatchTexWidth.value = mat.userData.uBatchTexWidth.value as number;
+      this.outlineMaterial.uniforms.uBatchTexActive.value = mat.userData.uBatchTexActive.value as number;
+    }
+    const outline = new THREE.Mesh(result.mesh.geometry, this.outlineMaterial);
+    outline.renderOrder = 3;
+    outline.frustumCulled = false;
+    outline.raycast = () => {};
+    result.mesh.add(outline); // 作为子节点，直接继承世界变换
+    this._outlineMesh = outline;
+  }
+
+  /** 只改 uniform：颜色 / 粗细 / 拔高，拖着滑块实时生效，不重建几何 */
+  private _syncSelectionStyle(): void {
+    const s = this.style;
+    const u = this.selectionEdgeMaterial.uniforms;
+    u.uColor.value.set(s.outlineColor ?? s.selectColor);
+    u.uWidth.value = Math.max(0.1, s.outlineWidthPx ?? 3);
+    u.uOpacity.value = Math.min(1, Math.max(0.05, s.opacity ?? 1));
+    u.uElevation.value = this._selection ? this._selectionElevation(this._selection) : 0;
+  }
+
+  /** 选中单体的实际拔高 = 全局选中拔高 + 该单体的独立拔高（与着色器口径一致） */
+  private _selectionElevation(result: PickResult): number {
+    let elev = this.style.selectElevation ?? 0;
+    if (result.smid != null) elev += this._featureStyles.get(result.smid)?.elevation ?? 0;
+    return elev;
+  }
+
+  private _clearSelectionDecoration(): void {
+    if (this._outlineMesh) {
+      this._outlineMesh.parent?.remove(this._outlineMesh);
+      this._outlineMesh = null;
+    }
+    if (this._selectionEdges) {
+      this._selectionEdges.parent?.remove(this._selectionEdges);
+      this._selectionEdges.geometry.dispose();
+      this._selectionEdges = null;
+    }
   }
 
   /* ---------------------------------------------------------------- 渲染 */
+
+  /** 等宽线要按设备像素换算线宽：uResolution 用绘图缓冲尺寸，uDpr 是缓冲 / CSS 的比值 */
+  private _updateLineResolution(canvas: HTMLCanvasElement): void {
+    const w = canvas.width || 1;
+    const h = canvas.height || 1;
+    const cssW = canvas.clientWidth || w;
+    this.lineShared.uResolution.value.set(w, h);
+    this.lineShared.uDpr.value = Math.max(1, w / cssW);
+  }
 
   /** 从 render 参数里取出 mercator→clip 矩阵，兼容 MapLibre v4 / v5 与 Mapbox 两种签名 */
   private _extractMatrix(arg: unknown): ArrayLike<number> | null {
@@ -1200,6 +1334,9 @@ export class S3MLayer {
     }
 
     this._updateLights();
+
+    // 等宽棱线按设备像素撑开，分辨率每帧同步一次
+    this._updateLineResolution(canvas);
 
     this.renderer.setViewport(0, 0, canvas.width, canvas.height);
     this.renderer.resetState();

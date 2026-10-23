@@ -210,11 +210,23 @@
         <label class="chk"><input type="checkbox" id="optOutline" checked /> 选中单体描边</label>
         <div id="wrapOutlineOpts" style="margin: 2px 0 6px 18px;">
           <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+            <span style="color:#7b8794; font-size:11px;">画法</span>
+            <select id="optOutlineStyle" style="padding: 2px 5px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #fff; color: #111827; outline: none;">
+              <option value="edges" selected>棱线（单体折边）</option>
+              <option value="hull">外扩轮廓</option>
+            </select>
+          </div>
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
             <span style="color:#7b8794; font-size:11px;">描边颜色</span>
             <input type="color" id="optOutlineColor" value="#22d3ee" style="width:24px; height:18px; border:1px solid #dfe3e8; border-radius:4px; padding:0; cursor:pointer;" />
           </div>
-          <label class="rng" style="padding:0;">
-            <span style="font-size:11px;">粗细</span>
+          <label class="rng" id="wrapOutlineWidthPx" style="padding:0;">
+            <span style="font-size:11px;">棱线粗细</span>
+            <input type="range" id="optOutlineWidthPx" min="10" max="80" step="5" value="30" />
+            <b id="outlineWidthPxVal">3.0px</b>
+          </label>
+          <label class="rng" id="wrapOutlineWidth" style="padding:0; display:none;">
+            <span style="font-size:11px;">外扩粗细</span>
             <input type="range" id="optOutlineWidth" min="2" max="30" step="1" value="9" />
             <b id="outlineWidthVal">0.9m</b>
           </label>
@@ -225,6 +237,11 @@
           <span>棱线透明度</span>
           <input type="range" id="optEdgeOpacity" min="10" max="100" step="5" value="45" />
           <b id="edgeOpacityVal">45%</b>
+        </label>
+        <label class="rng" id="wrapEdgeWidth" style="display:none; margin-top: 4px;">
+          <span>棱线粗细</span>
+          <input type="range" id="optEdgeWidth" min="10" max="60" step="5" value="12" />
+          <b id="edgeWidthVal">1.2px</b>
         </label>
         <label class="chk"><input type="checkbox" id="optOccludeBack" checked /> 遮挡内部与背面线条 (深度防透)</label>
       </section>

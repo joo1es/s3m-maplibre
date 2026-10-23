@@ -69,4 +69,12 @@ export type { StyleMode, StyledMaterial, StyledMaterialOptions, OutlineMaterial 
 export { Picker } from './render/Picker.js';
 export type { PickHit } from './render/Picker.js';
 
+export {
+  createThickLineMaterial,
+  createLineSharedUniforms,
+  buildThickLineGeometry,
+  buildFeatureEdgeSegments,
+} from './render/EdgeLines.js';
+export type { ThickLineMaterial, LineSharedUniforms, EdgeVertexRange } from './render/EdgeLines.js';
+
 export { S3MLayer as default } from './render/S3MLayer.js';
