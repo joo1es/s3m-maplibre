@@ -28,6 +28,17 @@ jobs:
       - name: Install dependencies
         run: npm install
 
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::标签 v$TAG 与 package.json 的版本 $PKG 不一致，已终止发布"
+            exit 1
+          fi
+          echo "版本一致：v$PKG"
+
       - name: Build and typecheck
         run: |
           npm run build
