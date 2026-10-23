@@ -86,6 +86,8 @@ export interface TileNode {
   distance?: number;
   /** 最近一次「在有效范围内」的帧号，越小越该被淘汰 */
   lastSeen?: number;
+  /** 上一级瓦片的 URL（淘汰到最细一级时，要把上一级找回来补洞） */
+  parentUrl?: string;
 }
 
 /** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
@@ -131,6 +133,8 @@ export class S3MTileset {
   /** 失败重试计数与下次可用时间，退避期间 _enqueue 会直接跳过 */
   private readonly _retryCount = new Map<string, number>();
   private readonly _retryAt = new Map<string, number>();
+  /** 子瓦片 URL → 父瓦片 URL，用于淘汰后补洞 */
+  private readonly _parentOf = new Map<string, string>();
   private _frame = 0;
   private _buildTile: BuildTileFn | null;
   private readonly _uniforms: StyleUniforms | null;
@@ -175,8 +179,9 @@ export class S3MTileset {
     return this;
   }
 
-  private _enqueue(url: string | null): void {
+  private _enqueue(url: string | null, parentUrl?: string): void {
     if (!url) return;
+    if (parentUrl) this._parentOf.set(url, parentUrl);
     if (this.nodes.has(url) || this.pending.has(url) || this.failed.has(url)) return;
     if (this._queue.includes(url)) return;
     // 失败退避期间不重入队，等 update() 下一轮再来
@@ -193,13 +198,43 @@ export class S3MTileset {
   /**
    * 淘汰一块瓦片给新瓦片腾位置。
    *
-   * 规则：只在「没有已加载子瓦片」的叶子上挑（删父瓦片容易露洞），
-   * 优先淘汰最久没进过有效范围的，同帧内再挑最远的。
+   * 分两轮挑：
+   * 1. 先挑「没有已加载子瓦片」的叶子 —— 删父瓦片容易露洞；
+   * 2. 但如果树的形状是「所有节点都已细化」，一棵叶子都没有，第 1 轮会挑空，
+   *    于是永远拒绝加载、相机移到哪都卡在旧画面。这时退一步挑「已经不带
+   *    渲染职责」的父瓦片：它的子节点完全覆盖同一片区域，删掉视觉上无损。
+   *
+   * 两轮都按「最久没进有效范围」排，同帧再比距离。
+   * 淘汰最细一级时，如果上一级也不在内存里，顺手把上一级排回队列补洞。
    */
   private _evictOne(): boolean {
+    const victim = this._pickVictim(false) ?? this._pickVictim(true);
+    if (!victim) return false;
+
+    const parentUrl = victim.parentUrl ?? this._parentOf.get(victim.url);
+    const isLeaf = !victim.childUrl || !this.nodes.has(victim.childUrl);
+
+    this.nodes.delete(victim.url);
+    victim.group.parent?.remove(victim.group);
+    this._onTileRemoved(victim);
+    this._parentOf.delete(victim.url);
+
+    // 删的是最细一级、而上一级又不在内存里 → 把上一级排回去，别让那块地空着
+    if (isLeaf && parentUrl && !this.nodes.has(parentUrl) && !this.pending.has(parentUrl)) {
+      this._enqueue(parentUrl);
+    }
+    return true;
+  }
+
+  /**
+   * 挑淘汰候选。
+   * @param allowRefined false = 只挑叶子；true = 只挑「子节点已全部加载」的父瓦片
+   */
+  private _pickVictim(allowRefined: boolean): TileNode | null {
     let victim: TileNode | null = null;
     for (const node of this.nodes.values()) {
-      if (node.childUrl && this.nodes.has(node.childUrl)) continue;
+      const refined = !!node.childUrl && this.nodes.has(node.childUrl);
+      if (refined !== allowRefined) continue;
       if (!victim) {
         victim = node;
         continue;
@@ -208,11 +243,7 @@ export class S3MTileset {
       const b = victim.lastSeen ?? -1;
       if (a < b || (a === b && (node.distance ?? 0) > (victim.distance ?? 0))) victim = node;
     }
-    if (!victim) return false;
-    this.nodes.delete(victim.url);
-    victim.group.parent?.remove(victim.group);
-    this._onTileRemoved(victim);
-    return true;
+    return victim;
   }
 
   /** 把之前彻底失败的瓦片全部放回队列（网络恢复后手动调一次） */
@@ -307,6 +338,7 @@ export class S3MTileset {
         rangeValue: lod?.rangeValue ?? 0,
         rangeMode: lod?.rangeMode ?? 1,
         childUrl: resolveUrl(dirOf(url), lod?.childTile),
+        parentUrl: this._parentOf.get(url),
         state: 'ready',
       };
 
@@ -367,7 +399,7 @@ export class S3MTileset {
 
       if (!node.childUrl || this.failed.has(node.childUrl)) continue;
       const needRefine = node.rangeMode === 0 ? metric < node.rangeValue : metric > node.rangeValue;
-      if (needRefine) this._enqueue(node.childUrl);
+      if (needRefine) this._enqueue(node.childUrl, node.url);
     }
   }
 
