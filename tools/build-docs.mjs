@@ -395,13 +395,108 @@ const htmlTemplate = `<!doctype html>
         padding-left: 0.5rem;
       }
 
-      .table-responsive th, .table-responsive td {
-        padding: 0.75rem 1rem;
-        vertical-align: top;
+      /* 暗黑 / 明亮主题适配 */
+      html.dark body {
+        background-color: #0b101b;
+        color: #cbd5e1;
+      }
+      html:not(.dark) body {
+        background-color: #f8fafc;
+        color: #334155;
+      }
+      html:not(.dark) header {
+        background-color: rgba(255, 255, 255, 0.9) !important;
+        border-color: rgba(0, 0, 0, 0.08) !important;
+      }
+      html:not(.dark) header a {
+        color: #0f172a !important;
+      }
+      html:not(.dark) #searchInput {
+        background-color: #f1f5f9;
+        border-color: #cbd5e1;
+        color: #0f172a;
+      }
+      html:not(.dark) #sidebar {
+        border-color: rgba(0, 0, 0, 0.06) !important;
+      }
+      html:not(.dark) .sidebar-link {
+        color: #64748b;
+      }
+      html:not(.dark) .sidebar-link:hover {
+        background: rgba(0, 0, 0, 0.05);
+        color: #0f172a;
+      }
+      html:not(.dark) .sidebar-link.active {
+        background: rgba(14, 165, 233, 0.12);
+        color: #0284c7;
+      }
+      html:not(.dark) .doc-content h1 {
+        color: #0f172a;
+        border-bottom-color: rgba(0, 0, 0, 0.1);
+      }
+      html:not(.dark) .doc-content h2 {
+        color: #1e293b;
+        border-bottom-color: rgba(0, 0, 0, 0.08);
+      }
+      html:not(.dark) .doc-content h3 {
+        color: #334155;
+      }
+      html:not(.dark) .doc-content p, 
+      html:not(.dark) .doc-content ul, 
+      html:not(.dark) .doc-content ol {
+        color: #475569;
+      }
+      html:not(.dark) .doc-content strong {
+        color: #0f172a;
+      }
+      html:not(.dark) .doc-content a {
+        color: #0284c7;
+      }
+      html:not(.dark) .doc-content code:not(pre code) {
+        background: #e2e8f0;
+        color: #0f172a;
+        border-color: #cbd5e1;
+      }
+      html:not(.dark) .callout {
+        background: #f0fdf4 !important;
+        border-left-color: #10b981 !important;
+        color: #166534 !important;
+      }
+      html:not(.dark) .table-responsive {
+        background: #ffffff !important;
+        border-color: #e2e8f0 !important;
+        box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+      }
+      html:not(.dark) .table-responsive thead {
+        background: #f8fafc !important;
+        color: #1e293b !important;
+        border-color: #e2e8f0 !important;
+      }
+      html:not(.dark) .table-responsive table {
+        color: #475569 !important;
+      }
+      html:not(.dark) .table-responsive tbody {
+        divide-color: #f1f5f9 !important;
+      }
+      html:not(.dark) .toc-link {
+        color: #64748b;
+      }
+      html:not(.dark) .toc-link:hover {
+        color: #0284c7;
+      }
+      html:not(.dark) #tocLinks {
+        border-left-color: rgba(0,0,0,0.08) !important;
+      }
+      html:not(.dark) footer {
+        border-top-color: rgba(0,0,0,0.08) !important;
+        color: #94a3b8;
+      }
+      html:not(.dark) footer a:hover {
+        color: #0f172a;
       }
     </style>
   </head>
-  <body class="min-h-screen flex flex-col">
+  <body class="min-h-screen flex flex-col transition-colors duration-200">
 
     <header class="sticky top-0 z-40 w-full border-b border-white/10 bg-[#0b101b]/90 backdrop-blur-md">
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -414,11 +509,11 @@ const htmlTemplate = `<!doctype html>
             <span>s3m-maplibre</span>
           </a>
           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-            v${version}
+            v\${version}
           </span>
         </div>
 
-        <div class="flex items-center gap-4">
+        <div class="flex items-center gap-3">
           <div class="relative hidden sm:block w-64 lg:w-80">
             <input 
               id="searchInput" 
@@ -428,6 +523,12 @@ const htmlTemplate = `<!doctype html>
             />
             <span class="absolute right-2.5 top-2 text-[10px] font-mono text-slate-500 border border-white/10 rounded px-1">/</span>
           </div>
+
+          <!-- 明亮 / 暗黑主题切换按钮 -->
+          <button id="themeToggleBtn" class="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition" title="切换深色/浅色主题">
+            <svg id="themeMoonIcon" class="w-4 h-4 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+            <svg id="themeSunIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 9H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+          </button>
 
           <a href="../demo/index.html" target="_blank" class="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-cyan-500 text-slate-950 font-semibold hover:bg-cyan-400 transition shadow-md shadow-cyan-500/10">
             <span>在线三维 Demo</span>
@@ -536,6 +637,35 @@ const htmlTemplate = `<!doctype html>
             e.preventDefault();
             searchInput.focus();
           }
+        });
+      }
+
+      // 主题切换逻辑
+      const themeToggleBtn = document.getElementById('themeToggleBtn');
+      const themeSunIcon = document.getElementById('themeSunIcon');
+      const themeMoonIcon = document.getElementById('themeMoonIcon');
+
+      function updateThemeIcons(isDark) {
+        if (themeSunIcon && themeMoonIcon) {
+          themeSunIcon.classList.toggle('hidden', !isDark);
+          themeMoonIcon.classList.toggle('hidden', isDark);
+        }
+      }
+
+      const savedTheme = localStorage.getItem('s3m_doc_theme');
+      if (savedTheme === 'light') {
+        document.documentElement.classList.remove('dark');
+        updateThemeIcons(false);
+      } else {
+        document.documentElement.classList.add('dark');
+        updateThemeIcons(true);
+      }
+
+      if (themeToggleBtn) {
+        themeToggleBtn.addEventListener('click', () => {
+          const isDark = document.documentElement.classList.toggle('dark');
+          localStorage.setItem('s3m_doc_theme', isDark ? 'dark' : 'light');
+          updateThemeIcons(isDark);
         });
       }
     </script>

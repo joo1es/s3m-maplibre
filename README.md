@@ -3,6 +3,7 @@
 **在 MapLibre GL JS 里原生渲染 SuperMap S3M 三维模型** —— 浏览器直接解析 `.s3mb` 瓦片，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端。
 
 [![npm](https://img.shields.io/npm/v/s3m-maplibre?color=blue&label=npm)](https://www.npmjs.com/package/s3m-maplibre)
+[![docs](https://img.shields.io/badge/docs-online-38bdf8)](https://joo1es.github.io/s3m-maplibre/docs/index.html)
 [![demo](https://img.shields.io/badge/demo-online-2ea44f)](https://joo1es.github.io/s3m-maplibre/demo/index.html)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
 [![types](https://img.shields.io/badge/types-included-blue)](./src/index.ts)
@@ -137,18 +138,18 @@ map.on('click', (e) => {
 });
 ```
 
-完整接口见 **[docs/API.md](./docs/API.md)**。
+完整接口见 **[开发指南与 API 文档（在线网页）](https://joo1es.github.io/s3m-maplibre/docs/index.html)** 或本地 **[docs/API.md](./docs/API.md)**。
 
 ---
 
-## 演示
+## 演示与在线文档
 
-在线跑（GitHub Pages，数据随仓库一起发布）：
+在线体验与文档（GitHub Pages，数据随仓库一起发布）：
 
-- **MapLibre 版** — <https://joo1es.github.io/s3m-maplibre/demo/index.html>
-- **纯 three.js 版** — <https://joo1es.github.io/s3m-maplibre/demo/three.html>
-
-（<https://joo1es.github.io/s3m-maplibre/> 是入口页，两个示例都能进）
+- **📚 完整开发指南 & API 文档** — <https://joo1es.github.io/s3m-maplibre/docs/index.html>
+- **🗺️ MapLibre 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/index.html>
+- **🧊 纯 three.js 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/three.html>
+- **🏠 Pages 导航入口** — <https://joo1es.github.io/s3m-maplibre/>
 
 本地跑：
 
