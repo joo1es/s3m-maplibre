@@ -36,6 +36,8 @@ import {
 } from './EdgeLines.js';
 import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
 import { resolveFeature, measureSegments, buildAttributes, DEFAULT_FLOOR_HEIGHT } from '../core/FeatureInfo.js';
+import { AttributeQuery } from '../core/AttributeQuery.js';
+import type { AttributeQueryOptions, AttributeRow } from '../core/AttributeQuery.js';
 import type {
   Anchor,
   FeatureAttributes,
@@ -248,11 +250,71 @@ export interface S3MLayerOptions {
   maxConcurrent?: number;
   /** 自定义瓦片构建器（测试 / 服务端渲染时注入） */
   buildTile?: BuildTileFn | null;
+  /**
+   * 可选：业务属性查询配置（iServer 数据服务）。
+   * 配上之后才能用 `colorByField()` 按业务字段着色 —— 属性值不在 S3M 瓦片里，只能去数据服务查。
+   */
+  attributes?: AttributeQueryOptions;
   onStats?: (stats: Stats) => void;
   onReady?: (entry: S3MDatasetEntry) => void;
   onPick?: (result: PickResult | null) => void;
   onError?: (error: unknown) => void;
 }
+
+/* ------------------------------------------------------------------ 专题着色 */
+
+/** 按业务字段着色的选项 */
+export interface ColorByFieldOptions {
+  /** 字段名，如 ENTITYID / KEYID / SmMaxZ */
+  field: string;
+  /**
+   * category —— 按不同取值分配颜色（默认）
+   * ramp     —— 数值字段连续色带
+   * breaks   —— 数值字段按 `breaks` 阈值分级
+   */
+  type?: 'category' | 'ramp' | 'breaks';
+  /** 调色板 / 色带，至少 2 个颜色；不给就用内置的 12 色 */
+  colors?: string[];
+  /** breaks 模式的分级阈值（升序）。颜色数应 ≥ 阈值数 + 1 */
+  breaks?: number[];
+  /** 只给这些单体上色，默认取「当前已加载的全部单体」 */
+  smids?: number[];
+  /** 取值预处理，分类模式下很有用（比如取编码前 12 位做分组） */
+  transform?: (value: string) => string;
+  /** 手动固定某些取值的颜色，key 是 transform 之后的值 */
+  colorMap?: Record<string, string>;
+}
+
+export interface ThematicLegendEntry {
+  label: string;
+  color: string;
+  count: number;
+}
+
+export interface ThematicResult {
+  field: string;
+  /** 真正上了色的单体数 */
+  matched: number;
+  /** 查不到属性值的单体数 */
+  missing: number;
+  legend: ThematicLegendEntry[];
+}
+
+/** 分类模式的默认调色板（色相拉开，深浅接近） */
+const DEFAULT_THEMATIC_COLORS = [
+  '#3b82f6',
+  '#22c55e',
+  '#f59e0b',
+  '#ef4444',
+  '#a855f7',
+  '#06b6d4',
+  '#84cc16',
+  '#ec4899',
+  '#6366f1',
+  '#14b8a6',
+  '#f97316',
+  '#64748b',
+];
 
 /* ------------------------------------------------------------------ 内部类型 */
 
@@ -288,6 +350,24 @@ function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
   const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
   const styled = m as StyledMaterial | undefined;
   return styled?.userData?.isStyled ? styled : null;
+}
+
+/** 在色带上取 t（0~1）位置的颜色，多段线性插值 */
+function sampleRamp(stops: THREE.Color[], t: number): THREE.Color {
+  if (stops.length < 2) return stops[0].clone();
+  const clamped = Math.min(1, Math.max(0, t));
+  const scaled = clamped * (stops.length - 1);
+  const i = Math.min(stops.length - 2, Math.floor(scaled));
+  return stops[i].clone().lerp(stops[i + 1], scaled - i);
+}
+
+/** 图例上的数值：够用就好，别出现 60.390098571777344 */
+function formatNumber(v: number): string {
+  if (!Number.isFinite(v)) return '—';
+  const abs = Math.abs(v);
+  if (abs >= 100) return v.toFixed(0);
+  if (abs >= 10) return v.toFixed(1);
+  return v.toFixed(2);
 }
 
 /* ------------------------------------------------------------------ 图层 */
@@ -332,6 +412,12 @@ export class S3MLayer {
   private _edgesEnabled = false;
 
   private readonly _featureStyles = new Map<number, FeatureStyle>();
+
+  /** 业务属性查询（可选，配了 `attributes` 才有） */
+  attributeQuery: AttributeQuery | null = null;
+  /** 专题着色：SMID → 颜色（手动 featureStyle 的颜色优先级更高） */
+  private _thematic = new Map<number, string>();
+  private _thematicField: string | null = null;
   private _filter: S3MFilter | null = null;
   private readonly _meshBatchTextures = new WeakMap<
     THREE.Mesh,
@@ -374,6 +460,7 @@ export class S3MLayer {
 
     this._fps.last = performance.now();
     this._datasetQueue = this._normalizeDatasets(options);
+    if (options.attributes) this.attributeQuery = new AttributeQuery(options.attributes);
   }
 
   /* ---------------------------------------------------------------- 生命周期 */
@@ -623,6 +710,173 @@ export class S3MLayer {
     }
   }
 
+  /* ---------------------------------------------------------------- 按业务字段着色 */
+
+  /**
+   * 换一个业务属性数据源（或传 null 关掉）。
+   * 属性值不在 S3M 瓦片里，得去 iServer 数据服务查，所以必须先有这一层配置。
+   */
+  setAttributeSource(options: AttributeQueryOptions | null): void {
+    this.attributeQuery = options ? new AttributeQuery(options) : null;
+  }
+
+  /** 当前场景里已经加载的单体 ID（按 SMID 去重），也是 colorByField 的默认范围 */
+  getLoadedSmids(): number[] {
+    const out = new Set<number>();
+    for (const p of this._pickables.values()) {
+      const pickInfo = (p.mesh.userData as MeshUserData).geoRef?.pickInfo;
+      if (!pickInfo) continue;
+      for (const key of Object.keys(pickInfo)) {
+        const smid = Number(key);
+        if (Number.isFinite(smid) && smid >= 0) out.add(smid);
+      }
+    }
+    return [...out];
+  }
+
+  /** 当前专题着色用的字段名 */
+  getThematicField(): string | null {
+    return this._thematicField;
+  }
+
+  /**
+   * 直接塞一份 SMID → 颜色。已经有属性值（或想按几何派生量自己算色）时用这个，
+   * 不走网络。
+   */
+  setThematicColors(colors: Map<number, string> | null, field = 'custom'): void {
+    this._thematic = colors && colors.size > 0 ? new Map(colors) : new Map();
+    this._thematicField = this._thematic.size > 0 ? field : null;
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
+  clearThematic(): void {
+    if (this._thematic.size === 0 && !this._thematicField) return;
+    this._thematic = new Map();
+    this._thematicField = null;
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+  }
+
+  /**
+   * 按业务字段给单体上色。
+   *
+   * 流程：已加载单体 ID → 数据服务取字段值 → 值映射成颜色 → 写进每网格的 batch 纹理。
+   * 颜色是逐单体写进现有 override 通道的，不重建几何、不重编译着色器，改字段就是重写一张一维纹理。
+   */
+  async colorByField(options: ColorByFieldOptions): Promise<ThematicResult> {
+    const query = this.attributeQuery;
+    if (!query) {
+      throw new Error('[s3m] 未配置业务属性数据源，先调用 setAttributeSource() 或构造时传 attributes');
+    }
+
+    const smids = options.smids?.length ? options.smids : this.getLoadedSmids();
+    const empty: ThematicResult = { field: options.field, matched: 0, missing: 0, legend: [] };
+    if (!smids.length) return empty;
+
+    const rows: Map<number, AttributeRow> = await query.queryBySmids(smids);
+    const palette = (options.colors?.length ? options.colors : DEFAULT_THEMATIC_COLORS).map(
+      (c) => new THREE.Color(c)
+    );
+    const stops = palette.length > 1 ? palette : [palette[0], palette[0]];
+    const type = options.type ?? 'category';
+    const colors = new Map<number, string>();
+    const legend: ThematicLegendEntry[] = [];
+
+    if (type === 'category') {
+      const transform = options.transform ?? ((v: string) => v);
+      const counts = new Map<string, number>();
+      const keyOf = new Map<number, string>();
+      for (const [smid, row] of rows) {
+        const raw = row[options.field];
+        if (raw == null || String(raw) === '') continue;
+        const key = transform(String(raw));
+        keyOf.set(smid, key);
+        counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      // 取值多的排前面，颜色分配稳定：同样的取值永远同一个颜色
+      const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1]);
+      const colorOf = new Map<string, string>();
+      ordered.forEach(([key, count], i) => {
+        const color = options.colorMap?.[key] ?? `#${stops[i % stops.length].getHexString()}`;
+        colorOf.set(key, color);
+        legend.push({ label: key, color, count });
+      });
+      for (const [smid, key] of keyOf) {
+        const color = colorOf.get(key);
+        if (color) colors.set(smid, color);
+      }
+    } else {
+      const numeric = new Map<number, number>();
+      for (const [smid, row] of rows) {
+        const value = Number(row[options.field]);
+        if (Number.isFinite(value)) numeric.set(smid, value);
+      }
+      if (numeric.size === 0) {
+        this._thematic = new Map();
+        this._thematicField = null;
+        this._applyOverridesToAllMeshes();
+        this.map?.triggerRepaint();
+        return { field: options.field, matched: 0, missing: smids.length, legend: [] };
+      }
+
+      const values = [...numeric.values()];
+      const min = Math.min(...values);
+      const max = Math.max(...values);
+
+      if (type === 'breaks') {
+        // 没给阈值就按色带档数等分，5 段
+        const segmentCount = Math.max(2, options.breaks?.length ? options.breaks.length + 1 : Math.min(stops.length, 5));
+        const breaks =
+          options.breaks?.length
+            ? options.breaks
+            : Array.from({ length: segmentCount - 1 }, (_, i) => min + ((max - min) * (i + 1)) / segmentCount);
+        const counts = new Array(segmentCount).fill(0) as number[];
+        for (const [smid, value] of numeric) {
+          let idx = 0;
+          while (idx < breaks.length && value > breaks[idx]) idx++;
+          counts[idx]++;
+          colors.set(smid, `#${stops[Math.min(idx, stops.length - 1)].getHexString()}`);
+        }
+        for (let i = 0; i < segmentCount; i++) {
+          const lo = i === 0 ? min : breaks[i - 1];
+          const hi = i === segmentCount - 1 ? max : breaks[i];
+          legend.push({
+            label: `${formatNumber(lo)} ~ ${formatNumber(hi)}`,
+            color: `#${stops[Math.min(i, stops.length - 1)].getHexString()}`,
+            count: counts[i],
+          });
+        }
+      } else {
+        const steps = 5;
+        for (const [smid, value] of numeric) {
+          const t = max - min < 1e-9 ? 0.5 : (value - min) / (max - min);
+          colors.set(smid, `#${sampleRamp(stops, t).getHexString()}`);
+        }
+        for (let i = 0; i < steps; i++) {
+          const t = i / (steps - 1);
+          legend.push({
+            label: formatNumber(min + (max - min) * t),
+            color: `#${sampleRamp(stops, t).getHexString()}`,
+            count: 0,
+          });
+        }
+      }
+    }
+
+    this._thematic = colors;
+    this._thematicField = options.field;
+    this._applyOverridesToAllMeshes();
+    this.map?.triggerRepaint();
+
+    return {
+      field: options.field,
+      matched: colors.size,
+      missing: smids.length - colors.size,
+      legend,
+    };
+  }
+
   /**
    * 设置图层过滤规则。
    * 支持按 SMID 白名单（include）、黑名单（exclude）、高度范围（minHeight/maxHeight）或谓词函数过滤。
@@ -672,7 +926,7 @@ export class S3MLayer {
     const ud = mesh.userData as MeshUserData;
     const pickInfo = ud.geoRef?.pickInfo;
 
-    const hasStyles = this._featureStyles.size > 0;
+    const hasStyles = this._featureStyles.size > 0 || this._thematic.size > 0;
     const filter = this._filter;
     const hasFilter =
       filter != null &&
@@ -748,15 +1002,18 @@ export class S3MLayer {
       }
 
       const st = this._featureStyles.get(smid);
-      if (st) {
+      const thematicColor = this._thematic.get(smid);
+      // 手动固定色 > 专题色（按业务字段）
+      const colorHex = st?.color ?? thematicColor;
+      if (st || thematicColor) {
         hasActive = true;
-        if (st.color) {
-          const c = new THREE.Color(st.color);
+        if (colorHex) {
+          const c = new THREE.Color(colorHex);
           data[bId * 4 + 0] = c.r;
           data[bId * 4 + 1] = c.g;
           data[bId * 4 + 2] = c.b;
         }
-        if (st.elevation != null && st.elevation > 0) {
+        if (st?.elevation != null && st.elevation > 0) {
           data[bId * 4 + 3] = st.elevation;
         }
       }

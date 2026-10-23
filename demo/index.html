@@ -261,6 +261,33 @@
         <div id="filterStatus" style="font-size: 11px; color: #6b7280; margin-top: 3px; min-height: 16px;"></div>
       </section>
 
+      <section>
+        <h2>按业务字段着色 (Thematic)</h2>
+        <input id="optAttrUrl" type="text" placeholder="数据服务地址 .../rest/data"
+          style="width: 100%; padding: 4px 6px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; margin-bottom: 5px;" />
+        <div style="display: flex; gap: 5px; margin-bottom: 5px;">
+          <input id="optAttrDataset" type="text" placeholder="DataSource:zhoubian"
+            style="flex: 1; min-width: 0; padding: 4px 6px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px;" />
+          <button id="btnAttrFields" style="padding: 4px 8px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #f9fafb; color: #374151; cursor: pointer;">读字段</button>
+        </div>
+        <div style="display: flex; gap: 5px; margin-bottom: 5px;">
+          <select id="optAttrField" style="flex: 1; min-width: 0; padding: 3px 5px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #fff; color: #111827; outline: none;">
+            <option value="">先点「读字段」</option>
+          </select>
+          <select id="optAttrType" style="padding: 3px 5px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #fff; color: #111827; outline: none;">
+            <option value="category" selected>分类</option>
+            <option value="ramp">渐变</option>
+            <option value="breaks">分级</option>
+          </select>
+        </div>
+        <div style="display: flex; gap: 5px;">
+          <button id="btnAttrApply" style="flex: 1; padding: 5px 4px; font-size: 11px; border: 1px solid #bfdbfe; border-radius: 5px; background: #eff6ff; color: #1d4ed8; cursor: pointer; font-weight: 500;">按字段上色</button>
+          <button id="btnAttrClear" style="padding: 5px 8px; font-size: 11px; border: 1px solid #d1d5db; border-radius: 5px; background: #f9fafb; color: #374151; cursor: pointer;">清除</button>
+        </div>
+        <div id="attrLegend" style="margin-top: 6px; font-size: 11px; color: #374151; max-height: 132px; overflow-y: auto;"></div>
+        <div id="attrStatus" style="font-size: 11px; color: #6b7280; margin-top: 3px; min-height: 16px;"></div>
+      </section>
+
       <footer>
         <div>瓦片 <b id="stTiles">0</b></div>
         <div>网格 <b id="stMeshes">0</b></div>

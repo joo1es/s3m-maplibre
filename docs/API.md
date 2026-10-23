@@ -12,6 +12,7 @@
 - [`S3MLayer`](#s3mlayer)
 - [样式（S3MStyle）](#样式s3mstyle)
 - [拾取与属性](#拾取与属性)
+- [按业务字段着色](#按业务字段着色)
 - [纯 three.js 使用](#纯-threejs-使用)
 - [底层 API](#底层-api)
 - [性能调优](#性能调优)
@@ -321,6 +322,61 @@ new S3MLayer({
   },
 });
 ```
+
+---
+
+## 按业务字段着色
+
+S3M 瓦片里**只有单体 ID**（SMID）和顶点区间，没有任何业务字段；业务属性在 iServer 的**数据服务**里（`data-xxx/rest/data`），和三维服务（`3D-xxx/rest/realspace`）是两个服务。所以按字段着色是「三维 + 数据」的跨服务查询，需要单独配一个数据源。
+
+```ts
+const layer = new S3MLayer({
+  datasets: [{ id: 'jingmo', configUrl: '.../jingmo.scp' }],
+  attributes: {
+    dataServiceUrl: 'https://host/iserver/services/data-xxx/rest/data',
+    datasetName: 'DataSource:zhoubian',   // 数据源:数据集，只写数据集名时默认补 DataSource:
+    // idField 默认 SmID，对应 scp 里的 idFieldName
+  },
+});
+
+// 分类字段：同一取值同色
+const result = await layer.colorByField({ field: 'KEYID', type: 'category' });
+
+// 数值字段：连续色带 / 按阈值分级
+await layer.colorByField({ field: 'SmMaxZ', type: 'ramp' });
+await layer.colorByField({ field: 'SmMaxZ', type: 'breaks', breaks: [10, 30, 60] });
+
+result.legend;    // [{ label, color, count }]  直接拿去画图例
+result.matched;   // 真正上了色的单体数
+```
+
+几个要点：
+
+- **默认范围是「当前已加载的单体」**（`getLoadedSmids()`），不是整个数据集。实测每条要素的响应约 10KB（`queryOption: ATTRIBUTE` 对模型数据集不生效，服务端仍会带 `geometry.model` 的 base64，`fromIndex/toIndex` 分页也被忽略），全量几千栋会变成几十 MB，所以只查加载进来的那部分，按 200 个一批分片；
+- 查询结果按 SMID 缓存（`AttributeQuery`），换字段只是重算颜色、重写一张一维纹理，不重建几何、不重编译着色器；
+- 手动 `setFeatureStyle()` 的颜色优先级高于专题色；
+- `transform` 用来归并取值：`KEYID` / `ENTITYID` 这种基本一栋一个值的字段直接上分类色，着出来就是「随机色」，要么改用 `ramp` / `breaks`，要么用 `transform` 把编码截到能分组的层级，比如 `(v) => v.slice(0, 6)`;
+- `breaks` 不给就用色带档数等分；`colors` 不给就用内置 12 色板。
+
+不想接数据服务时，也可以：
+
+```ts
+// 自己算好颜色（比如按几何派生量：高度 / 面积 / 楼层）
+layer.setThematicColors(new Map([[423, '#ef4444'], [424, '#22c55e']]));
+layer.clearThematic();
+```
+
+`AttributeQuery` 也能单独用（不依赖图层）：
+
+```ts
+import { AttributeQuery } from 's3m-maplibre';
+
+const query = new AttributeQuery({ dataServiceUrl, datasetName: 'DataSource:zhoubian' });
+const schema = await query.loadSchema();          // [{ name: 'SmID' }, ...]，也能用来判断有没有属性表
+const rows = await query.queryBySmids([423, 424]); // Map<smid, { SmID, ENTITYID, KEYID, ... }>
+```
+
+拾取结果里的 `attributes` 不在 `PickResult` 上：`pick()` 只负责拿 SMID，业务字段要按 SMID 再查一次。demo 里的属性卡就是这么补的（点楼 → 查 `featureResults` → 追加字段行）。
 
 ---
 

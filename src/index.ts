@@ -14,6 +14,12 @@ export { parseS3MB, S3M_VERSION, VertexTag, VertexTagV3 } from './core/S3MBParse
 export type { ParseOptions, InflateFn } from './core/S3MBParser.js';
 export { BinaryReader } from './core/BinaryReader.js';
 export { resolveFeature, measureSegments, buildAttributes, DEFAULT_FLOOR_HEIGHT } from './core/FeatureInfo.js';
+export { AttributeQuery } from './core/AttributeQuery.js';
+export type {
+  AttributeQueryOptions,
+  AttributeField,
+  AttributeRow,
+} from './core/AttributeQuery.js';
 
 // —— 公共类型
 export type {
@@ -55,6 +61,9 @@ export type {
   PickResult,
   MapLike,
   MapMouseEventLike,
+  ColorByFieldOptions,
+  ThematicLegendEntry,
+  ThematicResult,
 } from './render/S3MLayer.js';
 
 export { buildTileObjects } from './render/GeometryBuilder.js';

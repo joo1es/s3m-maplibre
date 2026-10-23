@@ -1,4 +1,4 @@
-import { S3MLayer, STYLE } from '../dist/index.js';
+import { S3MLayer, STYLE, AttributeQuery } from '../dist/index.js';
 
 /** 常用预设快捷方式 */
 const PRESETS = [
@@ -624,6 +624,111 @@ $('optFilterMaxH').addEventListener('input', (e) => {
 
 syncSwatches();
 
+/* ---------------------------------------------------------------- 按业务字段着色 */
+
+function setAttrStatus(text) {
+  $('attrStatus').textContent = text;
+}
+
+/** 上一次填的数据源记在本地，刷新页面不用重填 */
+function readAttrSource() {
+  const dataServiceUrl = $('optAttrUrl').value.trim();
+  const datasetName = $('optAttrDataset').value.trim();
+  if (!dataServiceUrl || !datasetName) return null;
+  localStorage.setItem('s3m.attr.url', dataServiceUrl);
+  localStorage.setItem('s3m.attr.dataset', datasetName);
+  return { dataServiceUrl, datasetName };
+}
+
+$('optAttrUrl').value = localStorage.getItem('s3m.attr.url') ?? '';
+$('optAttrDataset').value = localStorage.getItem('s3m.attr.dataset') ?? '';
+
+function renderAttrLegend(result) {
+  const host = $('attrLegend');
+  if (!result.legend.length) {
+    host.innerHTML = '';
+    return;
+  }
+  const rows = result.legend.slice(0, 12).map(
+    (e) => `<div style="display:flex; align-items:center; gap:6px; margin-top:4px;">
+        <span style="width:10px; height:10px; border-radius:2px; flex:none; background:${e.color};"></span>
+        <span style="flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${e.label}">${e.label}</span>
+        ${e.count ? `<span style="color:#9ca3af; flex:none;">${e.count}</span>` : ''}
+      </div>`
+  );
+  if (result.legend.length > 12) {
+    rows.push(`<div style="color:#9ca3af; margin-top:4px;">…共 ${result.legend.length} 类</div>`);
+  }
+  host.innerHTML = rows.join('');
+}
+
+$('btnAttrFields').addEventListener('click', async () => {
+  const source = readAttrSource();
+  if (!source) {
+    setAttrStatus('先填数据服务地址和数据集');
+    return;
+  }
+  setAttrStatus('读取字段表…');
+  try {
+    const query = new AttributeQuery(source);
+    const schema = await query.loadSchema();
+    const select = $('optAttrField');
+    select.innerHTML = '';
+    for (const f of schema) {
+      if (['SmGeometry', 'SmIndexKey', 'SmUserID'].includes(f.name)) continue;
+      const opt = document.createElement('option');
+      opt.value = f.name;
+      opt.textContent = f.name;
+      select.appendChild(opt);
+    }
+    // 优先选看起来像业务字段的
+    const preferred = ['KEYID', 'ENTITYID', 'NOTE', 'SmMaxZ', 'SmMinZ'];
+    const hit = preferred.find((name) => schema.some((f) => f.name === name));
+    if (hit) select.value = hit;
+    layer.setAttributeSource(source);
+    setAttrStatus(`共 ${schema.length} 个字段`);
+  } catch (e) {
+    setAttrStatus(String(e?.message ?? e));
+    console.error(e);
+  }
+});
+
+$('btnAttrApply').addEventListener('click', async () => {
+  const source = readAttrSource();
+  if (!source) {
+    setAttrStatus('先填数据服务地址和数据集');
+    return;
+  }
+  const field = $('optAttrField').value;
+  if (!field) {
+    setAttrStatus('先点「读字段」选择字段');
+    return;
+  }
+  const type = $('optAttrType').value;
+  layer.setAttributeSource(source);
+  setAttrStatus(`查询 ${field}…`);
+  try {
+    const t0 = performance.now();
+    const result = await layer.colorByField({ field, type });
+    renderAttrLegend(result);
+    const cost = Math.round(performance.now() - t0);
+    const many = type === 'category' && result.legend.length > 20;
+    setAttrStatus(
+      `${result.field} · 上色 ${result.matched} 栋 · 缺属性 ${result.missing} · ${cost}ms` +
+        (many ? ` · 该字段有 ${result.legend.length} 个取值，建议改用「渐变 / 分级」` : '')
+    );
+  } catch (e) {
+    setAttrStatus(String(e?.message ?? e));
+    console.error(e);
+  }
+});
+
+$('btnAttrClear').addEventListener('click', () => {
+  layer.clearThematic();
+  $('attrLegend').innerHTML = '';
+  setAttrStatus('已清除专题色');
+});
+
 /* ---------------------------------------------------------------- 属性卡展示 */
 
 function renderFeature(f) {
@@ -677,9 +782,38 @@ function renderFeature(f) {
     <div class="kv"><span>三角面 / 顶点</span><span>${fmt(f.triangles ?? 0)} / ${fmt(f.vertices ?? 0)}</span></div>
     <div class="kv"><span>中心坐标</span><span>${coord}</span></div>
     ${customHtml}
+    <div id="featAttrs"></div>
     <div class="note">SMID 取自 S3M 单体化信息；独立定制后点击其他建筑仍持久保留。</div>`;
 
   el.classList.add('on');
+
+  // 配了业务数据服务才有：按 SmID 把业务字段补进属性卡
+  if (f.smid != null && layer.attributeQuery) {
+    const attrsHost = $('featAttrs');
+    attrsHost.innerHTML = '<div class="kv"><span>业务属性</span><span>查询中…</span></div>';
+    layer.attributeQuery
+      .queryBySmids([f.smid])
+      .then((rows) => {
+        if (currentFeature?.smid !== f.smid) return;
+        const row = rows.get(f.smid);
+        if (!row) {
+          attrsHost.innerHTML = '<div class="note">数据服务里查不到这个 SmID</div>';
+          return;
+        }
+        attrsHost.innerHTML = Object.entries(row)
+          .filter(([key]) => !key.startsWith('SmGeo') && key !== 'SmIndexKey' && key !== 'SmUserID')
+          .map(([key, value]) => {
+            const text = String(value ?? '');
+            const shown = text.length > 34 ? `${text.slice(0, 34)}…` : text || '—';
+            return `<div class="kv"><span>${key}</span><span title="${text}">${shown}</span></div>`;
+          })
+          .join('');
+      })
+      .catch((e) => {
+        if (currentFeature?.smid !== f.smid) return;
+        attrsHost.innerHTML = `<div class="note">业务属性查询失败：${String(e?.message ?? e)}</div>`;
+      });
+  }
   $('closeFeature').addEventListener('click', () => {
     layer.select(null);
     el.classList.remove('on');
