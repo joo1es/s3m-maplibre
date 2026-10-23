@@ -342,6 +342,15 @@
 
       <section>
         <h2>质感与高程</h2>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+          <span style="color:#94a3b8; font-size:11.5px;">垂直对齐</span>
+          <select id="optAlign" class="form-select">
+            <option value="origin" selected>原生原点 (Origin)</option>
+            <option value="top">顶面对齐 (Top·地下工程)</option>
+            <option value="bottom">底面对齐 (Bottom·地上建筑)</option>
+            <option value="center">中心对齐 (Center)</option>
+          </select>
+        </div>
         <label class="rng">
           <span>高程调整</span>
           <input type="range" id="optHeightOffset" min="-50" max="50" step="0.5" value="0" />
@@ -363,6 +372,7 @@
 
       <section>
         <h2>环境与投影</h2>
+        <label class="chk"><input type="checkbox" id="optUnderground" /> 地下透视模式（半透明地表）</label>
         <label class="chk"><input type="checkbox" id="optHideBasemap" /> 隐藏地图底图</label>
         <label class="chk"><input type="checkbox" id="optOrtho" /> 正交投影（工程俯视/轴测）</label>
       </section>

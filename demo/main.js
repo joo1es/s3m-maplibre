@@ -8,6 +8,9 @@ const PRESETS = [
     url: './data/CBD/cbd.scp',
     color: '#2563eb',
     tip: '北京 CBD 核心区 · CCTV总部大楼',
+    align: 'origin',
+    heightOffset: 0,
+    underground: false,
   },
   {
     id: 'comModel',
@@ -15,6 +18,9 @@ const PRESETS = [
     url: './data/comModel/comModel.scp',
     color: '#d97706',
     tip: '单体建筑样例模型',
+    align: 'origin',
+    heightOffset: 0,
+    underground: false,
   },
   {
     id: 'subwayCrn',
@@ -24,7 +30,12 @@ const PRESETS = [
       'https://www.supermapol.com/realspace/services/3D-local3DCache-SubwayStationCombined' +
       '/rest/realspace/datas/SubwayStationCombined/config',
     color: '#16a34a',
-    tip: 'SuperMap Online 公有服务 · 纹理为 CRN 压缩，转码后才能出贴图',
+    tip: 'SuperMap Online 公有服务 · 智能顶面对齐地表并开启半透明地下透视',
+    align: 'top', // 智能语义对齐：顶部对齐地表（下沉 28.5m）
+    heightOffset: 3.5, // 微调：出入口站房露于地面约 3.5m（净下沉 25m）
+    underground: true, // 默认开启半透明地下透视
+    pitch: 68,
+    bearing: -35,
   },
 ];
 
@@ -265,10 +276,18 @@ async function loadSource(rawUrl) {
     btn.classList.toggle('active', btn.dataset.url === url || (url === DEFAULT_URL && btn.dataset.id === 'cbd'));
   });
 
+  const matchedPreset = PRESETS.find((p) => p.url === url || (url === DEFAULT_URL && p.id === 'cbd'));
+  const presetAlign = matchedPreset?.align ?? 'origin';
+  const presetHeightOffset = matchedPreset?.heightOffset ?? 0;
+  const isUnderground = matchedPreset?.underground ?? false;
+
+  if ($('optAlign')) $('optAlign').value = presetAlign;
+  if ($('optUnderground')) $('optUnderground').checked = isUnderground;
+  layer.setGroundMode(isUnderground ? 'translucent' : 'none');
+  updateBasemapVisibility();
+
   setStatus('正在解析数据源…', 'busy');
   layer.clearDatasets();
-  $('optHeightOffset').value = 0;
-  $('heightOffsetVal').textContent = '0m';
 
   currentDatasets = await resolveUrlToDatasets(url);
   renderDatasetUI();
@@ -281,6 +300,8 @@ async function loadSource(rawUrl) {
         id: d.id,
         name: d.name,
         configUrl: d.configUrl,
+        align: presetAlign,
+        heightOffset: presetHeightOffset,
       });
       updateDatasetTag(d.id);
     } catch (e) {
@@ -288,8 +309,13 @@ async function loadSource(rawUrl) {
     }
   }
 
-  // 定位镜头到图层范围
-  fitLayerBounds();
+  // 同步实际生效的高程到 UI 控制器
+  const effectiveHeight = layer.getDatasetHeight();
+  $('optHeightOffset').value = effectiveHeight;
+  $('heightOffsetVal').textContent = `${effectiveHeight > 0 ? '+' : ''}${effectiveHeight.toFixed(1)}m`;
+
+  // 定位镜头到图层范围（如预设指定了推荐倾角/偏航则应用）
+  fitLayerBounds(matchedPreset ? { pitch: matchedPreset.pitch ?? 58, bearing: matchedPreset.bearing ?? -25 } : undefined);
 }
 
 function updateDatasetTag(id) {
@@ -303,10 +329,14 @@ function updateDatasetTag(id) {
   }
 }
 
-function fitLayerBounds() {
+function fitLayerBounds(customOptions) {
   const bounds = layer.getBounds();
   if (bounds) {
-    map.fitBounds(bounds, { padding: 80, pitch: 58, bearing: -25, maxZoom: 16.6, duration: 900 });
+    const opts = Object.assign(
+      { padding: 80, pitch: 58, bearing: -25, maxZoom: 16.6, duration: 900 },
+      customOptions
+    );
+    map.fitBounds(bounds, opts);
   }
 }
 
@@ -392,10 +422,28 @@ function initSourceControls() {
 
 function updateBasemapVisibility() {
   const hide = !!$('optHideBasemap')?.checked || !!$('optOrtho')?.checked;
+  const isUnderground = !!$('optUnderground')?.checked;
+
   for (const id of ['bg', 'osm']) {
     if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', hide ? 'none' : 'visible');
   }
+
+  if (!hide) {
+    if (map.getLayer('osm')) {
+      map.setPaintProperty('osm', 'raster-opacity', isUnderground ? 0.22 : 0.82);
+    }
+    if (map.getLayer('bg')) {
+      map.setPaintProperty('bg', 'background-color', isUnderground ? '#0f172a' : '#e9edf2');
+    }
+  }
 }
+
+$('optUnderground')?.addEventListener('change', (e) => {
+  const on = e.target.checked;
+  layer.setGroundMode(on ? 'translucent' : 'none');
+  updateBasemapVisibility();
+  setStatus(on ? '3D 物理地表与地下透视已开启' : '已恢复标准地表模式');
+});
 
 $('optHideBasemap').addEventListener('change', (e) => {
   updateBasemapVisibility();
@@ -488,6 +536,15 @@ for (const [id, key] of [['cA', 'colorA'], ['cB', 'colorB'], ['cC', 'colorC']]) 
 }
 
 // 控件事件绑定
+$('optAlign')?.addEventListener('change', (e) => {
+  const align = e.target.value;
+  layer.setDatasetAlign(align);
+  const currentTotal = layer.getDatasetHeight();
+  $('optHeightOffset').value = currentTotal;
+  $('heightOffsetVal').textContent = `${currentTotal > 0 ? '+' : ''}${currentTotal.toFixed(1)}m`;
+  setStatus(`垂直对齐已设为：${align}`);
+});
+
 $('optHeightOffset').addEventListener('input', (e) => {
   const v = Number(e.target.value);
   $('heightOffsetVal').textContent = `${v > 0 ? '+' : ''}${v}m`;

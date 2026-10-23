@@ -132,6 +132,15 @@ export class S3MTileset {
   maxTiles: number;
   lodRangeScale: number;
 
+  /** 数据集配置声明的高度范围（米），若配置未声明则返回 null */
+  get heightRange(): { min: number; max: number } | null {
+    const hr = this.config?.heightRange as { min?: number; max?: number } | undefined;
+    if (hr && typeof hr.min === 'number' && typeof hr.max === 'number') {
+      return { min: hr.min, max: hr.max };
+    }
+    return null;
+  }
+
   private readonly _onTile: (node: TileNode) => void;
   private readonly _onTileRemoved: (node: TileNode) => void;
   private readonly _onError: (error: unknown) => void;

@@ -50,14 +50,20 @@ export type { TileNode, BuildTileFn, S3MTilesetOptions } from './tileset/S3MTile
 
 // —— 渲染层
 export { S3MLayer, DEFAULT_STYLE, STYLE, STYLE_LABELS, SELECT_MODE, SELECT_MODE_LABELS } from './render/S3MLayer.js';
+export { GroundManager } from './render/GroundManager.js';
+export { DatasetManager } from './render/DatasetManager.js';
+export { FeatureStyleManager } from './render/FeatureStyleManager.js';
 export type {
   S3MLayerOptions,
   S3MStyle,
   SelectMode,
   FeatureStyle,
   S3MFilter,
+  DatasetAlignment,
   S3MDatasetOptions,
   S3MDatasetEntry,
+  GroundMode,
+  GroundOptions,
   PickResult,
   MapLike,
   MapMouseEventLike,

@@ -64,96 +64,72 @@ import type {
   StyleUniforms,
 } from '../core/types.js';
 
-const EARTH_RADIUS = 6378137;
-const DEFAULT_FOV = 0.6435011087932844; // MapLibre 默认垂直视场角
-/** 拾取 ID 用 RG 两个通道编码（都存 id+1），所以上限是 65535 个网格 */
+import {
+  EARTH_RADIUS,
+  DEFAULT_FOV,
+  type MapLike,
+  type WorldCoordinateHelperLike,
+  type MapMouseEventLike,
+  extractWorldCoordinateHelper,
+  mercatorFromLngLat,
+  lngLatFromMercator,
+  worldFromLngLat,
+  lngLatFromWorld,
+} from './CoordinateHelper.js';
+
+import {
+  DatasetManager,
+  type DatasetAlignment,
+  type S3MDatasetOptions,
+  type S3MDatasetEntry,
+} from './DatasetManager.js';
+
+import {
+  FeatureStyleManager,
+  type FeatureStyle,
+  type ColorByFieldOptions,
+  type ThematicLegendEntry,
+  type ThematicResult,
+  type BatchConflict,
+  type BatchAudit,
+  type FieldFilterOptions,
+  type FieldFilterResult,
+  type FieldElevationOptions,
+  type FieldElevationResult,
+  type S3MFilter,
+} from './FeatureStyleManager.js';
+
+import {
+  GroundManager,
+  type GroundMode,
+  type GroundOptions,
+} from './GroundManager.js';
+
+export type {
+  MapLike,
+  WorldCoordinateHelperLike,
+  MapMouseEventLike,
+  DatasetAlignment,
+  S3MDatasetOptions,
+  S3MDatasetEntry,
+  FeatureStyle,
+  ColorByFieldOptions,
+  ThematicLegendEntry,
+  ThematicResult,
+  BatchConflict,
+  BatchAudit,
+  FieldFilterOptions,
+  FieldFilterResult,
+  FieldElevationOptions,
+  FieldElevationResult,
+  S3MFilter,
+  GroundMode,
+  GroundOptions,
+};
+
+export { GroundManager, DatasetManager, FeatureStyleManager };
+
 const MAX_PICK_ID = 65534;
-
-/* ------------------------------------------------------------------ 宿主适配 */
-
-/** 宿主地图上我们真正用到的能力，MapLibre / Mapbox 的交集 */
-export interface MapLike {
-  getCanvas(): HTMLCanvasElement;
-  triggerRepaint(): void;
-  on(type: string, listener: (e: MapMouseEventLike) => void): unknown;
-  off(type: string, listener: (e: MapMouseEventLike) => void): unknown;
-  getBearing?(): number;
-  getFreeCameraOptions?(): { position?: { x: number; y: number; z: number } | null } | null;
-  /** 注意 fov 在 MapLibre v5 起是「度」，v4 / Mapbox 是「弧度」；弧度用 fovInRadians */
-  transform?: {
-    fov?: number;
-    fovInRadians?: number;
-    cameraToCenterDistance?: number;
-    worldCoordinateHelper?: unknown;
-    projection?: { worldCoordinateHelper?: unknown };
-  };
-  getProjection?(): unknown;
-}
-
-export interface WorldCoordinateHelperLike {
-  name?: string;
-  worldFromLngLat(lng: number, lat: number, altitude?: number): { x: number; y: number; z?: number };
-  lngLatFromWorld(x: number, y: number): { lng: number; lat: number } | [number, number];
-  metersPerWorldUnit?(x: number, y: number): number;
-}
-
-/**
- * 从宿主地图中提取 WorldCoordinateHelper（自动适配 MapLibre v5+ CRS 体系与自定义投影）
- */
-function extractWorldCoordinateHelper(map: unknown): WorldCoordinateHelperLike | null {
-  const m = map as {
-    transform?: {
-      worldCoordinateHelper?: unknown;
-      projection?: { worldCoordinateHelper?: unknown };
-    };
-    painter?: {
-      transform?: {
-        worldCoordinateHelper?: unknown;
-      };
-    };
-    getProjection?(): { worldCoordinateHelper?: unknown } | unknown;
-  };
-
-  const helper = (
-    m?.transform?.worldCoordinateHelper ??
-    m?.transform?.projection?.worldCoordinateHelper ??
-    m?.painter?.transform?.worldCoordinateHelper ??
-    (typeof m?.getProjection === 'function' ? (m.getProjection() as any)?.worldCoordinateHelper : null) ??
-    null
-  ) as WorldCoordinateHelperLike | null;
-
-  if (helper && typeof helper.worldFromLngLat === 'function' && typeof helper.lngLatFromWorld === 'function') {
-    return helper;
-  }
-  return null;
-}
-
-export interface MapMouseEventLike {
-  originalEvent?: { clientX: number; clientY: number };
-  point?: { x: number; y: number };
-}
-
-/* ------------------------------------------------------------------ 数学 */
-
-/** 经纬度 → 墨卡托归一化坐标（世界为 1×1）—— 默认墨卡托兜底 */
-function mercatorFromLngLat(
-  lon: number,
-  lat: number,
-  altitude = 0
-): { x: number; y: number; z: number; meterInMercator: number; altitude: number } {
-  const sinLat = Math.sin((lat * Math.PI) / 180);
-  const x = (180 + lon) / 360;
-  const y = 0.5 - (0.25 * Math.log((1 + sinLat) / (1 - sinLat))) / Math.PI;
-  const meterInMercator = 1 / (2 * Math.PI * EARTH_RADIUS) / Math.cos((lat * Math.PI) / 180);
-  return { x, y, z: altitude * meterInMercator, meterInMercator, altitude };
-}
-
-/** 墨卡托归一化坐标 → 经纬度 —— 默认墨卡托兜底 */
-function lngLatFromMercator(x: number, y: number): [number, number] {
-  const lon = x * 360 - 180;
-  const lat = (Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) * 180) / Math.PI;
-  return [lon, lat];
-}
 
 /* ------------------------------------------------------------------ 配置 */
 
@@ -241,57 +217,6 @@ export const DEFAULT_STYLE: S3MStyle = {
   depthWrite: true,
 };
 
-export interface S3MDatasetOptions {
-  id: string;
-  name?: string;
-  configUrl: string;
-  visible?: boolean;
-  maxTiles?: number;
-  /** LOD 切换范围缩放系数（默认 1.0） */
-  lodRangeScale?: number;
-  /** 垂直高度偏移（米），正数抬升，负数下降，默认 0 */
-  heightOffset?: number;
-}
-
-export interface S3MDatasetEntry {
-  id: string;
-  name: string;
-  options: S3MDatasetOptions;
-  root: THREE.Group;
-  tileset: S3MTileset | null;
-  anchor: Anchor | null;
-  /** 垂直高度偏移（米） */
-  heightOffset: number;
-  /** 相对场景锚点的偏移（米） */
-  offset: [number, number, number];
-  visible: boolean;
-  error: unknown;
-}
-
-export interface FeatureStyle {
-  /** 自定义单体颜色 */
-  color?: string;
-  /** 自定义单体独立拔高高度（米，垂直方向） */
-  elevation?: number;
-  /** 自定义单体三维平移偏移量 [dx, dy, dz]（米，S3M 本地坐标/ENU） */
-  translation?: [number, number, number];
-  /** 自定义单体不透明度（0~1） */
-  opacity?: number;
-}
-
-export interface S3MFilter {
-  /** 白名单：仅显示指定 SMID，其余全部隐藏 */
-  include?: number[];
-  /** 黑名单：隐藏指定 SMID */
-  exclude?: number[];
-  /** 最小高度（米，相对场景高程），低于此高度的建筑隐藏 */
-  minHeight?: number;
-  /** 最大高度（米，相对场景高程），高于此高度的建筑隐藏 */
-  maxHeight?: number;
-  /** 自定义谓词函数过滤（基于建筑属性） */
-  predicate?: (feature: FeatureAttributes & { smid: number | null }) => boolean;
-}
-
 export interface PickResult extends FeatureAttributes {
   datasetId: string;
   datasetName: string;
@@ -320,6 +245,8 @@ export interface S3MLayerOptions {
   /** 多数据集 */
   datasets?: S3MDatasetOptions[];
   style?: Partial<S3MStyle>;
+  /** 3D 物理地表面 / 基坑开挖配置 */
+  ground?: GroundOptions;
   pickable?: boolean;
   /** 每个数据集最多驻留瓦片 */
   maxTiles?: number;
@@ -347,141 +274,6 @@ export interface S3MLayerOptions {
   onPick?: (result: PickResult | null) => void;
   onError?: (error: unknown) => void;
 }
-
-/* ------------------------------------------------------------------ 专题着色 */
-
-/** 按业务字段着色的选项 */
-export interface ColorByFieldOptions {
-  /** 字段名，如 ENTITYID / KEYID / SmMaxZ */
-  field: string;
-  /**
-   * category —— 按不同取值分配颜色（默认）
-   * ramp     —— 数值字段连续色带
-   * breaks   —— 数值字段按 `breaks` 阈值分级
-   */
-  type?: 'category' | 'ramp' | 'breaks';
-  /** 调色板 / 色带，至少 2 个颜色；不给就用内置的 12 色 */
-  colors?: string[];
-  /** breaks 模式的分级阈值（升序）。颜色数应 ≥ 阈值数 + 1 */
-  breaks?: number[];
-  /** 只给这些单体上色，默认取「当前已加载的全部单体」 */
-  smids?: number[];
-  /** 取值预处理，分类模式下很有用（比如取编码前 12 位做分组） */
-  transform?: (value: string) => string;
-  /** 手动固定某些取值的颜色，key 是 transform 之后的值 */
-  colorMap?: Record<string, string>;
-}
-
-/** 被多个 SMID 共用的一个 batch */
-export interface BatchConflict {
-  datasetId: string;
-  batchId: number;
-  smids: number[];
-}
-
-export interface BatchAudit {
-  /** 当前已加载的单体数（SMID 去重） */
-  smids: number;
-  /** 当前已加载的 batch 数（按网格累加） */
-  batches: number;
-  /** 被多个 SMID 共用的 batch（这些单体在渲染层无法再细分） */
-  conflicts: BatchConflict[];
-  /** 卷进冲突的单体数（去重） */
-  conflictingSmids: number;
-}
-
-export interface ThematicLegendEntry {
-  label: string;
-  color: string;
-  count: number;
-}
-
-/** 按业务字段过滤：条件之间是「与」，一个条件都不给就按「字段非空」算命中 */
-export interface FieldFilterOptions {
-  /** 字段名 */
-  field: string;
-  /** 数值区间（含端点），只对能转成数字的取值生效 */
-  min?: number;
-  /** 数值区间上界 */
-  max?: number;
-  /** 取值白名单，按 `String(value)` 比较（编码类字段用它做精确匹配） */
-  values?: Array<string | number>;
-  /** 自定义判断，返回 true 表示命中 */
-  keep?: (value: string | number | null, row: AttributeRow) => boolean;
-  /** `keep`（默认）只显示命中的单体；`hide` 隐藏命中的单体 */
-  mode?: 'keep' | 'hide';
-  /** 查询范围，默认取「当前已加载的全部单体」 */
-  smids?: number[];
-  /** 查不到属性值的单体：`keep`（默认，保留）或 `hide` */
-  onMissing?: 'keep' | 'hide';
-}
-
-export interface FieldFilterResult {
-  field: string;
-  mode: 'keep' | 'hide';
-  /** 参与判断的单体数 */
-  total: number;
-  /** 命中条件的单体数 */
-  matched: number;
-  /** 查不到属性值的单体数 */
-  missing: number;
-  /** 最终被隐藏的单体 ID */
-  hidden: number[];
-}
-
-/** 按业务字段抬高：抬高 = 字段值 × scale + offset（米），也可用 map 自定义 */
-export interface FieldElevationOptions {
-  /** 数值字段名 */
-  field: string;
-  /** 米 / 字段单位，默认 1（即字段值直接当米） */
-  scale?: number;
-  /** 基础偏移（米），默认 0 */
-  offset?: number;
-  /** 抬高上限（米），超出按上限算 */
-  max?: number;
-  /** 自定义映射，第二参数是该字段在当前范围内的 min / max */
-  map?: (value: number, range: { min: number; max: number }) => number;
-  /** 只抬这些单体，默认取「当前已加载的全部单体」 */
-  smids?: number[];
-}
-
-export interface FieldElevationResult {
-  field: string;
-  /** 真正抬起来的单体数 */
-  matched: number;
-  /** 字段值不是数字、跳过的单体数 */
-  missing: number;
-  /** 该字段在当前范围内的最小 / 最大值 */
-  min: number;
-  max: number;
-  /** 实际最大抬高（米） */
-  appliedMax: number;
-}
-
-export interface ThematicResult {
-  field: string;
-  /** 真正上了色的单体数 */
-  matched: number;
-  /** 查不到属性值的单体数 */
-  missing: number;
-  legend: ThematicLegendEntry[];
-}
-
-/** 分类模式的默认调色板（色相拉开，深浅接近） */
-const DEFAULT_THEMATIC_COLORS = [
-  '#3b82f6',
-  '#22c55e',
-  '#f59e0b',
-  '#ef4444',
-  '#a855f7',
-  '#06b6d4',
-  '#84cc16',
-  '#ec4899',
-  '#6366f1',
-  '#14b8a6',
-  '#f97316',
-  '#64748b',
-];
 
 /* ------------------------------------------------------------------ 内部类型 */
 
@@ -519,48 +311,6 @@ function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
   return styled?.userData?.isStyled ? styled : null;
 }
 
-/** 在色带上取 t（0~1）位置的颜色，多段线性插值 */
-function sampleRamp(stops: THREE.Color[], t: number): THREE.Color {
-  if (stops.length < 2) return stops[0].clone();
-  const clamped = Math.min(1, Math.max(0, t));
-  const scaled = clamped * (stops.length - 1);
-  const i = Math.min(stops.length - 2, Math.floor(scaled));
-  return stops[i].clone().lerp(stops[i + 1], scaled - i);
-}
-
-/** 按字段值判断是否命中过滤条件（各条件之间是「与」） */
-function matchFieldValue(
-  value: string | number | null,
-  row: AttributeRow,
-  options: FieldFilterOptions
-): boolean {
-  if (options.keep && !options.keep(value, row)) return false;
-  if (options.values?.length) {
-    const text = value == null ? '' : String(value);
-    if (!options.values.some((v) => String(v) === text)) return false;
-  }
-  if (options.min != null || options.max != null) {
-    const num = Number(value);
-    if (!Number.isFinite(num)) return false;
-    if (options.min != null && num < options.min) return false;
-    if (options.max != null && num > options.max) return false;
-  }
-  // 一个条件都没给：字段非空就算命中
-  if (!options.keep && !options.values?.length && options.min == null && options.max == null) {
-    return value != null && String(value) !== '';
-  }
-  return true;
-}
-
-/** 图例上的数值：够用就好，别出现 60.390098571777344 */
-function formatNumber(v: number): string {
-  if (!Number.isFinite(v)) return '—';
-  const abs = Math.abs(v);
-  if (abs >= 100) return v.toFixed(0);
-  if (abs >= 10) return v.toFixed(1);
-  return v.toFixed(2);
-}
-
 /* ------------------------------------------------------------------ 图层 */
 
 export class S3MLayer {
@@ -579,7 +329,6 @@ export class S3MLayer {
   renderer: THREE.WebGLRenderer | null = null;
   scene: THREE.Scene | null = null;
   camera: THREE.Camera | null = null;
-  sceneAnchor: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null = null;
   picker: Picker | null = null;
 
   readonly uniforms: StyleUniforms;
@@ -593,19 +342,31 @@ export class S3MLayer {
   /** 选中棱线材质 */
   readonly selectionEdgeMaterial: ThickLineMaterial;
 
-  readonly datasets = new Map<string, S3MDatasetEntry>();
+  /** 3D 物理地表面 / 基坑开挖管理器 */
+  readonly groundManager: GroundManager;
+  /** 多数据集生命周期与锚点管理器 */
+  private readonly _datasetManager = new DatasetManager();
+  /** 单体样式、专题着色与状态纹理管理器 */
+  private readonly _featureStyleManager: FeatureStyleManager;
+
+  /** 兼容 datasets 映射表暴露 */
+  get datasets(): Map<string, S3MDatasetEntry> {
+    return this._datasetManager.datasets;
+  }
+
+  /** 场景主锚点（ENU 原点对应的世界坐标） */
+  get sceneAnchor(): { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null {
+    return this._datasetManager.sceneAnchor;
+  }
+  set sceneAnchor(val: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null) {
+    this._datasetManager.sceneAnchor = val;
+  }
 
   private readonly _pickables = new Map<number, PickableRef>();
   private _pickSeq = 0;
   private readonly _freePickIds: number[] = [];
   /** SMID → 包含它的网格。改单个单体样式时只重算这几块，不用全量扫 */
   private readonly _smidMeshes = new Map<number, Set<THREE.Mesh>>();
-  /** 待重写单体状态纹理的网格；_dirtyAll 为 true 时忽略这个集合 */
-  private readonly _dirtyMeshes = new Set<THREE.Mesh>();
-  private _dirtyAll = false;
-  private _flushScheduled = false;
-  /** batch 冲突只在第一次告警，避免每帧刷屏 */
-  private _batchConflictWarned = false;
   /** 每块网格的世界高度范围，用来增量维护 uHeightMin / uHeightMax */
   private readonly _meshHeight = new Map<THREE.Mesh, { min: number; max: number }>();
   private _heightMin = Infinity;
@@ -619,21 +380,8 @@ export class S3MLayer {
   private _selectionEdgeMeshes: THREE.Mesh[] = [];
   private _edgesEnabled = false;
 
-  private readonly _featureStyles = new Map<number, FeatureStyle>();
-
   /** 业务属性查询（可选，配了 `attributes` 才有） */
   attributeQuery: AttributeQuery | null = null;
-  /** 专题着色：SMID → 颜色（手动 featureStyle 的颜色优先级更高） */
-  private _thematic = new Map<number, string>();
-  private _thematicField: string | null = null;
-  private _thematicElevation = new Map<number, number>();
-  private _elevationField: string | null = null;
-  private _fieldFilter: { field: string; mode: 'keep' | 'hide'; matched: Set<number> } | null = null;
-  private _filter: S3MFilter | null = null;
-  private readonly _meshBatchTextures = new WeakMap<
-    THREE.Mesh,
-    { texture: THREE.DataTexture; data: Float32Array; width: number }
-  >();
 
   private readonly _enuMatrix = new THREE.Matrix4();
   private _needsRepaint = true;
@@ -659,6 +407,17 @@ export class S3MLayer {
     this.onReady = options.onReady ?? (() => {});
     this.onPick = options.onPick ?? (() => {});
     this.onError = options.onError ?? ((e) => console.warn('[s3m]', e));
+
+    this.groundManager = new GroundManager(options.ground);
+    this._featureStyleManager = new FeatureStyleManager(
+      () => this.style.floorHeight,
+      () => this.map?.triggerRepaint(),
+      () => {
+        if (this._selection) this._syncSelectionStyle();
+      },
+      () => this.getAllMeshes(),
+      (mesh) => this._applyOverridesToMesh(mesh)
+    );
 
     this.uniforms = createSharedUniforms();
     this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
@@ -703,6 +462,7 @@ export class S3MLayer {
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
 
     this.scene = new THREE.Scene();
+    this.scene.add(this.groundManager.group);
     this._addLights();
 
     this.camera = new THREE.Camera();
@@ -731,6 +491,7 @@ export class S3MLayer {
       this.map.off('projectiontransition', this._onProjectionChange);
     }
     for (const id of [...this.datasets.keys()]) this.removeDataset(id);
+    this.groundManager.dispose();
     this.picker?.dispose();
     this.picker = null;
     this.outlineMaterial.dispose();
@@ -744,9 +505,6 @@ export class S3MLayer {
     this._selectionEdges = null;
     this._smidMeshes.clear();
     this._meshHeight.clear();
-    this._dirtyMeshes.clear();
-    this._dirtyAll = false;
-    this._flushScheduled = false;
     this._heightMin = Infinity;
     this._heightMax = -Infinity;
     this.renderer?.dispose();
@@ -794,149 +552,63 @@ export class S3MLayer {
   /** 追加一个数据集。图层 addLayer 之前调用会抛错。 */
   async addDataset(ds: S3MDatasetOptions): Promise<S3MDatasetEntry> {
     if (!this.scene) throw new Error('[s3m] 图层尚未 addLayer，不能添加数据集');
-    const existing = this.datasets.get(ds.id);
-    if (existing) return existing;
-
-    const root = new THREE.Group();
-    root.name = `s3m-dataset:${ds.id}`;
-    root.visible = ds.visible !== false;
-    this.scene.add(root);
-
-    const entry: S3MDatasetEntry = {
-      id: ds.id,
-      name: ds.name ?? ds.id,
-      options: ds,
-      root,
-      tileset: null,
-      anchor: null,
-      heightOffset: ds.heightOffset ?? 0,
-      offset: [0, 0, 0],
-      visible: ds.visible !== false,
-      error: null,
-    };
-    this.datasets.set(ds.id, entry);
-
-    const tileset = new S3MTileset({
-      configUrl: ds.configUrl,
-      maxTiles: ds.maxTiles ?? this.options.maxTiles ?? 64,
-      maxConcurrent: this.options.maxConcurrent ?? 4,
-      lodRangeScale: ds.lodRangeScale ?? this._lodRangeScale,
-      buildTile: this.options.buildTile ?? null,
-      uniforms: this.uniforms,
-      onTile: (node) => {
-        this._registerTile(node, entry);
-        this.onStats(this.stats);
-        this._needsRepaint = true;
-        this.map?.triggerRepaint();
-      },
-      onTileRemoved: (node) => {
-        this._unregisterTile(node, entry);
-        this.onStats(this.stats);
-        this._needsRepaint = true;
-        this.map?.triggerRepaint();
-      },
-      onProgress: () => {
-        this.onStats(this.stats);
-        this.map?.triggerRepaint();
-      },
-      onError: (e) => {
-        entry.error = e;
-        this.onError(e);
-        this.onStats(this.stats);
-      },
-    });
-    entry.tileset = tileset;
-
-    try {
-      await tileset.init();
-    } catch (e) {
-      entry.error = e;
-      this.onError(e);
-      return entry;
-    }
-
-    entry.anchor = tileset.anchor;
-    this._layoutDataset(entry);
-    this.onReady(entry);
-    this.map?.triggerRepaint();
+    const entry = await this._datasetManager.addDataset(
+      ds,
+      this.scene,
+      this.map,
+      this.uniforms,
+      this._lodRangeScale,
+      this.options.buildTile,
+      this.options.maxTiles ?? 64,
+      this.options.maxConcurrent ?? 4,
+      {
+        onTile: (node, e) => {
+          this._registerTile(node, e);
+          this.onStats(this.stats);
+          this._needsRepaint = true;
+          this.map?.triggerRepaint();
+        },
+        onTileRemoved: (node, e) => {
+          this._unregisterTile(node, e);
+          this.onStats(this.stats);
+          this._needsRepaint = true;
+          this.map?.triggerRepaint();
+        },
+        onStats: () => {
+          this.onStats(this.stats);
+          this.map?.triggerRepaint();
+        },
+        onError: (e) => {
+          this.onError(e);
+          this.onStats(this.stats);
+        },
+        onReady: (e) => {
+          this.onReady(e);
+          this._refreshAllHeights();
+          if (!this.groundManager.excavationBounds) {
+            this.groundManager.autoFitExcavation(this.datasets.values());
+          }
+        },
+        triggerRepaint: () => {
+          this.map?.triggerRepaint();
+        },
+      }
+    );
     return entry;
-  }
-
-  /**
-   * 经纬度 + 高程 → 归一化世界坐标与尺度换算。
-   * 优先使用宿主 map 的 WorldCoordinateHelper（自动适配 MapLibre v5+ 任意 CRS，如自定义投影、平面直角坐标系等），
-   * 若宿主未就绪或为老版本则平滑回退至标准 Web 墨卡托。
-   */
-  private _worldFromLngLat(
-    lon: number,
-    lat: number,
-    altitude = 0
-  ): { x: number; y: number; z: number; meterInMercator: number; altitude: number } {
-    const helper = extractWorldCoordinateHelper(this.map);
-    if (helper) {
-      const coord = helper.worldFromLngLat(lon, lat, altitude);
-      let s = 0;
-      if (typeof helper.metersPerWorldUnit === 'function') {
-        const mpw = helper.metersPerWorldUnit(coord.x, coord.y);
-        if (Number.isFinite(mpw) && mpw > 0) s = 1 / mpw;
-      }
-      if (s === 0) {
-        const c1 = helper.worldFromLngLat(lon, lat, altitude + 1);
-        const dz = Math.abs((c1.z ?? 0) - (coord.z ?? 0));
-        s = dz > 0 ? dz : mercatorFromLngLat(lon, lat, altitude).meterInMercator;
-      }
-      return {
-        x: coord.x,
-        y: coord.y,
-        z: coord.z ?? (altitude * s),
-        meterInMercator: s,
-        altitude,
-      };
-    }
-    return mercatorFromLngLat(lon, lat, altitude);
   }
 
   /**
    * 归一化世界坐标 → 经纬度 [lng, lat]
    */
   private _lngLatFromWorld(x: number, y: number): [number, number] {
-    const helper = extractWorldCoordinateHelper(this.map);
-    if (helper) {
-      const res = helper.lngLatFromWorld(x, y);
-      if (Array.isArray(res)) return [res[0], res[1]];
-      if (res && typeof res.lng === 'number' && typeof res.lat === 'number') {
-        return [res.lng, res.lat];
-      }
-    }
-    return lngLatFromMercator(x, y);
+    return lngLatFromWorld(this.map, x, y);
   }
 
   /** 当地图 CRS 投影切换或宿主 map 挂载后，重新计算场景锚点与各数据集 offset */
   private _recomputeAnchors(): void {
-    if (this.datasets.size === 0) return;
-    this.sceneAnchor = null;
-    for (const entry of this.datasets.values()) {
-      this._layoutDataset(entry);
-    }
-    this.map?.triggerRepaint();
-  }
-
-  /** 数据集锚点对齐到场景锚点，并应用垂直高程偏移 */
-  private _layoutDataset(entry: S3MDatasetEntry): void {
-    if (!entry.anchor) return;
-    if (!this.sceneAnchor) {
-      this.sceneAnchor = this._worldFromLngLat(entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
-    }
-    const s = this.sceneAnchor.meterInMercator;
-    const a = this._worldFromLngLat(entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
-    entry.offset = [
-      (a.x - this.sceneAnchor.x) / s,
-      -(a.y - this.sceneAnchor.y) / s,
-      (a.z - this.sceneAnchor.z) / s + (entry.heightOffset ?? 0),
-    ];
-    entry.root.position.set(entry.offset[0], entry.offset[1], entry.offset[2]);
-    entry.root.updateMatrixWorld(true);
+    this._datasetManager.recomputeAnchors(this.map);
     this._refreshAllHeights();
+    this.map?.triggerRepaint();
   }
 
   /**
@@ -944,15 +616,11 @@ export class S3MLayer {
    * 若不传 id，默认获取第一个（或默认）数据集的高程偏移。
    */
   getDatasetHeight(id?: string): number {
-    const targetId = id ?? this.datasets.keys().next().value;
-    return targetId ? this.datasets.get(targetId)?.heightOffset ?? 0 : 0;
+    return this._datasetManager.getDatasetHeight(id);
   }
 
   /**
    * 设置指定数据集的垂直高程偏移（米），正数抬升，负数下降。
-   * 支持调用形式：
-   *   layer.setDatasetHeight(15.0)              // 针对当前第一个/默认数据集
-   *   layer.setDatasetHeight('datasetId', 15.0)  // 针对指定数据集
    */
   setDatasetHeight(idOrHeight: string | number, heightOffset?: number): void {
     let id: string;
@@ -964,660 +632,187 @@ export class S3MLayer {
       id = idOrHeight;
       h = heightOffset ?? 0;
     }
-    const entry = this.datasets.get(id);
-    if (!entry) return;
-    entry.heightOffset = h;
-    this._layoutDataset(entry);
+    this._datasetManager.setDatasetHeight(id, h, this.map);
+    this._refreshAllHeights();
     this.map?.triggerRepaint();
+  }
+
+  /**
+   * 动态设置指定数据集的垂直对齐基准（'origin' | 'bottom' | 'top' | 'center'）。
+   */
+  setDatasetAlign(idOrAlign: string | DatasetAlignment, align?: DatasetAlignment): void {
+    let id: string;
+    let a: DatasetAlignment;
+    if (align === undefined && (idOrAlign === 'origin' || idOrAlign === 'bottom' || idOrAlign === 'top' || idOrAlign === 'center')) {
+      id = this.datasets.keys().next().value ?? '';
+      a = idOrAlign;
+    } else {
+      id = idOrAlign as string;
+      a = align ?? 'origin';
+    }
+    this._datasetManager.setDatasetAlign(id, a, this.map);
+    this._refreshAllHeights();
+    this.map?.triggerRepaint();
+  }
+
+  /** @internal 语义高度对齐计算代理，供内部与测试使用 */
+  _computeAlignOffset(tileset: S3MTileset | any, align?: DatasetAlignment): number {
+    return this._datasetManager.computeAlignOffset(tileset, align);
   }
 
   /* ---------------------------------------------------------------- 单体自定义样式 & 过滤 */
 
   /**
    * 为指定单体（SMID）设置独立自定义样式（颜色、拔高、透明度）。
-   * 即使点击选中其他建筑，此单体的独立样式依然持久保留。
    */
   setFeatureStyle(smid: number, style: FeatureStyle): void {
-    this._featureStyles.set(smid, style);
-    this._markOverridesDirty(this._meshesOf([smid]));
-    if (this._selection) this._syncSelectionStyle();
-    this.map?.triggerRepaint();
+    this._featureStyleManager.setFeatureStyle(smid, style, this._meshesOf([smid]));
   }
 
   /** 批量为多个单体设置样式 */
   setFeaturesStyle(smids: number[], style: FeatureStyle): void {
-    for (const smid of smids) {
-      this._featureStyles.set(smid, style);
-    }
-    this._markOverridesDirty(this._meshesOf(smids));
-    if (this._selection) this._syncSelectionStyle();
-    this.map?.triggerRepaint();
+    this._featureStyleManager.setFeaturesStyle(smids, style, this._meshesOf(smids));
   }
 
   /** 获取指定单体的自定义样式 */
   getFeatureStyle(smid: number): FeatureStyle | null {
-    return this._featureStyles.get(smid) ?? null;
+    return this._featureStyleManager.getFeatureStyle(smid);
   }
 
   /** 获取所有自定义样式的单体映射表 */
   getFeatureStyles(): Map<number, FeatureStyle> {
-    return new Map(this._featureStyles);
+    return this._featureStyleManager.getFeatureStyles();
   }
 
   /** 移除指定单体的自定义样式，恢复为图层全局样式 */
   removeFeatureStyle(smid: number): void {
-    if (this._featureStyles.delete(smid)) {
-      this._markOverridesDirty(this._meshesOf([smid]));
-      if (this._selection) this._syncSelectionStyle();
-      this.map?.triggerRepaint();
-    }
+    this._featureStyleManager.removeFeatureStyle(smid, this._meshesOf([smid]));
   }
 
   /** 清空所有单体的自定义样式 */
   clearFeatureStyles(): void {
-    if (this._featureStyles.size > 0) {
-      this._featureStyles.clear();
-      this._markOverridesDirty();
-      if (this._selection) this._syncSelectionStyle();
-      this.map?.triggerRepaint();
-    }
+    this._featureStyleManager.clearFeatureStyles();
   }
 
   /* ---------------------------------------------------------------- 按业务字段着色 */
 
-  /**
-   * 换一个业务属性数据源（或传 null 关掉）。
-   * 属性值不在 S3M 瓦片里，得去 iServer 数据服务查，所以必须先有这一层配置。
-   */
   setAttributeSource(options: AttributeQueryOptions | null): void {
     this.attributeQuery = options ? new AttributeQuery(options) : null;
   }
 
-  /** 当前场景里已经加载的单体 ID（按 SMID 去重），也是 colorByField 的默认范围 */
   getLoadedSmids(): number[] {
     return [...this._smidMeshes.keys()];
   }
 
-  /**
-   * 盘一遍 batch 分配，列出被多个 SMID 共用的 batchId。
-   *
-   * S3M 的单体化粒度只到 batch：几个 SMID 落到同一个 batch 时，按单体隐藏 / 改色 /
-   * 抬高只能对这一批整体生效（内部规则：任一隐藏则整批隐藏，颜色 / 抬高取首个）。
-   * 拿这个结果可以判断手上的数据到底能把单体粒度用到哪一步。
-   */
   auditBatches(): BatchAudit {
-    const conflicts: BatchConflict[] = [];
-    const involved = new Set<number>();
-    let batches = 0;
-
-    for (const p of this._pickables.values()) {
-      const pickInfo = (p.mesh.userData as MeshUserData).geoRef?.pickInfo;
-      if (!pickInfo) continue;
-      const byBatch = new Map<number, number[]>();
-      for (const [key, entry] of Object.entries(pickInfo)) {
-        const bId = pickEntryId(entry);
-        if (bId < 0) continue;
-        const smid = Number(key);
-        const list = byBatch.get(bId);
-        if (list) list.push(smid);
-        else byBatch.set(bId, [smid]);
-      }
-      batches += byBatch.size;
-      for (const [batchId, smids] of byBatch) {
-        if (smids.length < 2) continue;
-        for (const smid of smids) involved.add(smid);
-        conflicts.push({ datasetId: p.datasetId, batchId, smids });
-      }
-    }
-
-    return { smids: this._smidMeshes.size, batches, conflicts, conflictingSmids: involved.size };
+    const res = this._featureStyleManager.auditBatches(this._pickables.values());
+    res.smids = this._smidMeshes.size;
+    return res;
   }
 
-  /** 当前专题着色用的字段名 */
   getThematicField(): string | null {
-    return this._thematicField;
+    return this._featureStyleManager.thematicField;
   }
 
-  /**
-   * 直接塞一份 SMID → 颜色。已经有属性值（或想按几何派生量自己算色）时用这个，
-   * 不走网络。
-   */
   setThematicColors(colors: Map<number, string> | null, field = 'custom'): void {
-    this._thematic = colors && colors.size > 0 ? new Map(colors) : new Map();
-    this._thematicField = this._thematic.size > 0 ? field : null;
-    this._markOverridesDirty();
-    this.map?.triggerRepaint();
+    this._featureStyleManager.setThematicColors(colors, field);
   }
 
   clearThematic(): void {
-    if (this._thematic.size === 0 && !this._thematicField) return;
-    this._thematic = new Map();
-    this._thematicField = null;
-    this._markOverridesDirty();
-    this.map?.triggerRepaint();
+    this._featureStyleManager.clearThematicColors();
   }
 
   /* ---------------------------------------------------------------- 按业务字段过滤 / 抬高 */
 
-  /** 当前过滤用的业务字段 */
   getFilterField(): string | null {
-    return this._fieldFilter?.field ?? null;
+    return this._featureStyleManager.fieldFilter?.field ?? null;
   }
 
-  /**
-   * 按业务字段过滤单体。
-   *
-   * 命中的单体集合会记下来参与渲染：`keep` 模式下不在集合里的单体直接不画（顶点被压到原点，
-   * 也不参与拾取）；`hide` 模式反之。和 `setFilter()` 是叠加关系（两个都满足才显示）。
-   */
-  async filterByField(options: FieldFilterOptions): Promise<FieldFilterResult> {
-    const query = this.attributeQuery;
-    if (!query) {
-      throw new Error('[s3m] 未配置业务属性数据源，先调用 setAttributeSource() 或构造时传 attributes');
-    }
-
-    const all = options.smids?.length ? [...new Set(options.smids)] : this.getLoadedSmids();
-    const mode = options.mode ?? 'keep';
-    const onMissing = options.onMissing ?? 'keep';
-    const result: FieldFilterResult = {
-      field: options.field,
-      mode,
-      total: all.length,
-      matched: 0,
-      missing: 0,
-      hidden: [],
-    };
-    if (!all.length) {
-      this._fieldFilter = null;
-      return result;
-    }
-
-    const rows: Map<number, AttributeRow> = await query.queryBySmids(all);
-    const matched = new Set<number>();
-    for (const smid of all) {
-      const row = rows.get(smid);
-      if (!row) {
-        result.missing++;
-        if (onMissing === 'keep') matched.add(smid);
-        continue;
-      }
-      if (matchFieldValue(row[options.field] ?? null, row, options)) matched.add(smid);
-    }
-    result.matched = matched.size;
-
-    this._fieldFilter = matched.size || mode === 'keep' ? { field: options.field, mode, matched } : null;
-    result.hidden = all.filter((smid) => (mode === 'keep' ? !matched.has(smid) : matched.has(smid)));
-
-    this._markOverridesDirty();
-    if (this._selection) this._syncSelectionStyle();
-    this.map?.triggerRepaint();
-    return result;
+  filterByField(options: FieldFilterOptions): Promise<FieldFilterResult> {
+    return this._featureStyleManager.filterByField(options, this.attributeQuery, this.getLoadedSmids());
   }
 
-  /** 清除业务字段过滤（不影响 setFilter 的规则） */
   clearFieldFilter(): void {
-    if (!this._fieldFilter) return;
-    this._fieldFilter = null;
-    this._markOverridesDirty();
-    this.map?.triggerRepaint();
+    this._featureStyleManager.clearFieldFilter();
   }
 
-  /** 当前抬高用的业务字段 */
   getElevationField(): string | null {
-    return this._elevationField;
+    return this._featureStyleManager.elevationField;
   }
 
-  /**
-   * 按业务字段抬高单体。
-   *
-   * 抬高量写进每网格的单体状态纹理（第四通道），顶点着色器里加到 z 上，
-   * 所以只影响显示、不改几何：换字段/改系数都是重写一张一维纹理。
-   */
-  async elevateByField(options: FieldElevationOptions): Promise<FieldElevationResult> {
-    const query = this.attributeQuery;
-    if (!query) {
-      throw new Error('[s3m] 未配置业务属性数据源，先调用 setAttributeSource() 或构造时传 attributes');
-    }
-
-    const all = options.smids?.length ? [...new Set(options.smids)] : this.getLoadedSmids();
-    const empty: FieldElevationResult = {
-      field: options.field,
-      matched: 0,
-      missing: all.length,
-      min: 0,
-      max: 0,
-      appliedMax: 0,
-    };
-    if (!all.length) {
-      this._thematicElevation = new Map();
-      this._elevationField = null;
-      this._markOverridesDirty();
-      return empty;
-    }
-
-    const rows: Map<number, AttributeRow> = await query.queryBySmids(all);
-    const numeric = new Map<number, number>();
-    for (const smid of all) {
-      const value = Number(rows.get(smid)?.[options.field]);
-      if (Number.isFinite(value)) numeric.set(smid, value);
-    }
-    if (numeric.size === 0) {
-      this._thematicElevation = new Map();
-      this._elevationField = null;
-      this._markOverridesDirty();
-      if (this._selection) this._syncSelectionStyle();
-      this.map?.triggerRepaint();
-      return empty;
-    }
-
-    const values = [...numeric.values()];
-    const min = Math.min(...values);
-    const max = Math.max(...values);
-    const scale = options.scale ?? 1;
-    const offset = options.offset ?? 0;
-    const next = new Map<number, number>();
-    let appliedMax = 0;
-    for (const [smid, value] of numeric) {
-      let height = options.map ? options.map(value, { min, max }) : value * scale + offset;
-      if (!Number.isFinite(height)) continue;
-      if (options.max != null && height > options.max) height = options.max;
-      // 负值等于往下压，没有实际意义，当没抬高处理
-      if (height <= 0) continue;
-      next.set(smid, height);
-      if (height > appliedMax) appliedMax = height;
-    }
-
-    this._thematicElevation = next;
-    this._elevationField = options.field;
-    this._markOverridesDirty();
-    if (this._selection) this._syncSelectionStyle();
-    this.map?.triggerRepaint();
-
-    return {
-      field: options.field,
-      matched: next.size,
-      missing: all.length - numeric.size,
-      min,
-      max,
-      appliedMax,
-    };
+  elevateByField(options: FieldElevationOptions): Promise<FieldElevationResult> {
+    return this._featureStyleManager.elevateByField(options, this.attributeQuery, this.getLoadedSmids());
   }
 
-  /**
-   * 直接塞一份 SMID → 抬高米数（已经算好、或不走网络时用这个）。
-   * 传 null 复位。
-   */
   setThematicElevation(elevations: Map<number, number> | null, field = 'custom'): void {
-    this._thematicElevation =
-      elevations && elevations.size > 0 ? new Map([...elevations].filter(([, h]) => Number.isFinite(h) && h > 0)) : new Map();
-    this._elevationField = this._thematicElevation.size > 0 ? field : null;
-    this._markOverridesDirty();
-    if (this._selection) this._syncSelectionStyle();
-    this.map?.triggerRepaint();
+    this._featureStyleManager.setThematicElevation(elevations, field);
   }
 
   clearThematicElevation(): void {
-    if (this._thematicElevation.size === 0) return;
-    this._thematicElevation = new Map();
-    this._elevationField = null;
-    this._markOverridesDirty();
-    if (this._selection) this._syncSelectionStyle();
-    this.map?.triggerRepaint();
+    this._featureStyleManager.clearThematicElevation();
   }
 
-  /**
-   * 按业务字段给单体上色。
-   *
-   * 流程：已加载单体 ID → 数据服务取字段值 → 值映射成颜色 → 写进每网格的 batch 纹理。
-   * 颜色是逐单体写进现有 override 通道的，不重建几何、不重编译着色器，改字段就是重写一张一维纹理。
-   */
-  async colorByField(options: ColorByFieldOptions): Promise<ThematicResult> {
-    const query = this.attributeQuery;
-    if (!query) {
-      throw new Error('[s3m] 未配置业务属性数据源，先调用 setAttributeSource() 或构造时传 attributes');
-    }
-
-    const smids = options.smids?.length ? options.smids : this.getLoadedSmids();
-    const empty: ThematicResult = { field: options.field, matched: 0, missing: 0, legend: [] };
-    if (!smids.length) return empty;
-
-    const rows: Map<number, AttributeRow> = await query.queryBySmids(smids);
-    const palette = (options.colors?.length ? options.colors : DEFAULT_THEMATIC_COLORS).map(
-      (c) => new THREE.Color(c)
-    );
-    const stops = palette.length > 1 ? palette : [palette[0], palette[0]];
-    const type = options.type ?? 'category';
-    const colors = new Map<number, string>();
-    const legend: ThematicLegendEntry[] = [];
-
-    if (type === 'category') {
-      const transform = options.transform ?? ((v: string) => v);
-      const counts = new Map<string, number>();
-      const keyOf = new Map<number, string>();
-      for (const [smid, row] of rows) {
-        const raw = row[options.field];
-        if (raw == null || String(raw) === '') continue;
-        const key = transform(String(raw));
-        keyOf.set(smid, key);
-        counts.set(key, (counts.get(key) ?? 0) + 1);
-      }
-      // 取值多的排前面，颜色分配稳定：同样的取值永远同一个颜色
-      const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1]);
-      const colorOf = new Map<string, string>();
-      ordered.forEach(([key, count], i) => {
-        const color = options.colorMap?.[key] ?? `#${stops[i % stops.length].getHexString()}`;
-        colorOf.set(key, color);
-        legend.push({ label: key, color, count });
-      });
-      for (const [smid, key] of keyOf) {
-        const color = colorOf.get(key);
-        if (color) colors.set(smid, color);
-      }
-    } else {
-      const numeric = new Map<number, number>();
-      for (const [smid, row] of rows) {
-        const value = Number(row[options.field]);
-        if (Number.isFinite(value)) numeric.set(smid, value);
-      }
-      if (numeric.size === 0) {
-        this._thematic = new Map();
-        this._thematicField = null;
-        this._markOverridesDirty();
-        this.map?.triggerRepaint();
-        return { field: options.field, matched: 0, missing: smids.length, legend: [] };
-      }
-
-      const values = [...numeric.values()];
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-
-      if (type === 'breaks') {
-        // 没给阈值就按色带档数等分，5 段
-        const segmentCount = Math.max(2, options.breaks?.length ? options.breaks.length + 1 : Math.min(stops.length, 5));
-        const breaks =
-          options.breaks?.length
-            ? options.breaks
-            : Array.from({ length: segmentCount - 1 }, (_, i) => min + ((max - min) * (i + 1)) / segmentCount);
-        const counts = new Array(segmentCount).fill(0) as number[];
-        for (const [smid, value] of numeric) {
-          let idx = 0;
-          while (idx < breaks.length && value > breaks[idx]) idx++;
-          counts[idx]++;
-          colors.set(smid, `#${stops[Math.min(idx, stops.length - 1)].getHexString()}`);
-        }
-        for (let i = 0; i < segmentCount; i++) {
-          const lo = i === 0 ? min : breaks[i - 1];
-          const hi = i === segmentCount - 1 ? max : breaks[i];
-          legend.push({
-            label: `${formatNumber(lo)} ~ ${formatNumber(hi)}`,
-            color: `#${stops[Math.min(i, stops.length - 1)].getHexString()}`,
-            count: counts[i],
-          });
-        }
-      } else {
-        const steps = 5;
-        for (const [smid, value] of numeric) {
-          const t = max - min < 1e-9 ? 0.5 : (value - min) / (max - min);
-          colors.set(smid, `#${sampleRamp(stops, t).getHexString()}`);
-        }
-        for (let i = 0; i < steps; i++) {
-          const t = i / (steps - 1);
-          legend.push({
-            label: formatNumber(min + (max - min) * t),
-            color: `#${sampleRamp(stops, t).getHexString()}`,
-            count: 0,
-          });
-        }
-      }
-    }
-
-    this._thematic = colors;
-    this._thematicField = options.field;
-    this._markOverridesDirty();
-    this.map?.triggerRepaint();
-
-    return {
-      field: options.field,
-      matched: colors.size,
-      missing: smids.length - colors.size,
-      legend,
-    };
+  colorByField(options: ColorByFieldOptions): Promise<ThematicResult> {
+    return this._featureStyleManager.colorByField(options, this.attributeQuery, this.getLoadedSmids());
   }
 
-  /**
-   * 设置图层过滤规则。
-   * 支持按 SMID 白名单（include）、黑名单（exclude）、高度范围（minHeight/maxHeight）或谓词函数过滤。
-   * 被过滤隐藏的建筑不渲染、不参与深度测试、鼠标无法拾取。
-   */
   setFilter(filter: S3MFilter | null): void {
-    this._filter = filter;
-    if (filter && (filter.minHeight != null || filter.maxHeight != null)) {
-      if (this.uniforms.uFilterMinZ) this.uniforms.uFilterMinZ.value = filter.minHeight ?? -99999;
-      if (this.uniforms.uFilterMaxZ) this.uniforms.uFilterMaxZ.value = filter.maxHeight ?? 99999;
-      if (this.uniforms.uFilterHeightActive) this.uniforms.uFilterHeightActive.value = 1;
-    } else if (this.uniforms.uFilterHeightActive) {
-      this.uniforms.uFilterHeightActive.value = 0;
-    }
-    this._markOverridesDirty();
-    if (this._selection) this._syncSelectionStyle();
+    this._featureStyleManager.setFilter(filter, this.uniforms);
+  }
+
+  getFilter(): S3MFilter | null {
+    return this._featureStyleManager.filter;
+  }
+
+  clearFilter(): void {
+    this._featureStyleManager.clearFilter(this.uniforms);
+  }
+
+  /* ---------------------------------------------------------------- 3D 物理地表与基坑 */
+
+  /** 设置 3D 物理地表面渲染模式：'none' 关闭 | 'translucent' 半透明透视 | 'excavate' 基坑开挖 */
+  setGroundMode(mode: GroundMode): void {
+    this.groundManager.setMode(mode);
     this.map?.triggerRepaint();
   }
 
-  /** 获取当前生效的过滤规则 */
-  getFilter(): S3MFilter | null {
-    return this._filter;
+  /** 设置 3D 物理地表面不透明度 (0~1) */
+  setGroundOpacity(opacity: number): void {
+    this.groundManager.setOpacity(opacity);
+    this.map?.triggerRepaint();
   }
 
-  /** 清除过滤规则，恢复全量建筑显示 */
-  clearFilter(): void {
-    this.setFilter(null);
+  /** 设置基坑开挖范围 [minX, minY, maxX, maxY]（米，场景 ENU 坐标） */
+  setExcavationBounds(bounds: [number, number, number, number] | null): void {
+    this.groundManager.setExcavationBounds(bounds);
+    this.map?.triggerRepaint();
   }
+
+  /* ---------------------------------------------------------------- 状态纹理同步 */
 
   private _isFeatureHidden(smid: number | null, _batchId: number): boolean {
-    if (smid != null && this._fieldFilter) {
-      const inSet = this._fieldFilter.matched.has(smid);
-      if (this._fieldFilter.mode === 'keep' ? !inSet : inSet) return true;
+    if (smid == null) return false;
+    const ff = this._featureStyleManager.fieldFilter;
+    if (ff) {
+      const inSet = ff.matched.has(smid);
+      if (ff.mode === 'keep' ? !inSet : inSet) return true;
     }
-    if (!this._filter) return false;
-    if (smid != null) {
-      if (this._filter.include && this._filter.include.length > 0 && !this._filter.include.includes(smid)) {
-        return true;
-      }
-      if (this._filter.exclude && this._filter.exclude.length > 0 && this._filter.exclude.includes(smid)) {
-        return true;
-      }
+    const filter = this._featureStyleManager.filter;
+    if (filter) {
+      if (filter.include && filter.include.length > 0 && !filter.include.includes(smid)) return true;
+      if (filter.exclude && filter.exclude.length > 0 && filter.exclude.includes(smid)) return true;
     }
+    const st = this._featureStyleManager.featureStyles.get(smid);
+    if (st?.hidden) return true;
     return false;
   }
 
-  private _applyOverridesToMesh(mesh: THREE.Mesh): void {
-    const mat = styledMaterialOf(mesh);
-    if (!mat) return;
-
-    const ud = mesh.userData as MeshUserData;
-    const pickInfo = ud.geoRef?.pickInfo;
-
-    const hasStyles =
-      this._featureStyles.size > 0 || this._thematic.size > 0 || this._thematicElevation.size > 0;
-    const filter = this._filter;
-    const hasFilter =
-      this._fieldFilter != null ||
-      (filter != null &&
-        ((filter.include?.length ?? 0) > 0 ||
-          (filter.exclude?.length ?? 0) > 0 ||
-          filter.predicate != null));
-
-    if (!hasStyles && !hasFilter) {
-      if (mat.userData.uBatchTexActive) {
-        mat.userData.uBatchTexActive.value = 0;
-      }
-      return;
-    }
-
-    if (!pickInfo || Object.keys(pickInfo).length === 0) {
-      if (mat.userData.uBatchTexActive) {
-        mat.userData.uBatchTexActive.value = 0;
-      }
-      return;
-    }
-
-    let maxBatch = 0;
-    for (const p of Object.values(pickInfo)) {
-      const id = pickEntryId(p);
-      if (id > maxBatch) maxBatch = id;
-    }
-    const width = Math.max(maxBatch + 1, 1);
-
-    let record = this._meshBatchTextures.get(mesh);
-    if (!record || record.width < width) {
-      const data = new Float32Array(width * 2 * 4);
-      const texture = new THREE.DataTexture(data, width, 2, THREE.RGBAFormat, THREE.FloatType);
-      texture.minFilter = THREE.NearestFilter;
-      texture.magFilter = THREE.NearestFilter;
-      record = { texture, data, width };
-      this._meshBatchTextures.set(mesh, record);
-      mat.userData.uBatchTex.value = texture;
-      mat.userData.uBatchTexWidth.value = width;
-    }
-
-    const { data, texture } = record;
-    const w = record.width;
-    // Row 0 默认值：[-1, -1, -1, 0]（无自定义色，不隐藏）
-    // Row 1 默认值：[0, 0, 0, 0]（无平移）
-    for (let i = 0; i < w; i++) {
-      data[i * 4 + 0] = -1;
-      data[i * 4 + 1] = -1;
-      data[i * 4 + 2] = -1;
-      data[i * 4 + 3] = 0;
-
-      const r1 = (w + i) * 4;
-      data[r1 + 0] = 0;
-      data[r1 + 1] = 0;
-      data[r1 + 2] = 0;
-      data[r1 + 3] = 0;
-    }
-
-    // 一个 batchId 可能被多个 SMID 共用（实测「邻店共 batchId」），
-    // 直接边遍历边写就是「后写的覆盖先写的」，谁生效取决于对象键的顺序。
-    // 所以先按 batchId 归并再落，规则：任一隐藏则整批隐藏，颜色 / 抬高取首个。
-    let hasActive = false;
-    const hiddenBatches = new Set<number>();
-    const colorOfBatch = new Map<number, string>();
-    const elevOfBatch = new Map<number, number>();
-    const translationOfBatch = new Map<number, [number, number, number]>();
-    /** batchId → 有几个 SMID 落在上面，用来判断「这个 batch 本来就没法单独控制」 */
-    const ownersOfBatch = new Map<number, number>();
-
-    for (const [smidStr, entry] of Object.entries(pickInfo)) {
-      const smid = Number(smidStr);
-      const bId = pickEntryId(entry);
-      if (bId < 0 || bId >= record.width) continue;
-      ownersOfBatch.set(bId, (ownersOfBatch.get(bId) ?? 0) + 1);
-
-      let hidden = false;
-      if (filter) {
-        if (filter.include && filter.include.length > 0 && !filter.include.includes(smid)) {
-          hidden = true;
-        }
-        if (filter.exclude && filter.exclude.length > 0 && filter.exclude.includes(smid)) {
-          hidden = true;
-        }
-        if (filter.predicate) {
-          const { segments } = resolveFeature(ud.geoRef, bId);
-          const box = measureSegments(mesh.geometry, segments);
-          const attrs = buildAttributes({ smid, box, triangles: 0, floorHeight: this.style.floorHeight });
-          if (!filter.predicate({ ...attrs, smid })) {
-            hidden = true;
-          }
-        }
-      }
-
-      if (hidden) {
-        hiddenBatches.add(bId);
-        continue;
-      }
-
-      // 业务字段过滤：和 setFilter 叠加，两个都放行才显示
-      if (this._fieldFilter) {
-        const inSet = this._fieldFilter.matched.has(smid);
-        if (this._fieldFilter.mode === 'keep' ? !inSet : inSet) {
-          hiddenBatches.add(bId);
-          continue;
-        }
-      }
-
-      const st = this._featureStyles.get(smid);
-      const thematicColor = this._thematic.get(smid);
-      // 手动固定色 > 专题色（按业务字段）
-      const colorHex = st?.color ?? thematicColor;
-      // 手动拔高 > 按业务字段抬高
-      const elevation = st?.elevation ?? this._thematicElevation.get(smid);
-      const translation = st?.translation;
-
-      if (colorHex && !colorOfBatch.has(bId)) colorOfBatch.set(bId, colorHex);
-      if (elevation != null && !elevOfBatch.has(bId)) elevOfBatch.set(bId, elevation);
-      if (translation && !translationOfBatch.has(bId)) translationOfBatch.set(bId, translation);
-    }
-
-    for (const bId of hiddenBatches) {
-      data[bId * 4 + 3] = -1.0; // 标记隐藏
-      hasActive = true;
-    }
-    for (const [bId, colorHex] of colorOfBatch) {
-      const c = new THREE.Color(colorHex);
-      data[bId * 4 + 0] = c.r;
-      data[bId * 4 + 1] = c.g;
-      data[bId * 4 + 2] = c.b;
-      hasActive = true;
-    }
-    for (const [bId, elevation] of elevOfBatch) {
-      if (hiddenBatches.has(bId)) continue; // 抬高会写 alpha，别把隐藏标记覆盖掉
-      data[bId * 4 + 3] = elevation;
-      const r1 = (w + bId) * 4;
-      data[r1 + 2] = elevation;
-      hasActive = true;
-    }
-    for (const [bId, trans] of translationOfBatch) {
-      if (hiddenBatches.has(bId)) continue;
-      const r1 = (w + bId) * 4;
-      data[r1 + 0] = trans[0];
-      data[r1 + 1] = trans[1];
-      data[r1 + 2] = (trans[2] ?? 0) + (elevOfBatch.get(bId) ?? 0);
-      hasActive = true;
-    }
-
-    // 只有「共用 batch 且这一批确实有样式要写」才算真的控制不了，才值得告警
-    let conflicts = 0;
-    for (const [bId, owners] of ownersOfBatch) {
-      if (owners < 2) continue;
-      if (!hiddenBatches.has(bId) && !colorOfBatch.has(bId) && !elevOfBatch.has(bId)) continue;
-      conflicts++;
-    }
-
-    if (conflicts > 0 && !this._batchConflictWarned) {
-      // 只在第一次喊一声，别每次重写纹理都刷屏
-      this._batchConflictWarned = true;
-      console.warn(
-        `[s3m] 有 ${conflicts} 个单体状态写不进独立的 batch（多个 SMID 共用同一个 batchId，\n` +
-          '  S3M 的单体化粒度只到 batch，无法单独隐藏/改色其中一部分）。\n' +
-          '  当前规则：任一 SMID 需要隐藏则整批隐藏，颜色 / 抬高取首个。\n' +
-          '  用 layer.auditBatches() 可以列出具体是哪些 SMID 共用了 batchId。'
-      );
-    }
-
-    texture.needsUpdate = true;
-    mat.userData.uBatchTexActive.value = hasActive ? 1 : 0;
+  getAllMeshes(): THREE.Mesh[] {
+    const list: THREE.Mesh[] = [];
+    for (const p of this._pickables.values()) list.push(p.mesh);
+    return list;
   }
 
-  private _applyOverridesToAllMeshes(meshes?: Iterable<THREE.Mesh>): void {
-    if (meshes) {
-      for (const mesh of meshes) this._applyOverridesToMesh(mesh);
-      return;
-    }
-    for (const p of this._pickables.values()) this._applyOverridesToMesh(p.mesh);
-  }
-
-  /** 哪些网格装了这些单体（查 SMID → 网格 反查表） */
   private _meshesOf(smids: Iterable<number>): Set<THREE.Mesh> {
     const out = new Set<THREE.Mesh>();
     for (const smid of smids) {
@@ -1627,74 +822,45 @@ export class S3MLayer {
     return out;
   }
 
-  /**
-   * 标记「单体状态纹理需要重写」。
-   *
-   * 逐个高亮时最贵的是这里：一个网格有几千个 batch，每改一个单体就全量重算一遍，
-   * 500 个门店 × 6848 个 batch 就是 340 万次迭代。所以只记脏，攒到微任务里合并成一次；
-   * 微任务一定在下一帧 render 之前跑完，画面不会看到中间状态。
-   */
   private _markOverridesDirty(scope: Iterable<THREE.Mesh> | 'all' = 'all'): void {
     if (scope === 'all') {
-      this._dirtyAll = true;
-      this._dirtyMeshes.clear();
-    } else if (!this._dirtyAll) {
-      for (const mesh of scope) this._dirtyMeshes.add(mesh);
+      this._featureStyleManager.markOverridesDirty(undefined, this.getAllMeshes());
+    } else {
+      this._featureStyleManager.markOverridesDirty(scope);
     }
-    if (!this._flushScheduled) {
-      this._flushScheduled = true;
-      queueMicrotask(() => this.flushOverrides());
-    }
-    this.map?.triggerRepaint();
   }
 
-  /** 立刻把待写的单体状态纹理刷出去（同步改完就要读纹理的场景用得上） */
   flushOverrides(): void {
-    if (!this._flushScheduled && !this._dirtyAll && this._dirtyMeshes.size === 0) return;
-    this._flushScheduled = false;
-    if (this._dirtyAll) {
-      this._dirtyAll = false;
-      this._dirtyMeshes.clear();
-      this._applyOverridesToAllMeshes();
-      return;
-    }
-    const meshes = [...this._dirtyMeshes];
-    this._dirtyMeshes.clear();
-    this._applyOverridesToAllMeshes(meshes);
+    this._featureStyleManager.flushOverrides();
+  }
+
+  /** @internal 内部状态纹理烘焙代理，保留供回归单测与钩子使用 */
+  _applyOverridesToMesh(mesh: THREE.Mesh): void {
+    this._featureStyleManager.applyOverridesToMesh(mesh);
   }
 
   removeDataset(id: string): void {
     const entry = this.datasets.get(id);
     if (!entry) return;
     if (this._selection?.datasetId === id) this.select(null);
-    entry.root.traverse((o) => {
-      const mesh = o as THREE.Mesh;
-      const ud = mesh.userData as MeshUserData;
-      if (ud.pickId != null) {
-        this._pickables.delete(ud.pickId);
-        this._releasePickId(ud.pickId);
-        ud.pickId = undefined;
-      }
-      this._unindexMeshSmids(mesh);
-      this._removeMeshHeight(mesh);
-      this._dirtyMeshes.delete(mesh);
-      // batch 状态纹理是 DataTexture，WeakMap 不会替 GPU 释放，必须显式 dispose
-      const record = this._meshBatchTextures.get(mesh);
-      if (record) {
-        record.texture.dispose();
-        this._meshBatchTextures.delete(mesh);
-      }
-      mesh.geometry?.dispose?.();
-      const styled = styledMaterialOf(mesh);
-      if (styled) styled.dispose();
+    this._datasetManager.removeDataset(id, this.scene!, this.map, (e) => {
+      e.root.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        const ud = mesh.userData as MeshUserData;
+        if (ud.pickId != null) {
+          this._pickables.delete(ud.pickId);
+          this._releasePickId(ud.pickId);
+          ud.pickId = undefined;
+        }
+        this._unindexMeshSmids(mesh);
+        this._removeMeshHeight(mesh);
+        mesh.geometry?.dispose?.();
+        const styled = styledMaterialOf(mesh);
+        if (styled) styled.dispose();
+        this._featureStyleManager.disposeMesh(mesh);
+      });
     });
-    entry.tileset?.dispose();
-    this.scene?.remove(entry.root);
     for (const [pickId, p] of this._pickables) if (p.datasetId === id) this._pickables.delete(pickId);
-    this.datasets.delete(id);
-    if (this.datasets.size === 0) {
-      this.sceneAnchor = null;
-    }
     this.onStats(this.stats);
     this.map?.triggerRepaint();
   }
@@ -1702,14 +868,10 @@ export class S3MLayer {
   /** 清空当前所有数据集 */
   clearDatasets(): void {
     for (const id of [...this.datasets.keys()]) this.removeDataset(id);
-    this.sceneAnchor = null;
   }
 
   setDatasetVisible(id: string, visible: boolean): void {
-    const entry = this.datasets.get(id);
-    if (!entry) return;
-    entry.visible = visible;
-    entry.root.visible = visible;
+    this._datasetManager.setDatasetVisible(id, visible);
     if (!visible && this._selection?.datasetId === id) this.select(null);
     this.map?.triggerRepaint();
   }
@@ -1755,7 +917,7 @@ export class S3MLayer {
         mat.depthWrite = o >= 0.999;
         mat.flatShading = this.style.shading !== 'smooth';
         mat.needsUpdate = true;
-        this._applyOverridesToMesh(mesh);
+        this._featureStyleManager.applyOverridesToMesh(mesh);
       }
     }
   }
@@ -1774,12 +936,7 @@ export class S3MLayer {
       }
       this._unindexMeshSmids(mesh);
       this._removeMeshHeight(mesh);
-      this._dirtyMeshes.delete(mesh);
-      const record = this._meshBatchTextures.get(mesh);
-      if (record) {
-        record.texture.dispose();
-        this._meshBatchTextures.delete(mesh);
-      }
+      this._featureStyleManager.disposeMesh(mesh);
       const styled = styledMaterialOf(mesh);
       styled?.dispose?.();
       mesh.geometry?.dispose?.();
@@ -2267,9 +1424,9 @@ export class S3MLayer {
     let altitude: number | null = null;
 
     if (hitPoint && this.sceneAnchor) {
-      const st = smid != null ? this._featureStyles.get(smid) : undefined;
-      const trans = st?.translation;
-      const elev = st?.elevation ?? (smid != null ? this._thematicElevation.get(smid) : undefined);
+      const off = smid != null ? this._featureStyleManager.getFeatureEffectiveOffset(smid) : {};
+      const trans = off.translation;
+      const elev = off.elevation;
       const finalPos = hitPoint.clone();
       if (trans) finalPos.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
       else if (elev) finalPos.z += elev;
@@ -2497,9 +1654,9 @@ export class S3MLayer {
           new THREE.Vector3(box.maxX, box.maxY, box.maxZ),
         ];
 
-        const st = this._featureStyles.get(smid);
-        const trans = st?.translation;
-        const elev = st?.elevation ?? this._thematicElevation.get(smid);
+        const off = smid != null ? this._featureStyleManager.getFeatureEffectiveOffset(smid) : {};
+        const trans = off.translation;
+        const elev = off.elevation;
 
         for (const c of corners) {
           if (trans) c.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
@@ -2765,8 +1922,8 @@ export class S3MLayer {
   private _selectionElevation(result: PickResult): number {
     let elev = this.style.selectElevation ?? 0;
     if (result.smid != null) {
-      // 手动拔高优先，否则用按业务字段抬高的值
-      elev += this._featureStyles.get(result.smid)?.elevation ?? this._thematicElevation.get(result.smid) ?? 0;
+      const off = this._featureStyleManager.getFeatureEffectiveOffset(result.smid);
+      if (off.elevation) elev += off.elevation;
     }
     return elev;
   }
@@ -2902,7 +2059,7 @@ export class S3MLayer {
     if (!this.renderer || !this.scene || !this.camera || !this.sceneAnchor || !this.map) return;
 
     // 脏标记正常由微任务刷掉；这里再兜一次底，保证「本帧画出来的」一定是最新样式
-    if (this._flushScheduled) this.flushOverrides();
+    this.flushOverrides();
 
     const matrix = this._extractMatrix(arg);
     if (!matrix) return;
@@ -2945,6 +2102,9 @@ export class S3MLayer {
     this.camera.position.set(camEnu[0], camEnu[1], camEnu[2]);
     this.camera.matrixWorld.setPosition(camEnu[0], camEnu[1], camEnu[2]);
     this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+
+    // 更新 3D 物理地表面中心随相机延伸
+    this.groundManager.update(this.camera);
 
     // 同上：弧度视场角。MapLibre v5 起 transform.fov 是「度」，当弧度用会让
     // LOD 屏幕误差算大 20% 以上（提前加载更细的瓦片）

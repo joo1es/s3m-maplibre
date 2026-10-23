@@ -23,6 +23,8 @@ const DATASETS = {
       'https://www.supermapol.com/realspace/services/3D-local3DCache-SubwayStationCombined' +
       '/rest/realspace/datas/SubwayStationCombined/config',
     name: '地铁站 (CRN 纹理)',
+    align: 'top', // 智能语义对齐：顶部对齐地表（下沉 28.5m）
+    heightOffset: 3.5, // 微调：出入口站房露于地面约 3.5m（净下沉 25m）
   },
 };
 
@@ -55,8 +57,25 @@ const sun = new THREE.DirectionalLight(0xffffff, 2.3);
 sun.position.set(0.45, 1, 0.3);
 scene.add(sun);
 
-const grid = new THREE.GridHelper(6000, 60, 0x27384f, 0x1b2634);
-scene.add(grid);
+const groundGroup = new THREE.Group();
+const grid = new THREE.GridHelper(6000, 60, 0x38bdf8, 0x1e293b);
+grid.material.transparent = true;
+grid.material.opacity = 0.65;
+groundGroup.add(grid);
+
+const groundGeo = new THREE.PlaneGeometry(6000, 6000);
+const groundMat = new THREE.MeshBasicMaterial({
+  color: 0x0f172a,
+  transparent: true,
+  opacity: 0.55,
+  depthWrite: false,
+  side: THREE.DoubleSide,
+});
+const groundMesh = new THREE.Mesh(groundGeo, groundMat);
+groundMesh.rotation.x = -Math.PI / 2;
+groundMesh.renderOrder = 200;
+groundGroup.add(groundMesh);
+scene.add(groundGroup);
 
 // 样式 uniform 全局共享：切「原色 / 白膜 / 按单体」只是改一个 int
 const uniforms = createSharedUniforms();
@@ -123,6 +142,7 @@ let framed = false;
 let loadToken = 0;
 
 function clearRoot() {
+  root.position.set(0, 0, 0);
   for (const child of [...root.children]) {
     child.traverse((o) => {
       if (o.geometry) o.geometry.dispose();
@@ -139,7 +159,8 @@ function frameCamera() {
   const sphere = box.getBoundingSphere(new THREE.Sphere());
   target.copy(sphere.center);
   dist = Math.max(sphere.radius * 2.4, 60);
-  grid.position.y = box.min.y;
+  // 地面网格与地表面固定在 y=0 作为地表绝对基准（地下部分沉在网格下方，地上出入口露出网格上方）
+  groundGroup.position.y = 0;
   applyOrbit();
   framed = true;
 }
@@ -171,7 +192,20 @@ async function load(key) {
   tileset = ts;
   try {
     await ts.init();
-    if (token === loadToken && !framed) frameCamera();
+    if (token === loadToken) {
+      // 计算垂直对齐偏移（在 three 场景中，root.rotation.x = -PI/2，ENU 的 Z 对应 three 的 Y）
+      const hr = ts.heightRange;
+      let offsetY = 0;
+      if (ds.align === 'top' && hr) {
+        offsetY = -hr.max + (ds.heightOffset ?? 0);
+      } else if (ds.align === 'bottom' && hr) {
+        offsetY = -hr.min + (ds.heightOffset ?? 0);
+      } else if (typeof ds.heightOffset === 'number') {
+        offsetY = ds.heightOffset;
+      }
+      root.position.y = offsetY;
+      if (!framed) frameCamera();
+    }
   } catch (e) {
     console.error(e);
   }

@@ -361,5 +361,50 @@ console.log('=== 测试新增功能集 ===');
   ok('多 Mesh 共享 SMID: 点击单面时联动选中同 SMID 的所有材质网格');
 }
 
+// ---- 8. 数据集智能垂直对齐（align: 'top' | 'bottom' | 'center'）
+{
+  const layer = new S3MLayer({ id: 's3m' });
+  const entry = {
+    id: 'subway',
+    name: 'Subway',
+    options: { id: 'subway', configUrl: 'http://example.com/cfg.json', align: 'top', heightOffset: 2 },
+    root: new THREE.Group(),
+    tileset: {
+      heightRange: { min: -5, max: 25 },
+      anchor: { lon: 116.4, lat: 39.9, height: 0 },
+    },
+    anchor: { lon: 116.4, lat: 39.9, height: 0 },
+    baseAlignOffset: 0,
+    heightOffset: 0,
+    offset: [0, 0, 0],
+    visible: true,
+    error: null,
+  };
+  layer.datasets.set('subway', entry);
+
+  // align: 'top' 时，baseAlignOffset = -max = -25，加上 heightOffset = 2，总偏移为 -23
+  entry.baseAlignOffset = layer._computeAlignOffset(entry.tileset, 'top');
+  entry.heightOffset = entry.baseAlignOffset + 2;
+  assert.strictEqual(entry.baseAlignOffset, -25, 'align: top 正确将顶部下沉 25m');
+  assert.strictEqual(entry.heightOffset, -23, '总高程偏移为 base + heightOffset = -23m');
+
+  // 动态切换为 'bottom'
+  layer.setDatasetAlign('subway', 'bottom');
+  assert.strictEqual(entry.baseAlignOffset, 5, 'align: bottom 正确抬升 -min = 5m');
+  assert.strictEqual(entry.heightOffset, 7, '切换后保留附加偏移 2m，总高程 = 7m');
+
+  // 动态切换为 'center'
+  layer.setDatasetAlign('subway', 'center');
+  assert.strictEqual(entry.baseAlignOffset, -10, 'align: center 正确居中 -(25-5)/2 = -10m');
+  assert.strictEqual(entry.heightOffset, -8, '切换后总高程 = -8m');
+
+  // 动态切换回 'origin'
+  layer.setDatasetAlign('subway', 'origin');
+  assert.strictEqual(entry.baseAlignOffset, 0, 'align: origin 恢复 0');
+  assert.strictEqual(entry.heightOffset, 2, '仅保留原始附加偏移 2m');
+
+  ok('智能对齐: align=top/bottom/center 自动计算高度范围并精确对齐地表');
+}
+
 console.log('\n全部新增能力测试通过！');
 
