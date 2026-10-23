@@ -206,6 +206,22 @@ const FRAG_PARS = /* glsl */ `
     return fract( p );
   }
 
+  /**
+   * 取整后的 batchId。
+   *
+   * vBatchId 是 varying：GPU 按像素做透视校正插值，即便一个三角形三个顶点的
+   * aBatchId 完全相等，三次乘加各自的舍入误差也不会正好抵消，结果会带
+   * 1e-7 量级的相对误差，而且逐像素不同（不同 GPU / 驱动还不一样）。
+   *
+   * 这个误差本身无害，但后面的哈希是混沌放大器：p → fract(p*0.1031) →
+   * p*(p+33.33) → p*2p，每一级都把误差放大几十倍，三级下来 1e-7 就能放大到 O(1)。
+   * 实测 batchId≈4.2 万时，1e-7 的抖动会让哈希输出在 0.20~0.78 之间乱跳，
+   * 直接表现为整屏彩色噪点。所以凡是要「按 id 取值」的地方都必须先取整。
+   */
+  float s3mBatchId() {
+    return floor( vBatchId + 0.5 );
+  }
+
   vec3 s3mHsv( float h, float s, float v ) {
     vec3 k = vec3( 1.0, 2.0 / 3.0, 1.0 / 3.0 );
     vec3 p = abs( fract( vec3( h ) + k.xyz ) * 6.0 - vec3( 3.0 ) );
@@ -216,6 +232,8 @@ const FRAG_PARS = /* glsl */ `
 const FRAG_COLOR = /* glsl */ `
   float s3mH = clamp( ( vWorldZ - uHeightMin ) / max( uHeightMax - uHeightMin, 0.001 ), 0.0, 1.0 );
   vec3 s3mBase = diffuseColor.rgb;   // 已含 diffuse × map
+  // 所有按单体取值（配色 / 状态纹理 / 选中判定）都走取整后的 id，避免插值噪声
+  float s3mBid = s3mBatchId();
 
   // 法线：优先使用顶点插值法线；若退化或为平面着色，使用屏幕导数精确计算真实几何法线
   vec3 s3mNorm = length( vWorldNormal ) > 0.1 ? normalize( vWorldNormal ) : normalize( cross( dFdx( vWorldPos ), dFdy( vWorldPos ) ) );
@@ -237,8 +255,8 @@ const FRAG_COLOR = /* glsl */ `
     float total = max( floor( ( uHeightMax - uHeightMin ) / max( uFloorHeight, 0.5 ) ), 1.0 );
     diffuseColor.rgb = mix( uColorA, uColorB, floors / total );
   } else if ( uMode == 5 ) {
-    // 按单体：同一个 batchId 同色，相邻单体色相拉开
-    diffuseColor.rgb = s3mHsv( s3mHash( vBatchId * 7.31 + 1.0 ), 0.52, 0.95 );
+    // 按单体：同一个 batchId 同色，相邻单体色相拉开（必须用取整后的 id，见 s3mBatchId）
+    diffuseColor.rgb = s3mHsv( s3mHash( s3mBid * 7.31 + 1.0 ), 0.52, 0.95 );
   } else if ( uMode == 6 ) {
     // 动态扫描：底色按高度渐变，一条亮带自下而上循环
     float scan = fract( uTime * 0.18 );
@@ -272,8 +290,9 @@ const FRAG_COLOR = /* glsl */ `
 
   // 2. 单体状态过滤（隐藏）与单体独立改色
   bool hasCustomColor = false;
-  if ( uBatchTexActive > 0 && vBatchId >= 0.0 ) {
-    vec4 bState = texture2D( uBatchTex, vec2( ( vBatchId + 0.5 ) / uBatchTexWidth, 0.5 ) );
+  if ( uBatchTexActive > 0 && s3mBid >= 0.0 ) {
+    // 用取整后的 id 采样：否则逐像素的插值误差会让纹素在边界上来回跳，同样出彩色噪点
+    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBid + 0.5 ) / uBatchTexWidth, 0.5 ) );
     if ( bState.a < -0.5 ) {
       discard; // 属于被过滤隐藏的单体
     }
@@ -285,7 +304,7 @@ const FRAG_COLOR = /* glsl */ `
   }
 
   // 3. 选中单体高亮 + 其余压暗
-  float s3mSel = max( step( 0.0, uSelBatch ) * step( abs( vBatchId - uSelBatch ), 0.5 ), uSelWhole );
+  float s3mSel = max( step( 0.0, uSelBatch ) * step( abs( s3mBid - uSelBatch ), 0.5 ), uSelWhole );
   if ( s3mSel > 0.5 && uSelMix > 0.001 ) {
     if ( hasCustomColor ) {
       // 若当前建筑已有用户固定的独立颜色，选中时保留该颜色，仅做轻微高亮叠色提示
@@ -311,7 +330,7 @@ const FRAG_COLOR = /* glsl */ `
 `;
 
 const FRAG_EMISSIVE = /* glsl */ `
-  float s3mSelE = max( step( 0.0, uSelBatch ) * step( abs( vBatchId - uSelBatch ), 0.5 ), uSelWhole );
+  float s3mSelE = max( step( 0.0, uSelBatch ) * step( abs( s3mBatchId() - uSelBatch ), 0.5 ), uSelWhole );
   // glowOnly 模式下表面不自发光，只保留描边边框；其他模式下适度发光
   if ( uSelMode != 3 ) {
     totalEmissiveRadiance += uSelColor * s3mSelE * uSelMix * ( uSelEmissive * 0.4 );
