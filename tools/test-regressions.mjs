@@ -480,4 +480,66 @@ console.log('\n=== 10. 叶子优先；脏数据（childTile 指回自己）时�
   console.log('  √ 叶子优先；无叶子可挑时退一步淘汰已细化的父瓦片，不会卡死');
 }
 
+/* ------------------------------------------------------------------ 11. LOD 可见性互斥 */
+
+console.log('\n=== 11. 瓦片层级可见性切换（HLOD 互斥，防止父子重叠 Z-fighting） ===');
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = () => new Promise(() => {});
+
+  const ts = new S3MTileset({
+    configUrl: 'http://example.com/a.scp',
+    maxTiles: 10,
+    buildTile: async () => ({ group: new THREE.Group(), stats: {} }),
+  });
+
+  const mkNodeWithSphere = (url, childUrl, radius, rangeValue) => {
+    const group = new THREE.Group();
+    group.visible = true;
+    return {
+      url,
+      tile: {},
+      group,
+      sphere: { center: { x: 0, y: 0, z: 0 }, radius },
+      rangeValue,
+      rangeMode: 1, // pixelSizeOnScreen
+      childUrl,
+      childUrls: childUrl ? [childUrl] : [],
+      state: 'ready',
+    };
+  };
+
+  const parent = mkNodeWithSphere('http://example.com/parent.s3mb', 'http://example.com/child.s3mb', 50, 20);
+  const child = mkNodeWithSphere('http://example.com/child.s3mb', null, 50, 0);
+
+  ts.nodes.set(parent.url, parent);
+  ts.rootUrls.push(parent.url);
+
+  try {
+    // 1. 距离较远时（视深 1000m，屏幕像素较小 < rangeValue 20）：父瓦片可见，子瓦片未就绪
+    // cam = [0, 0, 1000], fov = PI/3, h = 1000
+    ts.update([0, 0, 1000], Math.PI / 3, 1000);
+    assert.strictEqual(parent.group.visible, true, '视距远时父瓦片应可见');
+
+    // 2. 距离靠近（视深 100m，屏幕像素放大 > rangeValue 20），但子瓦片尚未载入内存
+    ts.update([0, 0, 100], Math.PI / 3, 1000);
+    assert.strictEqual(parent.group.visible, true, '子瓦片未加载完成时父瓦片必须保持显示以防破洞');
+
+    // 3. 子瓦片加载就绪后，再次 update：父瓦片应隐藏，子瓦片应显示
+    ts.nodes.set(child.url, child);
+    ts.update([0, 0, 100], Math.PI / 3, 1000);
+    assert.strictEqual(parent.group.visible, false, '子瓦片就绪后父瓦片必须隐藏，彻底杜绝 Z-fighting 深度冲突');
+    assert.strictEqual(child.group.visible, true, '子瓦片应接替父瓦片显示');
+
+    // 4. 再次拉远镜头（dist = 5000m，metric ≈ 8.66 < rangeValue 20）：父瓦片重新显示，子瓦片隐藏
+    ts.update([0, 0, 5000], Math.PI / 3, 1000);
+    assert.strictEqual(parent.group.visible, true, '拉远后父瓦片应恢复显示');
+    assert.strictEqual(child.group.visible, false, '拉远后子瓦片应隐藏');
+
+    console.log('  √ 父子瓦片按 LOD 正确互斥显示，同区域只保留一层网格，无 Z-fighting');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 console.log('\n全部通过');

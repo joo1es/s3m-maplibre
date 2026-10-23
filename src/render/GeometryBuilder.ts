@@ -679,14 +679,29 @@ export async function buildTileObjects(
       const f32 = new Float32Array(vp.instanceBuffer.buffer, vp.instanceBuffer.byteOffset, vp.instanceCount * stride);
       for (let i = 0; i < vp.instanceCount; i++) {
         const o = i * stride;
-        // S3M 的实例矩阵同样是列主序，直接按 three 的存储顺序铺
-        m4.fromArray(f32.subarray(o, o + 16));
+        // S3M 实例矩阵按 3x4 仿射矩阵（行主序）连续存储 12 个 float：
+        //   Row 0: [r00, r01, r02, tx]
+        //   Row 1: [r10, r11, r12, ty]
+        //   Row 2: [r20, r21, r22, tz]
+        //   Row 3: [0, 0, 0, 1] 隐式补齐
+        // 后续紧随 4 个 float 的 RGBA 颜色（stride >= 16）及可选 uint32 的 SMID（stride == 17）。
+        // 若用 fromArray 直接按列主序填充 Matrix4，会将平移分量塞进底部的投影行 (w)，
+        // 造成严重的透视奇点畸变（所有顶点拉扯成放射状尖锥）。
+        m4.set(
+          f32[o + 0], f32[o + 1], f32[o + 2], f32[o + 3],
+          f32[o + 4], f32[o + 5], f32[o + 6], f32[o + 7],
+          f32[o + 8], f32[o + 9], f32[o + 10], f32[o + 11],
+          0, 0, 0, 1
+        );
         instanced.setMatrixAt(i, m4);
-        if (stride === 17) {
-          // 第 17 个 float 是打包成 RGBA 字节的颜色
-          const packed = new Uint8Array(new Float32Array([f32[o + 16]]).buffer);
-          color.setRGB(packed[0] / 255, packed[1] / 255, packed[2] / 255);
-          instanced.setColorAt(i, color);
+        if (stride >= 16) {
+          const r = f32[o + 12];
+          const g = f32[o + 13];
+          const b = f32[o + 14];
+          if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
+            color.setRGB(r, g, b);
+            instanced.setColorAt(i, color);
+          }
         }
       }
       instanced.instanceMatrix.needsUpdate = true;

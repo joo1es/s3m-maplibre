@@ -81,6 +81,7 @@ export interface TileNode {
   rangeValue: number;
   rangeMode: number;
   childUrl: string | null;
+  childUrls?: string[];
   state: string;
   /** 最近一次 update() 到相机的距离（米），淘汰时按它排序 */
   distance?: number;
@@ -88,6 +89,8 @@ export interface TileNode {
   lastSeen?: number;
   /** 上一级瓦片的 URL（淘汰到最细一级时，要把上一级找回来补洞） */
   parentUrl?: string;
+  /** 当前帧是否满足细化条件 */
+  needRefine?: boolean;
 }
 
 /** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
@@ -118,6 +121,7 @@ export class S3MTileset {
   config: Record<string, unknown> | null = null;
   anchor: Anchor = { lon: 0, lat: 0, height: 0 };
 
+  readonly rootUrls: string[] = [];
   readonly nodes = new Map<string, TileNode>();
   readonly failed = new Set<string>();
   readonly textureCache = new Map<string, Texture>();
@@ -176,9 +180,15 @@ export class S3MTileset {
     const roots = (config.rootTiles ?? config.tiles ?? []) as Array<{ url: string }>;
     if (!roots.length) throw new Error('配置中缺少 root tile');
 
+    this.rootUrls.length = 0;
+    for (const r of roots) {
+      const u = resolveUrl(this.configUrl, r.url);
+      if (u) this.rootUrls.push(u);
+    }
+
     // 首棵树同步加载，保证 init 返回时已有内容可渲染
-    await this._load(resolveUrl(this.configUrl, roots[0].url)!);
-    for (const r of roots.slice(1)) this._enqueue(resolveUrl(this.configUrl, r.url));
+    await this._load(this.rootUrls[0]);
+    for (const r of this.rootUrls.slice(1)) this._enqueue(r);
 
     return this;
   }
@@ -216,7 +226,8 @@ export class S3MTileset {
     if (!victim) return false;
 
     const parentUrl = victim.parentUrl ?? this._parentOf.get(victim.url);
-    const isLeaf = !victim.childUrl || !this.nodes.has(victim.childUrl);
+    const childUrls = victim.childUrls ?? (victim.childUrl ? [victim.childUrl] : []);
+    const isLeaf = !childUrls.some((u) => u !== victim.url && this.nodes.has(u));
 
     this.nodes.delete(victim.url);
     victim.group.parent?.remove(victim.group);
@@ -237,7 +248,8 @@ export class S3MTileset {
   private _pickVictim(allowRefined: boolean): TileNode | null {
     let victim: TileNode | null = null;
     for (const node of this.nodes.values()) {
-      const refined = !!node.childUrl && this.nodes.has(node.childUrl);
+      const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+      const refined = childUrls.length > 0 && childUrls.some((u) => u !== node.url && this.nodes.has(u));
       if (refined !== allowRefined) continue;
       if (!victim) {
         victim = node;
@@ -324,8 +336,11 @@ export class S3MTileset {
     try {
       const res = await fetch(url);
       if (!res.ok) {
-        // 404 通常意味着数据树在这里被截断（样例数据常见），不是渲染错误
-        throw new Error(`${res.status} ${url}`);
+        throw new Error(`HTTP ${res.status} 加载瓦片失败: ${url}`);
+      }
+      const ctype = res.headers.get('content-type') || '';
+      if (ctype.includes('text/html')) {
+        throw new Error(`瓦片请求返回了 HTML 页面（通常为 404/500 服务端拦截）: ${url}`);
       }
       const buffer = await res.arrayBuffer();
       const tile = await parseS3MB(buffer);
@@ -334,6 +349,14 @@ export class S3MTileset {
       const { group, stats } = await build(tile, { textureCache: this.textureCache, uniforms: this._uniforms });
       const lod = this._pickLod(tile);
 
+      const childUrls: string[] = [];
+      for (const l of tile.groupNode?.pageLods ?? []) {
+        const u = resolveUrl(dirOf(url), l.childTile);
+        if (u && u !== url && !childUrls.includes(u)) {
+          childUrls.push(u);
+        }
+      }
+
       const node: TileNode = {
         url,
         tile,
@@ -341,7 +364,8 @@ export class S3MTileset {
         sphere: lod?.boundingSphere ?? null,
         rangeValue: lod?.rangeValue ?? 0,
         rangeMode: lod?.rangeMode ?? 1,
-        childUrl: resolveUrl(dirOf(url), lod?.childTile),
+        childUrl: childUrls[0] ?? resolveUrl(dirOf(url), lod?.childTile),
+        childUrls,
         parentUrl: this._parentOf.get(url),
         state: 'ready',
       };
@@ -376,11 +400,17 @@ export class S3MTileset {
    * @param camEnu 相机在该数据集局部 ENU 坐标系中的位置（米）
    * @param fovRad 垂直视场角（弧度）
    * @param screenHeight 视口像素高度
+   * @returns 瓦片加载队列或可见性是否发生变化
    */
-  update(camEnu: [number, number, number], fovRad: number, screenHeight: number): void {
+  update(camEnu: [number, number, number], fovRad: number, screenHeight: number): boolean {
     this._frame++;
+    let hasChanges = false;
+
     for (const node of this.nodes.values()) {
-      if (!node.sphere) continue;
+      if (!node.sphere) {
+        node.needRefine = false;
+        continue;
+      }
 
       const c = node.sphere.center;
       const dx = c.x - camEnu[0];
@@ -403,10 +433,95 @@ export class S3MTileset {
       const inRange = node.rangeMode === 0 ? dist < threshold * 2 : metric > threshold * 0.5;
       if (inRange) node.lastSeen = this._frame;
 
-      if (!node.childUrl || this.failed.has(node.childUrl)) continue;
-      const needRefine = node.rangeMode === 0 ? metric < threshold : metric > threshold;
-      if (needRefine) this._enqueue(node.childUrl, node.url);
+      const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+      const needRefine = childUrls.length > 0 && (node.rangeMode === 0 ? metric < threshold : metric > threshold);
+      node.needRefine = needRefine;
+
+      if (needRefine) {
+        for (const childUrl of childUrls) {
+          if (!this.failed.has(childUrl) && !this.nodes.has(childUrl) && !this.pending.has(childUrl)) {
+            this._enqueue(childUrl, node.url);
+            hasChanges = true;
+          }
+        }
+      }
     }
+
+    // 树状递归更新所有瓦片的可见性（确保每个位置只渲染一层最适合的 LOD，避免父子瓦片重叠 Z-fighting）
+    const visited = new Set<string>();
+    const roots = this.rootUrls.length > 0
+      ? this.rootUrls
+      : [...this.nodes.keys()].filter((u) => {
+          const p = this.nodes.get(u)?.parentUrl;
+          return !p || !this.nodes.has(p);
+        });
+
+    for (const rootUrl of roots) {
+      if (this._updateNodeVisibility(rootUrl, true, visited)) {
+        hasChanges = true;
+      }
+    }
+
+    // 防御：若有任何未被 root 树访问到的游离瓦片，全部隐藏
+    for (const [url, node] of this.nodes) {
+      if (!visited.has(url)) {
+        if (node.group.visible) {
+          node.group.visible = false;
+          hasChanges = true;
+        }
+      }
+    }
+
+    return hasChanges;
+  }
+
+  private _updateNodeVisibility(url: string, parentInBranch: boolean, visited: Set<string>): boolean {
+    const node = this.nodes.get(url);
+    if (!node) return false;
+    visited.add(url);
+
+    let changed = false;
+    const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+
+    if (!parentInBranch) {
+      if (node.group.visible) {
+        node.group.visible = false;
+        changed = true;
+      }
+      for (const cUrl of childUrls) {
+        if (this._updateNodeVisibility(cUrl, false, visited)) changed = true;
+      }
+      return changed;
+    }
+
+    const hasChildren = childUrls.length > 0;
+    const allChildrenReady = hasChildren && childUrls.every((cUrl) => this.nodes.has(cUrl));
+    const anyChildFailed = childUrls.some((cUrl) => this.failed.has(cUrl));
+
+    // 细化前提：需要细化、拥有子瓦片、子瓦片全部加载就绪且没有任何一个子瓦片失败
+    const shouldRefine = !!node.needRefine && allChildrenReady && !anyChildFailed;
+
+    if (shouldRefine) {
+      // 子节点接替当前节点渲染，当前父节点隐藏
+      if (node.group.visible) {
+        node.group.visible = false;
+        changed = true;
+      }
+      for (const cUrl of childUrls) {
+        if (this._updateNodeVisibility(cUrl, true, visited)) changed = true;
+      }
+    } else {
+      // 当前节点即为最终展示的 LOD：当前节点显示，下层所有已加载子代瓦片隐藏
+      if (!node.group.visible) {
+        node.group.visible = true;
+        changed = true;
+      }
+      for (const cUrl of childUrls) {
+        if (this._updateNodeVisibility(cUrl, false, visited)) changed = true;
+      }
+    }
+
+    return changed;
   }
 
   dispose(): void {

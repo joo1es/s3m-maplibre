@@ -71,7 +71,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 npm install s3m-maplibre three
 ```
 
-包在 npm 上是 [s3m-maplibre](https://www.npmjs.com/package/s3m-maplibre)，当前 `0.2.8`。
+包在 npm 上是 [s3m-maplibre](https://www.npmjs.com/package/s3m-maplibre)。
 
 `three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂；不用地图时也能只用解析和瓦片层（见「纯 three.js 使用」）。
 

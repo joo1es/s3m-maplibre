@@ -3,62 +3,210 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>S3M × 纯 three.js（不依赖 MapLibre）</title>
+    <title>S3M × 纯 Three.js 演示 | s3m-maplibre</title>
     <script type="importmap">
       { "imports": { "three": "./vendor/three.module.js" } }
     </script>
     <style>
-      html, body { margin: 0; height: 100%; overflow: hidden; background: #0d1420; }
-      body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
-      canvas { display: block; }
+      :root {
+        --bg-glass: rgba(13, 20, 32, 0.86);
+        --border-glass: rgba(255, 255, 255, 0.08);
+        --accent: #38bdf8;
+        --accent-glow: rgba(56, 189, 248, 0.25);
+        --text-main: #f8fafc;
+        --text-sub: #94a3b8;
+        --text-muted: #64748b;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0; height: 100%; overflow: hidden; background: #0b101b;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+        color: var(--text-main);
+        -webkit-font-smoothing: antialiased;
+      }
+      canvas { display: block; width: 100%; height: 100%; }
+
+      /* 毛玻璃面板容器 */
+      .card {
+        background: var(--bg-glass);
+        border: 1px solid var(--border-glass);
+        border-radius: 12px;
+        backdrop-filter: blur(16px);
+        -webkit-backdrop-filter: blur(16px);
+        box-shadow: 0 16px 36px rgba(0, 0, 0, 0.45), 0 0 0 1px rgba(255, 255, 255, 0.04);
+      }
 
       #panel {
-        position: absolute; top: 14px; left: 14px; z-index: 5;
-        width: 250px; padding: 12px 14px;
-        color: #e6edf7; font-size: 12px;
-        background: rgba(17, 25, 38, 0.86);
-        border: 1px solid rgba(255, 255, 255, 0.09);
-        border-radius: 10px;
-        backdrop-filter: blur(8px);
+        position: absolute; top: 16px; left: 16px; z-index: 5;
+        width: 290px; padding: 14px 16px;
+        display: flex; flex-direction: column; gap: 12px;
       }
-      #panel h1 { margin: 0 0 2px; font-size: 13px; font-weight: 600; }
-      #panel .sub { color: #7d8da4; font-size: 11px; margin-bottom: 10px; line-height: 1.5; }
-      #panel .row { display: flex; gap: 6px; margin-bottom: 8px; }
-      #panel select, #panel button {
-        font: inherit; font-size: 11.5px; color: #e6edf7;
-        background: rgba(255, 255, 255, 0.06);
+
+      /* 头部品牌栏 */
+      .brand-header {
+        display: flex; align-items: center; justify-content: space-between;
+        padding-bottom: 10px; border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+      }
+      .brand-title {
+        display: flex; align-items: center; gap: 7px;
+        font-size: 14px; font-weight: 700; letter-spacing: -0.01em;
+        background: linear-gradient(135deg, #ffffff 40%, #94a3b8 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+      }
+      .brand-badge {
+        font-size: 10.5px; font-weight: 600; padding: 2px 7px;
+        background: rgba(56, 189, 248, 0.12); color: var(--accent);
+        border: 1px solid rgba(56, 189, 248, 0.28); border-radius: 12px;
+        font-family: ui-monospace, monospace;
+      }
+
+      /* 顶部跨页导航胶囊 */
+      .nav-pills {
+        display: flex; gap: 5px; background: rgba(0, 0, 0, 0.25);
+        padding: 3px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05);
+      }
+      .nav-pill {
+        flex: 1; text-align: center; text-decoration: none;
+        padding: 5px 0; font-size: 11px; font-weight: 500;
+        color: var(--text-sub); border-radius: 6px;
+        transition: all 0.15s ease;
+      }
+      .nav-pill:hover { color: var(--text-main); background: rgba(255, 255, 255, 0.05); }
+      .nav-pill.active {
+        color: #ffffff; background: #2563eb; font-weight: 600;
+        box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35);
+      }
+
+      .desc-text {
+        color: var(--text-sub); font-size: 11.5px; line-height: 1.5; margin: 0;
+      }
+
+      /* 表单与分段按钮 */
+      .section-title {
+        font-size: 11px; font-weight: 600; color: #cbd5e1;
+        text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px;
+      }
+      .form-select {
+        width: 100%; padding: 6px 8px; font-size: 12px;
         border: 1px solid rgba(255, 255, 255, 0.14);
-        border-radius: 6px; padding: 4px 8px; cursor: pointer; outline: none;
+        border-radius: 6px; background: #0f172a; color: #f8fafc; outline: none;
+        transition: border-color 0.15s; cursor: pointer;
       }
-      #panel select { flex: 1; }
-      #panel button.on { background: #1d4ed8; border-color: #3b82f6; }
-      #stats { color: #8fa1b8; font-size: 11px; line-height: 1.7; }
-      #stats b { color: #dbe6f5; font-weight: 600; }
+      .form-select:focus { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-glow); }
+
+      .seg {
+        display: flex; background: rgba(0, 0, 0, 0.3);
+        border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 6px;
+        padding: 2px; gap: 2px;
+      }
+      .seg button {
+        flex: 1; background: transparent; border: none;
+        color: var(--text-sub); padding: 5px 0; font-size: 11.5px;
+        border-radius: 4px; cursor: pointer; font-weight: 500;
+        transition: all 0.15s ease; font-family: inherit;
+      }
+      .seg button:hover { color: var(--text-main); background: rgba(255, 255, 255, 0.05); }
+      .seg button.on {
+        background: #2563eb; color: #ffffff; font-weight: 600;
+        box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35);
+      }
+
+      /* 底部遥测数据 */
+      .stat-grid {
+        border-top: 1px solid rgba(255, 255, 255, 0.08); padding-top: 10px; margin-top: 4px;
+        display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; font-size: 11px;
+      }
+      .stat-chip {
+        display: flex; justify-content: space-between; align-items: center;
+        background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 6px; padding: 5px 8px; color: var(--text-muted);
+      }
+      .stat-chip b { color: var(--text-main); font-weight: 600; font-family: ui-monospace, monospace; font-size: 11px; }
+
+      /* 底部中心提示胶囊 */
       #hint {
-        position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
-        color: #93a3b8; font-size: 11.5px; white-space: nowrap;
-        background: rgba(17, 25, 38, 0.7); padding: 5px 12px; border-radius: 20px;
+        position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 4;
+        color: var(--text-sub); font-size: 11.5px; background: rgba(13, 20, 32, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 20px;
+        padding: 6px 16px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+        white-space: nowrap; pointer-events: none;
+      }
+
+      /* 跟随系统的浅色模式 (Light Mode) */
+      @media (prefers-color-scheme: light) {
+        :root {
+          --bg-glass: rgba(255, 255, 255, 0.88);
+          --border-glass: rgba(0, 0, 0, 0.08);
+          --accent: #0284c7;
+          --accent-glow: rgba(2, 132, 199, 0.25);
+          --text-main: #0f172a;
+          --text-sub: #475569;
+          --text-muted: #64748b;
+        }
+        html, body { background: #e2e8f0; color: #0f172a; }
+        .card { box-shadow: 0 16px 36px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.04); }
+        .brand-title { background: linear-gradient(135deg, #0f172a 40%, #475569 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+        .brand-header { border-bottom-color: rgba(0, 0, 0, 0.06); }
+        .nav-pills { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.06); }
+        .nav-pill:hover { color: #0f172a; background: rgba(0, 0, 0, 0.04); }
+        .form-select { background: #ffffff; color: #0f172a; border-color: #cbd5e1; }
+        .seg { background: rgba(0, 0, 0, 0.05); border-color: rgba(0, 0, 0, 0.08); }
+        .seg button { color: #64748b; }
+        .seg button:hover { color: #0f172a; }
+        .stat-grid { border-top-color: rgba(0, 0, 0, 0.06); }
+        .stat-chip { background: rgba(0, 0, 0, 0.02); border-color: rgba(0, 0, 0, 0.05); }
+        .stat-chip b { color: #0f172a; }
+        #hint { background: rgba(255, 255, 255, 0.92); border-color: rgba(0, 0, 0, 0.1); color: #475569; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1); }
       }
     </style>
   </head>
   <body>
-    <div id="panel">
-      <h1>S3M × 纯 three.js</h1>
-      <div class="sub">只有一个 three.js 场景，没有地图、没有 MapLibre。<br /><a href="./index.html" style="color:#60a5fa; text-decoration:none;">← MapLibre 版</a></div>
-      <div class="row">
-        <select id="ds">
+    <div id="panel" class="card">
+      <div class="brand-header">
+        <div class="brand-title">
+          <span>🏢</span>
+          <span>s3m-maplibre</span>
+        </div>
+        <span class="brand-badge">Three.js</span>
+      </div>
+
+      <div class="nav-pills">
+        <a href="./index.html" class="nav-pill">🗺️ MapLibre 版</a>
+        <span class="nav-pill active">🧊 纯 Three.js</span>
+        <a href="../docs/index.html" class="nav-pill">📚 开发文档</a>
+      </div>
+
+      <p class="desc-text">
+        宿主无关架构：直接驱动 Three.js 场景渲染 S3M 瓦片树，无需 MapLibre / GIS 地图底图。
+      </p>
+
+      <div>
+        <div class="section-title">测试数据集</div>
+        <select id="ds" class="form-select">
           <option value="cbd" selected>北京CBD (CCTV)</option>
           <option value="comModel">comModel (样例)</option>
           <option value="subwayCrn">地铁站 (CRN 纹理)</option>
         </select>
       </div>
-      <div class="row">
-        <button id="mTexture" class="on">原色</button>
-        <button id="mWhite">白膜</button>
-        <button id="mBatch">按单体</button>
+
+      <div>
+        <div class="section-title">材质模式</div>
+        <div class="seg">
+          <button id="mTexture" class="on">原色贴图</button>
+          <button id="mWhite">纯白模</button>
+          <button id="mBatch">按单体</button>
+        </div>
       </div>
-      <div id="stats">瓦片 <b id="stTiles">0</b> · 三角面 <b id="stTris">0</b> · 帧率 <b id="stFps">—</b></div>
+
+      <div class="stat-grid" id="stats">
+        <div class="stat-chip"><span>瓦片</span><b id="stTiles">0</b></div>
+        <div class="stat-chip"><span>三角面</span><b id="stTris">0</b></div>
+        <div class="stat-chip" style="grid-column: span 2;"><span>渲染帧率</span><b id="stFps">—</b></div>
+      </div>
     </div>
+
     <div id="hint">左键拖拽旋转 · 右键拖拽平移 · 滚轮缩放</div>
     <script type="module" src="./three.js"></script>
   </body>

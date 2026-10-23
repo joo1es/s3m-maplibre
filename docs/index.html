@@ -1,11 +1,24 @@
 <!doctype html>
-<html lang="zh-CN" class="dark scroll-smooth">
+<html lang="zh-CN" class="scroll-smooth">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>S3M for MapLibre - 完整开发指南与 API 参考</title>
     <meta name="description" content="SuperMap S3M/S3MB 三维瓦片格式原生 MapLibre / Mapbox 图层核心架构、API 文档与使用手册" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏢</text></svg>" />
+    <script>
+      (function() {
+        try {
+          const saved = localStorage.getItem('s3m_doc_theme');
+          const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          if (saved === 'dark' || (!saved && prefersDark)) {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
       tailwind.config = {
@@ -260,12 +273,25 @@
             <span>s3m-maplibre</span>
           </a>
           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-            v0.2.11
+            v0.2.12
           </span>
         </div>
 
+        <!-- 统一跨模块导航胶囊 -->
+        <nav class="hidden lg:flex items-center gap-1 bg-black/30 p-1 rounded-lg border border-white/10 text-xs">
+          <a href="../demo/index.html" class="px-3 py-1 rounded-md text-slate-400 hover:text-white hover:bg-white/5 transition flex items-center gap-1.5 font-medium">
+            <span>🗺️</span><span>MapLibre 演示</span>
+          </a>
+          <a href="../demo/three.html" class="px-3 py-1 rounded-md text-slate-400 hover:text-white hover:bg-white/5 transition flex items-center gap-1.5 font-medium">
+            <span>🧊</span><span>Three.js 演示</span>
+          </a>
+          <span class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold shadow-sm flex items-center gap-1.5">
+            <span>📚</span><span>开发文档</span>
+          </span>
+        </nav>
+
         <div class="flex items-center gap-3">
-          <div class="relative hidden sm:block w-64 lg:w-80">
+          <div class="relative hidden sm:block w-52 md:w-64">
             <input 
               id="searchInput" 
               type="text" 
@@ -281,8 +307,8 @@
             <svg id="themeSunIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 9H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
           </button>
 
-          <a href="../demo/index.html" target="_blank" class="hidden md:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-cyan-500 text-slate-950 font-semibold hover:bg-cyan-400 transition shadow-md shadow-cyan-500/10">
-            <span>在线三维 Demo</span>
+          <a href="../demo/index.html" class="hidden sm:inline-flex lg:hidden items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500 text-slate-950 hover:bg-cyan-400 transition shadow-md shadow-cyan-500/10">
+            <span>在线演示</span>
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
           </a>
 
@@ -350,7 +376,7 @@
       
 
         <div class="callout my-4 rounded-xl border-l-4 border-cyan-400 bg-cyan-950/20 px-5 py-3 text-slate-300 shadow-sm">
-          <div class="text-sm leading-relaxed">版本 0.2.8 · 对应 <code>s3m-maplibre</code> 的 <code>src/index.ts</code> 导出面</div>
+          <div class="text-sm leading-relaxed">对应 <code>s3m-maplibre</code> 的 <code>src/index.ts</code> 导出面</div>
         </div>
       
 <hr />
@@ -1563,7 +1589,7 @@ layer.flushOverrides();</code></pre>
         });
       }
 
-      // 主题切换逻辑
+      // 主题切换与系统自适应逻辑
       const themeToggleBtn = document.getElementById('themeToggleBtn');
       const themeSunIcon = document.getElementById('themeSunIcon');
       const themeMoonIcon = document.getElementById('themeMoonIcon');
@@ -1575,20 +1601,35 @@ layer.flushOverrides();</code></pre>
         }
       }
 
-      const savedTheme = localStorage.getItem('s3m_doc_theme');
-      if (savedTheme === 'light') {
-        document.documentElement.classList.remove('dark');
-        updateThemeIcons(false);
-      } else {
-        document.documentElement.classList.add('dark');
-        updateThemeIcons(true);
+      function getEffectiveTheme() {
+        const saved = localStorage.getItem('s3m_doc_theme');
+        if (saved === 'light' || saved === 'dark') return saved;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
       }
+
+      function applyTheme(theme) {
+        const isDark = theme === 'dark';
+        document.documentElement.classList.toggle('dark', isDark);
+        updateThemeIcons(isDark);
+      }
+
+      // 初始化应用当前生效的主题
+      applyTheme(getEffectiveTheme());
+
+      // 实时监听系统颜色主题偏好变化（用户未手动覆盖时自动同步）
+      const systemThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
+      systemThemeQuery.addEventListener('change', (e) => {
+        if (!localStorage.getItem('s3m_doc_theme')) {
+          applyTheme(e.matches ? 'dark' : 'light');
+        }
+      });
 
       if (themeToggleBtn) {
         themeToggleBtn.addEventListener('click', () => {
-          const isDark = document.documentElement.classList.toggle('dark');
-          localStorage.setItem('s3m_doc_theme', isDark ? 'dark' : 'light');
-          updateThemeIcons(isDark);
+          const isDarkNow = document.documentElement.classList.contains('dark');
+          const nextTheme = isDarkNow ? 'light' : 'dark';
+          localStorage.setItem('s3m_doc_theme', nextTheme);
+          applyTheme(nextTheme);
         });
       }
     </script>

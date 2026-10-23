@@ -51,6 +51,15 @@ function setStatus(text, kind) {
   $('dot').className = kind ?? '';
 }
 
+// 统一以 package.json 为唯一版本源动态显示
+fetch('../package.json')
+  .then((r) => r.json())
+  .then((pkg) => {
+    const el = $('versionTag');
+    if (el && pkg?.version) el.textContent = `v${pkg.version}`;
+  })
+  .catch(() => {});
+
 function baseStyle() {
   return {
     version: 8,
@@ -379,16 +388,25 @@ function initSourceControls() {
   });
 }
 
-/* ---------------------------------------------------------------- 正交投影 */
+/* ---------------------------------------------------------------- 底图与正交投影 */
+
+function updateBasemapVisibility() {
+  const hide = !!$('optHideBasemap')?.checked || !!$('optOrtho')?.checked;
+  for (const id of ['bg', 'osm']) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', hide ? 'none' : 'visible');
+  }
+}
+
+$('optHideBasemap').addEventListener('change', (e) => {
+  updateBasemapVisibility();
+  setStatus(e.target.checked ? '已隐藏地图底图' : '已恢复地图底图');
+});
 
 $('optOrtho').addEventListener('change', (e) => {
   const on = e.target.checked;
   layer.setProjection(on ? 'orthographic' : 'perspective');
   // 正交只覆盖 S3M 层：底图走 MapLibre 自己的透视投影，会与本层对不齐，整体退出。
-  // 拾取、选中描边、按单体着色/隐藏/抬高不受影响（都走同一个相机）。
-  for (const id of ['bg', 'osm']) {
-    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', on ? 'none' : 'visible');
-  }
+  updateBasemapVisibility();
   setStatus(on ? '正交投影已开启：底图退出' : '已切回透视投影');
 });
 
@@ -865,25 +883,26 @@ function renderFeature(f) {
 
   let customHtml = '';
   if (f.smid != null) {
+    const isPinned = !!custom;
     customHtml = `
-      <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #e5e7eb; display: flex; flex-direction: column; gap: 6px;">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-          <span style="font-weight: 600; font-size: 11px; color: #374151;">单体独立样式定制</span>
-          <span style="font-size: 10px; color: ${custom ? '#059669' : '#9ca3af'};">${custom ? '● 已固定' : '默认样式'}</span>
+      <div class="feat-custom">
+        <div class="feat-custom-hd">
+          <span>单体独立定制</span>
+          <span style="font-size: 10.5px; color: ${isPinned ? '#34d399' : '#64748b'};">${isPinned ? '● 已固定' : '默认样式'}</span>
         </div>
-        <div style="display: flex; gap: 6px; align-items: center;">
-          <span style="font-size: 11px; color: #6b7280;">颜色</span>
-          <input type="color" id="featColor" value="${custom?.color ?? '#ef4444'}" style="width: 26px; height: 20px; border: 1px solid #d1d5db; border-radius: 4px; padding: 0; cursor: pointer;" />
-          <label style="display: flex; align-items: center; gap: 4px; font-size: 11px; color: #6b7280; flex: 1; margin: 0;">
-            <span>拔高</span>
-            <input type="range" id="featElevation" min="0" max="40" step="1" value="${custom?.elevation ?? 0}" style="flex: 1; height: 14px;" />
-            <b id="featElevationVal" style="width: 26px; text-align: right; color: #111827;">${custom?.elevation ?? 0}m</b>
+        <div class="feat-row">
+          <span style="font-size: 11px; color: #94a3b8;">颜色</span>
+          <input type="color" id="featColor" value="${custom?.color ?? '#ef4444'}" style="width: 26px; height: 22px; border: 1px solid rgba(255,255,255,0.14); border-radius: 4px; padding: 0; cursor: pointer; background: transparent;" />
+          <label class="rng" style="margin: 0; flex: 1;">
+            <span style="color: #94a3b8;">拔高</span>
+            <input type="range" id="featElevation" min="0" max="40" step="1" value="${custom?.elevation ?? 0}" style="flex: 1;" />
+            <b id="featElevationVal" style="width: 26px; text-align: right; color: #f8fafc; font-family: ui-monospace, monospace;">${custom?.elevation ?? 0}m</b>
           </label>
         </div>
-        <div style="display: flex; gap: 4px; margin-top: 2px;">
-          <button id="btnPinFeature" style="flex: 1; padding: 4px 6px; font-size: 11px; background: #2563eb; color: #fff; border: none; border-radius: 4px; cursor: pointer; font-weight: 500;">固定此样式</button>
-          <button id="btnResetFeature" style="padding: 4px 6px; font-size: 11px; background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; border-radius: 4px; cursor: pointer;">重置</button>
-          <button id="btnHideFeature" style="padding: 4px 6px; font-size: 11px; background: #fee2e2; color: #dc2626; border: 1px solid #fecaca; border-radius: 4px; cursor: pointer;">隐藏/拆除</button>
+        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; margin-top: 4px;">
+          <button id="btnPinFeature" class="btn btn-primary" style="padding: 4px 6px; font-size: 11px;">固定样式</button>
+          <button id="btnResetFeature" class="btn" style="padding: 4px 6px; font-size: 11px;">重置</button>
+          <button id="btnHideFeature" class="btn btn-danger" style="padding: 4px 6px; font-size: 11px;">隐藏</button>
         </div>
       </div>
     `;

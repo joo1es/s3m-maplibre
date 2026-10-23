@@ -1,6 +1,6 @@
 # API 参考
 
-> 版本 0.2.8 · 对应 `s3m-maplibre` 的 `src/index.ts` 导出面
+> 对应 `s3m-maplibre` 的 `src/index.ts` 导出面
 
 ---
 

@@ -506,8 +506,8 @@ export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9)
     transparent: false,
     // 描边要压在建筑后面一点，避免和本体 z-fighting
     polygonOffset: true,
-    polygonOffsetFactor: -1,
-    polygonOffsetUnits: -1,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
   }) as OutlineMaterial;
   (mat.userData as Record<string, unknown>).isOutline = true;
   return mat;

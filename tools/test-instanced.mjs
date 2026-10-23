@@ -109,7 +109,18 @@ assert.ok(instancedMeshes.length > 0, '应当生成 InstancedMesh');
 
   const perVertex = mesh.geometry.getAttribute('aBatchId');
   assert.strictEqual(perVertex.count, mesh.geometry.getAttribute('position').count, 'aBatchId 仍是逐顶点，长度对');
-  ok(`建几何：${instancedMeshes.length} 个 InstancedMesh，实例属性长度 ${batchAttr.count}，逐顶点 aBatchId 保留兜底`);
+
+  // 验证实例矩阵结构：必须是纯仿射变换，底部投影行 [3, 7, 11, 15] 必须为 [0, 0, 0, 1]
+  const instM4 = new THREE.Matrix4();
+  mesh.getMatrixAt(0, instM4);
+  const el = instM4.elements;
+  assert.strictEqual(el[3], 0, '实例矩阵 elements[3] 应为 0（不能把平移误塞进投影行造成透视尖锥畸变）');
+  assert.strictEqual(el[7], 0, '实例矩阵 elements[7] 应为 0');
+  assert.strictEqual(el[11], 0, '实例矩阵 elements[11] 应为 0');
+  assert.strictEqual(el[15], 1, '实例矩阵 elements[15] 应为 1');
+  assert.ok(Math.abs(el[12]) > 10, '实例矩阵 elements[12] 应包含真实的 X 轴平移量');
+
+  ok(`建几何：${instancedMeshes.length} 个 InstancedMesh，实例矩阵纯正仿射无畸变，逐顶点 aBatchId 保留兜底`);
 }
 
 /* ---------------------------------------------- 3. 状态纹理：按实例改色 / 抬高 / 隐藏 */

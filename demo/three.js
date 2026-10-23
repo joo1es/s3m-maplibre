@@ -37,7 +37,11 @@ document.body.appendChild(renderer.domElement);
 setMaxAnisotropy(renderer.capabilities.getMaxAnisotropy());
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color('#0d1420');
+const isLight = window.matchMedia('(prefers-color-scheme: light)').matches;
+scene.background = new THREE.Color(isLight ? '#e2e8f0' : '#0d1420');
+window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', (e) => {
+  scene.background.set(e.matches ? '#e2e8f0' : '#0d1420');
+});
 
 const camera = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 1, 60000);
 

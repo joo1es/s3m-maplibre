@@ -1678,6 +1678,11 @@ export class S3MLayer {
 
   /* ---------------------------------------------------------------- 样式 */
 
+  /** 动态设置图层整体透明度 (0.0 ~ 1.0) */
+  setOpacity(opacity: number): void {
+    this.setStyle({ opacity });
+  }
+
   /** 合并并应用样式。只改 uniform 的项不会触发几何/着色器重建。 */
   setStyle(patch: Partial<S3MStyle> = {}): void {
     this.style = { ...this.style, ...patch };
@@ -2186,7 +2191,16 @@ export class S3MLayer {
     const raycaster = new THREE.Raycaster();
     raycaster.ray.copy(ray);
 
-    const meshes = [...this._pickables.values()].map((p) => p.mesh).filter((m) => m.visible);
+    const meshes = [...this._pickables.values()]
+      .map((p) => p.mesh)
+      .filter((m) => {
+        let curr: THREE.Object3D | null = m;
+        while (curr) {
+          if (!curr.visible) return false;
+          curr = curr.parent;
+        }
+        return true;
+      });
     const hits = raycaster.intersectObjects(meshes, false);
     if (!hits.length) return [];
 
@@ -2718,6 +2732,7 @@ export class S3MLayer {
     // 同上：弧度视场角。MapLibre v5 起 transform.fov 是「度」，当弧度用会让
     // LOD 屏幕误差算大 20% 以上（提前加载更细的瓦片）
     const fov = this._frameFov(arg);
+    let tilesetChanged = false;
     for (const entry of this.datasets.values()) {
       if (!entry.visible || !entry.tileset) continue;
       const local: [number, number, number] = [
@@ -2725,7 +2740,9 @@ export class S3MLayer {
         camEnu[1] - entry.offset[1],
         camEnu[2] - entry.offset[2],
       ];
-      entry.tileset.update(local, fov, canvas.height);
+      if (entry.tileset.update(local, fov, canvas.height)) {
+        tilesetChanged = true;
+      }
     }
 
     if (this.style.mode === STYLE.DYNAMIC) {
@@ -2741,8 +2758,8 @@ export class S3MLayer {
     this.renderer.resetState();
     this.renderer.render(this.scene, this.camera);
 
-    // 动态着色 / 有瓦片在队列里，都需要继续驱动下一帧
-    if (this.style.mode === STYLE.DYNAMIC || this.stats.loading > 0) this.map.triggerRepaint();
+    // 动态着色 / 瓦片加载中 / 瓦片层级或可见性改变，都需要继续驱动下一帧
+    if (this.style.mode === STYLE.DYNAMIC || this.stats.loading > 0 || tilesetChanged) this.map.triggerRepaint();
 
     this._frame++;
     const now = performance.now();
