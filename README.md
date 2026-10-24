@@ -61,7 +61,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
 | DXT / WebP 纹理 | ✅ | |
 | 骨骼动画 | ❌ | 未实现：LODPackage 上的 animations JSON 直接跳过不解析，官方 JS SDK 同样只读偏移不驱动 |
-| 地形遮挡 | ❌ | |
+| 地形遮挡 | ✅ | 与 MapLibre terrain 共用同一深度缓冲，山体可遮挡建筑；需宿主开启 `setTerrain` 并提供 DEM 源 |
 | Draco 压缩几何 | ❌ | 能识别、不能解码，遇到抛明确错误；接法见[未支持的格式](#未支持的格式draco--crn--ktx2) |
 | CRN 纹理（`compressType` 26 / 27 / 38001 / 50000） | ✅ | 内联 crunch wasm 转 DXT 后走同一套解码，只在遇到时懒加载；已在 SuperMap Online 公有服务实测 |
 | KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
@@ -390,7 +390,7 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 - **Draco 压缩几何**未实现（可解，缺样例数据），见[未支持的格式](#未支持的格式draco--ktx2)。
 - **纹理分包（`s3m:TextureSharing`）未支持**：这类数据集的 `tiles` 全是 `.s3mblock`（纹理块文件），不是 `.s3mb` 瓦片，加载会直接失败，例如 SuperMap Online 的 `3D-CBD/Xiaopin@CBD`。目前会如实报错，不做静默降级。
 - **多块 MeshOpt 骨架尚未对齐**：`3D-WorkSpace_pbr1/pbrmodel` 里有根瓦片是 `blockCount=2`，第二块的头按现有布局读会错位。单个属性流尺寸会先拦一道、给出可定位的报错，不会抛「Invalid typed array length」。
-- **地形遮挡**未实现：MapLibre 的地形深度没进 custom layer 的深度缓冲，建筑不会被地形裁掉。
+- **地形遮挡需要宿主把模型贴到真实地面高程**：深度测试本身是通的（地形网格与本层共用主 framebuffer 的同一深度缓冲、同一 `depthRangeFor3D`），但 S3M 数据通常按海拔 0 建模，必须用 `setDatasetHeight()` 抬到真实地面高程，否则模型会陷在地形下面。另外地形网格的贴图来自 raster / hillshade 层，没有这两层时地形面是空白的。
 - 跨城市量级的数据集叠加会重新引入 float32 精度问题。
 - 卸载只做了「超上限淘汰」：`maxTiles` 满了会淘汰最久没用的瓦片，但没有做预算式（按显存占用）的主动回收。
 - **切线（TANGENT）顶点流不参与渲染**：没有法线贴图通道，所以这条流只跳过不解码；但带它的数据（PBR 一类）不会因此失败。

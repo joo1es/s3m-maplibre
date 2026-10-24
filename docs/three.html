@@ -273,7 +273,7 @@
             <span>s3m-three</span>
           </a>
           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-            v0.1.0
+            v0.2.0
           </span>
         </div>
 
@@ -710,6 +710,23 @@ computeAlignOffset(tileset: S3MTileset | null, align?: DatasetAlignment): number
           </div>
         
 <p><code>addDataset</code> 在 <code>mount()</code> 之前调用会抛错（此时还没有 WebGL 上下文）。</p>
+<p><strong>垂直高程的两个独立通道</strong>：</p>
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>通道</th><th>含义</th><th>改它会影响什么</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td><code>baseAlignOffset</code></td><td>由 <code>align</code> 语义算出的基准偏移（<code>&#39;origin&#39;</code> / <code>&#39;bottom&#39;</code> / <code>&#39;top&#39;</code> / <code>&#39;center&#39;</code>）</td><td>换基准时自动重算，用户偏移原样保留</td></tr>
+<tr><td><code>userOffset</code></td><td>应用层设置的附加偏移（贴地高程、手动微调）</td><td><code>setDatasetHeight</code> 只改这一项</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+<p>最终落位 = <code>baseAlignOffset + userOffset</code>。</p>
+<p><code>setDatasetHeight(id, h)</code> 语义是<strong>「在当前 align 基准之上再抬升 h 米」</strong>，不覆盖 align 基准。所以把模型贴到真实地面高程（<code>setDatasetHeight(id, 40)</code>）不会破坏 <code>align=&#39;top&#39;</code> 的「顶部对齐地表并下沉」语义；<code>setDatasetAlign</code> 切换基准时手动偏移也原样保留。</p>
+<p><code>getDatasetHeight(id?)</code> 返回的是 <code>userOffset</code>（不含 align 基准）。</p>
 
         <h3 id="样式与棱线" class="doc-heading group">
           <span class="heading-anchor-link">#</span>
@@ -818,6 +835,12 @@ setGroundOpacity(opacity: number): void
 setExcavationBounds(bounds: [number, number, number, number] | null): void</code></pre>
           </div>
         
+<p>自带的物理地表网格锚定在<strong>场景 ENU 高程</strong>，解决的是「模型自身地上 / 地下结构的物理覆盖与透视关系」（地铁站、基坑这类数据没有真实地表 DEM 可用）：</p>
+<ul>
+<li><code>&#39;translucent&#39;</code> 半透明地表 + <code>depthWrite = false</code> ⇒ 地下结构透过地表显现</li>
+<li><code>&#39;excavate&#39;</code> 基坑范围内片元 <code>discard</code> ⇒ 挖空井口</li>
+</ul>
+<p>它与 MapLibre terrain 是<strong>两个正交维度</strong>，不存在替代关系：terrain 解决「真实世界地面的起伏与遮挡」，物理地表解决「模型自身的地上 / 地下语义」。贴地（<code>setDatasetHeight</code>）后物理地表网格的高度会跟随主数据集的抬升量自动同步，保证覆盖关系不错位。</p>
 
         <h3 id="拾取与空间查询" class="doc-heading group">
           <span class="heading-anchor-link">#</span>

@@ -273,7 +273,7 @@
             <span>s3m-maplibre</span>
           </a>
           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-            v0.3.0
+            v0.3.1
           </span>
         </div>
 
@@ -830,7 +830,8 @@ layer.projection  // 当前模式</code></pre>
         </h2>
       
 <ul>
-<li><strong>地形遮挡</strong>未实现：MapLibre 的地形深度没有写进 custom layer 的深度缓冲，建筑不会被地形裁掉。</li>
+<li><strong>地形遮挡</strong>已支持：MapLibre 的地形网格与本层（<code>renderingMode: &#39;3d&#39;</code>）共用主 framebuffer 的同一深度缓冲、同一 <code>depthRangeFor3D</code>、同一 <code>LEQUAL + ReadWrite</code> 深度模式，所以地形可以遮挡建筑。前提是宿主开启 <code>map.setTerrain({ source: &#39;dem&#39; })</code> 并提供 DEM 源，且地形网格需要有 raster / hillshade 层供图（否则地形面空白）。另外 S3M 数据通常按海拔 0 建模，需要用 <code>setDatasetHeight()</code> 把模型抬到真实地面高程，否则深度虽可比但空间位置对不上。</li>
+<li><strong>物理地表（地下透视 / 基坑）</strong>与 terrain 是两个正交维度：前者表达模型自身的地上 / 地下结构覆盖关系，后者表达真实地面的起伏遮挡，地铁站 / 基坑这类数据没有真实 DEM 时只能靠前者。</li>
 <li><strong>正交投影</strong>需要 MapLibre ≥ 5；v4 / v5 以下（含 Mapbox v2）只给合并矩阵，会告警一次并保持透视，见<a href="#投影">投影</a>。</li>
 <li><strong>多数据集叠加</strong>应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。</li>
 </ul>

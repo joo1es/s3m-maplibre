@@ -206,6 +206,19 @@ interface S3MDatasetOptions {
 
 `addDataset` 在 `mount()` 之前调用会抛错（此时还没有 WebGL 上下文）。
 
+**垂直高程的两个独立通道**：
+
+| 通道 | 含义 | 改它会影响什么 |
+|---|---|---|
+| `baseAlignOffset` | 由 `align` 语义算出的基准偏移（`'origin'` / `'bottom'` / `'top'` / `'center'`） | 换基准时自动重算，用户偏移原样保留 |
+| `userOffset` | 应用层设置的附加偏移（贴地高程、手动微调） | `setDatasetHeight` 只改这一项 |
+
+最终落位 = `baseAlignOffset + userOffset`。
+
+`setDatasetHeight(id, h)` 语义是**「在当前 align 基准之上再抬升 h 米」**，不覆盖 align 基准。所以把模型贴到真实地面高程（`setDatasetHeight(id, 40)`）不会破坏 `align='top'` 的「顶部对齐地表并下沉」语义；`setDatasetAlign` 切换基准时手动偏移也原样保留。
+
+`getDatasetHeight(id?)` 返回的是 `userOffset`（不含 align 基准）。
+
 ### 样式与棱线
 
 ```ts
@@ -265,6 +278,13 @@ setGroundMode(mode: GroundMode): void
 setGroundOpacity(opacity: number): void
 setExcavationBounds(bounds: [number, number, number, number] | null): void
 ```
+
+自带的物理地表网格锚定在**场景 ENU 高程**，解决的是「模型自身地上 / 地下结构的物理覆盖与透视关系」（地铁站、基坑这类数据没有真实地表 DEM 可用）：
+
+- `'translucent'` 半透明地表 + `depthWrite = false` ⇒ 地下结构透过地表显现
+- `'excavate'` 基坑范围内片元 `discard` ⇒ 挖空井口
+
+它与 MapLibre terrain 是**两个正交维度**，不存在替代关系：terrain 解决「真实世界地面的起伏与遮挡」，物理地表解决「模型自身的地上 / 地下语义」。贴地（`setDatasetHeight`）后物理地表网格的高度会跟随主数据集的抬升量自动同步，保证覆盖关系不错位。
 
 ### 拾取与空间查询
 
