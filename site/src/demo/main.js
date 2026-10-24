@@ -1,5 +1,17 @@
-import { S3MLayer, STYLE, AttributeQuery } from '../packages/s3m-maplibre/dist/index.js';
+import * as maplibregl from 'maplibre-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import { S3MLayer, STYLE, AttributeQuery } from 's3m-maplibre';
+import pkg from 's3m-maplibre/package.json';
 
+
+
+/** 迁移前的 main.js 逻辑原样收在一个初始化函数里。
+ *  UI 结构此时已由 Solid 渲染完毕，这里只做「抓 DOM → 绑事件 → 驱动图层」，
+ *  与迁移前的执行顺序一致，避免引入行为回归。
+ *  @param {HTMLElement} host 地图容器
+ *  @returns {() => void} 清理函数
+ */
+export function initDemo(host) {
 /** 常用预设快捷方式 */
 const PRESETS = [
   {
@@ -91,14 +103,11 @@ function setStatus(text, kind) {
   $('dot').className = kind ?? '';
 }
 
-// 统一以 package.json 为唯一版本源动态显示
-fetch('../package.json')
-  .then((r) => r.json())
-  .then((pkg) => {
-    const el = $('versionTag');
-    if (el && pkg?.version) el.textContent = `v${pkg.version}`;
-  })
-  .catch(() => {});
+// 版本号在构建期从包 package.json 打进来（产物里不再依赖仓库根文件）
+{
+  const el = $('versionTag');
+  if (el && pkg?.version) el.textContent = `v${pkg.version}`;
+}
 
 function baseStyle() {
   return {
@@ -162,7 +171,7 @@ function baseStyle() {
 /* ---------------------------------------------------------------- 地图与图层初始化 */
 
 const map = new maplibregl.Map({
-  container: 'map',
+  container: host,
   style: baseStyle(),
   center: [116.4581, 39.9123],
   zoom: 16.2,
@@ -1300,9 +1309,20 @@ map.on('load', async () => {
 
 /* ---------------------------------------------------------------- 状态轮询 */
 
-setInterval(() => {
+const statsTimer = setInterval(() => {
   $('stFps').textContent = layer.fps || '—';
   if (currentDatasets.length > 0) updateLegend();
 }, 600);
 
 window.__s3m = { map, layer, renderFeature, loadSource };
+
+return () => {
+  clearInterval(statsTimer);
+  try {
+    map.remove();
+  } catch {
+    /* 已经移除过 */
+  }
+};
+
+}

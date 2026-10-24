@@ -1,0 +1,290 @@
+/* demo 面板样式：从原 demo/index.html 的 <style> 原样迁出，
+   只是宿主从「整页」变成了「Solid 渲染的固定定位浮层」，选择器不需要改。 */
+
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b101b;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: #e2e8f0;
+        -webkit-font-smoothing: antialiased;
+      }
+      #map { position: absolute; inset: 0; background: #0b101b; }
+
+      /* 自定义精致滚动条 */
+      ::-webkit-scrollbar { width: 5px; height: 5px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.14); border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.28); }
+
+      /* 毛玻璃主卡片 */
+      .card {
+        background: rgba(13, 20, 32, 0.86);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        border-radius: 14px;
+        box-shadow: 0 20px 40px -8px rgba(0, 0, 0, 0.6), 0 0 0 1px rgba(255, 255, 255, 0.04);
+        backdrop-filter: blur(20px);
+        -webkit-backdrop-filter: blur(20px);
+      }
+
+      /* ---------- 左侧主控制面板 ---------- */
+      #panel {
+        position: absolute; top: 16px; left: 16px; z-index: 5;
+        width: 316px; padding: 16px;
+        font-size: 12px; color: #cbd5e1;
+        max-height: calc(100% - 32px); overflow-y: auto;
+      }
+
+      /* 统一品牌顶栏 */
+      .brand-bar {
+        display: flex; align-items: center; justify-content: space-between;
+        margin-bottom: 10px;
+      }
+      .brand-title {
+        display: flex; align-items: center; gap: 8px;
+        font-size: 14px; font-weight: 700; color: #f8fafc; letter-spacing: -0.01em;
+      }
+      .brand-icon {
+        width: 26px; height: 26px; border-radius: 7px;
+        background: linear-gradient(135deg, #06b6d4, #2563eb);
+        display: flex; align-items: center; justify-content: center;
+        font-size: 13px; box-shadow: 0 4px 10px rgba(6, 182, 212, 0.3);
+      }
+      .version-tag {
+        font-size: 10.5px; font-mono: ui-monospace, monospace; font-weight: 600;
+        padding: 2px 6px; border-radius: 6px;
+        background: rgba(56, 189, 248, 0.12); color: #38bdf8;
+        border: 1px solid rgba(56, 189, 248, 0.25);
+      }
+
+      /* 导航胶囊导航条 */
+      .nav-pills {
+        display: flex; gap: 5px; margin-bottom: 14px; padding-bottom: 12px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .nav-pill {
+        flex: 1; text-align: center; padding: 5px 0; border-radius: 6px;
+        font-size: 11px; text-decoration: none; font-weight: 500;
+        background: rgba(255, 255, 255, 0.04); color: #94a3b8;
+        border: 1px solid rgba(255, 255, 255, 0.08); transition: all 0.15s ease;
+      }
+      .nav-pill:hover {
+        background: rgba(255, 255, 255, 0.08); color: #f8fafc;
+        border-color: rgba(255, 255, 255, 0.16);
+      }
+      .nav-pill.active {
+        background: rgba(56, 189, 248, 0.15); color: #38bdf8;
+        border-color: rgba(56, 189, 248, 0.35); font-weight: 600;
+      }
+
+      #panel section { margin-bottom: 14px; }
+      #panel h2 {
+        margin: 0 0 8px; font-size: 10.5px; font-weight: 600; color: #64748b;
+        text-transform: uppercase; letter-spacing: 0.06em;
+        display: flex; align-items: center; gap: 6px;
+      }
+      #panel h2::before {
+        content: ''; width: 3px; height: 10px; border-radius: 2px;
+        background: #38bdf8; display: inline-block;
+      }
+
+      /* URL 输入框 & 预设胶囊 */
+      .url-box { display: flex; gap: 6px; margin-bottom: 7px; }
+      .url-box input, .form-input {
+        flex: 1; min-width: 0; padding: 6px 9px; font-size: 11.5px;
+        border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 6px; outline: none;
+        background: rgba(255, 255, 255, 0.04); color: #f8fafc; transition: all 0.15s;
+      }
+      .url-box input:focus, .form-input:focus {
+        border-color: #38bdf8; background: rgba(15, 23, 42, 0.95);
+        box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2);
+      }
+      .btn {
+        padding: 5px 10px; font-size: 11px; font-weight: 500; cursor: pointer;
+        border-radius: 6px; border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.06); color: #e2e8f0;
+        transition: all 0.15s; display: inline-flex; align-items: center; justify-content: center;
+      }
+      .btn:hover {
+        background: rgba(255, 255, 255, 0.12); border-color: rgba(255, 255, 255, 0.2);
+        color: #fff;
+      }
+      .btn-primary {
+        background: #0284c7; border-color: #38bdf8; color: #fff; font-weight: 600;
+        box-shadow: 0 0 10px rgba(56, 189, 248, 0.2);
+      }
+      .btn-primary:hover { background: #0ea5e9; border-color: #7dd3fc; }
+      .btn-danger {
+        background: rgba(239, 68, 68, 0.14); border-color: rgba(239, 68, 68, 0.35);
+        color: #fca5a5;
+      }
+      .btn-danger:hover { background: rgba(239, 68, 68, 0.25); color: #fff; }
+
+      .presets { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 4px; }
+      .presets button {
+        padding: 3px 8px; font-size: 10.5px; cursor: pointer; border-radius: 5px;
+        border: 1px solid rgba(255, 255, 255, 0.09); background: rgba(255, 255, 255, 0.04);
+        color: #94a3b8; transition: all 0.15s;
+      }
+      .presets button:hover {
+        border-color: rgba(255, 255, 255, 0.2); background: rgba(255, 255, 255, 0.08);
+        color: #f1f5f9;
+      }
+      .presets button.active {
+        border-color: #38bdf8; background: rgba(56, 189, 248, 0.14);
+        color: #38bdf8; font-weight: 600;
+      }
+
+      /* 数据集复选列表 */
+      .ds {
+        display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+        border-radius: 6px; cursor: pointer; margin-bottom: 3px;
+        background: rgba(255, 255, 255, 0.02); border: 1px solid rgba(255, 255, 255, 0.04);
+        transition: all 0.12s;
+      }
+      .ds:hover { background: rgba(255, 255, 255, 0.05); border-color: rgba(255, 255, 255, 0.08); }
+      .ds input { margin: 0; accent-color: #38bdf8; cursor: pointer; }
+      .ds .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cbd5e1; font-size: 11.5px; }
+      .ds .tag { color: #64748b; font-size: 10.5px; font-variant-numeric: tabular-nums; flex: none; font-family: ui-monospace, monospace; }
+      .ds .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+
+      /* 着色模式分段按钮 */
+      .seg { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; }
+      .seg button {
+        padding: 6px 3px; font-size: 11px; cursor: pointer; border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.08); background: rgba(255, 255, 255, 0.03);
+        color: #94a3b8; transition: all 0.15s; font-weight: 500;
+      }
+      .seg button:hover { border-color: rgba(255, 255, 255, 0.18); color: #f1f5f9; background: rgba(255, 255, 255, 0.06); }
+      .seg button.on {
+        background: #0284c7; color: #fff; border-color: #38bdf8;
+        font-weight: 600; box-shadow: 0 0 12px rgba(56, 189, 248, 0.28);
+      }
+
+      /* 调色板拾取器 */
+      .swatches { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 9px; align-items: center; }
+      .swatches label { display: flex; align-items: center; gap: 6px; color: #94a3b8; font-size: 11px; cursor: pointer; }
+      .swatches input[type=color] {
+        width: 24px; height: 20px; padding: 0; border: 1px solid rgba(255, 255, 255, 0.2);
+        border-radius: 4px; background: none; cursor: pointer;
+      }
+      .swatches.hide { display: none; }
+
+      /* 通用复选框与滑块 */
+      .chk { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; color: #cbd5e1; font-size: 11.5px; }
+      .chk input { margin: 0; accent-color: #38bdf8; cursor: pointer; }
+
+      .rng { display: flex; align-items: center; gap: 8px; padding: 3px 0 5px; color: #94a3b8; font-size: 11.5px; }
+      .rng input[type=range] { flex: 1; accent-color: #38bdf8; height: 16px; cursor: pointer; }
+      .rng b {
+        color: #38bdf8; font-weight: 600; font-family: ui-monospace, monospace;
+        font-size: 11px; width: 44px; text-align: right;
+        background: rgba(56, 189, 248, 0.08); padding: 2px 4px; border-radius: 4px;
+        border: 1px solid rgba(56, 189, 248, 0.15);
+      }
+
+      /* 现代下拉选框 */
+      .form-select {
+        padding: 4px 8px; font-size: 11.5px; border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 6px; background: #0f172a; color: #f8fafc; outline: none;
+      }
+      .form-select:focus { border-color: #38bdf8; box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.2); }
+
+      #legend { margin-top: 9px; }
+      #legend .bar { height: 6px; border-radius: 3px; }
+      #legend .lab { display: flex; justify-content: space-between; color: #64748b; font-size: 10px; margin-top: 3px; font-family: ui-monospace, monospace; }
+
+      /* 底部微型仪表盘 */
+      #panel footer {
+        border-top: 1px solid rgba(255, 255, 255, 0.08); padding-top: 10px; margin-top: 6px;
+        display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; font-size: 11px;
+      }
+      .stat-chip {
+        display: flex; justify-content: space-between; align-items: center;
+        background: rgba(255, 255, 255, 0.03); border: 1px solid rgba(255, 255, 255, 0.05);
+        border-radius: 6px; padding: 5px 8px; color: #64748b;
+      }
+      .stat-chip b { color: #f8fafc; font-weight: 600; font-family: ui-monospace, monospace; font-size: 11px; }
+
+      /* 状态与指示灯 */
+      #status {
+        display: flex; align-items: center; gap: 7px; margin-top: 10px;
+        color: #94a3b8; font-size: 11px; padding: 4px 6px;
+        background: rgba(255, 255, 255, 0.02); border-radius: 6px;
+      }
+      #dot { width: 6px; height: 6px; border-radius: 50%; background: #64748b; flex: none; }
+      #dot.busy { background: #f59e0b; box-shadow: 0 0 8px #f59e0b; animation: pulse 1s infinite; }
+      #dot.ok { background: #10b981; box-shadow: 0 0 8px #10b981; }
+      #dot.err { background: #ef4444; box-shadow: 0 0 8px #ef4444; }
+      @keyframes pulse { 50% { opacity: 0.3; } }
+
+      /* ---------- 右侧单体属性卡 ---------- */
+      #feature {
+        position: absolute; right: 18px; bottom: 18px; z-index: 6;
+        width: 290px; padding: 16px; font-size: 12px;
+        transform: translateY(14px) scale(0.98); opacity: 0; pointer-events: none;
+        transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+        border-color: rgba(56, 189, 248, 0.3);
+      }
+      #feature.on { transform: none; opacity: 1; pointer-events: auto; }
+      #feature .hd { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+      #feature .hd b { font-size: 13.5px; color: #f8fafc; font-family: ui-monospace, monospace; }
+      #feature .close { cursor: pointer; color: #64748b; font-size: 18px; line-height: 1; transition: color 0.15s; }
+      #feature .close:hover { color: #f8fafc; }
+      #feature .kv { display: flex; justify-content: space-between; padding: 3px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.03); }
+      #feature .kv span:first-child { color: #64748b; font-size: 11px; }
+      #feature .kv span:last-child { font-variant-numeric: tabular-nums; font-weight: 550; color: #cbd5e1; font-size: 11px; }
+      #feature .note {
+        margin-top: 10px; padding-top: 8px; border-top: 1px solid rgba(255, 255, 255, 0.08);
+        color: #64748b; font-size: 10.5px; line-height: 1.5;
+      }
+
+      /* 单体独立定制样式卡 */
+      .feat-custom { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255, 255, 255, 0.08); display: flex; flex-direction: column; gap: 7px; }
+      .feat-custom-hd { display: flex; justify-content: space-between; align-items: center; }
+      .feat-custom-hd span:first-child { font-weight: 600; font-size: 11px; color: #f1f5f9; }
+      .feat-row { display: flex; gap: 6px; align-items: center; }
+      .btn-danger { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.3); }
+      .btn-danger:hover { background: rgba(239, 68, 68, 0.25); border-color: rgba(239, 68, 68, 0.5); }
+
+      /* 底部中心操作提示胶囊 */
+      #hint {
+        position: absolute; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 4;
+        color: #94a3b8; font-size: 11.5px; background: rgba(13, 20, 32, 0.85);
+        border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 20px;
+        padding: 6px 16px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(12px); white-space: nowrap; pointer-events: none;
+      }
+
+      /* 跟随系统的浅色模式 (Light Mode) */
+      @media (prefers-color-scheme: light) {
+        html, body, #map { background: #f1f5f9; color: #1e293b; }
+        .card { background: rgba(255, 255, 255, 0.88); border-color: rgba(0, 0, 0, 0.08); box-shadow: 0 16px 36px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.04); }
+        .brand-title { color: #0f172a; }
+        #panel { color: #334155; }
+        #panel h2 { color: #475569; border-top-color: rgba(0, 0, 0, 0.06); }
+        .nav-pills { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.06); }
+        .nav-pill { color: #64748b; }
+        .nav-pill:hover { color: #0f172a; background: rgba(0, 0, 0, 0.04); }
+        .url-box input, .form-select { background: #ffffff; color: #0f172a; border-color: #cbd5e1; }
+        .preset-chip { background: #ffffff; border-color: #e2e8f0; color: #334155; }
+        .preset-chip:hover { border-color: #0284c7; color: #0284c7; }
+        .seg { background: rgba(0, 0, 0, 0.05); border-color: rgba(0, 0, 0, 0.08); }
+        .seg button { color: #64748b; }
+        .seg button:hover { color: #0f172a; }
+        .btn { background: #ffffff; border-color: #cbd5e1; color: #334155; }
+        .btn:hover { background: #f8fafc; color: #0f172a; }
+        label.chk, label.rng { color: #334155; }
+        label.rng b { color: #0f172a; }
+        .stat-chip { background: rgba(0, 0, 0, 0.02); border-color: rgba(0, 0, 0, 0.05); color: #64748b; }
+        .stat-chip b { color: #0f172a; }
+        #status { background: rgba(0, 0, 0, 0.03); color: #475569; }
+        #hint { background: rgba(255, 255, 255, 0.92); border-color: rgba(0, 0, 0, 0.1); color: #475569; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1); }
+        #feature .hd b { color: #0f172a; }
+        #feature .kv span:last-child { color: #0f172a; }
+        .feat-custom-hd span:first-child { color: #0f172a; }
+        #panel footer { border-top-color: rgba(0, 0, 0, 0.06); }
+      }
+    

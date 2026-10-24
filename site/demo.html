@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>S3M for MapLibre — 原生解析 · 叠加 · 着色 · 单体拾取</title>
+    <meta
+      name="description"
+      content="在浏览器里直接解析 SuperMap S3M 瓦片并用 three.js 渲染：数据集叠加、多种着色模式、单体拾取与属性查询。"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b101b;
+      }
+      @media (prefers-color-scheme: light) {
+        html,
+        body {
+          background: #f1f5f9;
+        }
+      }
+    </style>
+    <!--s3m-hydration-->
+  </head>
+  <body>
+    <div id="root"><!--ssr-outlet--></div>
+    <script type="module" src="/src/demo/entry-client.tsx"></script>
+  </body>
+</html>

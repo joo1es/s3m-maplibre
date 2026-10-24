@@ -43,7 +43,21 @@ async function inlineStylesheet(html) {
 
 async function main() {
   console.log('[docs] 构建前端资源…');
-  await build({ root: SITE, configFile: CONFIG, logLevel: 'warn' });
+  // 入口/输出目录由这里指定：同一份 vite.config.ts 也被 demo 构建复用
+  await build({
+    root: SITE,
+    configFile: CONFIG,
+    logLevel: 'warn',
+    build: {
+      outDir: DIST,
+      emptyOutDir: true,
+      rollupOptions: {
+        input: Object.fromEntries(
+          PAGES.map((p) => [p.entry.replace(/\.html$/, ''), path.join(SITE, p.entry)]),
+        ),
+      },
+    },
+  });
 
   // 单独打 SSR 包：build.ssr 会把 environment 切到 server，
   // solid 插件据此把 JSX 编译成服务端模式（同一份 config，不能用两份，否则客户端会丢 hydratable）
@@ -102,7 +116,9 @@ async function main() {
     if (name.endsWith('.css')) await rm(path.join(assetsDir, name), { force: true });
   }
 
+  // dist/ 与 dist-ssr/ 只是中转站，产物已经落到 docs/，留着只会越积越多
   await rm(SSR_OUT, { recursive: true, force: true });
+  await rm(DIST, { recursive: true, force: true });
 
   console.log(
     `[docs] 输出 docs/ （${PAGES.length} 页，${((Date.now() - started) / 1000).toFixed(1)}s）`,

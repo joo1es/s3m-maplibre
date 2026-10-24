@@ -5,3 +5,5 @@ _tmp/
 .DS_Store
 package-lock.json
 site/dist-ssr/
+site/dist-demo/
+site/dist-demo-ssr/

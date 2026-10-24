@@ -161,23 +161,29 @@ map.on('click', (e) => {
 本地跑：
 
 ```bash
-npm run dev      # 开发模式：tsc -w + 静态服务，保存源码后浏览器自动刷新
-npm run demo     # 一次性编译后起静态服务（不做监听）
+npm run dev    # 开发：编一次 packages → tsc -w + vite dev（一个端口同时出文档和 demo）
+npm run serve  # 只服务已构建的产物（http://localhost:8123/s3m-maplibre/demo/index.html）
+npm run demo   # 全量构建后起静态服务
+npm run build  # 只产出，不起服务
 ```
 
-两个命令都指向 http://localhost:8123/s3m-maplibre/demo/index.html ，`demo/three.html` 是同一台服务器上的纯 three 版。
+`npm run dev` 起来后：
 
-文档站单独预览（改 `packages/*/docs/API.md` 保存即刷新，走的是和生产构建同一条 SSG 链路）：
+| 地址 | 内容 |
+|---|---|
+| <http://localhost:5173/> | s3m-maplibre 文档（改 `packages/*/docs/API.md` 保存即刷新） |
+| <http://localhost:5173/three.html> | s3m-three 内核文档 |
+| <http://localhost:5173/demo/> | demo（和线上 `demo/index.html` 同路径，相对资源不用改） |
 
-```bash
-npm run dev:docs   # http://localhost:5173/index.html  →  http://localhost:5173/three.html
-```
+改 `packages/*/src/**/*.ts` 由 `tsc -w` 增量编译，vite 直接读到新产物；改 `site/` 下的组件走 HMR。
+
+`npm run build` 会按 `s3m-three → s3m-maplibre → docs → demo` 的顺序全部产出，其中 docs/ 与 demo/index.html 都由 `site/` 构建（共用一份 `site/vite.config.ts`，只是入口和输出目录不同；产物位置不变，URL 不变）。
 
 演示自带两份本地样例数据（北京 CBD 的 CCTV、comModel，离线可用），另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并默认勾选第一个。
 
 演示包含：数据集叠加开关、着色模式、透明度、平面/平滑着色、选中描边（棱线 / 外扩两种画法，粗细可调）、全局棱线、点击属性卡；右侧面板还能填 iServer 数据服务地址，按业务字段（KEYID / SmMaxZ…）上色出图例、按区间过滤、按字段值抬高。
 
-「投影」分组里的**正交投影**勾选框（或 `?ortho=1`）会把 S3M 层切成正交相机——pan / zoom / pitch / 拾取 / 选中全部照常，勾选时自动隐藏底图（正交层和透视底图对不齐，见[正交投影](#正交投影)）。演示内置的是 MapLibre GL JS v5.0.0（`demo/vendor/`），正交需要的独立投影矩阵从 v5 开始才有。
+「投影」分组里的**正交投影**勾选框（或 `?ortho=1`）会把 S3M 层切成正交相机——pan / zoom / pitch / 拾取 / 选中全部照常，勾选时自动隐藏底图（正交层和透视底图对不齐，见[正交投影](#正交投影)）。演示用的是 `devDependencies` 里的 MapLibre GL JS v5（由 vite 打包，不再有 `demo/vendor/` 下的那份 UMD 副本），正交需要的独立投影矩阵从 v5 开始才有。
 
 ---
 
@@ -441,8 +447,8 @@ packages/
       index.ts            包入口（再导出 s3m-three 全量符号，0.2.x 用法不破）
       S3MLayer.ts          薄图层：custom layer 生命周期 / render 矩阵提取 / 事件
       MapLibreGeoAdapter.ts WorldCoordinateHelper 提取 → GeoAdapter
-demo/       两个在线演示（MapLibre 版 / 纯 three.js 版）
-site/       文档站源码（vite + Solid，SSG 后输出到 docs/；正文由 markdown-it + shiki 在构建期渲染）
+demo/       在线演示产物（index.html 由 site/ 构建）+ 样例数据；three.html 仍是单文件版
+site/       站点源码（vite + Solid SSG）：docs 正文由 markdown-it + shiki 构建期渲染，demo 面板为 Solid 组件
 tools/      自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
 tests/      类型级用法测试（tests/types/usage.ts）
 docs/       API 文档站产物（`npm run build:docs` 生成，图层 + 内核双页面，勿手改）
