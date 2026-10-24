@@ -3,8 +3,21 @@ name: Publish to npm
 on:
   push:
     tags:
+      # 按包打标签：s3m-three@0.1.0 只发内核，s3m-maplibre@0.3.0 只发图层
+      - 's3m-three@*'
+      - 's3m-maplibre@*'
+      # v* 是 s3m-maplibre 的 legacy 别名（0.2.x 时代的习惯），继续可用
       - 'v*'
   workflow_dispatch:
+    inputs:
+      package:
+        description: '要发布的包'
+        required: true
+        default: 's3m-maplibre'
+        type: choice
+        options:
+          - 's3m-three'
+          - 's3m-maplibre'
 
 jobs:
   publish:
@@ -33,34 +46,64 @@ jobs:
       - name: Install dependencies via Bun
         run: bun install --frozen-lockfile
 
-      # monorepo：s3m-maplibre 是面向使用方的发布包，标签版本与它对齐
-      - name: Verify tag matches s3m-maplibre version
-        if: startsWith(github.ref, 'refs/tags/v')
+      # 标签 → 发布哪个包。s3m-maplibre 是面向使用方的发布包，v* legacy 别名指向它
+      - name: Resolve target package from tag
+        id: resolve
         run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
-          PKG="$(node -p "require('./packages/s3m-maplibre/package.json').version")"
-          if [ "$TAG" != "$PKG" ]; then
-            echo "::error::标签 v$TAG 与 packages/s3m-maplibre 的版本 $PKG 不一致，已终止发布"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PKG="${{ inputs.package }}"
+          else
+            REF="${GITHUB_REF#refs/tags/}"
+            case "$REF" in
+              s3m-three@*)    PKG="s3m-three" ;;
+              s3m-maplibre@*) PKG="s3m-maplibre" ;;
+              v*)             PKG="s3m-maplibre" ;;
+              *) echo "::error::无法识别的标签格式：$REF"; exit 1 ;;
+            esac
+          fi
+          echo "target=$PKG" >> "$GITHUB_OUTPUT"
+          echo "发布目标：$PKG"
+
+      # 标签版本必须与对应包的 package.json 一致，防止改完代码忘了改版本号
+      - name: Verify tag matches package version
+        if: github.event_name != 'workflow_dispatch'
+        run: |
+          PKG="${{ steps.resolve.outputs.target }}"
+          REF="${GITHUB_REF#refs/tags/}"
+          case "$REF" in
+            s3m-three@*)    TAG="${REF#s3m-three@}" ;;
+            s3m-maplibre@*) TAG="${REF#s3m-maplibre@}" ;;
+            v*)             TAG="${REF#v}" ;;
+          esac
+          PKGVER="$(node -p "require('./packages/$PKG/package.json').version")"
+          if [ "$TAG" != "$PKGVER" ]; then
+            echo "::error::标签 $REF 与 packages/$PKG 的版本 $PKGVER 不一致，已终止发布"
             exit 1
           fi
-          echo "版本一致：v$PKG"
+          echo "版本一致：$PKG@$PKGVER"
 
       - name: Build and typecheck
         run: |
           npm run build
           npm run typecheck
 
-      # 先发渲染内核，再发依赖它的适配层
-      - name: Publish s3m-three to npm
-        run: npm publish --access public --provenance
-        working-directory: packages/s3m-three
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # s3m-maplibre 发布时依赖会写成 ^x.y.z（prepublishOnly 替换 workspace:*），
+      # 内核不在 npm 上就会装不上，先挡一道
+      - name: Verify s3m-three dependency is on npm
+        if: steps.resolve.outputs.target == 's3m-maplibre'
+        run: |
+          DEP="$(node -p "require('./packages/s3m-maplibre/package.json').dependencies['s3m-three']")"
+          DEP="${DEP#workspace:}"
+          if npm view "s3m-three@$DEP" version >/dev/null 2>&1; then
+            echo "依赖已就绪：s3m-three@$DEP"
+          else
+            echo "::error::npm 上不存在 s3m-three@$DEP —— 请先打标签发布 s3m-three@$DEP（git tag s3m-three@$DEP && git push origin s3m-three@$DEP）"
+            exit 1
+          fi
 
-      # prepublishOnly 会把 workspace:* 依赖替换成正式版本号后再发布
-      - name: Publish s3m-maplibre to npm
+      - name: Publish to npm
         run: npm publish --access public --provenance
-        working-directory: packages/s3m-maplibre
+        working-directory: packages/${{ steps.resolve.outputs.target }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
