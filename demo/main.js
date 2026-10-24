@@ -57,6 +57,35 @@ const $ = (id) => document.getElementById(id);
 const fmt = (n) => (n >= 10000 ? `${(n / 10000).toFixed(1)} 万` : String(Math.round(n ?? 0)));
 const num = (n, d = 1) => (n == null ? '—' : Number(n).toFixed(d));
 
+/* ------------------------------------------------------------------ 地形 (Terrain) */
+
+/**
+ * 真实地形数据源：AWS elevation-tiles-prod 是公开的 terrarium 编码 DEM，
+ * MapLibre 原生支持 `encoding: 'terrarium'`，且响应带 CORS 头，浏览器可直接拉。
+ *
+ * 关于高程基准：MapLibre 的 _viewProjMatrix 里含 translate(0,0,-elevation)，
+ * 地形网格与 3D custom layer 共用同一个矩阵 ⇒ 两边都是「海拔 0」基准，
+ * 深度测试天然可比，地形可以直接遮挡 S3M 建筑。
+ * 唯一需要处理的是 S3M 模型自身按海拔 0 建模，而地面在海拔 G ⇒ 建筑要抬 G。
+ */
+const DEM_SOURCE = {
+  type: 'raster-dem',
+  tiles: ['https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png'],
+  encoding: 'terrarium',
+  tileSize: 256,
+  minzoom: 0,
+  maxzoom: 15,
+};
+
+const terrainState = {
+  enabled: false,
+  exaggeration: 1,
+  shade: true,
+  snap: true,
+  /** 当前已生效的自动贴地量（米） */
+  groundOffset: 0,
+};
+
 function setStatus(text, kind) {
   $('statusText').textContent = text;
   $('dot').className = kind ?? '';
@@ -82,6 +111,20 @@ function baseStyle() {
         maxzoom: 19,
         attribution: '© OpenStreetMap contributors',
       },
+      // 地形 DEM 源（AWS Terrarium，公开免 key）
+      dem: {
+        ...DEM_SOURCE,
+        attribution: 'Elevation: AWS Terrain Tiles',
+      },
+      // 地形表面纹理源：地形网格的贴图来自 RTT 栈（raster/hillshade/background 等层
+      // 渲染进 FBO 的结果），所以必须有一个 raster 层为它供图。
+      // 独立于 osm 源 ⇒ 「隐藏地图底图」时地形仍能出图。
+      terrainTex: {
+        type: 'raster',
+        tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+        tileSize: 256,
+        maxzoom: 19,
+      },
     },
     layers: [
       { id: 'bg', type: 'background', paint: { 'background-color': '#e9edf2' } },
@@ -90,6 +133,27 @@ function baseStyle() {
         type: 'raster',
         source: 'osm',
         paint: { 'raster-opacity': 0.82, 'raster-saturation': -0.55, 'raster-brightness-max': 0.94 },
+      },
+      {
+        // 地形纹理层：只在地形开启时可见，视觉上盖在 osm 之上给地形面供图
+        id: 'terrainTex',
+        type: 'raster',
+        source: 'terrainTex',
+        layout: { visibility: 'none' },
+        paint: { 'raster-opacity': 0.82, 'raster-saturation': -0.55, 'raster-brightness-max': 0.94 },
+      },
+      {
+        id: 'terrainShade',
+        type: 'hillshade',
+        source: 'dem',
+        layout: { visibility: 'none' },
+        paint: {
+          'hillshade-shadow-color': '#0b1220',
+          'hillshade-highlight-color': '#8fb6d8',
+          'hillshade-accent-color': '#4a6fa5',
+          'hillshade-exaggeration': 0.4,
+          'hillshade-illumination-direction': 335,
+        },
       },
     ],
   };
@@ -418,6 +482,149 @@ function initSourceControls() {
   });
 }
 
+/* ---------------------------------------------------------------- 地形 (Terrain) */
+
+/**
+ * 开关地形。
+ * - dem 源在初始 style 里已建好，terrainShade(hillshade) 层引用它 ⇒ 不能 removeSource
+ * - setTerrain 开关真正的高程网格（带 DEM 的地形面）
+ */
+function applyTerrain() {
+  if (terrainState.enabled) {
+    map.setTerrain({ source: 'dem', exaggeration: terrainState.exaggeration });
+  } else {
+    map.setTerrain(null);
+  }
+
+  // 地形网格的贴图来自 RTT 栈 ⇒ 必须有 raster 层供图，否则地形面空白
+  if (map.getLayer('terrainTex')) {
+    map.setLayoutProperty('terrainTex', 'visibility', terrainState.enabled ? 'visible' : 'none');
+  }
+
+  // hillshade 层跟着开关走
+  if (map.getLayer('terrainShade')) {
+    map.setLayoutProperty(
+      'terrainShade',
+      'visibility',
+      terrainState.enabled && terrainState.shade ? 'visible' : 'none'
+    );
+  }
+
+  map.triggerRepaint();
+  updateTerrainInfo();
+}
+
+/**
+ * 建筑贴地：S3M 模型的 z 基准是海拔 0，而真实 DEM 地面在海拔 G（北京 CBD 约 40m）。
+ * MapLibre 的 _viewProjMatrix 含 translate(0,0,-elevation)，地形与 custom layer 共用
+ * 同一个矩阵 ⇒ 两边同为海拔 0 基准，深度测试天然可比，地形能直接挡住建筑。
+ * 这里只需把数据集整体抬到地面高程。
+ *
+ * setDatasetHeight 的语义是「在 align 基准之上再抬升」，
+ * 所以 align='top'（顶部对齐地表并下沉）的数据集贴地后仍然是「顶部落在地面高度」。
+ *
+ * 注意：queryTerrainElevation 返回的是「含 exaggeration」的地面高程，
+ * 所以夸张倍数变化后必须重新贴地。
+ */
+function snapDatasetsToTerrain() {
+  if (!terrainState.enabled || !terrainState.snap) return;
+
+  const b = layer.getBounds();
+  if (!b) return;
+  const center = [(b[0][0] + b[1][0]) / 2, (b[0][1] + b[1][1]) / 2];
+
+  let elev = null;
+  try {
+    elev = map.queryTerrainElevation(center);
+  } catch (e) {
+    console.warn('[terrain] queryTerrainElevation 失败', e);
+  }
+
+  if (typeof elev !== 'number' || !Number.isFinite(elev)) {
+    updateTerrainInfo('贴地：高程未就绪（DEM 瓦片仍在加载）');
+    return;
+  }
+
+  // S3M 原始基准是海拔 0 ⇒ 抬到地面高程（不覆盖 align 基准）
+  for (const id of layer.datasets.keys()) {
+    layer.setDatasetHeight(id, elev);
+  }
+  terrainState.groundOffset = elev;
+
+  const el = $('optHeightOffset');
+  if (el) {
+    el.value = Math.max(Number(el.min), Math.min(Number(el.max), elev));
+    $('heightOffsetVal').textContent = `${elev > 0 ? '+' : ''}${elev.toFixed(1)}m`;
+  }
+  updateTerrainInfo(`地面海拔 ${elev.toFixed(1)}m · 已贴地`);
+}
+
+/** 关闭贴地时把附加偏移还回 0（align 基准不受影响） */
+function clearTerrainSnap() {
+  terrainState.groundOffset = 0;
+  for (const id of layer.datasets.keys()) layer.setDatasetHeight(id, 0);
+  const el = $('optHeightOffset');
+  if (el) {
+    el.value = 0;
+    $('heightOffsetVal').textContent = '0m';
+  }
+}
+
+function updateTerrainInfo(note) {
+  const el = $('terrainInfo');
+  if (!el) return;
+  if (!terrainState.enabled) {
+    el.textContent = '未开启';
+    return;
+  }
+  const base = `AWS Terrarium · 夸张 ${terrainState.exaggeration}×`;
+  el.textContent = note ? `${base} · ${note}` : base;
+}
+
+$('optTerrain')?.addEventListener('change', (e) => {
+  terrainState.enabled = e.target.checked;
+  applyTerrain();
+  if (terrainState.enabled) {
+    setStatus('地形已开启', 'ok');
+    // DEM 瓦片异步加载，分多次尝试贴地
+    setTimeout(snapDatasetsToTerrain, 1000);
+    setTimeout(snapDatasetsToTerrain, 2500);
+    setTimeout(snapDatasetsToTerrain, 5000);
+  } else {
+    clearTerrainSnap();
+    setStatus('地形已关闭');
+  }
+});
+
+$('optExagg')?.addEventListener('input', (e) => {
+  terrainState.exaggeration = Number(e.target.value);
+  $('exaggVal').textContent = `${terrainState.exaggeration}×`;
+  if (terrainState.enabled) {
+    map.setTerrain({ source: 'dem', exaggeration: terrainState.exaggeration });
+    map.triggerRepaint();
+    // 高程含 exaggeration ⇒ 贴地量也要跟着变
+    setTimeout(snapDatasetsToTerrain, 600);
+  }
+  updateTerrainInfo();
+});
+
+$('optTerrainShade')?.addEventListener('change', (e) => {
+  terrainState.shade = e.target.checked;
+  if (map.getLayer('terrainShade')) {
+    map.setLayoutProperty(
+      'terrainShade',
+      'visibility',
+      terrainState.enabled && terrainState.shade ? 'visible' : 'none'
+    );
+  }
+});
+
+$('optTerrainSnap')?.addEventListener('change', (e) => {
+  terrainState.snap = e.target.checked;
+  if (terrainState.snap) snapDatasetsToTerrain();
+  else clearTerrainSnap();
+});
+
 /* ---------------------------------------------------------------- 底图与正交投影 */
 
 function updateBasemapVisibility() {
@@ -428,9 +635,24 @@ function updateBasemapVisibility() {
     if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', hide ? 'none' : 'visible');
   }
 
+  // 地形开启时，terrainTex 是地形的贴图来源：
+  // 隐藏底图时它也得跟着隐藏（否则地形上会浮着第二层底图）；
+  // 不隐藏时它与 osm 重叠，靠 terrainTex 在图层顺序上位于 osm 之后、覆盖其上。
+  if (map.getLayer('terrainTex')) {
+    map.setLayoutProperty(
+      'terrainTex',
+      'visibility',
+      terrainState.enabled && !hide ? 'visible' : 'none'
+    );
+  }
+
   if (!hide) {
+    const opacity = isUnderground ? 0.22 : 0.82;
     if (map.getLayer('osm')) {
-      map.setPaintProperty('osm', 'raster-opacity', isUnderground ? 0.22 : 0.82);
+      map.setPaintProperty('osm', 'raster-opacity', opacity);
+    }
+    if (map.getLayer('terrainTex')) {
+      map.setPaintProperty('terrainTex', 'raster-opacity', opacity);
     }
     if (map.getLayer('bg')) {
       map.setPaintProperty('bg', 'background-color', isUnderground ? '#0f172a' : '#e9edf2');
@@ -539,6 +761,7 @@ for (const [id, key] of [['cA', 'colorA'], ['cB', 'colorB'], ['cC', 'colorC']]) 
 $('optAlign')?.addEventListener('change', (e) => {
   const align = e.target.value;
   layer.setDatasetAlign(align);
+  // align 只换基准，手动偏移原样保留
   const currentTotal = layer.getDatasetHeight();
   $('optHeightOffset').value = currentTotal;
   $('heightOffsetVal').textContent = `${currentTotal > 0 ? '+' : ''}${currentTotal.toFixed(1)}m`;

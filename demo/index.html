@@ -371,6 +371,19 @@
       </section>
 
       <section>
+        <h2>地形 (MapLibre Terrain)</h2>
+        <label class="chk"><input type="checkbox" id="optTerrain" /> 开启真实地形（AWS Terrarium DEM）</label>
+        <label class="rng">
+          <span>垂直夸张</span>
+          <input type="range" id="optExagg" min="1" max="5" step="0.5" value="1" />
+          <b id="exaggVal">1×</b>
+        </label>
+        <label class="chk"><input type="checkbox" id="optTerrainShade" checked /> 地形阴影 (hillshade)</label>
+        <label class="chk"><input type="checkbox" id="optTerrainSnap" checked /> 建筑贴地（自动对齐 DEM 高程）</label>
+        <div id="terrainInfo" style="font-size:10.5px;color:#64748b;margin-top:4px;">未开启</div>
+      </section>
+
+      <section>
         <h2>环境与投影</h2>
         <label class="chk"><input type="checkbox" id="optUnderground" /> 地下透视模式（半透明地表）</label>
         <label class="chk"><input type="checkbox" id="optHideBasemap" /> 隐藏地图底图</label>
