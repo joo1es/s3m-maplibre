@@ -508,15 +508,18 @@ export class S3MViewer {
   }
 
   /**
-   * 获取指定数据集的垂直高程偏移（米）。
-   * 若不传 id，默认获取第一个（或默认）数据集的高程偏移。
+   * 获取指定数据集的应用层附加垂直偏移（米，不含 align 基准）。
+   * 若不传 id，默认获取第一个（或默认）数据集的偏移。
    */
   getDatasetHeight(id?: string): number {
     return this._datasetManager.getDatasetHeight(id);
   }
 
   /**
-   * 设置指定数据集的垂直高程偏移（米），正数抬升，负数下降。
+   * 设置指定数据集的应用层附加垂直偏移（米），正数抬升，负数下降。
+   *
+   * 语义为「在当前 align 基准之上再抬升多少米」：贴地（把模型抬到真实地面高程）
+   * 不会破坏 align='top' 等对齐语义。
    */
   setDatasetHeight(idOrHeight: string | number, heightOffset?: number): void {
     let id: string;
@@ -529,8 +532,20 @@ export class S3MViewer {
       h = heightOffset ?? 0;
     }
     this._datasetManager.setDatasetHeight(id, h, this.geo);
+    this._syncGroundHeight();
     this._refreshAllHeights();
     this._requestRepaint();
+  }
+
+  /**
+   * 物理地表网格的高度跟随「主数据集的应用层抬升量」，
+   * 保证贴地后地表覆盖 / 地下透视的物理关系与被抬升的模型一致。
+   */
+  private _syncGroundHeight(): void {
+    const primaryId = this.datasets.keys().next().value;
+    if (!primaryId) return;
+    const userOffset = this._datasetManager.getDatasetHeight(primaryId);
+    this.groundManager.setGroundHeight(userOffset);
   }
 
   /**

@@ -38,6 +38,8 @@ export class GroundManager {
   gridSize: number;
   excavationBounds: [number, number, number, number] | null = null;
   size: number;
+  /** 物理地表网格的高度（米，场景 ENU Z 坐标），默认 0 */
+  groundHeight = 0;
 
   readonly group: THREE.Group;
   private _mesh: THREE.Mesh | null = null;
@@ -153,7 +155,18 @@ export class GroundManager {
    */
   update(camera?: THREE.Camera | null): void {
     if (!camera || this.mode === 'none') return;
-    this.group.position.set(camera.position.x, camera.position.y, 0);
+    this.group.position.set(camera.position.x, camera.position.y, this.groundHeight);
+  }
+
+  /**
+   * 设置物理地表网格的高度（米，场景 ENU Z 坐标）
+   *
+   * 数据集被抬到真实地面高程后，地表网格需要同步抬高，
+   * 否则「地表覆盖 / 地下透视」的物理关系会与被抬升的模型脱节。
+   */
+  setGroundHeight(height: number): void {
+    this.groundHeight = height;
+    this.group.position.z = height;
   }
 
   setMode(mode: GroundMode): void {

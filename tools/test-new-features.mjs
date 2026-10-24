@@ -373,6 +373,7 @@ console.log('=== 测试新增功能集 ===');
     },
     anchor: { lon: 116.4, lat: 39.9, height: 0 },
     baseAlignOffset: 0,
+    userOffset: 2,
     heightOffset: 0,
     offset: [0, 0, 0],
     visible: true,
@@ -380,11 +381,11 @@ console.log('=== 测试新增功能集 ===');
   };
   layer.datasets.set('subway', entry);
 
-  // align: 'top' 时，baseAlignOffset = -max = -25，加上 heightOffset = 2，总偏移为 -23
+  // align: 'top' 时，baseAlignOffset = -max = -25，加上 userOffset = 2，总偏移为 -23
   entry.baseAlignOffset = layer._computeAlignOffset(entry.tileset, 'top');
-  entry.heightOffset = entry.baseAlignOffset + 2;
+  entry.heightOffset = entry.baseAlignOffset + entry.userOffset;
   assert.strictEqual(entry.baseAlignOffset, -25, 'align: top 正确将顶部下沉 25m');
-  assert.strictEqual(entry.heightOffset, -23, '总高程偏移为 base + heightOffset = -23m');
+  assert.strictEqual(entry.heightOffset, -23, '总高程偏移为 base + userOffset = -23m');
 
   // 动态切换为 'bottom'
   layer.setDatasetAlign('subway', 'bottom');
@@ -400,6 +401,14 @@ console.log('=== 测试新增功能集 ===');
   layer.setDatasetAlign('subway', 'origin');
   assert.strictEqual(entry.baseAlignOffset, 0, 'align: origin 恢复 0');
   assert.strictEqual(entry.heightOffset, 2, '仅保留原始附加偏移 2m');
+
+  // 贴地（setDatasetHeight）只改 userOffset，不覆盖 align 基准
+  layer.setDatasetAlign('subway', 'top');
+  layer.setDatasetHeight('subway', 40);
+  assert.strictEqual(entry.baseAlignOffset, -25, '贴地后 align 基准仍为 -25m');
+  assert.strictEqual(entry.userOffset, 40, '贴地量落在 userOffset 通道');
+  assert.strictEqual(entry.heightOffset, 15, '总高程 = -25 + 40 = 15m');
+  assert.strictEqual(layer.getDatasetHeight('subway'), 40, 'getDatasetHeight 返回 userOffset');
 
   ok('智能对齐: align=top/bottom/center 自动计算高度范围并精确对齐地表');
 }

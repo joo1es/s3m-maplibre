@@ -42,7 +42,9 @@ export interface S3MDatasetEntry {
   anchor: Anchor | null;
   /** 语义对齐方式计算出的基础偏移（米） */
   baseAlignOffset: number;
-  /** 最终垂直高度偏移（米，含 baseAlignOffset 与附加 heightOffset） */
+  /** 应用层设置的额外垂直偏移（米，贴地高程 / 手动微调），与对齐基准相互独立 */
+  userOffset: number;
+  /** 最终垂直高度偏移（米）= baseAlignOffset + userOffset */
   heightOffset: number;
   /** 相对场景锚点的偏移（米） */
   offset: [number, number, number];
@@ -110,6 +112,7 @@ export class DatasetManager {
       tileset: null,
       anchor: null,
       baseAlignOffset: 0,
+      userOffset: ds.heightOffset ?? 0,
       heightOffset: ds.heightOffset ?? 0,
       offset: [0, 0, 0],
       visible: ds.visible !== false,
@@ -152,7 +155,8 @@ export class DatasetManager {
 
     entry.anchor = tileset.anchor;
     entry.baseAlignOffset = this.computeAlignOffset(tileset, ds.align);
-    entry.heightOffset = entry.baseAlignOffset + (ds.heightOffset ?? 0);
+    entry.userOffset = ds.heightOffset ?? 0;
+    entry.heightOffset = entry.baseAlignOffset + entry.userOffset;
     this.layoutDataset(entry, geo);
     callbacks.onReady(entry);
     callbacks.triggerRepaint();
@@ -228,31 +232,38 @@ export class DatasetManager {
   }
 
   /**
-   * 获取指定数据集的垂直高程偏移（米）
+   * 获取指定数据集的应用层附加垂直偏移（米，不含 align 基准）
    */
   getDatasetHeight(id?: string): number {
     const targetId = id ?? this.datasets.keys().next().value;
-    return targetId ? this.datasets.get(targetId)?.heightOffset ?? 0 : 0;
+    return targetId ? this.datasets.get(targetId)?.userOffset ?? 0 : 0;
   }
 
   /**
-   * 设置垂直高程偏移（米）
+   * 设置应用层附加垂直偏移（米）
+   *
+   * 语义为「在当前 align 基准之上再抬升/下沉多少米」，
+   * 与 align 基准解耦：贴地（把模型抬到真实地面高程）不会破坏 align 语义。
    */
   setDatasetHeight(id: string, height: number, geo: GeoAdapter | null): void {
     const entry = this.datasets.get(id);
     if (!entry) return;
-    entry.heightOffset = height;
+    entry.userOffset = height;
+    entry.heightOffset = entry.baseAlignOffset + height;
     this.layoutDataset(entry, geo);
   }
 
   /**
    * 动态设置指定数据集的垂直对齐基准（'origin' | 'bottom' | 'top' | 'center'）
+   *
+   * 只更换 align 基准，应用层附加偏移（userOffset）保持不变。
    */
   setDatasetAlign(id: string, align: DatasetAlignment, geo: GeoAdapter | null): void {
     const entry = this.datasets.get(id);
     if (!entry) return;
     const manualOffset = entry.heightOffset - entry.baseAlignOffset;
     entry.baseAlignOffset = this.computeAlignOffset(entry.tileset, align);
+    entry.userOffset = manualOffset;
     entry.heightOffset = entry.baseAlignOffset + manualOffset;
     entry.options.align = align;
     this.layoutDataset(entry, geo);
