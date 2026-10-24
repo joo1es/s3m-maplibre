@@ -2,12 +2,14 @@
 
 **在 MapLibre GL JS 里原生渲染 SuperMap S3M 三维模型** —— 浏览器直接解析 `.s3mb` 瓦片，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端。
 
+仓库是 monorepo，两个 npm 包：**s3m-maplibre**（MapLibre / Mapbox 图层，本文主角）与 **s3m-three**（宿主无关的渲染内核，不接地图、纯 three.js 场景也能用，见「纯 three.js 使用」）。
+
 [![npm](https://img.shields.io/npm/v/s3m-maplibre?color=blue&label=npm)](https://www.npmjs.com/package/s3m-maplibre)
 [![npm](https://img.shields.io/npm/v/s3m-three?color=blue&label=npm%20s3m-three)](https://www.npmjs.com/package/s3m-three)
 [![docs](https://img.shields.io/badge/docs-online-38bdf8)](https://joo1es.github.io/s3m-maplibre/docs/index.html)
 [![demo](https://img.shields.io/badge/demo-online-2ea44f)](https://joo1es.github.io/s3m-maplibre/demo/index.html)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
-[![types](https://img.shields.io/badge/types-included-blue)](./packages/s3m-three/src/index.ts)
+[![types](https://img.shields.io/badge/types-included-blue)](./packages/s3m-maplibre/src/index.ts)
 
 ---
 
@@ -50,8 +52,8 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 全局棱线 | ✅ | 优先用数据自带棱线包，没有才 CPU 现算 |
 | 单体级点选 + 属性 | ✅ | GPU 拾取，代价与面数无关；支持 `pickPosition()` 返回精确表面交点与世界坐标 |
 | 穿透拾取 drillPick | ✅ | 沿视线方向穿透拾取多个单体并按深度排序返回 |
-| 单体包围盒与飞向 | ✅ | `getFeatureBounds(smid)` 与 `flyToFeature(smid)` 聚焦单体 |
-| 单体三维平移 | ✅ | 状态纹理 2 行存储，支持任意 `[dx, dy, dz]` 平移与着色器/拾取/描边全链路同步 |
+| 单体包围盒与飞向 | ✅ | `getFeatureBounds(smid)`（内核）与 `flyToFeature(smid)`（图层，内部走宿主 `map.fitBounds`）聚焦单体 |
+| 单体三维平移 | ✅ | `FeatureStyle.translation` 存 `[dx, dy, dz]`（米），与着色器 / 拾取 / 描边全链路同步 |
 | LOD 细化倍率 | ✅ | `lodRangeScale` 运行时动态调节粗细模判定阈值 |
 | 实例化几何 | ✅ | `instanceMode` 16 / 17 |
 | 正交投影 | ✅ | 可选开关（`projection: 'orthographic'`），默认透视；需 MapLibre ≥ 5，正交时底图 / 地形 / marker 需 App 退出，见[正交投影](#正交投影) |
@@ -73,7 +75,9 @@ npm install s3m-maplibre three     # MapLibre / Mapbox 宿主
 npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 ```
 
-两个包都在 npm 上：[s3m-maplibre](https://www.npmjs.com/package/s3m-maplibre)、[s3m-three](https://www.npmjs.com/package/s3m-three)。`s3m-maplibre` 依赖 `s3m-three`（渲染内核），装前者会自动带上后者。
+两个包都在 npm 上：[s3m-maplibre](https://www.npmjs.com/package/s3m-maplibre)、[s3m-three](https://www.npmjs.com/package/s3m-three)。`s3m-maplibre` 依赖 `s3m-three`（渲染内核，`^` 范围），装前者会自动带上后者。
+
+两包**版本各自独立**：内核修 bug 只发 `s3m-three` 的新 patch，图层包靠 `^` 范围自动获得，不必重复发；只有图层自己改了才需要发 `s3m-maplibre`。
 
 `three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂；不用地图时直接用 `s3m-three` 的 `S3MViewer`（见「纯 three.js 使用」）。
 
@@ -148,7 +152,8 @@ map.on('click', (e) => {
 
 在线体验与文档（GitHub Pages，数据随仓库一起发布）：
 
-- **📚 完整开发指南 & API 文档** — <https://joo1es.github.io/s3m-maplibre/docs/index.html>
+- **📚 图层开发指南 & API 文档** — <https://joo1es.github.io/s3m-maplibre/docs/index.html>
+- **📗 内核（s3m-three）API 文档** — <https://joo1es.github.io/s3m-maplibre/docs/three.html>
 - **🗺️ MapLibre 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/index.html>
 - **🧊 纯 three.js 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/three.html>
 - **🏠 Pages 导航入口** — <https://joo1es.github.io/s3m-maplibre/>
@@ -406,14 +411,18 @@ packages/
         S3MBParser.ts        S3MB 结构解析
         MeshOpt.ts           MeshOpt 几何压缩解码（量化还原 + 八面体法线）
         FeatureInfo.ts       单体属性反推
+        AttributeQuery.ts    业务属性查询（iServer 数据服务，供按字段着色/过滤/抬高）
         DXTTextureDecode.ts  DXT 解码（来自 SuperMap/s3m-spec）
         TextureFormat.ts     纹理格式判定（compressType / pixelFormat → 解码路径）
         CRNDecode.ts         CRN → DXT 转码（crunch wasm，按需加载）
+        types.ts             解析层共享类型
       tileset/    瓦片树 + LOD + 加载调度
       render/     three 渲染
         S3MViewer.ts         宿主无关场景查看器（多数据集 / 样式 / 拾取 / 选中）
         GeoAdapter.ts        地理坐标接口 + 墨卡托兜底
         DatasetManager.ts    多数据集生命周期与锚点对齐
+        FeatureStyleManager.ts  单体颜色 / 拔高 / 平移 / 显隐
+        GroundManager.ts     3D 物理地表与基坑开挖
         GeometryBuilder.ts   几何与材质组装
         StyleMaterial.ts     着色器注入的着色系统
         EdgeLines.ts         屏幕空间等宽棱线（选中描边 / 全局棱线）
@@ -423,13 +432,13 @@ packages/
       vendor/     meshoptimizer / crunch 解码器（wasm 内联，原样保留）
   s3m-maplibre/   MapLibre / Mapbox 适配层（依赖 s3m-three）
     src/
+      index.ts            包入口（再导出 s3m-three 全量符号，0.2.x 用法不破）
       S3MLayer.ts          薄图层：custom layer 生命周期 / render 矩阵提取 / 事件
       MapLibreGeoAdapter.ts WorldCoordinateHelper 提取 → GeoAdapter
-demo/
-  index.html / main.js   MapLibre 完整示例（控制面板 + 属性卡）
-  three.html / three.js  纯 three.js 示例（无地图）
-tools/       自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
-docs/        API 文档（由 tools/build-docs.mjs 零依赖生成）
+demo/       两个在线演示（MapLibre 版 / 纯 three.js 版）
+tools/      自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
+tests/      类型级用法测试（tests/types/usage.ts）
+docs/       API 文档站（tools/build-docs.mjs 零依赖生成，图层 + 内核双页面）
 ```
 
 `S3MViewer` 与 `S3MLayer` 的分界：前者不 import 任何地图 API，后者只做「宿主协议 ↔ 内核」的翻译（矩阵提取、事件、`triggerRepaint` 回调）。
