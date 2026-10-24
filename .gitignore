@@ -4,3 +4,4 @@ _tmp/
 *.log
 .DS_Store
 package-lock.json
+site/dist-ssr/

@@ -167,6 +167,12 @@ npm run demo     # 一次性编译后起静态服务（不做监听）
 
 两个命令都指向 http://localhost:8123/s3m-maplibre/demo/index.html ，`demo/three.html` 是同一台服务器上的纯 three 版。
 
+文档站单独预览（改 `packages/*/docs/API.md` 保存即刷新，走的是和生产构建同一条 SSG 链路）：
+
+```bash
+npm run dev:docs   # http://localhost:5173/index.html  →  http://localhost:5173/three.html
+```
+
 演示自带两份本地样例数据（北京 CBD 的 CCTV、comModel，离线可用），另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并默认勾选第一个。
 
 演示包含：数据集叠加开关、着色模式、透明度、平面/平滑着色、选中描边（棱线 / 外扩两种画法，粗细可调）、全局棱线、点击属性卡；右侧面板还能填 iServer 数据服务地址，按业务字段（KEYID / SmMaxZ…）上色出图例、按区间过滤、按字段值抬高。
@@ -436,9 +442,10 @@ packages/
       S3MLayer.ts          薄图层：custom layer 生命周期 / render 矩阵提取 / 事件
       MapLibreGeoAdapter.ts WorldCoordinateHelper 提取 → GeoAdapter
 demo/       两个在线演示（MapLibre 版 / 纯 three.js 版）
+site/       文档站源码（vite + Solid，SSG 后输出到 docs/；正文由 markdown-it + shiki 在构建期渲染）
 tools/      自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
 tests/      类型级用法测试（tests/types/usage.ts）
-docs/       API 文档站（tools/build-docs.mjs 零依赖生成，图层 + 内核双页面）
+docs/       API 文档站产物（`npm run build:docs` 生成，图层 + 内核双页面，勿手改）
 ```
 
 `S3MViewer` 与 `S3MLayer` 的分界：前者不 import 任何地图 API，后者只做「宿主协议 ↔ 内核」的翻译（矩阵提取、事件、`triggerRepaint` 回调）。

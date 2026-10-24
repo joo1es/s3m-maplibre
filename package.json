@@ -8,10 +8,11 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "bun run build:three && bun run build:maplibre && node tools/build-docs.mjs",
+    "build": "bun run build:three && bun run build:maplibre && bun run build:docs",
     "build:three": "bun run --cwd packages/s3m-three build",
     "build:maplibre": "bun run --cwd packages/s3m-maplibre build",
-    "build:docs": "node tools/build-docs.mjs",
+    "build:docs": "node site/scripts/build-docs.mjs",
+    "dev:docs": "vite --config site/vite.config.ts",
     "clean": "bun run --cwd packages/s3m-three clean && bun run --cwd packages/s3m-maplibre clean",
     "typecheck": "bun run --cwd packages/s3m-three typecheck && bun run --cwd packages/s3m-maplibre typecheck",
     "serve": "node tools/serve.mjs",
@@ -30,10 +31,16 @@
     "prepublishOnly:maplibre": "cd packages/s3m-maplibre && npm publish"
   },
   "devDependencies": {
+    "@types/markdown-it": "^14.2.0",
     "@types/three": "^0.169.0",
     "maplibre-gl": ">=4.0.0",
+    "markdown-it": "^15.0.3",
+    "shiki": "^4.5.0",
+    "solid-js": "^1.9.17",
     "three": "^0.169.0",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vite": "^8.3.5",
+    "vite-plugin-solid": "^2.11.14"
   },
   "author": "",
   "license": "Apache-2.0"
