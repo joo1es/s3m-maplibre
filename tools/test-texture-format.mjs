@@ -8,8 +8,8 @@
  *   v3.01  ct=50000  pf=32856  → crn   （3D-BIMTreeModel / SubwayStationCombined）
  */
 import assert from 'node:assert';
-import { dxtPixelFormatOf, resolveTextureKind } from '../dist/core/TextureFormat.js';
-import { transcodeCRN } from '../dist/core/CRNDecode.js';
+import { dxtPixelFormatOf, resolveTextureKind } from '../packages/s3m-three/dist/core/TextureFormat.js';
+import { transcodeCRN } from '../packages/s3m-three/dist/core/CRNDecode.js';
 
 let n = 0;
 function eq(actual, expected, label) {

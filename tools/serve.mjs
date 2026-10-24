@@ -3,9 +3,9 @@
  * 从工作区根目录提供服务，这样 demo 能同时访问 s3m-maplibre/ 和 s3m-spec/ 下的样例数据。
  *
  * 加 --watch（等价于 npm run dev）会：
- *   1. 先编译一次 dist，避免浏览器一打开就 404；
- *   2. 起一个 tsc -w 常驻增量编译；
- *   3. 监听 dist/ 与 demo/，文件一变就用 SSE 通知页面自动刷新。
+ *   1. 先编译一次两个包的 dist，避免浏览器一打开就 404；
+ *   2. 给两个包各起一个 tsc -w 常驻增量编译；
+ *   3. 监听各包 dist 与 demo/，文件一变就用 SSE 通知页面自动刷新。
  * 注意 tsc 只负责 .ts，src/vendor 下的第三方 .js 仍由 copy-assets.mjs 拷一次。
  */
 import { createServer } from 'node:http';
@@ -20,6 +20,9 @@ const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const args = process.argv.slice(2);
 const WATCH = args.includes('--watch') || process.env.S3M_WATCH === '1';
 const PORT = Number(args.find((a) => /^\d+$/.test(a)) ?? 8123);
+
+const PACKAGES = ['s3m-three', 's3m-maplibre'];
+const tscBin = () => join(PROJECT, 'node_modules', 'typescript', 'bin', 'tsc');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -71,28 +74,38 @@ function injectLiveReload(html) {
 /* ------------------------------------------------------------------ 联动构建 */
 
 function tsc(args) {
-  return spawnSync(process.execPath, [join(PROJECT, 'node_modules', 'typescript', 'bin', 'tsc'), ...args], {
+  return spawnSync(process.execPath, [tscBin(), ...args], {
     cwd: PROJECT,
     stdio: 'inherit',
   });
 }
 
 function buildOnce() {
-  const r = tsc(['-p', 'tsconfig.build.json']);
-  if (r.status !== 0) console.warn('[watch] 首次编译失败，先修好类型再打开 demo');
-  spawnSync(process.execPath, [join(PROJECT, 'tools', 'copy-assets.mjs')], { cwd: PROJECT, stdio: 'inherit' });
+  // s3m-maplibre 的产物要 import 's3m-three'，必须先编译 s3m-three
+  for (const pkg of PACKAGES) {
+    const r = tsc(['-p', join('packages', pkg, 'tsconfig.build.json')]);
+    if (r.status !== 0) {
+      console.warn(`[watch] ${pkg} 首次编译失败，先修好类型再打开 demo`);
+      return;
+    }
+  }
+  spawnSync(process.execPath, [join(PROJECT, 'tools', 'copy-assets.mjs'), 's3m-three'], { cwd: PROJECT, stdio: 'inherit' });
 }
 
 function startTscWatch() {
-  const child = spawn(
-    process.execPath,
-    [join(PROJECT, 'node_modules', 'typescript', 'bin', 'tsc'), '-p', 'tsconfig.build.json', '-w', '--preserveWatchOutput'],
-    { cwd: PROJECT, stdio: 'inherit' }
+  const children = PACKAGES.map((pkg) =>
+    spawn(
+      process.execPath,
+      [tscBin(), '-p', join('packages', pkg, 'tsconfig.build.json'), '-w', '--preserveWatchOutput'],
+      { cwd: PROJECT, stdio: 'inherit' }
+    )
   );
-  child.on('exit', (code) => {
-    if (code) console.warn(`[watch] tsc -w 退出，code=${code}`);
-  });
-  return child;
+  for (const child of children) {
+    child.on('exit', (code) => {
+      if (code) console.warn(`[watch] tsc -w 退出，code=${code}`);
+    });
+  }
+  return children;
 }
 
 let pending = null;
@@ -127,7 +140,7 @@ if (WATCH) {
   buildOnce();
   startTscWatch();
   watchDirs([
-    [join(PROJECT, 'dist'), 'dist'],
+    ...PACKAGES.map((pkg) => [join(PROJECT, 'packages', pkg, 'dist'), `packages/${pkg}/dist`]),
     [join(PROJECT, 'demo'), 'demo'],
   ]);
 }

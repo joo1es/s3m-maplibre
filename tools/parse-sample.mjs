@@ -5,7 +5,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
-import { parseS3MB } from '../dist/core/S3MBParser.js';
+import { parseS3MB } from '../packages/s3m-three/dist/core/S3MBParser.js';
 
 // 官方样例仓库是可选依赖：本地没克隆（或在 CI 里）就跳过，不要因此让整条测试链挂掉
 const DEFAULT_ROOT = fileURLToPath(new URL('../../s3m-spec/S3M_SDK/S3M_JS/data/', import.meta.url));

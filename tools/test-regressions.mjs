@@ -11,9 +11,9 @@
  */
 import assert from 'node:assert';
 import * as THREE from 'three';
-import { buildTileObjects } from '../dist/render/GeometryBuilder.js';
-import { S3MTileset } from '../dist/tileset/S3MTileset.js';
-import { S3MLayer } from '../dist/index.js';
+import { buildTileObjects } from '../packages/s3m-three/dist/render/GeometryBuilder.js';
+import { S3MTileset } from '../packages/s3m-three/dist/tileset/S3MTileset.js';
+import { S3MLayer } from '../packages/s3m-maplibre/dist/index.js';
 
 const quad = () => ({
   vertexPackage: {
@@ -162,11 +162,11 @@ console.log('\n=== 3. 瓦片失败退避重试，超次数才进 failed ===');
 console.log('\n=== 4. 拾取 ID 回收复用（2 字节上限）===');
 {
   const layer = new S3MLayer({ configUrl: 'http://example.com/a.scp' });
-  const a = layer._allocPickId();
-  const b = layer._allocPickId();
+  const a = layer.viewer._allocPickId();
+  const b = layer.viewer._allocPickId();
   assert.deepStrictEqual([a, b], [0, 1]);
-  layer._releasePickId(a);
-  const c = layer._allocPickId();
+  layer.viewer._releasePickId(a);
+  const c = layer.viewer._allocPickId();
   assert.strictEqual(c, a, '释放过的 ID 应被复用');
   console.log('  √ 释放的 ID 会被下一个网格复用，不会无限增长');
 }
@@ -176,7 +176,7 @@ console.log('\n=== 4. 拾取 ID 回收复用（2 字节上限）===');
 
 console.log('\n=== 5. 批量改单体样式只重写一次状态纹理 ===');
 {
-  const { createSharedUniforms, createStyledMaterial } = await import('../dist/render/StyleMaterial.js');
+  const { createSharedUniforms, createStyledMaterial } = await import('../packages/s3m-three/dist/render/StyleMaterial.js');
 
   /** 造一块装了 n 个单体的网格 */
   const makeMesh = (smids) => {
@@ -204,12 +204,12 @@ console.log('\n=== 5. 批量改单体样式只重写一次状态纹理 ===');
   const layer = new S3MLayer({});
   const smids = Array.from({ length: 300 }, (_, i) => i + 1);
   const mesh = makeMesh(smids);
-  layer._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' });
-  layer._indexMeshSmids(mesh);
+  layer.viewer._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' });
+  layer.viewer._indexMeshSmids(mesh);
 
   let calls = 0;
-  const original = layer._applyOverridesToMesh.bind(layer);
-  layer._applyOverridesToMesh = (m) => {
+  const original = layer.viewer._applyOverridesToMesh.bind(layer.viewer);
+  layer.viewer._applyOverridesToMesh = (m) => {
     calls++;
     original(m);
   };
@@ -225,8 +225,8 @@ console.log('\n=== 5. 批量改单体样式只重写一次状态纹理 ===');
 
   // 只改其中一个单体时，不该碰不含它的网格
   const other = makeMesh([9001, 9002]);
-  layer._pickables.set(2, { datasetId: 'd', mesh: other, tile: {}, skeletonName: '' });
-  layer._indexMeshSmids(other);
+  layer.viewer._pickables.set(2, { datasetId: 'd', mesh: other, tile: {}, skeletonName: '' });
+  layer.viewer._indexMeshSmids(other);
   calls = 0;
   layer.setFeatureStyle(9001, { color: '#00ff00' });
   await new Promise((r) => setTimeout(r, 0));
@@ -249,28 +249,28 @@ console.log('\n=== 6. uHeightMin / uHeightMax 增量维护 ===');
   const a = boxAt(0, 10);
   const b = boxAt(5, 80);
   const c = boxAt(-2, 30);
-  for (const m of [a, b, c]) layer._addMeshHeight(m);
+  for (const m of [a, b, c]) layer.viewer._addMeshHeight(m);
 
   const near = (x, y) => Math.abs(x - y) < 1e-6;
   assert.ok(near(layer.uniforms.uHeightMin.value, -2), 'min 应为 -2，实际 ' + layer.uniforms.uHeightMin.value);
   assert.ok(near(layer.uniforms.uHeightMax.value, 80), 'max 应为 80，实际 ' + layer.uniforms.uHeightMax.value);
 
   // 淘汰非边界网格：不动全局值
-  layer._removeMeshHeight(a);
+  layer.viewer._removeMeshHeight(a);
   assert.ok(
     near(layer.uniforms.uHeightMin.value, -2) && near(layer.uniforms.uHeightMax.value, 80),
     '非边界淘汰不该改变范围'
   );
 
   // 淘汰顶到边界的网格：必须回退到次大值，不能留着 80
-  layer._removeMeshHeight(b);
+  layer.viewer._removeMeshHeight(b);
   assert.ok(
     near(layer.uniforms.uHeightMax.value, 30),
     '淘汰边界网格后 max 应回退到 30，实际 ' + layer.uniforms.uHeightMax.value
   );
 
   // 清空后回到兜底范围
-  layer._removeMeshHeight(c);
+  layer.viewer._removeMeshHeight(c);
   assert.deepStrictEqual(
     [layer.uniforms.uHeightMin.value, layer.uniforms.uHeightMax.value],
     [0, 100],
@@ -283,7 +283,7 @@ console.log('\n=== 6. uHeightMin / uHeightMax 增量维护 ===');
 
 console.log('\n=== 7. 拾取渲染目标缩到 1×1，靠平移 viewport 定位 ===');
 {
-  const { Picker } = await import('../dist/render/Picker.js');
+  const { Picker } = await import('../packages/s3m-three/dist/render/Picker.js');
 
   const captured = { reads: [] };
   const fakeRenderer = {
@@ -344,7 +344,7 @@ console.log('\n=== 7. 拾取渲染目标缩到 1×1，靠平移 viewport 定位 
 
 console.log('\n=== 8. 多个 SMID 共用 batchId 时不互相覆盖 ===');
 {
-  const { createSharedUniforms, createStyledMaterial } = await import('../dist/render/StyleMaterial.js');
+  const { createSharedUniforms, createStyledMaterial } = await import('../packages/s3m-three/dist/render/StyleMaterial.js');
 
   const layer = new S3MLayer({});
   const geo = new THREE.BufferGeometry();
@@ -357,8 +357,8 @@ console.log('\n=== 8. 多个 SMID 共用 batchId 时不互相覆盖 ===');
     pickInfo: { 1: { batchId: 0 }, 2: { batchId: 0 }, 3: { batchId: 1 } },
     entities: [],
   };
-  layer._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' });
-  layer._indexMeshSmids(mesh);
+  layer.viewer._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' });
+  layer.viewer._indexMeshSmids(mesh);
 
   const data = () => mesh.material.userData.uBatchTex.value.image.data;
 
@@ -402,7 +402,7 @@ console.log('\n=== 8. 多个 SMID 共用 batchId 时不互相覆盖 ===');
 
 console.log('\n=== 9. CRN 解码器：魔数先拦、非法数据能明确拒绝 ===');
 {
-  const { transcodeCRN } = await import('../dist/core/CRNDecode.js');
+  const { transcodeCRN } = await import('../packages/s3m-three/dist/core/CRNDecode.js');
 
   // 空数据和非 CRN 数据在进 wasm 之前就该被拦掉（省一次 76KB wasm 的实例化）
   await assert.rejects(() => transcodeCRN(new Uint8Array(0)), /为空/, '空数据应直接拒绝');

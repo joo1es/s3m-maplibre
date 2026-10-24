@@ -10,10 +10,10 @@ import assert from 'node:assert';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import * as THREE from 'three';
-import { parseS3MB } from '../dist/core/S3MBParser.js';
-import { buildTileObjects } from '../dist/render/GeometryBuilder.js';
-import { buildInstanceLookup, pickEntryId, resolveFeature } from '../dist/core/FeatureInfo.js';
-import { S3MLayer } from '../dist/index.js';
+import { parseS3MB } from '../packages/s3m-three/dist/core/S3MBParser.js';
+import { buildTileObjects } from '../packages/s3m-three/dist/render/GeometryBuilder.js';
+import { buildInstanceLookup, pickEntryId, resolveFeature } from '../packages/s3m-three/dist/core/FeatureInfo.js';
+import { S3MLayer } from '../packages/s3m-maplibre/dist/index.js';
 
 const ROOT = 'demo/data/comModel/Tile_-166159_525382_0000';
 
@@ -134,14 +134,14 @@ assert.ok(instancedMeshes.length > 0, '应当生成 InstancedMesh');
   const layer = new S3MLayer({});
   // 按生产路径注册（TileNode 装载时做的就是这三步），只塞 _smidMeshes 的话
   // setFilter 的全量脏标记走 _pickables 会漏掉这个网格
-  mesh.userData.pickId = layer._allocPickId();
-  layer._pickables.set(mesh.userData.pickId, {
+  mesh.userData.pickId = layer.viewer._allocPickId();
+  layer.viewer._pickables.set(mesh.userData.pickId, {
     datasetId: 'test',
     mesh,
     tile: null,
     skeletonName: 'test',
   });
-  layer._indexMeshSmids(mesh);
+  layer.viewer._indexMeshSmids(mesh);
 
   layer.setFeatureStyle(smid, { color: '#ff0000', elevation: 12 });
   layer.flushOverrides();
@@ -205,7 +205,7 @@ assert.ok(instancedMeshes.length > 0, '应当生成 InstancedMesh');
   const mesh = instancedMeshes.find((m) => m.userData.geoRef === geo);
   const layer = new S3MLayer({});
 
-  const box = layer._instanceBox(mesh, entry.instanceIds[0]);
+  const box = layer.viewer._instanceBox(mesh, entry.instanceIds[0]);
   assert.ok(box, '实例应当能算出包围盒');
   assert.ok(box.maxX > box.minX && box.maxZ > box.minZ, '实例包围盒不能退化成点');
 

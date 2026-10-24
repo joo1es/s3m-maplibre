@@ -7,7 +7,7 @@ import { inflateSync } from 'node:zlib';
 const BASE = process.argv[2] ?? 'http://localhost:8123/s3m-maplibre/demo/index.html';
 globalThis.document = { baseURI: BASE };
 
-const { S3MTileset } = await import('../dist/tileset/S3MTileset.js');
+const { S3MTileset } = await import('../packages/s3m-three/dist/tileset/S3MTileset.js');
 
 const stubBuild = async (tile) => ({
   group: { traverse() {} },

@@ -17,8 +17,8 @@ import {
   extractFovRadians,
   extractProjectionMatrix,
   extractNearFar,
-} from '../dist/render/OrthoProjection.js';
-import { S3MLayer } from '../dist/index.js';
+} from '../packages/s3m-three/dist/render/OrthoProjection.js';
+import { S3MLayer } from '../packages/s3m-maplibre/dist/index.js';
 
 let n = 0;
 const ok = (msg) => {

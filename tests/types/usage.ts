@@ -5,20 +5,22 @@
 import type { BufferGeometry } from 'three';
 import {
   S3MLayer,
-  S3MTileset,
   STYLE,
   STYLE_LABELS,
-  parseS3MB,
-  resolveFeature,
-  measureSegments,
-  buildAttributes,
   type PickResult,
   type S3MStyle,
   type Stats,
   type S3MDatasetEntry,
   type MapLike,
   type MapMouseEventLike,
-} from '../../src/index.js';
+} from '../../packages/s3m-maplibre/src/index.js';
+import {
+  S3MTileset,
+  parseS3MB,
+  resolveFeature,
+  measureSegments,
+  buildAttributes,
+} from '../../packages/s3m-three/src/index.js';
 
 /* ---------------- 宿主适配：MapLibre / Mapbox 的结构化断言 ---------------- */
 

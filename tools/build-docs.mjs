@@ -10,8 +10,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
-// 读取 package.json 获取唯一真实版本号
-const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8'));
+// 读取 s3m-maplibre 包（面向使用方的发布包）的版本号作为唯一真实版本源
+const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'packages', 's3m-maplibre', 'package.json'), 'utf8'));
 const version = pkg.version;
 
 // 读取 docs/API.md

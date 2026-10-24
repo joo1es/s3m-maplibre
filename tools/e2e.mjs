@@ -11,8 +11,8 @@ const BASE = process.argv[2] ?? 'http://localhost:8123/s3m-maplibre/demo/index.h
 // 伪装成浏览器：toAbsolute 依赖 document.baseURI
 globalThis.document = { baseURI: BASE };
 
-const { S3MTileset } = await import('../dist/tileset/S3MTileset.js');
-const { parseS3MB } = await import('../dist/core/S3MBParser.js');
+const { S3MTileset } = await import('../packages/s3m-three/dist/tileset/S3MTileset.js');
+const { parseS3MB } = await import('../packages/s3m-three/dist/core/S3MBParser.js');
 
 // 用桩替代渲染层，验证 URL 解析 + 解析器本身，不引入 three
 const stubBuild = async (tile) => ({

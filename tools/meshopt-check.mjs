@@ -14,7 +14,7 @@
  *   5. 单骨架瓦片额外对比 OBB 包围盒（多骨架瓦片的 OBB 是整块的，不做对照）
  */
 import { readFileSync } from 'node:fs';
-import { parseS3MB } from '../dist/core/S3MBParser.js';
+import { parseS3MB } from '../packages/s3m-three/dist/core/S3MBParser.js';
 
 const BASE = 'https://yyxk-cs.sggs.sh.cn/iserver/services/shenyinzhilian/rest/realspace/datas';
 const PRESET_SHENYIN = ['zhoubian', 'jingmo', 'cheng', 'fang', 'tiao'].map((n) => `${BASE}/${n}/data/path/${n}.scp`);

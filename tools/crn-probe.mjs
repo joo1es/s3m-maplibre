@@ -11,10 +11,10 @@
  */
 import { readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
-import DXTTextureDecode from '../dist/core/DXTTextureDecode.js';
-import { transcodeCRN } from '../dist/core/CRNDecode.js';
-import { parseS3MB } from '../dist/core/S3MBParser.js';
-import { resolveTextureKind } from '../dist/core/TextureFormat.js';
+import DXTTextureDecode from '../packages/s3m-three/dist/core/DXTTextureDecode.js';
+import { transcodeCRN } from '../packages/s3m-three/dist/core/CRNDecode.js';
+import { parseS3MB } from '../packages/s3m-three/dist/core/S3MBParser.js';
+import { resolveTextureKind } from '../packages/s3m-three/dist/core/TextureFormat.js';
 
 /* ------------------------------------------------------------------ 参数 */
 

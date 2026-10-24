@@ -12,7 +12,7 @@
  * 所以根节点绕 X 轴转 -90°，相机位置要反算回 ENU 才能喂给 LOD 调度。
  */
 import * as THREE from 'three';
-import { S3MTileset, createSharedUniforms, STYLE, setMaxAnisotropy } from '../dist/index.js';
+import { S3MTileset, createSharedUniforms, STYLE, setMaxAnisotropy } from '../packages/s3m-three/dist/index.js';
 
 const DATASETS = {
   cbd: { url: './data/CBD/cbd.scp', name: '北京CBD (CCTV)' },

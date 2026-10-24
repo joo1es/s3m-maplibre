@@ -1,4 +1,4 @@
-import { S3MLayer, STYLE, AttributeQuery } from '../dist/index.js';
+import { S3MLayer, STYLE, AttributeQuery } from '../packages/s3m-maplibre/dist/index.js';
 
 /** 常用预设快捷方式 */
 const PRESETS = [

@@ -40,7 +40,7 @@ jobs:
         run: |
           mkdir -p _site
           cp -r demo _site/demo
-          cp -r dist _site/dist
+          cp -r packages _site/packages
           cp -r docs _site/docs
           cat << 'EOF' > _site/index.html
           <!doctype html>

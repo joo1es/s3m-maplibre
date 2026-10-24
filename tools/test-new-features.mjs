@@ -8,8 +8,8 @@
  */
 import assert from 'node:assert';
 import * as THREE from 'three';
-import { S3MLayer } from '../dist/render/S3MLayer.js';
-import { S3MTileset } from '../dist/tileset/S3MTileset.js';
+import { S3MLayer } from '../packages/s3m-maplibre/dist/S3MLayer.js';
+import { S3MTileset } from '../packages/s3m-three/dist/tileset/S3MTileset.js';
 
 function ok(msg) {
   console.log(`  √ ${msg}`);
@@ -79,7 +79,7 @@ console.log('=== 测试新增功能集 ===');
   });
 
   // 触发写入
-  layer._applyOverridesToMesh(mesh);
+  layer.viewer._applyOverridesToMesh(mesh);
 
   const tex = mat.userData.uBatchTex.value;
   assert.ok(tex, '状态纹理已创建');
@@ -127,7 +127,7 @@ console.log('=== 测试新增功能集 ===');
       },
     },
   };
-  layer._pickables.set(1, { mesh, datasetId: 'test', skeletonName: 'box' });
+  layer.viewer._pickables.set(1, { mesh, datasetId: 'test', skeletonName: 'box' });
 
   // 1. 获取包围盒
   const bounds = layer.getFeatureBounds(202);
@@ -165,15 +165,14 @@ console.log('=== 测试新增功能集 ===');
     meterInMercator: 1e-6,
     altitude: 50,
   };
-  layer.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+  layer.viewer.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
   layer.camera.position.set(0, 0, 100);
   layer.camera.lookAt(0, 0, 0);
   layer.camera.updateMatrixWorld(true);
   layer.camera.updateProjectionMatrix();
 
-  layer.map = {
-    getCanvas: () => ({ clientWidth: 800, clientHeight: 600, width: 800, height: 600 }),
-  };
+  // viewer 在 mount 时缓存画布；测试直接注入
+  layer.viewer.canvas = { clientWidth: 800, clientHeight: 600, width: 800, height: 600 };
 
   // 地面交点测试：未命中建筑时与 z=0 地面求交
   const groundPos = layer.pickPosition(400, 300); // 屏幕正中心
@@ -198,15 +197,14 @@ console.log('=== 测试新增功能集 ===');
     meterInMercator: 1e-6,
     altitude: 0,
   };
-  layer.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
+  layer.viewer.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
   layer.camera.position.set(0, 0, 200);
   layer.camera.lookAt(0, 0, 0);
   layer.camera.updateMatrixWorld(true);
   layer.camera.updateProjectionMatrix();
 
-  layer.map = {
-    getCanvas: () => ({ clientWidth: 800, clientHeight: 600, width: 800, height: 600 }),
-  };
+  // viewer 在 mount 时缓存画布；测试直接注入
+  layer.viewer.canvas = { clientWidth: 800, clientHeight: 600, width: 800, height: 600 };
 
   // 沿 z 轴放置前后两个面（前层 z=50, 后层 z=10）
   const gFront = new THREE.PlaneGeometry(20, 20);
@@ -231,8 +229,8 @@ console.log('=== 测试新增功能集 ===');
     geoRef: { pickInfo: { 302: { batchId: 0 } } },
   };
 
-  layer._pickables.set(10, { mesh: mFront, datasetId: 'test', skeletonName: 'front' });
-  layer._pickables.set(11, { mesh: mBack, datasetId: 'test', skeletonName: 'back' });
+  layer.viewer._pickables.set(10, { mesh: mFront, datasetId: 'test', skeletonName: 'front' });
+  layer.viewer._pickables.set(11, { mesh: mBack, datasetId: 'test', skeletonName: 'back' });
 
   const drillResults = layer.drillPick(400, 300);
   assert.strictEqual(drillResults.length, 2, '穿透拾取命中前后两个物体');
@@ -292,7 +290,7 @@ console.log('=== 测试新增功能集 ===');
     tileset: null,
   });
 
-  layer._recomputeAnchors();
+  layer.viewer.recomputeAnchors();
 
   assert.ok(layer.sceneAnchor, 'sceneAnchor 应当被初始化');
   assert.strictEqual(layer.sceneAnchor.x, 0.5, '自定义 CRS 下 x 应为 0.5');
@@ -301,7 +299,7 @@ console.log('=== 测试新增功能集 ===');
   assert.strictEqual(layer.sceneAnchor.z, 100 / 50000, 'z 应当按 100 / 50000 计算');
 
   // 坐标反查经纬度
-  const [lng, lat] = layer._lngLatFromWorld(0.5, 0.5);
+  const [lng, lat] = layer.viewer._lngLatFromWorld(0.5, 0.5);
   assert.strictEqual(lng, 105, '归一化世界坐标反查经度应为 105');
   assert.strictEqual(lat, 35, '归一化世界坐标反查纬度应为 35');
 
@@ -315,7 +313,7 @@ console.log('=== 测试新增功能集 ===');
 
 // ---- 7. 多 Mesh 共享同一 SMID 时的联动选中测试 (CBD 模型场景)
 {
-  const { createStyledMaterial } = await import('../dist/render/StyleMaterial.js');
+  const { createStyledMaterial } = await import('../packages/s3m-three/dist/render/StyleMaterial.js');
   const layer = new S3MLayer();
 
   const g1 = new THREE.BufferGeometry();
@@ -332,8 +330,8 @@ console.log('=== 测试新增功能集 ===');
     geoRef: { pickInfo: { 20: { batchId: 0, segments: [{ vertexOffset: 0, vertexCount: 3 }] } } },
   };
 
-  layer._indexMeshSmids(m1);
-  layer._indexMeshSmids(m2);
+  layer.viewer._indexMeshSmids(m1);
+  layer.viewer._indexMeshSmids(m2);
 
   // 拾取命中 m1
   const pickResult = {
@@ -350,13 +348,13 @@ console.log('=== 测试新增功能集 ===');
   // 验证：虽然只点击了 m1，但共享 SMID 20 的 m1 和 m2 都被高亮选中了
   assert.strictEqual(m1.material.userData.uSelBatch.value, 0, '网格 1 应当被选中');
   assert.strictEqual(m2.material.userData.uSelBatch.value, 0, '网格 2 (不同材质骨架) 应当联动被选中');
-  assert.strictEqual(layer._selectedMeshes.length, 2, '两块网格都进入了选中集合');
+  assert.strictEqual(layer.viewer._selectedMeshes.length, 2, '两块网格都进入了选中集合');
 
   // 取消选中
   layer.select(null);
   assert.strictEqual(m1.material.userData.uSelBatch.value, -1, '取消选中后网格 1 恢复 -1');
   assert.strictEqual(m2.material.userData.uSelBatch.value, -1, '取消选中后网格 2 恢复 -1');
-  assert.strictEqual(layer._selectedMeshes.length, 0, '选中集合清空');
+  assert.strictEqual(layer.viewer._selectedMeshes.length, 0, '选中集合清空');
 
   ok('多 Mesh 共享 SMID: 点击单面时联动选中同 SMID 的所有材质网格');
 }

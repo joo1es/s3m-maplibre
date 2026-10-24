@@ -11,7 +11,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { inflateSync } from 'node:zlib';
-import { parseS3MB } from '../dist/core/S3MBParser.js';
+import { parseS3MB } from '../packages/s3m-three/dist/core/S3MBParser.js';
 
 const DEFAULT_ROOT = fileURLToPath(new URL('../../s3m-spec/S3M_SDK/S3M_JS/data/', import.meta.url));
 const ROOT = process.env.S3M_SAMPLE_DIR ?? DEFAULT_ROOT;

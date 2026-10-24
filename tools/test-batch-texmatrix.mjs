@@ -4,7 +4,7 @@
  */
 import assert from 'node:assert';
 import * as THREE from 'three';
-import { buildTileObjects } from '../dist/render/GeometryBuilder.js';
+import { buildTileObjects } from '../packages/s3m-three/dist/render/GeometryBuilder.js';
 
 console.log('=== 测试 1: 纹理变换矩阵 (texmodmatrix) 与寻址模式 (addressmode) ===');
 

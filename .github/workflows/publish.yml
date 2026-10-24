@@ -33,13 +33,14 @@ jobs:
       - name: Install dependencies via Bun
         run: bun install --frozen-lockfile
 
-      - name: Verify tag matches package.json version
+      # monorepo：s3m-maplibre 是面向使用方的发布包，标签版本与它对齐
+      - name: Verify tag matches s3m-maplibre version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
-          PKG="$(node -p "require('./package.json').version")"
+          PKG="$(node -p "require('./packages/s3m-maplibre/package.json').version")"
           if [ "$TAG" != "$PKG" ]; then
-            echo "::error::标签 v$TAG 与 package.json 的版本 $PKG 不一致，已终止发布"
+            echo "::error::标签 v$TAG 与 packages/s3m-maplibre 的版本 $PKG 不一致，已终止发布"
             exit 1
           fi
           echo "版本一致：v$PKG"
@@ -49,8 +50,17 @@ jobs:
           npm run build
           npm run typecheck
 
-      - name: Publish package to npm
+      # 先发渲染内核，再发依赖它的适配层
+      - name: Publish s3m-three to npm
         run: npm publish --access public --provenance
+        working-directory: packages/s3m-three
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # prepublishOnly 会把 workspace:* 依赖替换成正式版本号后再发布
+      - name: Publish s3m-maplibre to npm
+        run: npm publish --access public --provenance
+        working-directory: packages/s3m-maplibre
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
