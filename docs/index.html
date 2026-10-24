@@ -273,7 +273,7 @@
             <span>s3m-maplibre</span>
           </a>
           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
-            v0.2.12
+            v0.3.0
           </span>
         </div>
 
@@ -376,7 +376,7 @@
       
 
         <div class="callout my-4 rounded-xl border-l-4 border-cyan-400 bg-cyan-950/20 px-5 py-3 text-slate-300 shadow-sm">
-          <div class="text-sm leading-relaxed">对应 <code>s3m-maplibre</code> 的 <code>src/index.ts</code> 导出面</div>
+          <div class="text-sm leading-relaxed">对应 <code>s3m-maplibre</code> 的 <code>packages/s3m-maplibre/src/index.ts</code> 导出面</div>
         </div>
       
 <hr />
@@ -716,7 +716,7 @@ getStyle(): S3MStyle &amp; { modeLabel: string }</code></pre>
         
 <p>优先用<strong>数据自带的棱线包</strong>（<code>primitiveType === 13</code> 的索引包，本质是线段对）：解析时就建好 <code>LineSegments</code>，开关只是切 <code>visible</code>，成本为零，颜色跟随 <code>style.edgeColor</code>。</p>
 <p>数据里没有棱线包时才用 <code>EdgesGeometry</code> 在 CPU 端现算。几十万面一次性建会卡住主线程（实测 20 个网格 1.9s），所以内部按 8ms 一帧切片执行，超过 12 万索引的几何直接跳过。</p>
-<p>棱线本身画成<strong>屏幕空间等宽线</strong>（<code>src/render/EdgeLines.ts</code>）：WebGL 的 <code>lineWidth</code> 在绝大多数平台被忽略、恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。因此：</p>
+<p>棱线本身画成<strong>屏幕空间等宽线</strong>（<code>packages/s3m-three/src/render/EdgeLines.ts</code>）：WebGL 的 <code>lineWidth</code> 在绝大多数平台被忽略、恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。因此：</p>
 <ul>
 <li><code>edgeWidth</code>（像素）控全局棱线粗细，缩放时线宽恒定；</li>
 <li>选中单体的描边默认也走同一套画法（<code>outlineStyle: &#39;edges&#39;</code>），只挑这个单体自己的三角面算折边，<code>outlineWidthPx</code> 控粗细；</li>
@@ -996,7 +996,7 @@ layer.projection  // 当前模式</code></pre>
 <li>需要 MapLibre ≥ 5（要拿到独立的投影矩阵）。v4 只给合并矩阵，会 <code>console.warn</code> 一次并保持透视，不会静默画错。</li>
 <li>解出的视图矩阵会做刚体校验（3×3 正交、底行 <code>[0,0,0,1]</code>）；校验不过说明两个输入矩阵不同源，同样退回透视并告警。</li>
 </ul>
-<p>底层数学在 <code>src/render/OrthoProjection.ts</code>，<code>npm test</code> 里的 <code>tools/test-ortho.mjs</code> 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。</p>
+<p>底层数学在 <code>packages/s3m-three/src/render/OrthoProjection.ts</code>，<code>npm test</code> 里的 <code>tools/test-ortho.mjs</code> 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。</p>
 <hr />
 
         <h2 id="按业务字段着色" class="doc-heading group">
@@ -1444,7 +1444,7 @@ layer.flushOverrides();</code></pre>
 <ul>
 <li><strong>Draco 压缩几何</strong>能识别、不能解码，遇到会抛明确错误。接法与 MeshOpt 相同（内联 wasm、按需 <code>import</code>、解码后走同一套 attribute 组装），但必须先拿 Draco 瓦片标定容器结构。MeshOpt 已支持，且是逐字节对过 60 个真实瓦片才做对的。</li>
 <li><strong>实例化单体</strong>（<code>pickInfo</code> 里给的是 <code>instanceIds</code> 而不是 <code>batchId</code>，白模常见）只做了渲染，没做按单体控制：<code>setFeatureStyle</code> / <code>filterByField</code> / <code>elevateByField</code> / GPU 拾取走的都是 <code>aBatchId</code>，这条路径对实例化几何不生效。要支持得把每个实例单独上色，得改 InstancedMesh 的 instanceColor + 拾取编码。</li>
-<li><strong>CRN 纹理</strong>已支持，且已在真实服务上验证：内联的 crunch wasm 转回 DXT 后走现成解码，DXT 具体格式看 CRN 头，wasm 约 76KB、只有真遇到 CRN 时才动态加载。<strong>判定看 <code>compressType</code> 而不是 <code>pixelFormat</code></strong>——实测 v3.00 是 <code>ct=26 / pf=13</code>、行标是 <code>ct=50000 / pf=32856</code>，按 <code>pixelFormat</code> 26 / 27 判断会把真实 CRN 整包丢掉（模型变灰模）。判定收敛在 <code>src/core/TextureFormat.ts</code>（<code>resolveTextureKind</code> / <code>TextureCompress</code> / <code>dxtPixelFormatOf</code>，已从包入口导出）。用 <code>npm run probe:crn -- --crn &lt;数据集 config 地址&gt;</code> 可以对任意服务跑「尺寸吻合 / 色数 / 粗糙度 / ASCII 预览」的实测。</li>
+<li><strong>CRN 纹理</strong>已支持，且已在真实服务上验证：内联的 crunch wasm 转回 DXT 后走现成解码，DXT 具体格式看 CRN 头，wasm 约 76KB、只有真遇到 CRN 时才动态加载。<strong>判定看 <code>compressType</code> 而不是 <code>pixelFormat</code></strong>——实测 v3.00 是 <code>ct=26 / pf=13</code>、行标是 <code>ct=50000 / pf=32856</code>，按 <code>pixelFormat</code> 26 / 27 判断会把真实 CRN 整包丢掉（模型变灰模）。判定收敛在 <code>packages/s3m-three/src/core/TextureFormat.ts</code>（<code>resolveTextureKind</code> / <code>TextureCompress</code> / <code>dxtPixelFormatOf</code>，已从包入口导出）。用 <code>npm run probe:crn -- --crn &lt;数据集 config 地址&gt;</code> 可以对任意服务跑「尺寸吻合 / 色数 / 粗糙度 / ASCII 预览」的实测。</li>
 <li><strong>纹理分包（<code>s3m:TextureSharing</code>）未支持</strong>：这类数据集的 <code>tiles</code> 全是 <code>.s3mblock</code>，不是 <code>.s3mb</code>，加载会失败（例：SuperMap Online <code>3D-CBD/Xiaopin@CBD</code>）。</li>
 <li><strong>多块 MeshOpt 骨架</strong>（<code>blockCount &gt; 1</code>）暂未对齐：例 <code>3D-WorkSpace_pbr1/pbrmodel</code>，第二块头部按现有布局读会错位，会给出「流尺寸异常」的可定位报错而不是底层 RangeError。</li>
 <li><strong>切线顶点流</strong>只跳过不解码（渲染没有法线贴图通道），带 TANGENT 的数据不会被判失败。</li>
@@ -1462,9 +1462,9 @@ layer.flushOverrides();</code></pre>
       
 <ul>
 <li>本库代码 Apache-2.0。</li>
-<li><code>src/core/DXTTextureDecode.ts</code> 来自 <a href="https://github.com/supermap/s3m-spec">SuperMap/s3m-spec</a>（Apache-2.0）。</li>
-<li><code>src/vendor/crunch_decoder.module.js</code> 是 crunch 的 emscripten 构建（Apache-2.0），wasm 内联、仅改动加载方式。</li>
-<li><code>src/vendor/meshopt_decoder.module.js</code> 是 <a href="https://github.com/zeux/meshoptimizer">meshoptimizer</a> 官方解码器（MIT，© Arseny Kapoulkine），未做修改。</li>
+<li><code>packages/s3m-three/src/core/DXTTextureDecode.ts</code> 来自 <a href="https://github.com/supermap/s3m-spec">SuperMap/s3m-spec</a>（Apache-2.0）。</li>
+<li><code>packages/s3m-three/src/vendor/crunch_decoder.module.js</code> 是 crunch 的 emscripten 构建（Apache-2.0），wasm 内联、仅改动加载方式。</li>
+<li><code>packages/s3m-three/src/vendor/meshopt_decoder.module.js</code> 是 <a href="https://github.com/zeux/meshoptimizer">meshoptimizer</a> 官方解码器（MIT，© Arseny Kapoulkine），未做修改。</li>
 <li>S3M 规范文本遵循 CC BY-ND 4.0，不得修改规范文本后再发布。</li>
 </ul>
         

@@ -3,10 +3,11 @@
 **在 MapLibre GL JS 里原生渲染 SuperMap S3M 三维模型** —— 浏览器直接解析 `.s3mb` 瓦片，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端。
 
 [![npm](https://img.shields.io/npm/v/s3m-maplibre?color=blue&label=npm)](https://www.npmjs.com/package/s3m-maplibre)
+[![npm](https://img.shields.io/npm/v/s3m-three?color=blue&label=npm%20s3m-three)](https://www.npmjs.com/package/s3m-three)
 [![docs](https://img.shields.io/badge/docs-online-38bdf8)](https://joo1es.github.io/s3m-maplibre/docs/index.html)
 [![demo](https://img.shields.io/badge/demo-online-2ea44f)](https://joo1es.github.io/s3m-maplibre/demo/index.html)
 [![license](https://img.shields.io/badge/license-Apache--2.0-green)](./LICENSE)
-[![types](https://img.shields.io/badge/types-included-blue)](./src/index.ts)
+[![types](https://img.shields.io/badge/types-included-blue)](./packages/s3m-three/src/index.ts)
 
 ---
 
@@ -68,14 +69,15 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 ## 安装
 
 ```bash
-npm install s3m-maplibre three
+npm install s3m-maplibre three     # MapLibre / Mapbox 宿主
+npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 ```
 
-包在 npm 上是 [s3m-maplibre](https://www.npmjs.com/package/s3m-maplibre)。
+两个包都在 npm 上：[s3m-maplibre](https://www.npmjs.com/package/s3m-maplibre)、[s3m-three](https://www.npmjs.com/package/s3m-three)。`s3m-maplibre` 依赖 `s3m-three`（渲染内核），装前者会自动带上后者。
 
-`three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂；不用地图时也能只用解析和瓦片层（见「纯 three.js 使用」）。
+`three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂；不用地图时直接用 `s3m-three` 的 `S3MViewer`（见「纯 three.js 使用」）。
 
-类型随包发布（`dist/index.d.ts`，由源码直接生成）。three `>=0.168` 自带类型，更老的版本需要自己装 `@types/three`。
+类型随包发布（各包 `dist/index.d.ts`，由源码直接生成）。three `>=0.168` 自带类型，更老的版本需要自己装 `@types/three`。
 
 ---
 
@@ -170,7 +172,39 @@ npm run demo     # 一次性编译后起静态服务（不做监听）
 
 ## 纯 three.js 使用（不用 MapLibre）
 
-可以。图层本身只是把三层粘到地图上，这三层都是宿主无关的：
+渲染内核 `s3m-three` 就是干这个的，两条路：
+
+**省事路线 —— `S3MViewer`**：把场景、相机、灯光、拾取、选中、样式都封好的宿主无关查看器，只差你自己喂帧：
+
+```js
+import * as THREE from 'three';
+import { S3MViewer } from 's3m-three';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+document.body.appendChild(renderer.domElement);
+
+const viewer = new S3MViewer({
+  configUrl: '.../jingmo.scp',
+  onRequestRepaint: () => {},        // 接自己的渲染循环
+  getBearing: () => 0,               // 可选：让灯光跟着视角走
+});
+viewer.geo = null;                   // null = 标准 Web 墨卡托兜底；也可注入自定义 GeoAdapter
+viewer.mount(renderer.domElement, renderer.getContext());
+
+function tick() {
+  const mvp = new THREE.Matrix4();   // 你的 world→clip 矩阵
+  const p = camera.position;
+  viewer.renderFrame({
+    mvp: mvp.elements,
+    cameraEnu: [p.x, -p.z, p.y],     // three（y 朝上）→ ENU（z 朝上）
+    fovRad: THREE.MathUtils.degToRad(camera.fov),
+    canvasHeight: renderer.domElement.height,
+  });
+  requestAnimationFrame(tick);
+}
+```
+
+**自由路线 —— 只用分层**。`core/` 解析与 `tileset/` 瓦片树都是宿主无关的：
 
 | 层 | 需要什么 | 与地图的关系 |
 |---|---|---|
@@ -180,7 +214,7 @@ npm run demo     # 一次性编译后起静态服务（不做监听）
 
 ```js
 import * as THREE from 'three';
-import { S3MTileset, createSharedUniforms, STYLE } from 's3m-maplibre';
+import { S3MTileset, createSharedUniforms, STYLE } from 's3m-three';
 
 const uniforms = createSharedUniforms();       // 材质 uniform 全局共享
 uniforms.uMode.value = STYLE.TEXTURE;          // 改这一行就是切样式
@@ -207,13 +241,6 @@ function tick() {
 
 完整可运行版本见 [`demo/three.js`](./demo/three.js)（一个文件，含轨道控制、切片统计、样式切换）。
 
-自己搭宿主时需要补的几件事，`S3MLayer` 不会代劳：
-
-- **光照**：`MeshStandardMaterial` 的标准光照，自己加 `HemisphereLight` + `DirectionalLight`；
-- **多数据集对齐**：每份数据有各自的锚点，`S3MLayer` 会按墨卡托算锚点差、写进数据集 `Group.position`（米），纯 three 里需要自己算一次；
-- **贴地 / 经纬度**：不接地图就没有「贴在地球上」这一步，只有局部米制坐标；
-- **拾取 / 选中描边 / 样式切换 UI**：`Picker`、等宽棱线、`setStyle` 都是 `S3MLayer` 上的，纯 three 用法需要直接操作 `uniforms` 与 Mesh。
-
 ---
 
 ## 未支持的格式：Draco / KTX2
@@ -224,7 +251,7 @@ function tick() {
 官方 SDK 里有 `S3MParser/S3MDracoDecode.js` + `draco_decode.module.js`（对 `DecodeBufferToPointCloud` 的封装，POSITION / NORMAL / TEX_COORD 三个属性，再按 `compressOptions` 分支处理）。接法与本项目的 MeshOpt 完全一致：内联 wasm 解码器、只在遇到 `VertexTag.DRACO` 时动态 `import`、解码后走同一套 attribute 组装 + 量化还原。真正的成本不在写代码，而在**标定容器**——MeshOpt 当时就是靠 60 个真实瓦片逐字节对齐才做对的，Draco 的 attribute 映射、`compressOptions` 与实际数据是否一致也必须拿样例验。仓库里没有 Draco 瓦片，所以现在是「识别到就抛明确错误」。
 
 **CRN 纹理 —— 已支持，并在真实服务上验过。**
-`src/vendor/crunch_decoder.module.js`（crunch 的 emscripten 胶水，wasm 内联成 base64，只在真的遇到 CRN 时动态 import）把 CRN 转回 DXT 块，再走现成的 DXT1/3/4/5 解码；具体是 DXT1 还是 DXT5 由 CRN 头部给出。判定逻辑收敛在 `src/core/TextureFormat.ts`，单测钉死 25 条断言。
+`packages/s3m-three/src/vendor/crunch_decoder.module.js`（crunch 的 emscripten 胶水，wasm 内联成 base64，只在真的遇到 CRN 时动态 import）把 CRN 转回 DXT 块，再走现成的 DXT1/3/4/5 解码；具体是 DXT1 还是 DXT5 由 CRN 头部给出。判定逻辑收敛在 `packages/s3m-three/src/core/TextureFormat.ts`，单测钉死 25 条断言。
 
 **关键点：「是不是 CRN」看 `compressType`，不能看 `pixelFormat`。** 实测到的三组组合（SuperMap Online 公有服务）：
 
@@ -368,38 +395,51 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 
 ## 目录结构
 
+monorepo（bun workspaces），两个发布包：
+
 ```
-src/
-  core/      解析层（无 three 依赖，Node 可用）
-    BinaryReader.ts      小端二进制读取
-    S3MBParser.ts        S3MB 结构解析
-    MeshOpt.ts           MeshOpt 几何压缩解码（量化还原 + 八面体法线）
-    FeatureInfo.ts       单体属性反推
-    DXTTextureDecode.ts  DXT 解码（来自 SuperMap/s3m-spec）
-    TextureFormat.ts     纹理格式判定（compressType / pixelFormat → 解码路径）
-    CRNDecode.ts         CRN → DXT 转码（crunch wasm，按需加载）
-  tileset/   瓦片树 + LOD + 加载调度
-  render/    three 渲染
-    S3MLayer.ts          图层主体（多数据集 / 样式 / 拾取）
-    GeometryBuilder.ts   几何与材质组装
-    StyleMaterial.ts     着色器注入的着色系统
-    EdgeLines.ts         屏幕空间等宽棱线（选中描边 / 全局棱线）
-    OrthoProjection.ts   正交投影：反推视图矩阵 + 正交视锥（纯数学，可单测）
-    Picker.ts            GPU 拾取
-    TextureFactory.ts    纹理解码
-  vendor/    meshoptimizer 解码器（wasm 内联，原样保留）
+packages/
+  s3m-three/      渲染内核（宿主无关，peer: three）
+    src/
+      core/      解析层（无 three 依赖，Node 可用）
+        BinaryReader.ts      小端二进制读取
+        S3MBParser.ts        S3MB 结构解析
+        MeshOpt.ts           MeshOpt 几何压缩解码（量化还原 + 八面体法线）
+        FeatureInfo.ts       单体属性反推
+        DXTTextureDecode.ts  DXT 解码（来自 SuperMap/s3m-spec）
+        TextureFormat.ts     纹理格式判定（compressType / pixelFormat → 解码路径）
+        CRNDecode.ts         CRN → DXT 转码（crunch wasm，按需加载）
+      tileset/    瓦片树 + LOD + 加载调度
+      render/     three 渲染
+        S3MViewer.ts         宿主无关场景查看器（多数据集 / 样式 / 拾取 / 选中）
+        GeoAdapter.ts        地理坐标接口 + 墨卡托兜底
+        DatasetManager.ts    多数据集生命周期与锚点对齐
+        GeometryBuilder.ts   几何与材质组装
+        StyleMaterial.ts     着色器注入的着色系统
+        EdgeLines.ts         屏幕空间等宽棱线（选中描边 / 全局棱线）
+        OrthoProjection.ts   正交投影：反推视图矩阵 + 正交视锥（纯数学，可单测）
+        Picker.ts            GPU 拾取
+        TextureFactory.ts    纹理解码
+      vendor/     meshoptimizer / crunch 解码器（wasm 内联，原样保留）
+  s3m-maplibre/   MapLibre / Mapbox 适配层（依赖 s3m-three）
+    src/
+      S3MLayer.ts          薄图层：custom layer 生命周期 / render 矩阵提取 / 事件
+      MapLibreGeoAdapter.ts WorldCoordinateHelper 提取 → GeoAdapter
 demo/
   index.html / main.js   MapLibre 完整示例（控制面板 + 属性卡）
   three.html / three.js  纯 three.js 示例（无地图）
 tools/       自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
+docs/        API 文档（由 tools/build-docs.mjs 零依赖生成）
 ```
+
+`S3MViewer` 与 `S3MLayer` 的分界：前者不 import 任何地图 API，后者只做「宿主协议 ↔ 内核」的翻译（矩阵提取、事件、`triggerRepaint` 回调）。
 
 ---
 
 ## 许可
 
 - 本项目 [Apache-2.0](./LICENSE)。
-- `src/core/DXTTextureDecode.ts` 来自 [SuperMap/s3m-spec](https://github.com/supermap/s3m-spec)（Apache-2.0）。
-- `src/vendor/crunch_decoder.module.js` 是 [crunch](https://github.com/BinomialLLC/crunch) 的 emscripten 构建（经 SuperMap SDK 转发，Apache-2.0）；只改了两处：wasm 改为内联字节、Node ESM 下 `__dirname` 兜底。
-- `src/vendor/meshopt_decoder.module.js` 是 [meshoptimizer](https://github.com/zeux/meshoptimizer) 官方解码器（MIT，© Arseny Kapoulkine），未做修改。
+- `packages/s3m-three/src/core/DXTTextureDecode.ts` 来自 [SuperMap/s3m-spec](https://github.com/supermap/s3m-spec)（Apache-2.0）。
+- `packages/s3m-three/src/vendor/crunch_decoder.module.js` 是 [crunch](https://github.com/BinomialLLC/crunch) 的 emscripten 构建（经 SuperMap SDK 转发，Apache-2.0）；只改了两处：wasm 改为内联字节、Node ESM 下 `__dirname` 兜底。
+- `packages/s3m-three/src/vendor/meshopt_decoder.module.js` 是 [meshoptimizer](https://github.com/zeux/meshoptimizer) 官方解码器（MIT，© Arseny Kapoulkine），未做修改。
 - S3M 规范文本遵循 CC BY-ND 4.0，不得修改规范文本后再发布。
