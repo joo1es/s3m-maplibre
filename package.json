@@ -1,93 +1,40 @@
 {
-  "name": "s3m-maplibre",
-  "version": "0.2.12",
-  "description": "SuperMap S3M 三维模型格式的 MapLibre / Mapbox 原生渲染图层：浏览器内直接解析 .s3mb 瓦片，无需转 3D Tiles，支持多数据集叠加、白膜/按高度/按单体/动态扫描着色、单体级 GPU 拾取与属性查询。",
+  "name": "s3m-monorepo",
+  "version": "0.0.0",
+  "private": true,
+  "description": "SuperMap S3M 渲染库 monorepo：packages/s3m-three（three.js 渲染内核，宿主无关）+ packages/s3m-maplibre（MapLibre / Mapbox 适配层）",
   "type": "module",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/joo1es/s3m-maplibre.git"
-  },
-  "homepage": "https://github.com/joo1es/s3m-maplibre#readme",
-  "bugs": {
-    "url": "https://github.com/joo1es/s3m-maplibre/issues"
-  },
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "default": "./dist/index.js"
-    },
-    "./core": {
-      "types": "./dist/core/S3MBParser.d.ts",
-      "import": "./dist/core/S3MBParser.js",
-      "default": "./dist/core/S3MBParser.js"
-    },
-    "./package.json": "./package.json"
-  },
-  "files": [
-    "dist",
-    "src",
-    "tools",
-    "docs",
-    "README.md",
-    "LICENSE"
+  "workspaces": [
+    "packages/*"
   ],
-  "sideEffects": false,
-  "engines": {
-    "node": ">=18"
-  },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/build-docs.mjs",
+    "build": "bun run build:three && bun run build:maplibre && node tools/build-docs.mjs",
+    "build:three": "bun run --cwd packages/s3m-three build",
+    "build:maplibre": "bun run --cwd packages/s3m-maplibre build",
     "build:docs": "node tools/build-docs.mjs",
-    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "clean": "bun run --cwd packages/s3m-three clean && bun run --cwd packages/s3m-maplibre clean",
+    "typecheck": "bun run --cwd packages/s3m-three typecheck && bun run --cwd packages/s3m-maplibre typecheck",
     "serve": "node tools/serve.mjs",
     "dev": "node tools/serve.mjs --watch",
-    "demo": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/serve.mjs",
-    "test:parse": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/parse-sample.mjs",
-    "test:meshopt": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/meshopt-check.mjs --preset shenyin",
+    "demo": "bun run build && node tools/serve.mjs",
+    "test": "bun run build && node tools/parse-sample.mjs && node tools/test-batch-texmatrix.mjs && node tools/test-texture-format.mjs && node tools/test-ortho.mjs && node tools/test-instanced.mjs && node tools/test-regressions.mjs && node tools/test-parser.mjs && node tools/test-new-features.mjs",
+    "test:parse": "bun run build:three && node tools/parse-sample.mjs",
+    "test:meshopt": "bun run build:three && node tools/meshopt-check.mjs --preset shenyin",
     "test:oracle": "node tools/official-oracle.mjs",
-    "test:e2e": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/e2e.mjs",
-    "test": "tsc --noEmit -p tsconfig.json && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/parse-sample.mjs && node tools/test-batch-texmatrix.mjs && node tools/test-texture-format.mjs && node tools/test-ortho.mjs && node tools/test-instanced.mjs && node tools/test-regressions.mjs && node tools/test-parser.mjs && node tools/test-new-features.mjs",
-    "test:texture": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/test-texture-format.mjs",
-    "probe:crn": "npm run build && node tools/crn-probe.mjs",
-    "prepublishOnly": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && node tools/copy-assets.mjs && tsc --noEmit -p tsconfig.json",
-    "test:regress": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/test-regressions.mjs",
-    "test:parser": "tsc -p tsconfig.build.json && node tools/copy-assets.mjs && node tools/test-parser.mjs"
-  },
-  "keywords": [
-    "s3m",
-    "s3mb",
-    "supermap",
-    "iserver",
-    "maplibre",
-    "maplibre-gl",
-    "mapbox",
-    "mapbox-gl",
-    "webgl",
-    "three",
-    "3d-tiles",
-    "gis",
-    "bim",
-    "photogrammetry"
-  ],
-  "author": "",
-  "license": "Apache-2.0",
-  "peerDependencies": {
-    "three": ">=0.168.0"
-  },
-  "peerDependenciesMeta": {
-    "three": {
-      "optional": false
-    }
+    "test:e2e": "bun run build && node tools/e2e.mjs",
+    "test:texture": "bun run build:three && node tools/test-texture-format.mjs",
+    "probe:crn": "bun run build:three && node tools/crn-probe.mjs",
+    "test:regress": "bun run build && node tools/test-regressions.mjs",
+    "test:parser": "bun run build:three && node tools/test-parser.mjs",
+    "prepublishOnly:three": "cd packages/s3m-three && npm publish",
+    "prepublishOnly:maplibre": "cd packages/s3m-maplibre && npm publish"
   },
   "devDependencies": {
     "@types/three": "^0.169.0",
     "maplibre-gl": ">=4.0.0",
     "three": "^0.169.0",
     "typescript": "^5.6.3"
-  }
+  },
+  "author": "",
+  "license": "Apache-2.0"
 }

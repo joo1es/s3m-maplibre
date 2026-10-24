@@ -10,6 +10,20 @@
         "three": "^0.169.0",
         "typescript": "^5.6.3",
       },
+    },
+    "packages/s3m-maplibre": {
+      "name": "s3m-maplibre",
+      "version": "0.3.0",
+      "dependencies": {
+        "s3m-three": "workspace:*",
+      },
+      "peerDependencies": {
+        "three": ">=0.168.0",
+      },
+    },
+    "packages/s3m-three": {
+      "name": "s3m-three",
+      "version": "0.1.0",
       "peerDependencies": {
         "three": ">=0.168.0",
       },
@@ -77,6 +91,10 @@
     "require-from-string": ["require-from-string@2.0.2", "https://registry.npmmirror.com/require-from-string/-/require-from-string-2.0.2.tgz", {}, "sha512-Xf0nWe6RseziFMu+Ap9biiUbmplq6S9/p+7w7YXP/JBHhrUDDUhwa+vANyubuqfZWTveU//DYVGsDG7RKL/vEw=="],
 
     "resolve-protobuf-schema": ["resolve-protobuf-schema@2.1.0", "https://registry.npmmirror.com/resolve-protobuf-schema/-/resolve-protobuf-schema-2.1.0.tgz", { "dependencies": { "protocol-buffers-schema": "^3.3.1" } }, "sha512-kI5ffTiZWmJaS/huM8wZfEMer1eRd7oJQhDuxeCLe3t7N7mX3z94CN0xPxBQxFYQTSNz9T0i+v6inKqSdK8xrQ=="],
+
+    "s3m-maplibre": ["s3m-maplibre@workspace:packages/s3m-maplibre"],
+
+    "s3m-three": ["s3m-three@workspace:packages/s3m-three"],
 
     "three": ["three@0.169.0", "https://registry.npmmirror.com/three/-/three-0.169.0.tgz", {}, "sha512-Ed906MA3dR4TS5riErd4QBsRGPcx+HBDX2O5yYE5GqJeFQTPU+M56Va/f/Oph9X7uZo3W3o4l2ZhBZ6f6qUv0w=="],
 

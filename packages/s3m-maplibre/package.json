@@ -1,0 +1,70 @@
+{
+  "name": "s3m-maplibre",
+  "version": "0.3.0",
+  "description": "SuperMap S3M 三维模型格式的 MapLibre / Mapbox 原生渲染图层：浏览器内直接解析 .s3mb 瓦片，无需转 3D Tiles，支持多数据集叠加、白膜/按高度/按单体/动态扫描着色、单体级 GPU 拾取与属性查询。基于 s3m-three 渲染内核。",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/joo1es/s3m-maplibre.git"
+  },
+  "homepage": "https://github.com/joo1es/s3m-maplibre#readme",
+  "bugs": {
+    "url": "https://github.com/joo1es/s3m-maplibre/issues"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "node -e \"const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.dependencies['s3m-three']='^0.1.0';fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\\n')\" && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && tsc --noEmit -p tsconfig.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
+  },
+  "keywords": [
+    "s3m",
+    "s3mb",
+    "supermap",
+    "iserver",
+    "maplibre",
+    "maplibre-gl",
+    "mapbox",
+    "mapbox-gl",
+    "webgl",
+    "three",
+    "3d-tiles",
+    "gis",
+    "bim",
+    "photogrammetry"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "s3m-three": "workspace:*"
+  },
+  "peerDependencies": {
+    "three": ">=0.168.0"
+  },
+  "peerDependenciesMeta": {
+    "three": {
+      "optional": false
+    }
+  }
+}

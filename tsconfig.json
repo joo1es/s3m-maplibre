@@ -9,7 +9,11 @@
     "noImplicitOverride": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "forceConsistentCasingInFileNames": true
+    "forceConsistentCasingInFileNames": true,
+    "baseUrl": ".",
+    "paths": {
+      "s3m-three": ["./packages/s3m-three/src/index.ts"]
+    }
   },
-  "include": ["src/**/*.ts", "tests/types/**/*.ts"]
+  "include": ["packages/*/src/**/*.ts", "tests/types/**/*.ts"]
 }
