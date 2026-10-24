@@ -387,13 +387,15 @@ export class S3MTileset {
 
       this._onTile(node);
     } catch (e) {
-      this.stats.failed++;
       const attempts = (this._retryCount.get(url) ?? 0) + 1;
       this._retryCount.set(url, attempts);
       if (attempts <= this._maxRetries) {
         // 退避重试：不进 failed，下一帧 update() 会重新入队，避免网络抖一下就留个永久空洞
         this._retryAt.set(url, performance.now() + 800 * attempts);
       } else {
+        // 只有重试耗尽的瓦片才计入 failed：瞬态失败下一轮就成功了，
+        // 计进去会让状态栏永久挂着一个「N 个瓦片失败」的假警告
+        this.stats.failed++;
         this.failed.add(url);
         this._retryAt.delete(url);
       }
