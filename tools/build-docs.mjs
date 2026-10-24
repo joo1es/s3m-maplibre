@@ -1,5 +1,7 @@
 /**
- * 零依赖编译 docs/API.md 生成精美独立的现代文档网页 docs/index.html
+ * 零依赖编译两个包的 docs/API.md 生成文档站：
+ *   packages/s3m-maplibre/docs/API.md → docs/index.html（对外主入口，URL 不变）
+ *   packages/s3m-three/docs/API.md    → docs/three.html
  * 不依赖任何外部 npm 包，CI/CD 环境 100% 绿色通过
  */
 import fs from 'node:fs';
@@ -10,17 +12,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const rootDir = path.resolve(__dirname, '..');
 
-// 读取 s3m-maplibre 包（面向使用方的发布包）的版本号作为唯一真实版本源
-const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'packages', 's3m-maplibre', 'package.json'), 'utf8'));
-const version = pkg.version;
-
-// 读取 docs/API.md
-const apiMdPath = path.join(rootDir, 'docs', 'API.md');
-const mdContent = fs.readFileSync(apiMdPath, 'utf8');
-
-// 提取所有标题（用于生成左侧目录和大纲）
-const headings = [];
-const lines = mdContent.split(/\r?\n/);
+// 提取所有标题（用于生成左侧目录和大纲）；按页重置，见 buildPage
+let headings = [];
 
 function escapeHtml(str) {
   return str
@@ -161,10 +154,12 @@ function parseMarkdown(src) {
       const depth = mHead[1].length;
       const rawText = mHead[2].trim();
       const plainText = rawText.replace(/<[^>]+>/g, '').trim();
+      // 标题 id 走 GitHub 语义（去标点、空格转连字符），与 md 里的 #锚点 一致
       const id = plainText
         .toLowerCase()
-        .replace(/[^\w\u4e00-\u9fa5]+/g, '-')
-        .replace(/^-|-$/g, '');
+        .replace(/[^\w\u4e00-\u9fa5\s-]/g, '')
+        .trim()
+        .replace(/\s+/g, '-');
 
       if (depth <= 3) {
         headings.push({ id, text: plainText, depth });
@@ -225,7 +220,16 @@ function parseMarkdown(src) {
   return out.join('\n');
 }
 
-const mainHtml = parseMarkdown(mdContent);
+function buildPage(cfg) {
+  // 版本号以各自包的 package.json 为唯一真实源
+  const version = JSON.parse(fs.readFileSync(path.join(rootDir, cfg.pkg), 'utf8')).version;
+  const mdContent = fs.readFileSync(path.join(rootDir, cfg.md), 'utf8');
+  headings = [];
+
+  // 文档站内互链：md 里写仓库相对路径，生成时改写为站点页面地址
+  const mainHtml = parseMarkdown(mdContent)
+    .replace(/href="\.\.\/s3m-three\/docs\/API\.md/g, 'href="./three.html')
+    .replace(/href="\.\.\/s3m-maplibre\/docs\/API\.md/g, 'href="./index.html');
 
 // 生成左侧目录
 let sidebarHtml = '';
@@ -252,8 +256,8 @@ const htmlTemplate = `<!doctype html>
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>S3M for MapLibre - 完整开发指南与 API 参考</title>
-    <meta name="description" content="SuperMap S3M/S3MB 三维瓦片格式原生 MapLibre / Mapbox 图层核心架构、API 文档与使用手册" />
+    <title>${cfg.title}</title>
+    <meta name="description" content="${cfg.desc}" />
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏢</text></svg>" />
     <script>
       (function() {
@@ -519,7 +523,7 @@ const htmlTemplate = `<!doctype html>
             <span class="w-8 h-8 rounded-lg bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center text-white shadow-lg shadow-cyan-500/20">
               🏢
             </span>
-            <span>s3m-maplibre</span>
+            <span>${cfg.brand}</span>
           </a>
           <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
             v${version}
@@ -537,6 +541,7 @@ const htmlTemplate = `<!doctype html>
           <span class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold shadow-sm flex items-center gap-1.5">
             <span>📚</span><span>开发文档</span>
           </span>
+          ${cfg.docSwitch}
         </nav>
 
         <div class="flex items-center gap-3">
@@ -583,7 +588,7 @@ const htmlTemplate = `<!doctype html>
         ${mainHtml}
         
         <footer class="mt-16 pt-8 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-4">
-          <p>© 2026 s3m-maplibre 项目组 · Apache-2.0 开源协议</p>
+          <p>© 2026 s3m 项目组 · Apache-2.0 开源协议</p>
           <div class="flex items-center gap-4">
             <a href="https://github.com/joo1es/s3m-maplibre" class="hover:text-slate-300">GitHub</a>
             <span>·</span>
@@ -714,11 +719,34 @@ const htmlTemplate = `<!doctype html>
 </html>
 `;
 
-// 输出文件
-const outputHtmlPath = path.join(rootDir, 'docs', 'index.html');
-fs.writeFileSync(outputHtmlPath, htmlTemplate, 'utf8');
+  // 输出文件
+  fs.writeFileSync(path.join(rootDir, cfg.out), htmlTemplate, 'utf8');
+  console.log(`✅ ${cfg.brand} → ${cfg.out}（标题 ${headings.length} 个节节点）`);
+}
 
-console.log(`\n🎉 零依赖精美文档编译完成！`);
-console.log(`输出路径: ${outputHtmlPath}`);
-console.log(`提取标题: ${headings.length} 个节节点`);
-console.log(`100% 纯 Node 原生，无需任何第三方 npm 依赖包`);
+// 双页面：图层文档（对外主入口，URL 不变）+ 内核文档
+const PAGES = [
+  {
+    md: 'packages/s3m-maplibre/docs/API.md',
+    pkg: 'packages/s3m-maplibre/package.json',
+    out: 'docs/index.html',
+    brand: 's3m-maplibre',
+    title: 's3m-maplibre - 完整开发指南与 API 参考',
+    desc: 'SuperMap S3M/S3MB 三维瓦片格式原生 MapLibre / Mapbox 图层核心架构、API 文档与使用手册',
+    docSwitch:
+      '<a href="./three.html" class="px-3 py-1 rounded-md text-slate-400 hover:text-white hover:bg-white/5 transition flex items-center gap-1.5 font-medium"><span>🧊</span><span>s3m-three 内核文档</span></a>',
+  },
+  {
+    md: 'packages/s3m-three/docs/API.md',
+    pkg: 'packages/s3m-three/package.json',
+    out: 'docs/three.html',
+    brand: 's3m-three',
+    title: 's3m-three - 渲染内核 API 参考',
+    desc: 'SuperMap S3M/S3MB 三维瓦片格式的 three.js 渲染内核：宿主无关的解析、瓦片树与 S3MViewer API 参考',
+    docSwitch:
+      '<a href="./index.html" class="px-3 py-1 rounded-md text-slate-400 hover:text-white hover:bg-white/5 transition flex items-center gap-1.5 font-medium"><span>🗺️</span><span>s3m-maplibre 图层文档</span></a>',
+  },
+];
+
+for (const cfg of PAGES) buildPage(cfg);
+console.log('100% 纯 Node 原生，无需任何第三方 npm 依赖包');

@@ -1,0 +1,1743 @@
+<!doctype html>
+<html lang="zh-CN" class="scroll-smooth">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>s3m-three - 渲染内核 API 参考</title>
+    <meta name="description" content="SuperMap S3M/S3MB 三维瓦片格式的 three.js 渲染内核：宿主无关的解析、瓦片树与 S3MViewer API 参考" />
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🏢</text></svg>" />
+    <script>
+      (function() {
+        try {
+          const saved = localStorage.getItem('s3m_doc_theme');
+          const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          if (saved === 'dark' || (!saved && prefersDark)) {
+            document.documentElement.classList.add('dark');
+          } else {
+            document.documentElement.classList.remove('dark');
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        darkMode: 'class',
+        theme: {
+          extend: {
+            colors: {
+              brand: {
+                50: '#f0f9ff',
+                400: '#38bdf8',
+                500: '#0ea5e9',
+                600: '#0284c7',
+              }
+            }
+          }
+        }
+      }
+    </script>
+    <style>
+      ::-webkit-scrollbar { width: 6px; height: 6px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.28); }
+
+      body {
+        background-color: #0b101b;
+        color: #cbd5e1;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      }
+      .doc-content h1 {
+        font-size: 2.25rem;
+        font-weight: 800;
+        letter-spacing: -0.025em;
+        color: #f8fafc;
+        margin-top: 1.5rem;
+        margin-bottom: 1.25rem;
+        padding-bottom: 0.75rem;
+        border-bottom: 1px solid rgba(255,255,255,0.1);
+      }
+      .doc-content h2 {
+        font-size: 1.6rem;
+        font-weight: 700;
+        color: #f1f5f9;
+        margin-top: 2.75rem;
+        margin-bottom: 1rem;
+        padding-bottom: 0.4rem;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+      }
+      .doc-content h3 {
+        font-size: 1.25rem;
+        font-weight: 600;
+        color: #e2e8f0;
+        margin-top: 2rem;
+        margin-bottom: 0.75rem;
+      }
+      .doc-content p {
+        margin-top: 0.85rem;
+        margin-bottom: 0.85rem;
+        line-height: 1.78;
+        color: #94a3b8;
+      }
+      .doc-content ul {
+        list-style-type: disc;
+        padding-left: 1.5rem;
+        margin-top: 0.75rem;
+        margin-bottom: 0.75rem;
+        color: #94a3b8;
+        line-height: 1.7;
+      }
+      .doc-content ol {
+        list-style-type: decimal;
+        padding-left: 1.5rem;
+        margin-top: 0.75rem;
+        margin-bottom: 0.75rem;
+        color: #94a3b8;
+        line-height: 1.7;
+      }
+      .doc-content li { margin-bottom: 0.35rem; }
+      .doc-content a {
+        color: #38bdf8;
+        text-decoration: underline;
+        text-underline-offset: 3px;
+        transition: color 0.15s;
+      }
+      .doc-content a:hover { color: #7dd3fc; }
+      .doc-content code:not(pre code) {
+        background: rgba(255,255,255,0.08);
+        color: #e2e8f0;
+        padding: 0.18rem 0.38rem;
+        border-radius: 0.375rem;
+        font-size: 0.86em;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        border: 1px solid rgba(255,255,255,0.06);
+      }
+      .doc-content hr {
+        margin: 3rem 0;
+        border-color: rgba(255,255,255,0.08);
+      }
+      .doc-content strong { color: #f8fafc; font-weight: 600; }
+
+      .doc-heading { position: relative; }
+      .heading-anchor-link {
+        position: absolute;
+        left: -1.25rem;
+        top: 50%;
+        transform: translateY(-50%);
+        color: #38bdf8;
+        opacity: 0;
+        font-weight: 400;
+        transition: opacity 0.15s;
+      }
+      .doc-heading:hover .heading-anchor-link { opacity: 1; }
+      .doc-heading a.heading-text { text-decoration: none; color: inherit; }
+
+      .sidebar-link {
+        display: block;
+        padding: 0.35rem 0.75rem;
+        margin-bottom: 0.15rem;
+        border-radius: 0.375rem;
+        color: #94a3b8;
+        font-size: 0.875rem;
+        text-decoration: none !important;
+        transition: all 0.15s;
+      }
+      .sidebar-link:hover {
+        background: rgba(255,255,255,0.05);
+        color: #f1f5f9;
+      }
+      .sidebar-link.active {
+        background: rgba(56,189,248,0.12);
+        color: #38bdf8;
+        font-weight: 600;
+      }
+      .toc-link.active {
+        color: #38bdf8;
+        font-weight: 600;
+        border-left: 2px solid #38bdf8;
+        padding-left: 0.5rem;
+      }
+
+      /* 暗黑 / 明亮主题适配 */
+      html.dark body {
+        background-color: #0b101b;
+        color: #cbd5e1;
+      }
+      html:not(.dark) body {
+        background-color: #f8fafc;
+        color: #334155;
+      }
+      html:not(.dark) header {
+        background-color: rgba(255, 255, 255, 0.9) !important;
+        border-color: rgba(0, 0, 0, 0.08) !important;
+      }
+      html:not(.dark) header a {
+        color: #0f172a !important;
+      }
+      html:not(.dark) #searchInput {
+        background-color: #f1f5f9;
+        border-color: #cbd5e1;
+        color: #0f172a;
+      }
+      html:not(.dark) #sidebar {
+        border-color: rgba(0, 0, 0, 0.06) !important;
+      }
+      html:not(.dark) .sidebar-link {
+        color: #64748b;
+      }
+      html:not(.dark) .sidebar-link:hover {
+        background: rgba(0, 0, 0, 0.05);
+        color: #0f172a;
+      }
+      html:not(.dark) .sidebar-link.active {
+        background: rgba(14, 165, 233, 0.12);
+        color: #0284c7;
+      }
+      html:not(.dark) .doc-content h1 {
+        color: #0f172a;
+        border-bottom-color: rgba(0, 0, 0, 0.1);
+      }
+      html:not(.dark) .doc-content h2 {
+        color: #1e293b;
+        border-bottom-color: rgba(0, 0, 0, 0.08);
+      }
+      html:not(.dark) .doc-content h3 {
+        color: #334155;
+      }
+      html:not(.dark) .doc-content p, 
+      html:not(.dark) .doc-content ul, 
+      html:not(.dark) .doc-content ol {
+        color: #475569;
+      }
+      html:not(.dark) .doc-content strong {
+        color: #0f172a;
+      }
+      html:not(.dark) .doc-content a {
+        color: #0284c7;
+      }
+      html:not(.dark) .doc-content code:not(pre code) {
+        background: #e2e8f0;
+        color: #0f172a;
+        border-color: #cbd5e1;
+      }
+      html:not(.dark) .callout {
+        background: #f0fdf4 !important;
+        border-left-color: #10b981 !important;
+        color: #166534 !important;
+      }
+      html:not(.dark) .table-responsive {
+        background: #ffffff !important;
+        border-color: #e2e8f0 !important;
+        box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05);
+      }
+      html:not(.dark) .table-responsive thead {
+        background: #f8fafc !important;
+        color: #1e293b !important;
+        border-color: #e2e8f0 !important;
+      }
+      html:not(.dark) .table-responsive table {
+        color: #475569 !important;
+      }
+      html:not(.dark) .table-responsive tbody {
+        divide-color: #f1f5f9 !important;
+      }
+      html:not(.dark) .toc-link {
+        color: #64748b;
+      }
+      html:not(.dark) .toc-link:hover {
+        color: #0284c7;
+      }
+      html:not(.dark) #tocLinks {
+        border-left-color: rgba(0,0,0,0.08) !important;
+      }
+      html:not(.dark) footer {
+        border-top-color: rgba(0,0,0,0.08) !important;
+        color: #94a3b8;
+      }
+      html:not(.dark) footer a:hover {
+        color: #0f172a;
+      }
+    </style>
+  </head>
+  <body class="min-h-screen flex flex-col transition-colors duration-200">
+
+    <header class="sticky top-0 z-40 w-full border-b border-white/10 bg-[#0b101b]/90 backdrop-blur-md">
+      <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+        
+        <div class="flex items-center gap-3">
+          <a href="../demo/index.html" class="flex items-center gap-2.5 text-white font-bold text-lg tracking-tight hover:opacity-90 transition">
+            <span class="w-8 h-8 rounded-lg bg-gradient-to-tr from-cyan-500 to-blue-600 flex items-center justify-center text-white shadow-lg shadow-cyan-500/20">
+              🏢
+            </span>
+            <span>s3m-three</span>
+          </a>
+          <span class="inline-flex items-center px-2 py-0.5 rounded text-xs font-mono font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+            v0.1.0
+          </span>
+        </div>
+
+        <!-- 统一跨模块导航胶囊 -->
+        <nav class="hidden lg:flex items-center gap-1 bg-black/30 p-1 rounded-lg border border-white/10 text-xs">
+          <a href="../demo/index.html" class="px-3 py-1 rounded-md text-slate-400 hover:text-white hover:bg-white/5 transition flex items-center gap-1.5 font-medium">
+            <span>🗺️</span><span>MapLibre 演示</span>
+          </a>
+          <a href="../demo/three.html" class="px-3 py-1 rounded-md text-slate-400 hover:text-white hover:bg-white/5 transition flex items-center gap-1.5 font-medium">
+            <span>🧊</span><span>Three.js 演示</span>
+          </a>
+          <span class="px-3 py-1 rounded-md bg-blue-600 text-white font-semibold shadow-sm flex items-center gap-1.5">
+            <span>📚</span><span>开发文档</span>
+          </span>
+          <a href="./index.html" class="px-3 py-1 rounded-md text-slate-400 hover:text-white hover:bg-white/5 transition flex items-center gap-1.5 font-medium"><span>🗺️</span><span>s3m-maplibre 图层文档</span></a>
+        </nav>
+
+        <div class="flex items-center gap-3">
+          <div class="relative hidden sm:block w-52 md:w-64">
+            <input 
+              id="searchInput" 
+              type="text" 
+              placeholder="搜索文档 (如: pick, lod, 投影...)" 
+              class="w-full bg-[#131b2e] border border-white/10 rounded-lg px-3.5 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-400 transition"
+            />
+            <span class="absolute right-2.5 top-2 text-[10px] font-mono text-slate-500 border border-white/10 rounded px-1">/</span>
+          </div>
+
+          <!-- 明亮 / 暗黑主题切换按钮 -->
+          <button id="themeToggleBtn" class="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 transition" title="切换深色/浅色主题">
+            <svg id="themeMoonIcon" class="w-4 h-4 hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path></svg>
+            <svg id="themeSunIcon" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 9H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+          </button>
+
+          <a href="../demo/index.html" class="hidden sm:inline-flex lg:hidden items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-500 text-slate-950 hover:bg-cyan-400 transition shadow-md shadow-cyan-500/10">
+            <span>在线演示</span>
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
+          </a>
+
+          <a href="https://github.com/joo1es/s3m-maplibre" target="_blank" class="p-2 text-slate-400 hover:text-white transition" title="GitHub 仓库">
+            <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z"></path></svg>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 w-full flex-1 flex gap-8">
+      
+      <aside id="sidebar" class="hidden md:block w-64 shrink-0 py-8 border-r border-white/5 pr-4 h-[calc(100vh-4rem)] sticky top-16 overflow-y-auto">
+        <div class="text-xs font-semibold text-slate-400 tracking-wider uppercase mb-3 px-2 select-none">
+          文档导航
+        </div>
+        <nav class="space-y-0.5" id="navLinks">
+          <a href="#目录" class="sidebar-link depth-2">目录</a>
+<a href="#安装" class="sidebar-link depth-2">安装</a>
+<a href="#typescript" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">TypeScript</a>
+<a href="#快速开始" class="sidebar-link depth-2">快速开始</a>
+<a href="#核心概念" class="sidebar-link depth-2">核心概念</a>
+<a href="#坐标链路" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">坐标链路</a>
+<a href="#锚点" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">锚点</a>
+<a href="#瓦片与-lod" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">瓦片与 LOD</a>
+<a href="#单体化" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">单体化</a>
+<a href="#s3mviewer" class="sidebar-link depth-2">`S3MViewer`</a>
+<a href="#构造函数" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">构造函数</a>
+<a href="#挂载与帧驱动" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">挂载与帧驱动</a>
+<a href="#数据集管理" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">数据集管理</a>
+<a href="#样式与棱线" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">样式与棱线</a>
+<a href="#单体样式与状态" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">单体样式与状态</a>
+<a href="#字段着色-过滤-抬高" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">字段着色 / 过滤 / 抬高</a>
+<a href="#3d-物理地表与基坑" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">3D 物理地表与基坑</a>
+<a href="#拾取与空间查询" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">拾取与空间查询</a>
+<a href="#lod-与统计" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">LOD 与统计</a>
+<a href="#投影" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">投影</a>
+<a href="#释放" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">释放</a>
+<a href="#样式s3mstyle" class="sidebar-link depth-2">样式（S3MStyle）</a>
+<a href="#着色模式" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">着色模式</a>
+<a href="#关于按单体配色" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">关于「按单体」配色</a>
+<a href="#关于-shading" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">关于 `shading`</a>
+<a href="#关于光照" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">关于光照</a>
+<a href="#拾取与属性" class="sidebar-link depth-2">拾取与属性</a>
+<a href="#投影" class="sidebar-link depth-2">投影</a>
+<a href="#按业务字段着色" class="sidebar-link depth-2">按业务字段着色</a>
+<a href="#过滤-抬高" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">过滤 / 抬高</a>
+<a href="#为什么这么重以及怎么减" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">为什么这么重，以及怎么减</a>
+<a href="#纯-threejs-使用" class="sidebar-link depth-2">纯 three.js 使用</a>
+<a href="#底层-api" class="sidebar-link depth-2">底层 API</a>
+<a href="#parses3mb" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">`parseS3MB`</a>
+<a href="#meshopt-压缩几何" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">MeshOpt 压缩几何</a>
+<a href="#s3mtileset" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">`S3MTileset`</a>
+<a href="#单体属性工具" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">单体属性工具</a>
+<a href="#性能调优" class="sidebar-link depth-2">性能调优</a>
+<a href="#批量改单体样式" class="sidebar-link depth-3 pl-3 text-slate-400 hover:text-cyan-300 text-xs">批量改单体样式</a>
+<a href="#已知限制" class="sidebar-link depth-2">已知限制</a>
+<a href="#数据与许可" class="sidebar-link depth-2">数据与许可</a>
+
+        </nav>
+      </aside>
+
+      <main class="flex-1 min-w-0 py-8 lg:py-10 max-w-4xl doc-content">
+        
+        <h1 id="s3m-three-api-参考" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#s3m-three-api-参考" class="heading-text">s3m-three API 参考</a>
+        </h1>
+      
+
+        <div class="callout my-4 rounded-xl border-l-4 border-cyan-400 bg-cyan-950/20 px-5 py-3 text-slate-300 shadow-sm">
+          <div class="text-sm leading-relaxed">对应 <code>s3m-three</code> 的 <code>packages/s3m-three/src/index.ts</code> 导出面</div>
+        </div>
+      
+<hr />
+
+        <h2 id="目录" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#目录" class="heading-text">目录</a>
+        </h2>
+      
+<ul>
+<li><a href="#安装">安装</a></li>
+<li><a href="#快速开始">快速开始</a></li>
+<li><a href="#核心概念">核心概念</a></li>
+<li><a href="#s3mviewer"><code>S3MViewer</code></a></li>
+<li><a href="#样式s3mstyle">样式（S3MStyle）</a></li>
+<li><a href="#拾取与属性">拾取与属性</a></li>
+<li><a href="#投影">投影</a></li>
+<li><a href="#按业务字段着色">按业务字段着色</a></li>
+<li><a href="#纯-threejs-使用">纯 three.js 使用</a></li>
+<li><a href="#底层-api">底层 API</a></li>
+<li><a href="#性能调优">性能调优</a></li>
+<li><a href="#已知限制">已知限制</a></li>
+<li><a href="#数据与许可">数据与许可</a></li>
+</ul>
+<hr />
+
+        <h2 id="安装" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#安装" class="heading-text">安装</a>
+        </h2>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">BASH</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="npm%20install%20s3m-three%20three">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>npm install s3m-three three</code></pre>
+          </div>
+        
+<p><code>three</code> 是 peer 依赖，需要宿主项目自己提供（要求 <code>&gt;=0.168.0</code>，该版本起自带 TypeScript 类型）。</p>
+<p>本包<strong>不 import 任何地图 API</strong>，宿主无关：可以单独用于任意 three 场景，也可以被上层适配层驱动（MapLibre / Mapbox 用法见 <a href="./index.html">s3m-maplibre</a>，它内部就是在用本包）。</p>
+
+        <h3 id="typescript" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#typescript" class="heading-text">TypeScript</a>
+        </h3>
+      
+<p>包内置类型声明（<code>dist/index.d.ts</code>），由 TS 源码直接编译产出，开箱可用。公开 API 会暴露 <code>THREE.Mesh</code> / <code>THREE.Group</code> 等对象，three <code>&gt;=0.168</code> 自带类型；更老的版本需要 <code>@types/three</code>。</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="import%20%7B%20S3MViewer%2C%20S3MTileset%2C%20STYLE%2C%20type%20PickResult%20%7D%20from%20's3m-three'%3B">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>import { S3MViewer, S3MTileset, STYLE, type PickResult } from &#39;s3m-three&#39;;</code></pre>
+          </div>
+        
+<hr />
+
+        <h2 id="快速开始" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#快速开始" class="heading-text">快速开始</a>
+        </h2>
+      
+<p><code>S3MViewer</code> 是把场景、相机、灯光、拾取、选中、样式都封好的宿主无关查看器，只差你自己喂帧：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">JS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="import%20*%20as%20THREE%20from%20'three'%3B%0Aimport%20%7B%20S3MViewer%20%7D%20from%20's3m-three'%3B%0A%0Aconst%20renderer%20%3D%20new%20THREE.WebGLRenderer(%7B%20antialias%3A%20true%20%7D)%3B%0Adocument.body.appendChild(renderer.domElement)%3B%0A%0Aconst%20viewer%20%3D%20new%20S3MViewer(%7B%0A%20%20configUrl%3A%20'...%2Fjingmo.scp'%2C%0A%20%20onRequestRepaint%3A%20()%20%3D%3E%20%7B%7D%2C%20%20%20%20%20%20%20%20%2F%2F%20%E6%8E%A5%E8%87%AA%E5%B7%B1%E7%9A%84%E6%B8%B2%E6%9F%93%E5%BE%AA%E7%8E%AF%0A%20%20getBearing%3A%20()%20%3D%3E%200%2C%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E5%8F%AF%E9%80%89%EF%BC%9A%E8%AE%A9%E7%81%AF%E5%85%89%E8%B7%9F%E7%9D%80%E8%A7%86%E8%A7%92%E8%B5%B0%0A%7D)%3B%0Aviewer.geo%20%3D%20null%3B%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20null%20%3D%20%E6%A0%87%E5%87%86%20Web%20%E5%A2%A8%E5%8D%A1%E6%89%98%E5%85%9C%E5%BA%95%EF%BC%9B%E4%B9%9F%E5%8F%AF%E6%B3%A8%E5%85%A5%E8%87%AA%E5%AE%9A%E4%B9%89%20GeoAdapter%0Aviewer.mount(renderer.domElement%2C%20renderer.getContext())%3B%0A%0Afunction%20tick()%20%7B%0A%20%20const%20mvp%20%3D%20new%20THREE.Matrix4()%3B%20%20%20%2F%2F%20%E4%BD%A0%E7%9A%84%20world%E2%86%92clip%20%E7%9F%A9%E9%98%B5%0A%20%20const%20p%20%3D%20camera.position%3B%0A%20%20viewer.renderFrame(%7B%0A%20%20%20%20mvp%3A%20mvp.elements%2C%0A%20%20%20%20cameraEnu%3A%20%5Bp.x%2C%20-p.z%2C%20p.y%5D%2C%20%20%20%20%20%2F%2F%20three%EF%BC%88y%20%E6%9C%9D%E4%B8%8A%EF%BC%89%E2%86%92%20ENU%EF%BC%88z%20%E6%9C%9D%E4%B8%8A%EF%BC%89%0A%20%20%20%20fovRad%3A%20THREE.MathUtils.degToRad(camera.fov)%2C%0A%20%20%20%20canvasHeight%3A%20renderer.domElement.height%2C%0A%20%20%7D)%3B%0A%20%20requestAnimationFrame(tick)%3B%0A%7D">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>import * as THREE from &#39;three&#39;;
+import { S3MViewer } from &#39;s3m-three&#39;;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+document.body.appendChild(renderer.domElement);
+
+const viewer = new S3MViewer({
+  configUrl: &#39;.../jingmo.scp&#39;,
+  onRequestRepaint: () =&gt; {},        // 接自己的渲染循环
+  getBearing: () =&gt; 0,               // 可选：让灯光跟着视角走
+});
+viewer.geo = null;                   // null = 标准 Web 墨卡托兜底；也可注入自定义 GeoAdapter
+viewer.mount(renderer.domElement, renderer.getContext());
+
+function tick() {
+  const mvp = new THREE.Matrix4();   // 你的 world→clip 矩阵
+  const p = camera.position;
+  viewer.renderFrame({
+    mvp: mvp.elements,
+    cameraEnu: [p.x, -p.z, p.y],     // three（y 朝上）→ ENU（z 朝上）
+    fovRad: THREE.MathUtils.degToRad(camera.fov),
+    canvasHeight: renderer.domElement.height,
+  });
+  requestAnimationFrame(tick);
+}</code></pre>
+          </div>
+        
+<p>完整可运行版本见仓库 <code>demo/three.js</code>（一个文件，含轨道控制、切片统计、样式切换）。</p>
+<hr />
+
+        <h2 id="核心概念" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#核心概念" class="heading-text">核心概念</a>
+        </h2>
+      
+
+        <h3 id="坐标链路" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#坐标链路" class="heading-text">坐标链路</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">CODE</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="S3M%20%E9%A1%B6%E7%82%B9%EF%BC%88%E6%95%B0%E6%8D%AE%E9%9B%86%E5%B1%80%E9%83%A8%20ENU%EF%BC%8C%E7%B1%B3%EF%BC%89%0A%20%20%E2%86%92%20%E6%95%B0%E6%8D%AE%E9%9B%86%20Group%20%E5%81%8F%E7%A7%BB%EF%BC%9A%E6%8A%8A%E5%90%84%E6%95%B0%E6%8D%AE%E9%9B%86%E9%94%9A%E7%82%B9%E5%AF%B9%E9%BD%90%E5%88%B0%E3%80%8C%E5%9C%BA%E6%99%AF%E9%94%9A%E7%82%B9%E3%80%8D%0A%20%20%E2%86%92%20L%20%E7%9F%A9%E9%98%B5%EF%BC%9AENU%20%E2%86%92%20Web%20Mercator%20%E5%BD%92%E4%B8%80%E5%8C%96%E5%9D%90%E6%A0%87%0A%20%20%E2%86%92%20%E5%AE%BF%E4%B8%BB%E4%BC%A0%E5%85%A5%E7%9A%84%20mercator%E2%86%92clip%20%E7%9F%A9%E9%98%B5">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>S3M 顶点（数据集局部 ENU，米）
+  → 数据集 Group 偏移：把各数据集锚点对齐到「场景锚点」
+  → L 矩阵：ENU → Web Mercator 归一化坐标
+  → 宿主传入的 mercator→clip 矩阵</code></pre>
+          </div>
+        
+<p>three 场景原点固定在<strong>场景锚点</strong>（第一个成功加载的数据集的位置），所有顶点只保留「相对锚点的米」。这是 3D Tiles <code>RTC_CENTER</code> 的同类做法，目的是避免 float32 在墨卡托大坐标下抖动。</p>
+<p>多数据集叠加时，每个数据集一个 <code>THREE.Group</code>，用 <code>position</code> 承担锚点差。因此<strong>所有数据集应当位于同一城市量级</strong>（几公里内），跨城市叠加会重新引入精度问题。</p>
+
+        <h3 id="锚点" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#锚点" class="heading-text">锚点</a>
+        </h3>
+      
+<p>锚点来自数据集配置的 <code>position</code>，但会做一致性校验：若 <code>position</code> 与 <code>geoBounds</code> 中心偏差超过 0.5°，判定为生产时的占位脏数据，回退到 <code>geoBounds</code> 中心。</p>
+
+        <h3 id="瓦片与-lod" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#瓦片与-lod" class="heading-text">瓦片与 LOD</a>
+        </h3>
+      
+<p>配置里的 <code>tiles</code>（桌面导出）或 <code>rootTiles</code>（iServer，可多棵）是瓦片树入口。LOD 按规范里的 <code>RangeMode</code> 判定：</p>
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>rangeMode</th><th>含义</th><th>判定</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td>0</td><td><code>Distance_From_EyePoint</code></td><td>相机到包围球中心距离 < rangeValue 时细化</td></tr>
+<tr><td>1</td><td><code>Pixel_Size_OnScreen</code></td><td>包围球投影像素半径 > rangeValue 时细化</td></tr>
+<tr><td>2</td><td><code>Geometric_Error</code></td><td>按屏幕像素半径近似处理</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+
+        <h3 id="单体化" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#单体化" class="heading-text">单体化</a>
+        </h3>
+      
+<p>S3M 瓦片里可能带 <code>pickInfo</code>：<code>SMID → batchId + 顶点区间</code>。解析时会把它展开成逐顶点的 <code>aBatchId</code> 属性，于是 GPU 可以按单体着色、按单体拾取。没有单体化信息的几何 <code>batchId = -1</code>，只能整块拾取。</p>
+
+        <h4 id="batch-粒度多个-smid-共用一个-batch" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#batch-粒度多个-smid-共用一个-batch" class="heading-text">batch 粒度：多个 SMID 共用一个 batch</a>
+        </h4>
+      
+<p>单体化的分辨率只到 <strong>batch</strong>，不是 SMID。实测有数据会把若干相邻铺面合并成一个 batch（白模里甚至 81 个 mesh 共用一个材质码），于是「给 3 号楼单独上色」这件事在几何层面就不成立。</p>
+<p>内部规则（确定性的，不再「最后写的说了算」）：</p>
+<ul>
+<li><strong>任一 SMID 需要隐藏 → 整批隐藏</strong>；</li>
+<li><strong>颜色 / 抬高取 SMID 最小的那一个</strong>；</li>
+<li>真的发生时只 <code>console.warn</code> 一次，不会每次重写纹理都刷屏。</li>
+</ul>
+<p>先摸清数据能细到什么程度：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="const%20audit%20%3D%20viewer.auditBatches()%3B%0A%2F%2F%20%7B%20smids%2C%20batches%2C%20conflicts%3A%20%5B%7B%20datasetId%2C%20batchId%2C%20smids%20%7D%5D%2C%20conflictingSmids%20%7D">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>const audit = viewer.auditBatches();
+// { smids, batches, conflicts: [{ datasetId, batchId, smids }], conflictingSmids }</code></pre>
+          </div>
+        
+<p><code>conflicts</code> 为空说明这批数据可以放心按单体操作；不为空时，这些单体对应「按 batch 罩层」之类的做法，靠本库的单体化通道做不到。</p>
+<hr />
+
+        <h2 id="s3mviewer" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#s3mviewer" class="heading-text"><code>S3MViewer</code></a>
+        </h2>
+      
+<p>宿主无关的三维查看器：场景、相机、灯光、uniforms、拾取、选中描边、棱线、高度跟踪、数据集注册全在这里，不依赖任何地图 API。宿主只负责两件事——提供 WebGL 上下文（<code>mount</code>）和每帧喂矩阵（<code>renderFrame</code>）。</p>
+
+        <h3 id="构造函数" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#构造函数" class="heading-text">构造函数</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="new%20S3MViewer(options%3F%3A%20S3MViewerOptions)">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>new S3MViewer(options?: S3MViewerOptions)</code></pre>
+          </div>
+        
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>参数</th><th>类型</th><th>默认</th><th>说明</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td><code>configUrl</code></td><td><code>string</code></td><td>—</td><td>单数据集简写</td></tr>
+<tr><td><code>datasets</code></td><td><code>S3MDatasetOptions[]</code></td><td><code>[]</code></td><td>多数据集叠加</td></tr>
+<tr><td><code>style</code></td><td><code>Partial&lt;S3MStyle&gt;</code></td><td>见<a href="#样式s3mstyle">样式</a></td><td>初始样式</td></tr>
+<tr><td><code>ground</code></td><td><code>GroundOptions</code></td><td>—</td><td>3D 物理地表面 / 基坑开挖配置</td></tr>
+<tr><td><code>pickable</code></td><td><code>boolean</code></td><td><code>true</code></td><td>是否响应拾取</td></tr>
+<tr><td><code>maxTiles</code></td><td><code>number</code></td><td><code>64</code></td><td>每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载）</td></tr>
+<tr><td><code>maxConcurrent</code></td><td><code>number</code></td><td><code>4</code></td><td>每个数据集并发请求数</td></tr>
+<tr><td><code>lodRangeScale</code></td><td><code>number</code></td><td><code>1.0</code></td><td>LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化</td></tr>
+<tr><td><code>buildTile</code></td><td>`BuildTileFn \</td><td>null`</td><td>—</td><td>自定义瓦片构建器（测试 / 服务端渲染时注入）</td></tr>
+<tr><td><code>attributes</code></td><td><code>AttributeQueryOptions</code></td><td>—</td><td>业务属性查询配置，配了才能 <code>colorByField()</code>，见<a href="#按业务字段着色">按业务字段着色</a></td></tr>
+<tr><td><code>onRequestRepaint</code></td><td><code>() =&gt; void</code></td><td>—</td><td>宿主请求重画的信号：纯 three 宿主接自己的渲染循环</td></tr>
+<tr><td><code>getBearing</code></td><td><code>() =&gt; number</code></td><td>—</td><td>地图朝向（弧度），让灯光跟着视角走；不传则灯光方向固定</td></tr>
+<tr><td><code>onStats</code></td><td><code>(s: Stats) =&gt; void</code></td><td>—</td><td>统计更新</td></tr>
+<tr><td><code>onReady</code></td><td><code>(entry) =&gt; void</code></td><td>—</td><td>某个数据集就绪</td></tr>
+<tr><td><code>onPick</code></td><td>`(f: PickResult \</td><td>null) => void`</td><td>—</td><td>拾取结果</td></tr>
+<tr><td><code>onError</code></td><td><code>(e: unknown) =&gt; void</code></td><td>—</td><td>瓦片加载 / 解析错误</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+<p><code>configUrl</code> 与 <code>datasets</code> 二选一；同时给时以 <code>datasets</code> 为准。</p>
+
+        <h3 id="挂载与帧驱动" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#挂载与帧驱动" class="heading-text">挂载与帧驱动</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="mount(canvas%3A%20HTMLCanvasElement%2C%20gl%3A%20WebGLRenderingContext%20%7C%20WebGL2RenderingContext)%3A%20void%0Aunmount()%3A%20void%0ArenderFrame(opts%3A%20%7B%0A%20%20mvp%3A%20ArrayLike%3Cnumber%3E%3B%20%20%20%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E5%AE%BF%E4%B8%BB%E6%9C%AC%E5%B8%A7%E7%9A%84%20world%E2%86%92clip%20%E7%9F%A9%E9%98%B5%EF%BC%88%20Mercator%20%E5%BD%92%E4%B8%80%E5%8C%96%20%E2%86%92%20clip%20%EF%BC%89%0A%20%20cameraEnu%3A%20%5Bnumber%2C%20number%2C%20number%5D%3B%20%2F%2F%20%E7%9B%B8%E6%9C%BA%E5%9C%A8%E5%9C%BA%E6%99%AF%20ENU%20%E4%B8%AD%E7%9A%84%E4%BD%8D%E7%BD%AE%EF%BC%88%E7%B1%B3%EF%BC%89%0A%20%20fovRad%3A%20number%3B%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E6%9C%AC%E5%B8%A7%E5%9E%82%E7%9B%B4%E8%A7%86%E5%9C%BA%E8%A7%92%EF%BC%88%E5%BC%A7%E5%BA%A6%EF%BC%89%0A%20%20canvasHeight%3A%20number%3B%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E7%BB%98%E5%9B%BE%E7%BC%93%E5%86%B2%E9%AB%98%E5%BA%A6%EF%BC%8C%E4%BE%9B%20LOD%20%E5%B1%8F%E5%B9%95%E8%AF%AF%E5%B7%AE%E8%AE%A1%E7%AE%97%0A%7D)%3A%20boolean%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E8%BF%94%E5%9B%9E%20true%20%3D%20%E6%9C%AC%E5%B8%A7%E6%9C%89%E5%8F%98%E5%8C%96%EF%BC%8C%E5%AE%BF%E4%B8%BB%E5%BA%94%E7%BB%A7%E7%BB%AD%E9%A9%B1%E5%8A%A8%E4%B8%8B%E4%B8%80%E5%B8%A7">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>mount(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void
+unmount(): void
+renderFrame(opts: {
+  mvp: ArrayLike&lt;number&gt;;              // 宿主本帧的 world→clip 矩阵（ Mercator 归一化 → clip ）
+  cameraEnu: [number, number, number]; // 相机在场景 ENU 中的位置（米）
+  fovRad: number;                      // 本帧垂直视场角（弧度）
+  canvasHeight: number;                // 绘图缓冲高度，供 LOD 屏幕误差计算
+}): boolean                            // 返回 true = 本帧有变化，宿主应继续驱动下一帧</code></pre>
+          </div>
+        
+<p><code>mvp</code> 由宿主负责给出：地图宿主（如 s3m-maplibre）从 <code>render()</code> 入参提取；纯 three 宿主用自己的投影 × 视图矩阵。viewer 会在其后再乘 ENU → Mercator 矩阵，所以<strong>传进来的 mvp 作用在 Mercator 归一化坐标上</strong>，不是场景米制坐标。</p>
+<p><code>geo</code> 是可写的 <code>GeoAdapter | null</code>：<code>null</code> 用内置的墨卡托兜底（<code>worldFromLngLat</code> / <code>lngLatFromWorld</code>），地图宿主注入适配器以支持任意 CRS / 自定义投影。</p>
+
+        <h3 id="数据集管理" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#数据集管理" class="heading-text">数据集管理</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="addDataset(ds%3A%20S3MDatasetOptions)%3A%20Promise%3CS3MDatasetEntry%3E%0AremoveDataset(id%3A%20string)%3A%20void%0AclearDatasets()%3A%20void%0AsetDatasetVisible(id%3A%20string%2C%20visible%3A%20boolean)%3A%20void%0ArecomputeAnchors()%3A%20void%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20CRS%20%E5%88%87%E6%8D%A2%20%2F%20geo%20%E9%87%8D%E6%B3%A8%E5%85%A5%E5%90%8E%E9%87%8D%E7%AE%97%E9%94%9A%E7%82%B9%E4%B8%8E%20offset%0AgetDatasetHeight(id%3F%3A%20string)%3A%20number%0AsetDatasetHeight(idOrHeight%3A%20string%20%7C%20number%2C%20heightOffset%3F%3A%20number)%3A%20void%0AsetDatasetAlign(idOrAlign%3A%20string%20%7C%20DatasetAlignment%2C%20align%3F%3A%20DatasetAlignment)%3A%20void%0AcomputeAlignOffset(tileset%3A%20S3MTileset%20%7C%20null%2C%20align%3F%3A%20DatasetAlignment)%3A%20number">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>addDataset(ds: S3MDatasetOptions): Promise&lt;S3MDatasetEntry&gt;
+removeDataset(id: string): void
+clearDatasets(): void
+setDatasetVisible(id: string, visible: boolean): void
+recomputeAnchors(): void                    // CRS 切换 / geo 重注入后重算锚点与 offset
+getDatasetHeight(id?: string): number
+setDatasetHeight(idOrHeight: string | number, heightOffset?: number): void
+setDatasetAlign(idOrAlign: string | DatasetAlignment, align?: DatasetAlignment): void
+computeAlignOffset(tileset: S3MTileset | null, align?: DatasetAlignment): number</code></pre>
+          </div>
+        
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="interface%20S3MDatasetOptions%20%7B%0A%20%20id%3A%20string%3B%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E5%94%AF%E4%B8%80%E6%A0%87%E8%AF%86%0A%20%20name%3F%3A%20string%3B%20%20%20%20%20%20%20%20%2F%2F%20%E5%B1%95%E7%A4%BA%E5%90%8D%0A%20%20configUrl%3A%20string%3B%20%20%20%20%2F%2F%20.scp%20%E5%9C%B0%E5%9D%80%0A%20%20visible%3F%3A%20boolean%3B%20%20%20%20%2F%2F%20%E9%BB%98%E8%AE%A4%20true%0A%20%20maxTiles%3F%3A%20number%3B%20%20%20%20%2F%2F%20%E8%A6%86%E7%9B%96%20viewer%20%E7%BA%A7%E9%85%8D%E7%BD%AE%0A%7D">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>interface S3MDatasetOptions {
+  id: string;           // 唯一标识
+  name?: string;        // 展示名
+  configUrl: string;    // .scp 地址
+  visible?: boolean;    // 默认 true
+  maxTiles?: number;    // 覆盖 viewer 级配置
+}</code></pre>
+          </div>
+        
+<p><code>addDataset</code> 在 <code>mount()</code> 之前调用会抛错（此时还没有 WebGL 上下文）。</p>
+
+        <h3 id="样式与棱线" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#样式与棱线" class="heading-text">样式与棱线</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="setStyle(patch%3F%3A%20Partial%3CS3MStyle%3E)%3A%20void%0AgetStyle()%3A%20S3MStyle%20%26%20%7B%20modeLabel%3A%20string%20%7D%0AsetOpacity(opacity%3A%20number)%3A%20void%0AsetEdges(enabled%3A%20boolean)%3A%20void">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>setStyle(patch?: Partial&lt;S3MStyle&gt;): void
+getStyle(): S3MStyle &amp; { modeLabel: string }
+setOpacity(opacity: number): void
+setEdges(enabled: boolean): void</code></pre>
+          </div>
+        
+<p><code>setStyle</code> 是<strong>合并</strong>语义，只传要改的字段。除了 <code>shading</code>（编译期宏，需重编译着色器）之外，其余字段都是 uniform / 材质状态更新，热切换零成本。</p>
+<p>棱线优先用<strong>数据自带的棱线包</strong>（<code>primitiveType === 13</code> 的索引包）：解析时就建好 <code>LineSegments</code>，开关只是切 <code>visible</code>，成本为零。数据里没有时才用 <code>EdgesGeometry</code> 在 CPU 端现算（8ms 一帧切片，超过 12 万索引直接跳过）。棱线画成<strong>屏幕空间等宽线</strong>（<code>packages/s3m-three/src/render/EdgeLines.ts</code>）：WebGL 的 <code>lineWidth</code> 恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。</p>
+
+        <div class="callout my-4 rounded-xl border-l-4 border-cyan-400 bg-cyan-950/20 px-5 py-3 text-slate-300 shadow-sm">
+          <div class="text-sm leading-relaxed">注意：棱线包<strong>不能</strong>当三角面画。把它当 <code>TRIANGLES</code> 提交，每条棱线都会被连成一根几十上百米的尖刺。</div>
+        </div>
+      
+
+        <h3 id="单体样式与状态" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#单体样式与状态" class="heading-text">单体样式与状态</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="setFeatureStyle(smid%3A%20number%2C%20style%3A%20FeatureStyle)%3A%20void%0AsetFeaturesStyle(smids%3A%20number%5B%5D%2C%20style%3A%20FeatureStyle)%3A%20void%0AgetFeatureStyle(smid%3A%20number)%3A%20FeatureStyle%20%7C%20null%0AgetFeatureStyles()%3A%20Map%3Cnumber%2C%20FeatureStyle%3E%0AremoveFeatureStyle(smid%3A%20number)%3A%20void%0AclearFeatureStyles()%3A%20void%0AflushOverrides()%3A%20void%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E6%89%8B%E5%8A%A8%E5%88%B7%E8%84%8F%E6%A0%87%E8%AE%B0%EF%BC%88%E7%B4%A7%E6%8E%A5%E7%9D%80%E8%AF%BB%E7%BA%B9%E7%90%86%20%2F%20%E6%88%AA%E5%9B%BE%20%2F%20%E5%AF%BC%E5%87%BA%E5%89%8D%E7%94%A8%EF%BC%89%0AgetAllMeshes()%3A%20THREE.Mesh%5B%5D%20%20%20%20%2F%2F%20%E5%BD%93%E5%89%8D%E9%A9%BB%E7%95%99%E7%9A%84%E5%85%A8%E9%83%A8%E7%BD%91%E6%A0%BC">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>setFeatureStyle(smid: number, style: FeatureStyle): void
+setFeaturesStyle(smids: number[], style: FeatureStyle): void
+getFeatureStyle(smid: number): FeatureStyle | null
+getFeatureStyles(): Map&lt;number, FeatureStyle&gt;
+removeFeatureStyle(smid: number): void
+clearFeatureStyles(): void
+flushOverrides(): void          // 手动刷脏标记（紧接着读纹理 / 截图 / 导出前用）
+getAllMeshes(): THREE.Mesh[]    // 当前驻留的全部网格</code></pre>
+          </div>
+        
+
+        <h3 id="字段着色-过滤-抬高" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#字段着色-过滤-抬高" class="heading-text">字段着色 / 过滤 / 抬高</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="setAttributeSource(options%3A%20AttributeQueryOptions%20%7C%20null)%3A%20void%0AgetLoadedSmids()%3A%20number%5B%5D%0AauditBatches()%3A%20BatchAudit%0AgetThematicField()%3A%20string%20%7C%20null%0AsetThematicColors(colors%3A%20Map%3Cnumber%2C%20string%3E%20%7C%20null%2C%20field%20%3D%20'custom')%3A%20void%0AclearThematic()%3A%20void%0AgetFilterField()%3A%20string%20%7C%20null%0AfilterByField(options%3A%20FieldFilterOptions)%3A%20Promise%3CFieldFilterResult%3E%0AclearFieldFilter()%3A%20void%0AgetElevationField()%3A%20string%20%7C%20null%0AelevateByField(options%3A%20FieldElevationOptions)%3A%20Promise%3CFieldElevationResult%3E%0AsetThematicElevation(elevations%3A%20Map%3Cnumber%2C%20number%3E%20%7C%20null%2C%20field%20%3D%20'custom')%3A%20void%0AclearThematicElevation()%3A%20void%0AcolorByField(options%3A%20ColorByFieldOptions)%3A%20Promise%3CThematicResult%3E%0AsetFilter(filter%3A%20S3MFilter%20%7C%20null)%3A%20void%0AgetFilter()%3A%20S3MFilter%20%7C%20null%0AclearFilter()%3A%20void">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>setAttributeSource(options: AttributeQueryOptions | null): void
+getLoadedSmids(): number[]
+auditBatches(): BatchAudit
+getThematicField(): string | null
+setThematicColors(colors: Map&lt;number, string&gt; | null, field = &#39;custom&#39;): void
+clearThematic(): void
+getFilterField(): string | null
+filterByField(options: FieldFilterOptions): Promise&lt;FieldFilterResult&gt;
+clearFieldFilter(): void
+getElevationField(): string | null
+elevateByField(options: FieldElevationOptions): Promise&lt;FieldElevationResult&gt;
+setThematicElevation(elevations: Map&lt;number, number&gt; | null, field = &#39;custom&#39;): void
+clearThematicElevation(): void
+colorByField(options: ColorByFieldOptions): Promise&lt;ThematicResult&gt;
+setFilter(filter: S3MFilter | null): void
+getFilter(): S3MFilter | null
+clearFilter(): void</code></pre>
+          </div>
+        
+<p>详见<a href="#按业务字段着色">按业务字段着色</a>。</p>
+
+        <h3 id="3d-物理地表与基坑" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#3d-物理地表与基坑" class="heading-text">3D 物理地表与基坑</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="setGroundMode(mode%3A%20GroundMode)%3A%20void%0AsetGroundOpacity(opacity%3A%20number)%3A%20void%0AsetExcavationBounds(bounds%3A%20%5Bnumber%2C%20number%2C%20number%2C%20number%5D%20%7C%20null)%3A%20void">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>setGroundMode(mode: GroundMode): void
+setGroundOpacity(opacity: number): void
+setExcavationBounds(bounds: [number, number, number, number] | null): void</code></pre>
+          </div>
+        
+
+        <h3 id="拾取与空间查询" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#拾取与空间查询" class="heading-text">拾取与空间查询</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="pick(x%3A%20number%2C%20y%3A%20number)%3A%20PickResult%20%7C%20null%0ApickPosition(x%3A%20number%2C%20y%3A%20number)%3A%20%7B%20lngLat%3A%20%5Bnumber%2C%20number%5D%3B%20altitude%3A%20number%3B%20point%3A%20%5Bnumber%2C%20number%2C%20number%5D%20%7D%20%7C%20null%0AdrillPick(x%3A%20number%2C%20y%3A%20number%2C%20limit%3F%3A%20number)%3A%20PickResult%5B%5D%0AgetRayAt(x%3A%20number%2C%20y%3A%20number)%3A%20THREE.Ray%20%7C%20null%0Aselect(result%3A%20PickResult%20%7C%20null%2C%20opts%3F%3A%20%7B%20silent%3F%3A%20boolean%20%7D)%3A%20void%0AgetFeatureBounds(smid%3A%20number)%3A%20%5B%5Bnumber%2C%20number%5D%2C%20%5Bnumber%2C%20number%5D%5D%20%7C%20null">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>pick(x: number, y: number): PickResult | null
+pickPosition(x: number, y: number): { lngLat: [number, number]; altitude: number; point: [number, number, number] } | null
+drillPick(x: number, y: number, limit?: number): PickResult[]
+getRayAt(x: number, y: number): THREE.Ray | null
+select(result: PickResult | null, opts?: { silent?: boolean }): void
+getFeatureBounds(smid: number): [[number, number], [number, number]] | null</code></pre>
+          </div>
+        
+<p>坐标是<strong>相对 canvas 左上角的 CSS 像素</strong>（宿主适配层负责把鼠标事件换算过来）。返回值结构见<a href="#拾取与属性">拾取与属性</a>。</p>
+<p>拾取走 GPU：把「物体编号 + batchId」编码成 RGBA 渲染到 <strong>1×1</strong> 离屏目标再读那一个像素——viewport 仍是整块画布、原点平移到点击点，于是整幅画面按原样光栅化，只有点击点那一格落在目标上。代价与三角面数无关，且天然只命中最前面的可见面。</p>
+
+        <h3 id="lod-与统计" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#lod-与统计" class="heading-text">LOD 与统计</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="setLodRangeScale(scale%3A%20number%2C%20datasetId%3F%3A%20string)%3A%20void%0Areadonly%20lodRangeScale%3A%20number%0Areadonly%20stats%3A%20Stats%0Areadonly%20fps%3A%20number%0AgetBounds()%3A%20%5B%5Bnumber%2C%20number%5D%2C%20%5Bnumber%2C%20number%5D%5D%20%7C%20null%20%20%2F%2F%20%E5%90%88%E5%B9%B6%E7%BB%8F%E7%BA%AC%E5%BA%A6%E8%8C%83%E5%9B%B4">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>setLodRangeScale(scale: number, datasetId?: string): void
+readonly lodRangeScale: number
+readonly stats: Stats
+readonly fps: number
+getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围</code></pre>
+          </div>
+        
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="interface%20Stats%20%7B%0A%20%20tiles%3A%20number%3B%20loading%3A%20number%3B%20failed%3A%20number%3B%0A%20%20meshes%3A%20number%3B%20vertices%3A%20number%3B%20triangles%3A%20number%3B%20datasets%3A%20number%3B%0A%7D">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>interface Stats {
+  tiles: number; loading: number; failed: number;
+  meshes: number; vertices: number; triangles: number; datasets: number;
+}</code></pre>
+          </div>
+        
+
+        <h3 id="投影" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#投影" class="heading-text">投影</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="setProjection(mode%3A%20'perspective'%20%7C%20'orthographic')%3A%20void%20%20%2F%2F%20%E8%BF%90%E8%A1%8C%E6%97%B6%E5%88%87%E6%8D%A2%EF%BC%8C%E4%B8%8B%E4%B8%80%E5%B8%A7%E7%94%9F%E6%95%88%0Areadonly%20projection%3A%20'perspective'%20%7C%20'orthographic'">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>setProjection(mode: &#39;perspective&#39; | &#39;orthographic&#39;): void  // 运行时切换，下一帧生效
+readonly projection: &#39;perspective&#39; | &#39;orthographic&#39;</code></pre>
+          </div>
+        
+<p>内核只消费宿主给的 <code>mvp</code>；正交 MVP 由宿主在传入前自行替换，数学工具（<code>buildOrthoMVP</code> / <code>extractFovRadians</code> / <code>extractNearFar</code> / <code>extractProjectionMatrix</code>）从本包导出，见<a href="#投影">投影</a>。</p>
+
+        <h3 id="释放" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#释放" class="heading-text">释放</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="dispose()%3A%20void">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>dispose(): void</code></pre>
+          </div>
+        
+<hr />
+
+        <h2 id="样式s3mstyle" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#样式s3mstyle" class="heading-text">样式（S3MStyle）</a>
+        </h2>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="interface%20S3MStyle%20%7B%0A%20%20mode%3A%20S3MStyleMode%3B%0A%20%20colorA%3A%20string%3B%20%20%20%20%20%20%20%2F%2F%20%E7%99%BD%E8%86%9C%E5%9F%BA%E8%89%B2%EF%BC%9B%E9%A1%B6%2F%E4%BE%A7%E5%88%86%E8%89%B2%E4%B8%AD%E7%9A%84%E9%A1%B6%E9%9D%A2%E8%89%B2%EF%BC%9B%E9%AB%98%E5%BA%A6%E6%B8%90%E5%8F%98%E4%BD%8E%E7%AB%AF%E8%89%B2%0A%20%20colorB%3A%20string%3B%20%20%20%20%20%20%20%2F%2F%20%E9%A1%B6%2F%E4%BE%A7%E5%88%86%E8%89%B2%E4%B8%AD%E7%9A%84%E4%BE%A7%E7%AB%8B%E9%9D%A2%E8%89%B2%EF%BC%9B%E9%AB%98%E5%BA%A6%2F%E6%A5%BC%E5%B1%82%E6%B8%90%E5%8F%98%E9%AB%98%E7%AB%AF%E8%89%B2%0A%20%20colorC%3A%20string%3B%20%20%20%20%20%20%20%2F%2F%20%E5%8A%A8%E6%80%81%E6%89%AB%E6%8F%8F%E8%89%B2%20%2F%20%E5%A4%8D%E5%90%88%E6%B8%90%E5%8F%98%E9%AB%98%E7%AB%AF%E8%89%B2%0A%20%20selectColor%3A%20string%3B%20%20%2F%2F%20%E9%80%89%E4%B8%AD%E5%8D%95%E4%BD%93%E9%AB%98%E4%BA%AE%E8%89%B2%0A%20%20floorHeight%3A%20number%3B%20%20%2F%2F%20%E6%A5%BC%E5%B1%82%E4%BC%B0%E7%AE%97%E5%B1%82%E9%AB%98%EF%BC%8C%E9%BB%98%E8%AE%A4%203.2%0A%20%20speed%3A%20number%3B%20%20%20%20%20%20%20%20%2F%2F%20%E5%8A%A8%E6%80%81%E6%89%AB%E6%8F%8F%E9%80%9F%E5%BA%A6%E5%80%8D%E7%8E%87%0A%20%20opacity%3A%20number%3B%20%20%20%20%20%20%2F%2F%200.05%20~%201%0A%20%20shading%3A%20'flat'%20%7C%20'smooth'%3B%0A%20%20dimOthers%3A%20boolean%3B%20%20%20%2F%2F%20%E9%80%89%E4%B8%AD%E6%97%B6%E5%8E%8B%E6%9A%97%E5%85%B6%E4%BB%96%E5%BB%BA%E7%AD%91%0A%20%20outline%3A%20boolean%3B%20%20%20%20%20%2F%2F%20%E9%80%89%E4%B8%AD%E5%8D%95%E4%BD%93%E6%8F%8F%E8%BE%B9%0A%20%20outlineStyle%3F%3A%20'edges'%20%7C%20'hull'%3B%20%2F%2F%20%E6%8F%8F%E8%BE%B9%E7%94%BB%E6%B3%95%EF%BC%9A'edges'%20%E5%8D%95%E4%BD%93%E6%A3%B1%E7%BA%BF%EF%BC%88%E9%BB%98%E8%AE%A4%EF%BC%89%7C%20'hull'%20%E8%83%8C%E9%9D%A2%E5%A4%96%E6%89%A9%E8%BD%AE%E5%BB%93%0A%20%20outlineColor%3F%3A%20string%3B%20%20%2F%2F%20%E6%8F%8F%E8%BE%B9%E9%A2%9C%E8%89%B2%EF%BC%8C%E9%BB%98%E8%AE%A4%E8%B7%9F%E9%9A%8F%20selectColor%0A%20%20outlineWidthPx%3F%3A%20number%3B%20%2F%2F%20%E9%80%89%E4%B8%AD%E6%A3%B1%E7%BA%BF%E7%B2%97%E7%BB%86%EF%BC%88%E5%83%8F%E7%B4%A0%EF%BC%8C%E9%BB%98%E8%AE%A4%203%EF%BC%89%EF%BC%8C%E4%BB%85%20outlineStyle%3A%20'edges'%0A%20%20outlineWidth%3F%3A%20number%3B%20%20%20%2F%2F%20%E5%A4%96%E6%89%A9%E8%BD%AE%E5%BB%93%E7%B2%97%E7%BB%86%EF%BC%88%E7%B1%B3%EF%BC%8C%E9%BB%98%E8%AE%A4%200.9%EF%BC%89%EF%BC%8C%E4%BB%85%20outlineStyle%3A%20'hull'%0A%20%20edges%3A%20boolean%3B%20%20%20%20%20%20%20%2F%2F%20%E5%85%A8%E5%B1%80%E6%A3%B1%E7%BA%BF%0A%20%20edgeColor%3A%20string%3B%20%20%20%20%2F%2F%20%E6%A3%B1%E7%BA%BF%E9%A2%9C%E8%89%B2%0A%20%20edgeWidth%3F%3A%20number%3B%20%20%20%2F%2F%20%E5%85%A8%E5%B1%80%E6%A3%B1%E7%BA%BF%E7%B2%97%E7%BB%86%EF%BC%88%E5%83%8F%E7%B4%A0%EF%BC%8C%E9%BB%98%E8%AE%A4%201.2%EF%BC%89%0A%20%20edgeOpacity%3F%3A%20number%3B%20%2F%2F%20%E6%A3%B1%E7%BA%BF%E9%80%8F%E6%98%8E%E5%BA%A6%EF%BC%880.1%20~%201.0%EF%BC%89%EF%BC%8C%E9%BB%98%E8%AE%A4%200.45%0A%20%20roofThreshold%3F%3A%20number%3B%20%2F%2F%20%E9%A1%B6%E9%9D%A2%E6%B3%95%E7%BA%BF%E5%88%A4%E5%AE%9A%E9%98%88%E5%80%BC%EF%BC%8C%E9%BB%98%E8%AE%A4%200.65%0A%7D">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>interface S3MStyle {
+  mode: S3MStyleMode;
+  colorA: string;       // 白膜基色；顶/侧分色中的顶面色；高度渐变低端色
+  colorB: string;       // 顶/侧分色中的侧立面色；高度/楼层渐变高端色
+  colorC: string;       // 动态扫描色 / 复合渐变高端色
+  selectColor: string;  // 选中单体高亮色
+  floorHeight: number;  // 楼层估算层高，默认 3.2
+  speed: number;        // 动态扫描速度倍率
+  opacity: number;      // 0.05 ~ 1
+  shading: &#39;flat&#39; | &#39;smooth&#39;;
+  dimOthers: boolean;   // 选中时压暗其他建筑
+  outline: boolean;     // 选中单体描边
+  outlineStyle?: &#39;edges&#39; | &#39;hull&#39;; // 描边画法：&#39;edges&#39; 单体棱线（默认）| &#39;hull&#39; 背面外扩轮廓
+  outlineColor?: string;  // 描边颜色，默认跟随 selectColor
+  outlineWidthPx?: number; // 选中棱线粗细（像素，默认 3），仅 outlineStyle: &#39;edges&#39;
+  outlineWidth?: number;   // 外扩轮廓粗细（米，默认 0.9），仅 outlineStyle: &#39;hull&#39;
+  edges: boolean;       // 全局棱线
+  edgeColor: string;    // 棱线颜色
+  edgeWidth?: number;   // 全局棱线粗细（像素，默认 1.2）
+  edgeOpacity?: number; // 棱线透明度（0.1 ~ 1.0），默认 0.45
+  roofThreshold?: number; // 顶面法线判定阈值，默认 0.65
+}</code></pre>
+          </div>
+        
+
+        <h3 id="着色模式" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#着色模式" class="heading-text">着色模式</a>
+        </h3>
+      
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>常量</th><th>值</th><th>说明</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td><code>STYLE.WHITE</code></td><td>0</td><td>白模：忽略贴图与顶点色，纯色 + 光照</td></tr>
+<tr><td><code>STYLE.TEXTURE</code></td><td>1</td><td>原色：贴图 × 顶点色</td></tr>
+<tr><td><code>STYLE.SOLID</code></td><td>2</td><td>单色（<code>colorA</code>）</td></tr>
+<tr><td><code>STYLE.HEIGHT</code></td><td>3</td><td>按高度连续渐变（<code>colorA</code> → <code>colorB</code>）</td></tr>
+<tr><td><code>STYLE.FLOORS</code></td><td>4</td><td>按楼层离散分层，层高取 <code>floorHeight</code></td></tr>
+<tr><td><code>STYLE.BATCH</code></td><td>5</td><td>按单体自动分配色相</td></tr>
+<tr><td><code>STYLE.DYNAMIC</code></td><td>6</td><td>动态扫描：底色按高度渐变 + 扫描线自下而上循环</td></tr>
+<tr><td><code>STYLE.TOP_SIDE</code></td><td>7</td><td>顶面/侧面分色：顶面（<code>colorA</code>）与立面/侧面（<code>colorB</code>）智能分色</td></tr>
+<tr><td><code>STYLE.CUSTOM</code></td><td>8</td><td>自定义复合模式：顶面分色 + 侧立面高度渐变</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+<p>所有模式都在同一个 <code>MeshStandardMaterial</code> 的片元着色器里用 <code>uMode</code> 分支实现，切换不重建几何、不重建材质。</p>
+
+        <h3 id="关于按单体配色" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#关于按单体配色" class="heading-text">关于「按单体」配色</a>
+        </h3>
+      
+<p><code>STYLE.BATCH</code> 的色相是对 <code>batchId</code> 做哈希（<code>s3mHash</code>）得到的。这里有个很容易踩的坑：<strong><code>batchId</code> 在着色器里是 varying</strong>。GPU 逐像素做透视校正插值时，即使一个三角形三个顶点的 <code>aBatchId</code> 完全相等，三次乘加的舍入误差也不会正好抵消，结果会带 <code>1e-7</code> 量级的相对误差，而且逐像素不同（不同 GPU / 驱动还不一样）。</p>
+<p>这个误差本身无害，但哈希是混沌放大器：<code>fract(p<em>0.1031)</code> → <code>p</em>(p+33.33)</code> → <code>p*2p</code>，每级放大几十倍。实测 <code>batchId≈4.2 万</code> 时，<code>1e-7</code> 的抖动就能把哈希输出从单一值扩散到 <code>0.20~0.78</code> 整个区间 —— 表现就是<strong>整屏彩色噪点</strong>，而且只在部分机器上出现。</p>
+<p>所以凡是「按 id 取值」的地方都先取整（<code>s3mBatchId()</code> = <code>floor(vBatchId + 0.5)</code>）：按单体配色、单体状态纹理（隐藏 / 独立改色）采样、选中判定统一走它。同一个单体在所有像素上得到完全相同的颜色，跨 GPU 一致。</p>
+
+        <h3 id="关于-shading" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#关于-shading" class="heading-text">关于 <code>shading</code></a>
+        </h3>
+      
+<p><strong>默认 <code>&#39;flat&#39;</code>（平面着色）</strong>。原因：白模 / OSGB 转 S3M 的数据，法线多是共享顶点平均出来的，平滑插值会让墙面出现大片斑驳。平面着色在片元里用屏幕空间导数算法线，墙面干净得多。</p>
+<p>倾斜摄影这类本身法线连续的模型，可以改成 <code>&#39;smooth&#39;</code>。</p>
+
+        <h3 id="关于光照" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#关于光照" class="heading-text">关于光照</a>
+        </h3>
+      
+<p>主光与补光方向<strong>每帧跟随 <code>getBearing</code> 回调重算</strong>（主光在镜头后上方偏左 150°、仰角 50°；补光偏右 215°、仰角 30°）。相当于一盏头灯，保证任意旋转角度下白模都是受光的，不会转到背光面就一片死灰。</p>
+<p>如果你需要固定的物理太阳方向，可以自行替换 viewer 内部的 <code>_keyLight</code> / <code>_fillLight</code>（非公开 API，升级可能变化）。</p>
+<hr />
+
+        <h2 id="拾取与属性" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#拾取与属性" class="heading-text">拾取与属性</a>
+        </h2>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="interface%20PickResult%20%7B%0A%20%20datasetId%3A%20string%3B%0A%20%20datasetName%3A%20string%3B%0A%20%20objectId%3A%20number%3B%20%20%20%20%20%20%2F%2F%20%E7%BD%91%E6%A0%BC%E5%9C%A8%E5%9B%BE%E5%B1%82%E5%86%85%E7%9A%84%E7%BC%96%E5%8F%B7%0A%20%20batchId%3A%20number%3B%20%20%20%20%20%20%20%2F%2F%20%E5%8D%95%E4%BD%93%E7%BC%96%E5%8F%B7%EF%BC%8C-1%20%E8%A1%A8%E7%A4%BA%E6%97%A0%E5%8D%95%E4%BD%93%E5%8C%96%E4%BF%A1%E6%81%AF%0A%20%20skeletonName%3A%20string%3B%0A%20%20centerLngLat%3A%20%5Bnumber%2C%20number%5D%20%7C%20null%3B%0A%20%20mesh%3A%20THREE.Mesh%20%7C%20THREE.InstancedMesh%3B%0A%0A%20%20%2F%2F%20%E4%BB%A5%E4%B8%8B%E7%94%B1%E5%87%A0%E4%BD%95%E5%AE%9E%E6%97%B6%E8%AE%A1%E7%AE%97%0A%20%20smid%3A%20number%20%7C%20null%3B%20%20%20%2F%2F%20S3M%20%E5%8D%95%E4%BD%93%E5%8C%96%E4%BF%A1%E6%81%AF%E9%87%8C%E7%9A%84%20SMID%0A%20%20height%3F%3A%20number%3B%20%20%20%20%20%20%20%2F%2F%20%E7%B1%B3%EF%BC%8C%E5%8D%95%E4%BD%93%E5%8C%85%E5%9B%B4%E7%9B%92%20z%20%E8%B7%A8%E5%BA%A6%0A%20%20baseElevation%3F%3A%20number%3B%0A%20%20size%3F%3A%20%5Bnumber%2C%20number%5D%3B%20%20%20%2F%2F%20%E5%A4%96%E6%8E%A5%E7%9B%92%20%5B%E5%AE%BD%2C%20%E6%B7%B1%5D%0A%20%20bboxArea%3F%3A%20number%3B%20%20%20%20%20%20%20%20%20%2F%2F%20%E5%A4%96%E6%8E%A5%E7%9B%92%E5%BA%95%E9%9D%A2%E7%A7%AF%EF%BC%88%E3%8E%A1%EF%BC%89%0A%20%20floors%3F%3A%20number%3B%20%20%20%20%20%20%20%20%20%20%20%2F%2F%20%E9%AB%98%E5%BA%A6%20%2F%20floorHeight%0A%20%20triangles%3F%3A%20number%3B%20%20%20%20%20%20%20%20%2F%2F%20%E6%9C%AC%E5%8D%95%E4%BD%93%E8%87%AA%E8%BA%AB%E4%B8%89%E8%A7%92%E9%9D%A2%E6%95%B0%0A%20%20vertices%3F%3A%20number%3B%0A%20%20bbox%3F%3A%20%5B%5Bnumber%2C%20number%2C%20number%5D%2C%20%5Bnumber%2C%20number%2C%20number%5D%5D%3B%0A%7D">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>interface PickResult {
+  datasetId: string;
+  datasetName: string;
+  objectId: number;      // 网格在图层内的编号
+  batchId: number;       // 单体编号，-1 表示无单体化信息
+  skeletonName: string;
+  centerLngLat: [number, number] | null;
+  mesh: THREE.Mesh | THREE.InstancedMesh;
+
+  // 以下由几何实时计算
+  smid: number | null;   // S3M 单体化信息里的 SMID
+  height?: number;       // 米，单体包围盒 z 跨度
+  baseElevation?: number;
+  size?: [number, number];   // 外接盒 [宽, 深]
+  bboxArea?: number;         // 外接盒底面积（㎡）
+  floors?: number;           // 高度 / floorHeight
+  triangles?: number;        // 本单体自身三角面数
+  vertices?: number;
+  bbox?: [[number, number, number], [number, number, number]];
+}</code></pre>
+          </div>
+        
+
+        <div class="callout my-4 rounded-xl border-l-4 border-cyan-400 bg-cyan-950/20 px-5 py-3 text-slate-300 shadow-sm">
+          <div class="text-sm leading-relaxed"><strong>注意</strong>：<code>height</code> / <code>floors</code> / <code>bboxArea</code> 这些是<strong>从几何算出来的</strong>，不是业务属性表。OSGB 转 S3M 的数据通常不带属性表，<code>smid</code> 是与 iServer 侧数据对齐的唯一标识，业务字段需要你自己按 <code>smid</code> 去外部关联。</div>
+        </div>
+      
+<p>需要接业务属性时，用 <code>onPick</code> 拿到 <code>smid</code> 后自行查询：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="new%20S3MViewer(%7B%0A%20%20onPick%3A%20async%20(f)%20%3D%3E%20%7B%0A%20%20%20%20if%20(!f%3F.smid)%20return%3B%0A%20%20%20%20const%20info%20%3D%20await%20fetch(%60%2Fapi%2Fbuilding%2F%24%7Bf.smid%7D%60).then((r)%20%3D%3E%20r.json())%3B%0A%20%20%20%20showPanel(%7B%20...f%2C%20...info%20%7D)%3B%0A%20%20%7D%2C%0A%7D)%3B">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>new S3MViewer({
+  onPick: async (f) =&gt; {
+    if (!f?.smid) return;
+    const info = await fetch(`/api/building/${f.smid}`).then((r) =&gt; r.json());
+    showPanel({ ...f, ...info });
+  },
+});</code></pre>
+          </div>
+        
+<hr />
+
+        <h2 id="投影" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#投影" class="heading-text">投影</a>
+        </h2>
+      
+<p>内核消费的是宿主给的 <code>mvp</code>（Mercator 归一化 → clip），不区分透视 / 正交——<strong>正交 MVP 由宿主在传入前自行替换</strong>。MapLibre 宿主（s3m-maplibre 的 <code>S3MLayer</code>）的做法是：MapLibre ≥ 5 的 <code>render()</code> 入参会把 <code>projectionMatrix</code>（view→clip）和 <code>modelViewProjectionMatrix</code>（world→clip）分开给，视图矩阵可以精确解出来：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">CODE</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="V%20%3D%20P%E2%81%BB%C2%B9%20%C3%97%20MVP%0A%E6%AD%A3%E4%BA%A4%20MVP%20%3D%20P_ortho%20%C2%B7%20V%20%EF%BC%8CP_ortho%20%E5%8D%8A%E9%AB%98%20%3D%20%E7%9B%B8%E6%9C%BA%E8%B7%9D%20%C3%97%20tan(fov%2F2)">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>V = P⁻¹ × MVP
+正交 MVP = P_ortho · V ，P_ortho 半高 = 相机距 × tan(fov/2)</code></pre>
+          </div>
+        
+<p>半高取「目标深度处透视视锥的半高」，于是正交与透视在目标平面上逐点重合；zoom 改的是相机距离，距离减半 = 半高减半 = 放大一倍，pan / pitch / rotate 与透视手感一致。拾取、选中描边、按单体着色 / 隐藏 / 抬高都读同一个相机，自动跟随，不需要额外适配。</p>
+<p>边界：</p>
+<ul>
+<li>解出的视图矩阵会做刚体校验（3×3 正交、底行 <code>[0,0,0,1]</code>）；校验不过说明两个输入矩阵不同源，同样退回透视并告警。</li>
+<li>MapLibre < 5 只给合并矩阵，解不出独立投影矩阵，宿主会 <code>console.warn</code> 一次并保持透视，不会静默画错。</li>
+</ul>
+<p>底层数学在 <code>packages/s3m-three/src/render/OrthoProjection.ts</code>，从包入口导出（<code>buildOrthoMVP</code> / <code>extractFovRadians</code> / <code>extractNearFar</code> / <code>extractProjectionMatrix</code>），<code>npm test</code> 里的 <code>tools/test-ortho.mjs</code> 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。</p>
+<hr />
+
+        <h2 id="按业务字段着色" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#按业务字段着色" class="heading-text">按业务字段着色</a>
+        </h2>
+      
+<p>S3M 瓦片里<strong>只有单体 ID</strong>（SMID）和顶点区间，没有任何业务字段；业务属性在 iServer 的<strong>数据服务</strong>里（<code>data-xxx/rest/data</code>），和三维服务（<code>3D-xxx/rest/realspace</code>）是两个服务。所以按字段着色是「三维 + 数据」的跨服务查询，需要单独配一个数据源。</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="const%20viewer%20%3D%20new%20S3MViewer(%7B%0A%20%20configUrl%3A%20'...%2Fjingmo.scp'%2C%0A%20%20attributes%3A%20%7B%0A%20%20%20%20dataServiceUrl%3A%20'https%3A%2F%2Fhost%2Fiserver%2Fservices%2Fdata-xxx%2Frest%2Fdata'%2C%0A%20%20%20%20datasetName%3A%20'DataSource%3Azhoubian'%2C%20%20%20%2F%2F%20%E6%95%B0%E6%8D%AE%E6%BA%90%3A%E6%95%B0%E6%8D%AE%E9%9B%86%EF%BC%8C%E5%8F%AA%E5%86%99%E6%95%B0%E6%8D%AE%E9%9B%86%E5%90%8D%E6%97%B6%E9%BB%98%E8%AE%A4%E8%A1%A5%20DataSource%3A%0A%20%20%20%20%2F%2F%20idField%20%E9%BB%98%E8%AE%A4%20SmID%EF%BC%8C%E5%AF%B9%E5%BA%94%20scp%20%E9%87%8C%E7%9A%84%20idFieldName%0A%20%20%7D%2C%0A%7D)%3B%0A%0A%2F%2F%20%E5%88%86%E7%B1%BB%E5%AD%97%E6%AE%B5%EF%BC%9A%E5%90%8C%E4%B8%80%E5%8F%96%E5%80%BC%E5%90%8C%E8%89%B2%0Aconst%20result%20%3D%20await%20viewer.colorByField(%7B%20field%3A%20'KEYID'%2C%20type%3A%20'category'%20%7D)%3B%0A%0A%2F%2F%20%E6%95%B0%E5%80%BC%E5%AD%97%E6%AE%B5%EF%BC%9A%E8%BF%9E%E7%BB%AD%E8%89%B2%E5%B8%A6%20%2F%20%E6%8C%89%E9%98%88%E5%80%BC%E5%88%86%E7%BA%A7%0Aawait%20viewer.colorByField(%7B%20field%3A%20'SmMaxZ'%2C%20type%3A%20'ramp'%20%7D)%3B%0Aawait%20viewer.colorByField(%7B%20field%3A%20'SmMaxZ'%2C%20type%3A%20'breaks'%2C%20breaks%3A%20%5B10%2C%2030%2C%2060%5D%20%7D)%3B%0A%0Aresult.legend%3B%20%20%20%20%2F%2F%20%5B%7B%20label%2C%20color%2C%20count%20%7D%5D%20%20%E7%9B%B4%E6%8E%A5%E6%8B%BF%E5%8E%BB%E7%94%BB%E5%9B%BE%E4%BE%8B%0Aresult.matched%3B%20%20%20%2F%2F%20%E7%9C%9F%E6%AD%A3%E4%B8%8A%E4%BA%86%E8%89%B2%E7%9A%84%E5%8D%95%E4%BD%93%E6%95%B0">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>const viewer = new S3MViewer({
+  configUrl: &#39;.../jingmo.scp&#39;,
+  attributes: {
+    dataServiceUrl: &#39;https://host/iserver/services/data-xxx/rest/data&#39;,
+    datasetName: &#39;DataSource:zhoubian&#39;,   // 数据源:数据集，只写数据集名时默认补 DataSource:
+    // idField 默认 SmID，对应 scp 里的 idFieldName
+  },
+});
+
+// 分类字段：同一取值同色
+const result = await viewer.colorByField({ field: &#39;KEYID&#39;, type: &#39;category&#39; });
+
+// 数值字段：连续色带 / 按阈值分级
+await viewer.colorByField({ field: &#39;SmMaxZ&#39;, type: &#39;ramp&#39; });
+await viewer.colorByField({ field: &#39;SmMaxZ&#39;, type: &#39;breaks&#39;, breaks: [10, 30, 60] });
+
+result.legend;    // [{ label, color, count }]  直接拿去画图例
+result.matched;   // 真正上了色的单体数</code></pre>
+          </div>
+        
+<p>几个要点：</p>
+<ul>
+<li><strong>默认范围是「当前已加载的单体」</strong>（<code>getLoadedSmids()</code>），不是整个数据集。实测每条要素的响应约 5KB（模型数据集每条都挂着 <code>geometry.model</code>，见下面的「为什么这么重」），全量几千栋会变成几十 MB，所以只查加载进来的那部分，按 200 个一批分片；</li>
+<li>查询结果按 SMID 缓存<strong>整行</strong>（<code>AttributeQuery</code>），换字段只是重算颜色、重写一张一维纹理，不重建几何、不重编译着色器，也不再发一次请求；</li>
+<li>手动 <code>setFeatureStyle()</code> 的颜色优先级高于专题色；</li>
+<li><code>transform</code> 用来归并取值：<code>KEYID</code> / <code>ENTITYID</code> 这种基本一栋一个值的字段直接上分类色，着出来就是「随机色」，要么改用 <code>ramp</code> / <code>breaks</code>，要么用 <code>transform</code> 把编码截到能分组的层级，比如 <code>(v) =&gt; v.slice(0, 6)</code>;</li>
+<li><code>breaks</code> 不给就用色带档数等分；<code>colors</code> 不给就用内置 12 色板。</li>
+</ul>
+<p>不想接数据服务时，也可以：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="%2F%2F%20%E8%87%AA%E5%B7%B1%E7%AE%97%E5%A5%BD%E9%A2%9C%E8%89%B2%EF%BC%88%E6%AF%94%E5%A6%82%E6%8C%89%E5%87%A0%E4%BD%95%E6%B4%BE%E7%94%9F%E9%87%8F%EF%BC%9A%E9%AB%98%E5%BA%A6%20%2F%20%E9%9D%A2%E7%A7%AF%20%2F%20%E6%A5%BC%E5%B1%82%EF%BC%89%0Aviewer.setThematicColors(new%20Map(%5B%5B423%2C%20'%23ef4444'%5D%2C%20%5B424%2C%20'%2322c55e'%5D%5D))%3B%0Aviewer.clearThematic()%3B">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>// 自己算好颜色（比如按几何派生量：高度 / 面积 / 楼层）
+viewer.setThematicColors(new Map([[423, &#39;#ef4444&#39;], [424, &#39;#22c55e&#39;]]));
+viewer.clearThematic();</code></pre>
+          </div>
+        
+<p><code>AttributeQuery</code> 也能单独用（不依赖 viewer）：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="import%20%7B%20AttributeQuery%20%7D%20from%20's3m-three'%3B%0A%0Aconst%20query%20%3D%20new%20AttributeQuery(%7B%20dataServiceUrl%2C%20datasetName%3A%20'DataSource%3Azhoubian'%20%7D)%3B%0Aconst%20schema%20%3D%20await%20query.loadSchema()%3B%20%20%20%20%20%20%20%20%20%20%2F%2F%20%5B%7B%20name%3A%20'SmID'%20%7D%2C%20...%5D%EF%BC%8C%E4%B9%9F%E8%83%BD%E7%94%A8%E6%9D%A5%E5%88%A4%E6%96%AD%E6%9C%89%E6%B2%A1%E6%9C%89%E5%B1%9E%E6%80%A7%E8%A1%A8%0Aconst%20rows%20%3D%20await%20query.queryBySmids(%5B423%2C%20424%5D)%3B%20%2F%2F%20Map%3Csmid%2C%20%7B%20SmID%2C%20ENTITYID%2C%20KEYID%2C%20...%20%7D%3E">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>import { AttributeQuery } from &#39;s3m-three&#39;;
+
+const query = new AttributeQuery({ dataServiceUrl, datasetName: &#39;DataSource:zhoubian&#39; });
+const schema = await query.loadSchema();          // [{ name: &#39;SmID&#39; }, ...]，也能用来判断有没有属性表
+const rows = await query.queryBySmids([423, 424]); // Map&lt;smid, { SmID, ENTITYID, KEYID, ... }&gt;</code></pre>
+          </div>
+        
+<p>拾取结果里的 <code>attributes</code> 不在 <code>PickResult</code> 上：<code>pick()</code> 只负责拿 SMID，业务字段要按 SMID 再查一次。demo 里的属性卡就是这么补的（点楼 → 查 <code>featureResults</code> → 追加字段行）。</p>
+
+        <h3 id="过滤-抬高" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#过滤-抬高" class="heading-text">过滤 / 抬高</a>
+        </h3>
+      
+<p>同一份属性除了上色，还能直接拿来过滤和抬高——都是「查一次字段 → 写进每网格的单体状态纹理」，不重建几何、不重编译着色器。</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="%2F%2F%20%E5%8F%AA%E6%98%BE%E7%A4%BA%2030~80%20%E7%B1%B3%E4%B9%8B%E9%97%B4%E7%9A%84%E5%BB%BA%E7%AD%91%0Aawait%20viewer.filterByField(%7B%20field%3A%20'SmMaxZ'%2C%20min%3A%2030%2C%20max%3A%2080%20%7D)%3B%0A%0A%2F%2F%20%E6%8C%89%E7%BC%96%E7%A0%81%E7%B2%BE%E7%A1%AE%E5%8C%B9%E9%85%8D%EF%BC%88values%20%E6%8C%89%20String(value)%20%E6%AF%94%EF%BC%89%0Aawait%20viewer.filterByField(%7B%20field%3A%20'KEYID'%2C%20values%3A%20%5B'C10100SVK57YDUALQHRR00'%5D%20%7D)%3B%0A%0A%2F%2F%20%E5%8F%8D%E8%BF%87%E6%9D%A5%EF%BC%9A%E9%9A%90%E8%97%8F%2020%20%E7%B1%B3%E4%BB%A5%E4%B8%8B%E7%9A%84%0Aawait%20viewer.filterByField(%7B%20field%3A%20'SmMaxZ'%2C%20max%3A%2020%2C%20mode%3A%20'hide'%20%7D)%3B%0A%0A%2F%2F%20%E8%87%AA%E5%AE%9A%E4%B9%89%E6%9D%A1%E4%BB%B6%0Aawait%20viewer.filterByField(%7B%20field%3A%20'SmMaxZ'%2C%20keep%3A%20(v)%20%3D%3E%20Number(v)%20%3E%20100%20%7D)%3B%0A%0Aviewer.clearFieldFilter()%3B%20%20%20%2F%2F%20%E6%81%A2%E5%A4%8D%E5%85%A8%E9%87%8F%EF%BC%8C%E4%B8%8D%E5%BD%B1%E5%93%8D%20setFilter()%20%E7%9A%84%E8%A7%84%E5%88%99%0A%0A%2F%2F%20%E6%8A%AC%E9%AB%98%EF%BC%9A%E5%AD%97%E6%AE%B5%E5%80%BC%20%C3%97%20%E5%80%8D%E7%8E%87%EF%BC%88%E7%B1%B3%EF%BC%89%0Aawait%20viewer.elevateByField(%7B%20field%3A%20'SmMaxZ'%2C%20scale%3A%200.5%20%7D)%3B%0A%0A%2F%2F%20%E6%88%96%E8%80%85%E8%87%AA%E5%B7%B1%E6%98%A0%E5%B0%84%EF%BC%8C%E7%AC%AC%E4%BA%8C%E4%B8%AA%E5%8F%82%E6%95%B0%E6%98%AF%E6%95%B0%E6%8D%AE%E5%88%86%E5%B8%83%0Aawait%20viewer.elevateByField(%7B%0A%20%20field%3A%20'SmMaxZ'%2C%0A%20%20map%3A%20(v%2C%20r)%20%3D%3E%20((v%20-%20r.min)%20%2F%20(r.max%20-%20r.min))%20*%20200%2C%0A%20%20max%3A%20120%2C%20%2F%2F%20%E5%B0%81%E9%A1%B6%0A%7D)%3B%0Aviewer.clearThematicElevation()%3B">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>// 只显示 30~80 米之间的建筑
+await viewer.filterByField({ field: &#39;SmMaxZ&#39;, min: 30, max: 80 });
+
+// 按编码精确匹配（values 按 String(value) 比）
+await viewer.filterByField({ field: &#39;KEYID&#39;, values: [&#39;C10100SVK57YDUALQHRR00&#39;] });
+
+// 反过来：隐藏 20 米以下的
+await viewer.filterByField({ field: &#39;SmMaxZ&#39;, max: 20, mode: &#39;hide&#39; });
+
+// 自定义条件
+await viewer.filterByField({ field: &#39;SmMaxZ&#39;, keep: (v) =&gt; Number(v) &gt; 100 });
+
+viewer.clearFieldFilter();   // 恢复全量，不影响 setFilter() 的规则
+
+// 抬高：字段值 × 倍率（米）
+await viewer.elevateByField({ field: &#39;SmMaxZ&#39;, scale: 0.5 });
+
+// 或者自己映射，第二个参数是数据分布
+await viewer.elevateByField({
+  field: &#39;SmMaxZ&#39;,
+  map: (v, r) =&gt; ((v - r.min) / (r.max - r.min)) * 200,
+  max: 120, // 封顶
+});
+viewer.clearThematicElevation();</code></pre>
+          </div>
+        
+<p>返回值够用：<code>filterByField</code> 给 <code>{ total, matched, missing, hidden }</code>，<code>elevateByField</code> 给 <code>{ matched, missing, min, max, appliedMax }</code>。</p>
+<p>几个约定：</p>
+<ul>
+<li><code>filterByField</code> 与 <code>setFilter()</code> 是<strong>叠加</strong>关系（两个都放行才显示）；被隐藏的单体不渲染、也不参与拾取；<code>onMissing</code> 控制查不到属性的单体怎么算（默认保留）；</li>
+<li><code>keep</code> 模式记的是「命中集合」，之后才加载进来的单体不在集合里，同样隐藏——符合「只显示命中的」，也不会漏出新瓦片里的建筑；</li>
+<li><code>elevateByField</code> 的抬高量写在单体状态纹理的第四通道，顶点着色器加到 z 上；手动 <code>setFeatureStyle(smid, { elevation })</code> 优先级更高；</li>
+<li>抬高只改显示、不改几何，但<strong>拾取和高亮都跟着抬高后的位置走</strong>：GPU 拾取的那一趟渲染会采样同一张状态纹理，选中棱线也会加上同样的偏移，所以抬起来的楼点得中、描边也贴在楼上；</li>
+<li>上色 / 过滤 / 抬高共用同一个 <code>AttributeQuery</code> 缓存，切字段不会重复查；</li>
+<li>不想走网络时，用 <code>setThematicElevation(new Map([[423, 20]]))</code> 直接塞 SMID → 抬高米数。</li>
+</ul>
+
+        <h3 id="为什么这么重以及怎么减" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#为什么这么重以及怎么减" class="heading-text">为什么这么重，以及怎么减</a>
+        </h3>
+      
+<p>数据服务没有「只取属性」的接口。iServer 2026 上逐项试过，结论如下（数据集 <code>DataSource:zhoubian</code>，4461 条）：</p>
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>尝试</th><th>结果</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td><code>queryOption: &#39;ATTRIBUTE&#39;</code>（body / query string / 大小写）</td><td><strong>完全被忽略</strong>，几何照返回</td></tr>
+<tr><td><code>hasGeometry</code> / <code>returnGeometry</code> / <code>withGeometry</code>（顶层与 <code>queryParameter</code> 内）</td><td>全被忽略</td></tr>
+<tr><td><code>fromIndex</code> / <code>toIndex</code></td><td>被忽略，不能翻页</td></tr>
+<tr><td><code>maxFeatures</code></td><td>✅ 生效，但只能「取前 N 条」</td></tr>
+<tr><td><code>.fastjson</code> 替代 <code>.json</code></td><td>✅ 模型数据集 −40~50%</td></tr>
+<tr><td>逐条 <code>GET /rest/data/feature/{a}-{b}-{idx}.json</code></td><td>957B/条（<code>model</code> 为 null），但 300 条并发 16 要 2~14s，反而不如一次 POST</td></tr>
+<tr><td>二维数据源 <code>DataSource_erwei</code></td><td>✅ 若同名数据集存在，体积只有 1/2.5（<code>REGION</code> 而非 <code>GEOMODEL3D</code>）</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+<p>体积的 90% 是 <code>geometry.model</code>：每条要素都带着自己那栋楼的 S3M 模型字节（deflate 压缩后约 2.5KB），而我们要的只是几个字段。所以策略是「一次把全部字段捞回来，尽量少发请求」：</p>
+<ul>
+<li>响应格式按数据集自动选（<code>format: &#39;auto&#39;</code>）。模型数据集的 <code>model</code> 是 byte[]，<code>.fastjson</code> 用 hex 表示只要 2 字符/字节，<code>.json</code> 是十进制数字数组（3~4 字符/字节），所以走 fastjson；二维数据集的几何是坐标 double，hex 反而更胖（实测 3.9KB vs 2.4KB/条），那种就留在 json。判断依据是 <code>features.json</code> 返回的 <code>geometryType</code>，一次几十字节。</li>
+</ul>
+<p>  fastjson <strong>不是严格 JSON</strong>（<code>0.0D</code>、<code>423L</code>、<code>x&#39;D7A34040…&#39;</code> 都是 Java 字面量），<code>AttributeQuery</code> 会先在字符串上把 <code>x&#39;…&#39;</code> 抹成 <code>null</code> 再 <code>JSON.parse</code>——顺便省掉了整个模型的解析开销；解析失败自动回退 <code>.json</code>。</p>
+<ul>
+<li>默认取字段表里除 <code>SmGeometry</code> / <code>SmIndexKey</code> 外的<strong>全部字段</strong>（字段名本身很便宜，模型才是大头），这样换专题字段、看属性卡都命中缓存。</li>
+<li>需要压到极限时，如果同一份数据还发布了二维数据源，把 <code>datasetName</code> 指过去即可：</li>
+</ul>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="attributes%3A%20%7B%0A%20%20dataServiceUrl%3A%20'...%2Frest%2Fdata'%2C%0A%20%20datasetName%3A%20'DataSource_erwei%3Acheng'%2C%20%20%20%2F%2F%20%E4%BA%8C%E7%BB%B4%E7%89%88%E6%9C%AC%EF%BC%8C%E5%90%8C%E6%A0%B7%E7%9A%84%E5%B1%9E%E6%80%A7%E3%80%81%E6%B2%A1%E6%9C%89%E6%A8%A1%E5%9E%8B%0A%7D">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>attributes: {
+  dataServiceUrl: &#39;.../rest/data&#39;,
+  datasetName: &#39;DataSource_erwei:cheng&#39;,   // 二维版本，同样的属性、没有模型
+}</code></pre>
+          </div>
+        
+<p>实测同一批 100 栋：</p>
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>数据集</th><th>格式</th><th>体积</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td><code>DataSource:zhoubian</code>（模型）</td><td>json</td><td>9.2 KB/条</td></tr>
+<tr><td><code>DataSource:zhoubian</code>（模型）</td><td>fastjson（自动）</td><td>6.3 KB/条</td></tr>
+<tr><td><code>DataSource:cheng</code>（模型）</td><td>json</td><td>10.8 KB/条</td></tr>
+<tr><td><code>DataSource:cheng</code>（模型）</td><td>fastjson（自动）</td><td>5.5 KB/条</td></tr>
+<tr><td><code>DataSource_erwei:cheng</code>（二维）</td><td>json（自动）</td><td>2.1 KB/条</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+<p><code>AttributeQuery</code> 还提供 <code>format</code>、<code>chunkSize</code>、<code>fields</code> 三个开关，以及 <code>query.stats</code>（<code>{ requests, bytes, ms }</code>）用来观察实际开销。</p>
+<hr />
+
+        <h2 id="纯-threejs-使用" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#纯-threejs-使用" class="heading-text">纯 three.js 使用</a>
+        </h2>
+      
+<p><code>S3MViewer</code> 之下还有一层完全裸的用法：<code>core/</code> 解析与 <code>tileset/</code> 瓦片树都是宿主无关的，可以直接塞进任意 three 场景（<code>demo/three.js</code> 是一个完整例子，走的就是 <code>S3MViewer</code>；下面是不用 viewer 的最底层接法）：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="import%20*%20as%20THREE%20from%20'three'%3B%0Aimport%20%7B%20S3MTileset%2C%20createSharedUniforms%2C%20STYLE%2C%20setMaxAnisotropy%20%7D%20from%20's3m-three'%3B%0A%0Aconst%20renderer%20%3D%20new%20THREE.WebGLRenderer(%7B%20antialias%3A%20true%20%7D)%3B%0AsetMaxAnisotropy(renderer.capabilities.getMaxAnisotropy())%3B%20%2F%2F%20%E7%BA%B9%E7%90%86%E5%90%84%E5%90%91%E5%BC%82%E6%80%A7%EF%BC%8C%E8%B6%8A%E6%97%A9%E8%B0%83%E7%94%A8%E8%B6%8A%E5%A5%BD%0A%0Aconst%20uniforms%20%3D%20createSharedUniforms()%3B%0Auniforms.uMode.value%20%3D%20STYLE.TEXTURE%3B%20%20%2F%2F%20%E5%88%87%E6%A0%B7%E5%BC%8F%E5%B0%B1%E6%98%AF%E6%94%B9%E8%BF%99%E4%B8%AA%20int%0A%0A%2F%2F%20S3M%20%E9%A1%B6%E7%82%B9%E6%98%AF%E5%B1%80%E9%83%A8%20ENU%EF%BC%88x%20%E4%B8%9C%20%2F%20y%20%E5%8C%97%20%2F%20z%20%E5%A4%A9%EF%BC%89%EF%BC%8Cthree%20%E6%98%AF%20y%20%E6%9C%9D%E4%B8%8A%0Aconst%20root%20%3D%20new%20THREE.Group()%3B%0Aroot.rotation.x%20%3D%20-Math.PI%20%2F%202%3B%0Ascene.add(root)%3B%0A%0Aconst%20tileset%20%3D%20new%20S3MTileset(%7B%0A%20%20configUrl%3A%20'...%2Fjingmo.scp'%2C%0A%20%20maxTiles%3A%2064%2C%0A%20%20uniforms%2C%0A%20%20onTile%3A%20(node)%20%3D%3E%20root.add(node.group)%2C%20%20%2F%2F%20%E6%AF%8F%E4%B8%AA%E7%93%A6%E7%89%87%E4%B8%80%E4%B8%AA%20Group%EF%BC%8C%E5%9D%90%E6%A0%87%E6%98%AF%E7%B1%B3%E5%88%B6%E5%B1%80%E9%83%A8%20ENU%0A%7D)%3B%0Aawait%20tileset.init()%3B%20%20%2F%2F%20%E8%BF%94%E5%9B%9E%E6%97%B6%E9%A6%96%E6%A3%B5%E7%93%A6%E7%89%87%E5%B7%B2%E6%9E%84%E5%BB%BA%E5%AE%8C%E6%88%90%0A%0A%2F%2F%20%E6%AF%8F%E5%B8%A7%E9%A9%B1%E5%8A%A8%20LOD%EF%BC%9A%E7%9B%B8%E6%9C%BA%E4%BD%8D%E7%BD%AE%E8%A6%81%E5%8F%8D%E7%AE%97%E5%9B%9E%20ENU%EF%BC%88world%20x%2Cy%2Cz%20%E2%86%90%20ENU%20x%2C-z%2Cy%EF%BC%89%0Atileset.update(%0A%20%20%5Bcamera.position.x%2C%20-camera.position.z%2C%20camera.position.y%5D%2C%0A%20%20THREE.MathUtils.degToRad(camera.fov)%2C%0A%20%20renderer.domElement.height%0A)%3B">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>import * as THREE from &#39;three&#39;;
+import { S3MTileset, createSharedUniforms, STYLE, setMaxAnisotropy } from &#39;s3m-three&#39;;
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+setMaxAnisotropy(renderer.capabilities.getMaxAnisotropy()); // 纹理各向异性，越早调用越好
+
+const uniforms = createSharedUniforms();
+uniforms.uMode.value = STYLE.TEXTURE;  // 切样式就是改这个 int
+
+// S3M 顶点是局部 ENU（x 东 / y 北 / z 天），three 是 y 朝上
+const root = new THREE.Group();
+root.rotation.x = -Math.PI / 2;
+scene.add(root);
+
+const tileset = new S3MTileset({
+  configUrl: &#39;.../jingmo.scp&#39;,
+  maxTiles: 64,
+  uniforms,
+  onTile: (node) =&gt; root.add(node.group),  // 每个瓦片一个 Group，坐标是米制局部 ENU
+});
+await tileset.init();  // 返回时首棵瓦片已构建完成
+
+// 每帧驱动 LOD：相机位置要反算回 ENU（world x,y,z ← ENU x,-z,y）
+tileset.update(
+  [camera.position.x, -camera.position.z, camera.position.y],
+  THREE.MathUtils.degToRad(camera.fov),
+  renderer.domElement.height
+);</code></pre>
+          </div>
+        
+<p>需要自己补的部分（<code>S3MViewer</code> 不代劳）：</p>
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>事项</th><th>说明</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td>光照</td><td>渲染用的是 <code>MeshStandardMaterial</code>，自己加 <code>HemisphereLight</code> + <code>DirectionalLight</code></td></tr>
+<tr><td>多数据集对齐</td><td>每份数据各有锚点，<code>S3MViewer</code> 会把锚点差写进数据集的 <code>Group.position</code>（米），裸用法需要自己算一次</td></tr>
+<tr><td>贴地与经纬度</td><td>没有地图就没有墨卡托那一步，只有局部米制坐标</td></tr>
+<tr><td>拾取 / 描边 / 样式 UI</td><td><code>Picker</code>、等宽棱线、<code>setStyle</code> 都在 <code>S3MViewer</code> 上，裸用法要直接操作 <code>uniforms</code> 和 Mesh</td></tr>
+<tr><td>瓦片卸载</td><td>超出 <code>maxTiles</code> 时按「最久没进有效范围」淘汰，同帧再比距离</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+<hr />
+
+        <h2 id="底层-api" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#底层-api" class="heading-text">底层 API</a>
+        </h2>
+      
+
+        <h3 id="parses3mb" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#parses3mb" class="heading-text"><code>parseS3MB</code></a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="parseS3MB(buffer%3A%20ArrayBuffer%2C%20options%3F)%3A%20Promise%3CS3MParsedTile%3E">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>parseS3MB(buffer: ArrayBuffer, options?): Promise&lt;S3MParsedTile&gt;</code></pre>
+          </div>
+        
+<p>纯解析，<strong>不依赖 three</strong>，可在 Node 里跑：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="import%20%7B%20parseS3MB%20%7D%20from%20's3m-three%2Fcore'%3B%0Aimport%20%7B%20inflateSync%20%7D%20from%20'node%3Azlib'%3B%0A%0Aconst%20tile%20%3D%20await%20parseS3MB(buf%2C%20%7B%20inflate%3A%20inflateSync%20%7D)%3B%0Aconsole.log(tile.version%2C%20Object.keys(tile.geoPackage))%3B">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>import { parseS3MB } from &#39;s3m-three/core&#39;;
+import { inflateSync } from &#39;node:zlib&#39;;
+
+const tile = await parseS3MB(buf, { inflate: inflateSync });
+console.log(tile.version, Object.keys(tile.geoPackage));</code></pre>
+          </div>
+        
+<p>解析结果可用 <code>bytesRead === bytesTotal</code> 自检——不等说明偏移算错了。</p>
+
+        <h3 id="meshopt-压缩几何" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#meshopt-压缩几何" class="heading-text">MeshOpt 压缩几何</a>
+        </h3>
+      
+<p>v3 瓦片默认用 MeshOpt 压几何。解析器内部按需 <code>import</code> 内联的 meshoptimizer wasm 解码器（约 22KB），只有真的遇到 MeshOpt 瓦片才会加载，v1/v2 与未压缩的 v3 不受影响。</p>
+<p>解码后的顶点属性已经还原成 float，下游无感知：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">CODE</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="position%20%3D%20minVerticesValue%20%2B%20uint16%20*%20vertCompressConstant%0Atexcoord%20%3D%20minTexCoordValue%5Bi%5D%20%2B%20uint16%20*%20texCoordCompressConstant%5Bi%5D%0Anormal%20%20%20%3D%20octDecode(int16%20%2F%2032767)">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>position = minVerticesValue + uint16 * vertCompressConstant
+texcoord = minTexCoordValue[i] + uint16 * texCoordCompressConstant[i]
+normal   = octDecode(int16 / 32767)</code></pre>
+          </div>
+        
+<p>回归校验（60 个真实瓦片，校验偏移、索引范围、法线归一化、包围盒与 OBB 尺寸）：</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">BASH</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="npm%20run%20test%3Ameshopt">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>npm run test:meshopt</code></pre>
+          </div>
+        
+<p>需要 WebAssembly；不支持 wasm 的环境会在遇到 MeshOpt 瓦片时抛明确错误。</p>
+
+        <h3 id="s3mtileset" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#s3mtileset" class="heading-text"><code>S3MTileset</code></a>
+        </h3>
+      
+<p>单个数据集的瓦片树。不依赖 three，可以用注入的 <code>buildTile</code> 在 Node 里跑通完整链路（URL 解析 → 解析 → LOD 调度），适合做数据体检。</p>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="const%20ts%20%3D%20new%20S3MTileset(%7B%20configUrl%2C%20buildTile%3A%20async%20()%20%3D%3E%20(%7B%20group%3A%20null%2C%20stats%3A%20%7B%7D%20%7D)%20%7D)%3B%0Aawait%20ts.init()%3B%0Ats.update(%5B0%2C%200%2C%20500%5D%2C%200.64%2C%20900)%3B%20%2F%2F%20%E7%9B%B8%E6%9C%BA%E5%9C%A8%E5%B1%80%E9%83%A8%20ENU%20%E7%9A%84%E4%BD%8D%E7%BD%AE">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>const ts = new S3MTileset({ configUrl, buildTile: async () =&gt; ({ group: null, stats: {} }) });
+await ts.init();
+ts.update([0, 0, 500], 0.64, 900); // 相机在局部 ENU 的位置</code></pre>
+          </div>
+        
+
+        <h3 id="单体属性工具" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#单体属性工具" class="heading-text">单体属性工具</a>
+        </h3>
+      
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="resolveFeature(geo%2C%20batchId)%20%20%20%2F%2F%20%E2%86%92%20%7B%20smid%2C%20segments%20%7D%0AmeasureSegments(geometry%2C%20segments)%20%20%2F%2F%20%E2%86%92%20%E5%8C%85%E5%9B%B4%E7%9B%92%20%2B%20%E5%8D%95%E4%BD%93%E4%B8%89%E8%A7%92%E9%9D%A2%E6%95%B0%0AbuildAttributes(%7B%20smid%2C%20box%2C%20triangles%2C%20floorHeight%20%7D)%20%20%2F%2F%20%E2%86%92%20S3MFeatureAttributes">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>resolveFeature(geo, batchId)   // → { smid, segments }
+measureSegments(geometry, segments)  // → 包围盒 + 单体三角面数
+buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttributes</code></pre>
+          </div>
+        
+<hr />
+
+        <h2 id="性能调优" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#性能调优" class="heading-text">性能调优</a>
+        </h2>
+      
+
+      <div class="table-responsive my-6 overflow-x-auto rounded-xl border border-white/10 bg-[#121826]/70 shadow-lg">
+        <table class="w-full text-left text-sm text-slate-300">
+          <thead class="bg-white/5 text-slate-200 font-semibold border-b border-white/10">
+            <tr><th>手段</th><th>说明</th></tr>
+          </thead>
+          <tbody class="divide-y divide-white/5">
+            <tr><td><code>maxTiles</code></td><td>每个数据集驻留瓦片上限，默认 64。叠加 5 个数据集时建议 40~48</td></tr>
+<tr><td><code>maxConcurrent</code></td><td>每数据集并发，默认 4。公开服务建议 2~3</td></tr>
+<tr><td>关闭 <code>edges</code></td><td>棱线是 CPU 端构建的等宽线几何（每段线段 4 个顶点），内存和 drawcall 都随网格数增长，大场景慎用</td></tr>
+<tr><td><code>shading: &#39;flat&#39;</code></td><td>与 <code>&#39;smooth&#39;</code> 性能相当，但视觉更干净</td></tr>
+<tr><td>不透明度 < 1</td><td>会开启混合并关闭深度写入，overdraw 明显上升，仅用于演示</td></tr>
+<tr><td>批量改单体样式</td><td>同一同步块里的多次 <code>setFeatureStyle</code> 会合并成一次状态纹理重写，见下</td></tr>
+<tr><td><code>pick</code> 只渲染 1 个像素</td><td>已内置；hover 高亮、框选这类高频拾取不再有整屏开销</td></tr>
+          </tbody>
+        </table>
+      </div>
+    
+<p>实测（上海某区，5 数据集叠加，45 万三角面，1440×900）：<strong>85~90 fps</strong>。</p>
+
+        <h3 id="批量改单体样式" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#批量改单体样式" class="heading-text">批量改单体样式</a>
+        </h3>
+      
+<p>单体状态（颜色 / 抬高 / 隐藏）写在<strong>每个网格各自一张一维纹理</strong>里，改一个单体就是重写这张纹理。</p>
+<p>逐个高亮时最贵的就是这里：一块白模网格常有几千个 batch，每改一个单体就全量重算一遍，500 个门店 × 6848 个 batch 就是 340 万次迭代。</p>
+<p>所以内部做了两层合并：</p>
+<ul>
+<li><strong>按 SMID 定位网格</strong>：维护 <code>SMID → 网格</code> 反查表，改一个只重算包含它的那几块；</li>
+<li><strong>脏标记 + 微任务合并</strong>：同一个同步块里的多次调用只重算一次。微任务一定在下一帧 <code>renderFrame()</code> 之前跑完，画面不会看到中间状态。</li>
+</ul>
+
+          <div class="code-wrapper my-5 rounded-xl border border-white/10 bg-[#121826] overflow-hidden shadow-2xl">
+            <div class="flex items-center justify-between px-4 py-2 border-b border-white/5 bg-[#0e1420] text-xs font-mono text-slate-400 select-none">
+              <span class="font-semibold text-cyan-400 tracking-wider">TS</span>
+              <button class="copy-btn flex items-center gap-1.5 px-2.5 py-1 rounded bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white transition-all text-xs" data-code="%2F%2F%20300%20%E6%AC%A1%E8%B0%83%E7%94%A8%20%E2%86%92%201%20%E6%AC%A1%E7%BA%B9%E7%90%86%E9%87%8D%E5%86%99%0Afor%20(const%20smid%20of%20hits)%20viewer.setFeatureStyle(smid%2C%20%7B%20color%3A%20'%23ef4444'%20%7D)%3B%0A%0A%2F%2F%20%E9%9C%80%E8%A6%81%E5%90%8C%E6%AD%A5%E6%8B%BF%E5%88%B0%E7%BB%93%E6%9E%9C%EF%BC%88%E7%B4%A7%E6%8E%A5%E7%9D%80%E8%AF%BB%E7%BA%B9%E7%90%86%E3%80%81%E6%88%AA%E5%9B%BE%E3%80%81%E5%AF%BC%E5%87%BA%EF%BC%89%E6%97%B6%E6%89%8B%E5%8A%A8%E5%88%B7%0Aviewer.flushOverrides()%3B">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
+                <span class="copy-status">复制</span>
+              </button>
+            </div>
+            <pre class="p-4 overflow-x-auto text-sm leading-relaxed font-mono text-slate-200"><code>// 300 次调用 → 1 次纹理重写
+for (const smid of hits) viewer.setFeatureStyle(smid, { color: &#39;#ef4444&#39; });
+
+// 需要同步拿到结果（紧接着读纹理、截图、导出）时手动刷
+viewer.flushOverrides();</code></pre>
+          </div>
+        
+<p><code>filterByField</code> / <code>colorByField</code> / <code>elevateByField</code> / <code>setThematicColors</code> 这类<strong>全局</strong>改动会重算所有网格，但同样被合并成一次。</p>
+<hr />
+
+        <h2 id="已知限制" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#已知限制" class="heading-text">已知限制</a>
+        </h2>
+      
+<ul>
+<li><strong>Draco 压缩几何</strong>能识别、不能解码，遇到会抛明确错误。接法与 MeshOpt 相同（内联 wasm、按需 <code>import</code>、解码后走同一套 attribute 组装），但必须先拿 Draco 瓦片标定容器结构。MeshOpt 已支持，且是逐字节对过 60 个真实瓦片才做对的。</li>
+<li><strong>实例化单体</strong>（<code>pickInfo</code> 里给的是 <code>instanceIds</code> 而不是 <code>batchId</code>，白模常见）只做了渲染，没做按单体控制：<code>setFeatureStyle</code> / <code>filterByField</code> / <code>elevateByField</code> / GPU 拾取走的都是 <code>aBatchId</code>，这条路径对实例化几何不生效。要支持得把每个实例单独上色，得改 InstancedMesh 的 instanceColor + 拾取编码。</li>
+<li><strong>CRN 纹理</strong>已支持，且已在真实服务上验证：内联的 crunch wasm 转回 DXT 后走现成解码，DXT 具体格式看 CRN 头，wasm 约 76KB、只有真遇到 CRN 时才动态加载。<strong>判定看 <code>compressType</code> 而不是 <code>pixelFormat</code></strong>——实测 v3.00 是 <code>ct=26 / pf=13</code>、行标是 <code>ct=50000 / pf=32856</code>，按 <code>pixelFormat</code> 26 / 27 判断会把真实 CRN 整包丢掉（模型变灰模）。判定收敛在 <code>packages/s3m-three/src/core/TextureFormat.ts</code>（<code>resolveTextureKind</code> / <code>TextureCompress</code> / <code>dxtPixelFormatOf</code>，已从包入口导出）。用 <code>npm run probe:crn -- --crn &lt;数据集 config 地址&gt;</code> 可以对任意服务跑「尺寸吻合 / 色数 / 粗糙度 / ASCII 预览」的实测。</li>
+<li><strong>纹理分包（<code>s3m:TextureSharing</code>）未支持</strong>：这类数据集的 <code>tiles</code> 全是 <code>.s3mblock</code>，不是 <code>.s3mb</code>，加载会失败（例：SuperMap Online <code>3D-CBD/Xiaopin@CBD</code>）。</li>
+<li><strong>多块 MeshOpt 骨架</strong>（<code>blockCount &gt; 1</code>）暂未对齐：例 <code>3D-WorkSpace_pbr1/pbrmodel</code>，第二块头部按现有布局读会错位，会给出「流尺寸异常」的可定位报错而不是底层 RangeError。</li>
+<li><strong>切线顶点流</strong>只跳过不解码（渲染没有法线贴图通道），带 TANGENT 的数据不会被判失败。</li>
+<li><strong>KTX2</strong> 不在 S3M 的 <code>pixelFormat</code> 枚举里，iServer 也不会发；要支持需自行引入 <code>basis_transcoder.wasm</code> 并解析容器，属于「换数据源才需要考虑」的项。</li>
+<li><strong>骨骼动画</strong>解析了但未驱动。</li>
+<li>跨城市量级的数据集叠加会有 float32 精度问题。</li>
+</ul>
+<hr />
+
+        <h2 id="数据与许可" class="doc-heading group">
+          <span class="heading-anchor-link">#</span>
+          <a href="#数据与许可" class="heading-text">数据与许可</a>
+        </h2>
+      
+<ul>
+<li>本库代码 Apache-2.0。</li>
+<li><code>packages/s3m-three/src/core/DXTTextureDecode.ts</code> 来自 <a href="https://github.com/supermap/s3m-spec">SuperMap/s3m-spec</a>（Apache-2.0）。</li>
+<li><code>packages/s3m-three/src/vendor/crunch_decoder.module.js</code> 是 crunch 的 emscripten 构建（Apache-2.0），wasm 内联、仅改动加载方式。</li>
+<li><code>packages/s3m-three/src/vendor/meshopt_decoder.module.js</code> 是 <a href="https://github.com/zeux/meshoptimizer">meshoptimizer</a> 官方解码器（MIT，© Arseny Kapoulkine），未做修改。</li>
+<li>S3M 规范文本遵循 CC BY-ND 4.0，不得修改规范文本后再发布。</li>
+</ul>
+        
+        <footer class="mt-16 pt-8 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between text-xs text-slate-500 gap-4">
+          <p>© 2026 s3m 项目组 · Apache-2.0 开源协议</p>
+          <div class="flex items-center gap-4">
+            <a href="https://github.com/joo1es/s3m-maplibre" class="hover:text-slate-300">GitHub</a>
+            <span>·</span>
+            <a href="../demo/index.html" class="hover:text-slate-300">在线交互演示</a>
+          </div>
+        </footer>
+      </main>
+
+      <aside class="hidden xl:block w-56 shrink-0 py-8 pl-4 h-[calc(100vh-4rem)] sticky top-16 overflow-y-auto">
+        <div class="text-xs font-semibold text-slate-400 tracking-wider uppercase mb-3 select-none">
+          本页大纲
+        </div>
+        <ul class="space-y-1 border-l border-white/5 pl-2" id="tocLinks">
+          <li><a href="#目录" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">目录</a></li>
+<li><a href="#安装" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">安装</a></li>
+<li><a href="#typescript" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">TypeScript</a></li>
+<li><a href="#快速开始" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">快速开始</a></li>
+<li><a href="#核心概念" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">核心概念</a></li>
+<li><a href="#坐标链路" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">坐标链路</a></li>
+<li><a href="#锚点" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">锚点</a></li>
+<li><a href="#瓦片与-lod" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">瓦片与 LOD</a></li>
+<li><a href="#单体化" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">单体化</a></li>
+<li><a href="#s3mviewer" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">`S3MViewer`</a></li>
+<li><a href="#构造函数" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">构造函数</a></li>
+<li><a href="#挂载与帧驱动" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">挂载与帧驱动</a></li>
+<li><a href="#数据集管理" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">数据集管理</a></li>
+<li><a href="#样式与棱线" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">样式与棱线</a></li>
+<li><a href="#单体样式与状态" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">单体样式与状态</a></li>
+<li><a href="#字段着色-过滤-抬高" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">字段着色 / 过滤 / 抬高</a></li>
+<li><a href="#3d-物理地表与基坑" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">3D 物理地表与基坑</a></li>
+<li><a href="#拾取与空间查询" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">拾取与空间查询</a></li>
+<li><a href="#lod-与统计" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">LOD 与统计</a></li>
+<li><a href="#投影" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">投影</a></li>
+<li><a href="#释放" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">释放</a></li>
+<li><a href="#样式s3mstyle" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">样式（S3MStyle）</a></li>
+<li><a href="#着色模式" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">着色模式</a></li>
+<li><a href="#关于按单体配色" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">关于「按单体」配色</a></li>
+<li><a href="#关于-shading" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">关于 `shading`</a></li>
+<li><a href="#关于光照" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">关于光照</a></li>
+<li><a href="#拾取与属性" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">拾取与属性</a></li>
+<li><a href="#投影" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">投影</a></li>
+<li><a href="#按业务字段着色" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">按业务字段着色</a></li>
+<li><a href="#过滤-抬高" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">过滤 / 抬高</a></li>
+<li><a href="#为什么这么重以及怎么减" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">为什么这么重，以及怎么减</a></li>
+<li><a href="#纯-threejs-使用" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">纯 three.js 使用</a></li>
+<li><a href="#底层-api" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">底层 API</a></li>
+<li><a href="#parses3mb" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">`parseS3MB`</a></li>
+<li><a href="#meshopt-压缩几何" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">MeshOpt 压缩几何</a></li>
+<li><a href="#s3mtileset" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">`S3MTileset`</a></li>
+<li><a href="#单体属性工具" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">单体属性工具</a></li>
+<li><a href="#性能调优" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">性能调优</a></li>
+<li><a href="#批量改单体样式" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors ml-3 text-xs">批量改单体样式</a></li>
+<li><a href="#已知限制" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">已知限制</a></li>
+<li><a href="#数据与许可" class="toc-link block py-1 text-slate-400 hover:text-cyan-400 transition-colors font-medium text-xs">数据与许可</a></li>
+
+        </ul>
+      </aside>
+    </div>
+
+    <script>
+      document.querySelectorAll('.copy-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const raw = decodeURIComponent(btn.dataset.code || '');
+          try {
+            await navigator.clipboard.writeText(raw);
+            const status = btn.querySelector('.copy-status');
+            const orig = status.textContent;
+            status.textContent = '已复制！';
+            btn.classList.add('text-cyan-400');
+            setTimeout(() => {
+              status.textContent = orig;
+              btn.classList.remove('text-cyan-400');
+            }, 1800);
+          } catch (err) {
+            console.error('复制失败', err);
+          }
+        });
+      });
+
+      const headings = Array.from(document.querySelectorAll('.doc-heading'));
+      const tocLinks = Array.from(document.querySelectorAll('.toc-link'));
+      const sidebarLinks = Array.from(document.querySelectorAll('.sidebar-link'));
+
+      function onScroll() {
+        const top = window.scrollY + 100;
+        let currentId = '';
+        for (let i = 0; i < headings.length; i++) {
+          if (headings[i].offsetTop <= top) {
+            currentId = headings[i].id;
+          }
+        }
+        if (!currentId && headings.length > 0) currentId = headings[0].id;
+
+        tocLinks.forEach(link => {
+          const active = link.getAttribute('href') === '#' + currentId;
+          link.classList.toggle('active', active);
+        });
+
+        sidebarLinks.forEach(link => {
+          const active = link.getAttribute('href') === '#' + currentId;
+          link.classList.toggle('active', active);
+        });
+      }
+      window.addEventListener('scroll', onScroll, { passive: true });
+      onScroll();
+
+      const searchInput = document.getElementById('searchInput');
+      if (searchInput) {
+        searchInput.addEventListener('input', (e) => {
+          const query = e.target.value.toLowerCase().trim();
+          sidebarLinks.forEach(link => {
+            const text = link.textContent.toLowerCase();
+            link.style.display = (!query || text.includes(query)) ? '' : 'none';
+          });
+        });
+        window.addEventListener('keydown', (e) => {
+          if (e.key === '/' && document.activeElement !== searchInput) {
+            e.preventDefault();
+            searchInput.focus();
+          }
+        });
+      }
+
+      // 主题切换与系统自适应逻辑
+      const themeToggleBtn = document.getElementById('themeToggleBtn');
+      const themeSunIcon = document.getElementById('themeSunIcon');
+      const themeMoonIcon = document.getElementById('themeMoonIcon');
+
+      function updateThemeIcons(isDark) {
+        if (themeSunIcon && themeMoonIcon) {
+          themeSunIcon.classList.toggle('hidden', !isDark);
+          themeMoonIcon.classList.toggle('hidden', isDark);
+        }
+      }
+
+      function getEffectiveTheme() {
+        const saved = localStorage.getItem('s3m_doc_theme');
+        if (saved === 'light' || saved === 'dark') return saved;
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      }
+
+      function applyTheme(theme) {
+        const isDark = theme === 'dark';
+        document.documentElement.classList.toggle('dark', isDark);
+        updateThemeIcons(isDark);
+      }
+
+      // 初始化应用当前生效的主题
+      applyTheme(getEffectiveTheme());
+
+      // 实时监听系统颜色主题偏好变化（用户未手动覆盖时自动同步）
+      const systemThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
+      systemThemeQuery.addEventListener('change', (e) => {
+        if (!localStorage.getItem('s3m_doc_theme')) {
+          applyTheme(e.matches ? 'dark' : 'light');
+        }
+      });
+
+      if (themeToggleBtn) {
+        themeToggleBtn.addEventListener('click', () => {
+          const isDarkNow = document.documentElement.classList.contains('dark');
+          const nextTheme = isDarkNow ? 'light' : 'dark';
+          localStorage.setItem('s3m_doc_theme', nextTheme);
+          applyTheme(nextTheme);
+        });
+      }
+    </script>
+  </body>
+</html>

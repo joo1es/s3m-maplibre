@@ -50,7 +50,8 @@ tick();
 地理坐标通过可注入的 `GeoAdapter` 接口适配（默认标准 Web 墨卡托兜底）；
 接 MapLibre / Mapbox 请改用 [`s3m-maplibre`](https://www.npmjs.com/package/s3m-maplibre) 的 `S3MLayer`。
 
-完整文档、架构说明与在线演示见 <https://github.com/joo1es/s3m-maplibre>。
+完整 API 见 **[docs/API.md](./docs/API.md)**（样式系统、字段着色、底层解析、性能调优）；
+架构说明与在线演示见 <https://github.com/joo1es/s3m-maplibre>。
 
 ## 许可
 

@@ -1,6 +1,6 @@
-# API 参考
+# s3m-three API 参考
 
-> 对应 `s3m-maplibre` 的 `packages/s3m-maplibre/src/index.ts` 导出面
+> 对应 `s3m-three` 的 `packages/s3m-three/src/index.ts` 导出面
 
 ---
 
@@ -9,7 +9,7 @@
 - [安装](#安装)
 - [快速开始](#快速开始)
 - [核心概念](#核心概念)
-- [`S3MLayer`](#s3mlayer)
+- [`S3MViewer`](#s3mviewer)
 - [样式（S3MStyle）](#样式s3mstyle)
 - [拾取与属性](#拾取与属性)
 - [投影](#投影)
@@ -18,65 +18,63 @@
 - [底层 API](#底层-api)
 - [性能调优](#性能调优)
 - [已知限制](#已知限制)
+- [数据与许可](#数据与许可)
 
 ---
 
 ## 安装
 
 ```bash
-npm install s3m-maplibre three
+npm install s3m-three three
 ```
 
 `three` 是 peer 依赖，需要宿主项目自己提供（要求 `>=0.168.0`，该版本起自带 TypeScript 类型）。
 
-`maplibre-gl` **不是**本包的依赖：图层只是一个符合 `CustomLayerInterface` 的普通对象，你通过 `map.addLayer()` 挂上去即可。
+本包**不 import 任何地图 API**，宿主无关：可以单独用于任意 three 场景，也可以被上层适配层驱动（MapLibre / Mapbox 用法见 [s3m-maplibre](../s3m-maplibre/docs/API.md)，它内部就是在用本包）。
 
 ### TypeScript
 
 包内置类型声明（`dist/index.d.ts`），由 TS 源码直接编译产出，开箱可用。公开 API 会暴露 `THREE.Mesh` / `THREE.Group` 等对象，three `>=0.168` 自带类型；更老的版本需要 `@types/three`。
 
 ```ts
-import { S3MLayer, STYLE, type S3MPickResult } from 's3m-maplibre';
+import { S3MViewer, S3MTileset, STYLE, type PickResult } from 's3m-three';
 ```
-
-### 宿主兼容
-
-图层是 MapLibre / Mapbox 都能挂的普通对象，不依赖任何一方的类型：
-
-- `render(gl, matrix)` 同时接受 `Float32Array(16)`（MapLibre v4）、`{ defaultProjectionData: { mainMatrix } }`（MapLibre v5）和 `modelViewProjectionMatrix`（Mapbox）。
-- 只用到宿主的 `getCanvas / triggerRepaint / on / off / getBearing`，其余全部可选。
 
 ---
 
 ## 快速开始
 
-```ts
-import maplibregl from 'maplibre-gl';
-import { S3MLayer, STYLE } from 's3m-maplibre';
+`S3MViewer` 是把场景、相机、灯光、拾取、选中、样式都封好的宿主无关查看器，只差你自己喂帧：
 
-const map = new maplibregl.Map({
-  container: 'map',
-  style: 'https://demotiles.maplibre.org/style.json',
-  center: [121.4739, 31.244],
-  zoom: 16.5,
-  pitch: 60,
-  antialias: true, // 建筑边缘需要抗锯齿
+```js
+import * as THREE from 'three';
+import { S3MViewer } from 's3m-three';
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+document.body.appendChild(renderer.domElement);
+
+const viewer = new S3MViewer({
+  configUrl: '.../jingmo.scp',
+  onRequestRepaint: () => {},        // 接自己的渲染循环
+  getBearing: () => 0,               // 可选：让灯光跟着视角走
 });
+viewer.geo = null;                   // null = 标准 Web 墨卡托兜底；也可注入自定义 GeoAdapter
+viewer.mount(renderer.domElement, renderer.getContext());
 
-const layer = new S3MLayer({
-  datasets: [
-    {
-      id: 'jingmo',
-      name: '精模',
-      configUrl: 'https://host/iserver/services/svc/rest/realspace/datas/jingmo/data/path/jingmo.scp',
-    },
-  ],
-  style: { mode: STYLE.WHITE, opacity: 0.9 },
-  onPick: (f) => console.log(f?.smid, f?.height),
-});
-
-map.on('load', () => map.addLayer(layer));
+function tick() {
+  const mvp = new THREE.Matrix4();   // 你的 world→clip 矩阵
+  const p = camera.position;
+  viewer.renderFrame({
+    mvp: mvp.elements,
+    cameraEnu: [p.x, -p.z, p.y],     // three（y 朝上）→ ENU（z 朝上）
+    fovRad: THREE.MathUtils.degToRad(camera.fov),
+    canvasHeight: renderer.domElement.height,
+  });
+  requestAnimationFrame(tick);
+}
 ```
+
+完整可运行版本见仓库 `demo/three.js`（一个文件，含轨道控制、切片统计、样式切换）。
 
 ---
 
@@ -88,7 +86,7 @@ map.on('load', () => map.addLayer(layer));
 S3M 顶点（数据集局部 ENU，米）
   → 数据集 Group 偏移：把各数据集锚点对齐到「场景锚点」
   → L 矩阵：ENU → Web Mercator 归一化坐标
-  → MapLibre 传入的 mercator→clip 矩阵
+  → 宿主传入的 mercator→clip 矩阵
 ```
 
 three 场景原点固定在**场景锚点**（第一个成功加载的数据集的位置），所有顶点只保留「相对锚点的米」。这是 3D Tiles `RTC_CENTER` 的同类做法，目的是避免 float32 在墨卡托大坐标下抖动。
@@ -126,7 +124,7 @@ S3M 瓦片里可能带 `pickInfo`：`SMID → batchId + 顶点区间`。解析�
 先摸清数据能细到什么程度：
 
 ```ts
-const audit = layer.auditBatches();
+const audit = viewer.auditBatches();
 // { smids, batches, conflicts: [{ datasetId, batchId, smids }], conflictingSmids }
 ```
 
@@ -134,39 +132,66 @@ const audit = layer.auditBatches();
 
 ---
 
-## `S3MLayer`
+## `S3MViewer`
 
-MapLibre 自定义图层。`type === 'custom'`、`renderingMode === '3d'`。
+宿主无关的三维查看器：场景、相机、灯光、uniforms、拾取、选中描边、棱线、高度跟踪、数据集注册全在这里，不依赖任何地图 API。宿主只负责两件事——提供 WebGL 上下文（`mount`）和每帧喂矩阵（`renderFrame`）。
 
 ### 构造函数
 
 ```ts
-new S3MLayer(options?: S3MLayerOptions)
+new S3MViewer(options?: S3MViewerOptions)
 ```
 
 | 参数 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `id` | `string` | `'s3m'` | 图层 id |
 | `configUrl` | `string` | — | 单数据集简写 |
 | `datasets` | `S3MDatasetOptions[]` | `[]` | 多数据集叠加 |
 | `style` | `Partial<S3MStyle>` | 见[样式](#样式s3mstyle) | 初始样式 |
-| `pickable` | `boolean` | `true` | 是否响应点击 |
+| `ground` | `GroundOptions` | — | 3D 物理地表面 / 基坑开挖配置 |
+| `pickable` | `boolean` | `true` | 是否响应拾取 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
-| `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
-| `onStats` | `(s: S3MStats) => void` | — | 统计更新 |
+| `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
+| `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
+| `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，配了才能 `colorByField()`，见[按业务字段着色](#按业务字段着色) |
+| `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
+| `getBearing` | `() => number` | — | 地图朝向（弧度），让灯光跟着视角走；不传则灯光方向固定 |
+| `onStats` | `(s: Stats) => void` | — | 统计更新 |
 | `onReady` | `(entry) => void` | — | 某个数据集就绪 |
-| `onPick` | `(f: S3MPickResult \| null) => void` | — | 点击拾取结果 |
+| `onPick` | `(f: PickResult \| null) => void` | — | 拾取结果 |
 | `onError` | `(e: unknown) => void` | — | 瓦片加载 / 解析错误 |
 
 `configUrl` 与 `datasets` 二选一；同时给时以 `datasets` 为准。
+
+### 挂载与帧驱动
+
+```ts
+mount(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void
+unmount(): void
+renderFrame(opts: {
+  mvp: ArrayLike<number>;              // 宿主本帧的 world→clip 矩阵（ Mercator 归一化 → clip ）
+  cameraEnu: [number, number, number]; // 相机在场景 ENU 中的位置（米）
+  fovRad: number;                      // 本帧垂直视场角（弧度）
+  canvasHeight: number;                // 绘图缓冲高度，供 LOD 屏幕误差计算
+}): boolean                            // 返回 true = 本帧有变化，宿主应继续驱动下一帧
+```
+
+`mvp` 由宿主负责给出：地图宿主（如 s3m-maplibre）从 `render()` 入参提取；纯 three 宿主用自己的投影 × 视图矩阵。viewer 会在其后再乘 ENU → Mercator 矩阵，所以**传进来的 mvp 作用在 Mercator 归一化坐标上**，不是场景米制坐标。
+
+`geo` 是可写的 `GeoAdapter | null`：`null` 用内置的墨卡托兜底（`worldFromLngLat` / `lngLatFromWorld`），地图宿主注入适配器以支持任意 CRS / 自定义投影。
 
 ### 数据集管理
 
 ```ts
 addDataset(ds: S3MDatasetOptions): Promise<S3MDatasetEntry>
 removeDataset(id: string): void
+clearDatasets(): void
 setDatasetVisible(id: string, visible: boolean): void
+recomputeAnchors(): void                    // CRS 切换 / geo 重注入后重算锚点与 offset
+getDatasetHeight(id?: string): number
+setDatasetHeight(idOrHeight: string | number, heightOffset?: number): void
+setDatasetAlign(idOrAlign: string | DatasetAlignment, align?: DatasetAlignment): void
+computeAlignOffset(tileset: S3MTileset | null, align?: DatasetAlignment): number
 ```
 
 ```ts
@@ -175,81 +200,117 @@ interface S3MDatasetOptions {
   name?: string;        // 展示名
   configUrl: string;    // .scp 地址
   visible?: boolean;    // 默认 true
-  maxTiles?: number;    // 覆盖图层级配置
+  maxTiles?: number;    // 覆盖 viewer 级配置
 }
 ```
 
-`addDataset` 在图层 `onAdd` 之前调用会抛错（此时还没有 WebGL 上下文）。
+`addDataset` 在 `mount()` 之前调用会抛错（此时还没有 WebGL 上下文）。
 
-### 样式
+### 样式与棱线
 
 ```ts
 setStyle(patch?: Partial<S3MStyle>): void
 getStyle(): S3MStyle & { modeLabel: string }
+setOpacity(opacity: number): void
+setEdges(enabled: boolean): void
 ```
 
 `setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）之外，其余字段都是 uniform / 材质状态更新，热切换零成本。
 
-### 棱线
+棱线优先用**数据自带的棱线包**（`primitiveType === 13` 的索引包）：解析时就建好 `LineSegments`，开关只是切 `visible`，成本为零。数据里没有时才用 `EdgesGeometry` 在 CPU 端现算（8ms 一帧切片，超过 12 万索引直接跳过）。棱线画成**屏幕空间等宽线**（`packages/s3m-three/src/render/EdgeLines.ts`）：WebGL 的 `lineWidth` 恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。
+
+> 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺。
+
+### 单体样式与状态
 
 ```ts
-setEdges(enabled: boolean): void
+setFeatureStyle(smid: number, style: FeatureStyle): void
+setFeaturesStyle(smids: number[], style: FeatureStyle): void
+getFeatureStyle(smid: number): FeatureStyle | null
+getFeatureStyles(): Map<number, FeatureStyle>
+removeFeatureStyle(smid: number): void
+clearFeatureStyles(): void
+flushOverrides(): void          // 手动刷脏标记（紧接着读纹理 / 截图 / 导出前用）
+getAllMeshes(): THREE.Mesh[]    // 当前驻留的全部网格
 ```
 
-优先用**数据自带的棱线包**（`primitiveType === 13` 的索引包，本质是线段对）：解析时就建好 `LineSegments`，开关只是切 `visible`，成本为零，颜色跟随 `style.edgeColor`。
+### 字段着色 / 过滤 / 抬高
 
-数据里没有棱线包时才用 `EdgesGeometry` 在 CPU 端现算。几十万面一次性建会卡住主线程（实测 20 个网格 1.9s），所以内部按 8ms 一帧切片执行，超过 12 万索引的几何直接跳过。
+```ts
+setAttributeSource(options: AttributeQueryOptions | null): void
+getLoadedSmids(): number[]
+auditBatches(): BatchAudit
+getThematicField(): string | null
+setThematicColors(colors: Map<number, string> | null, field = 'custom'): void
+clearThematic(): void
+getFilterField(): string | null
+filterByField(options: FieldFilterOptions): Promise<FieldFilterResult>
+clearFieldFilter(): void
+getElevationField(): string | null
+elevateByField(options: FieldElevationOptions): Promise<FieldElevationResult>
+setThematicElevation(elevations: Map<number, number> | null, field = 'custom'): void
+clearThematicElevation(): void
+colorByField(options: ColorByFieldOptions): Promise<ThematicResult>
+setFilter(filter: S3MFilter | null): void
+getFilter(): S3MFilter | null
+clearFilter(): void
+```
 
-棱线本身画成**屏幕空间等宽线**（`packages/s3m-three/src/render/EdgeLines.ts`）：WebGL 的 `lineWidth` 在绝大多数平台被忽略、恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。因此：
+详见[按业务字段着色](#按业务字段着色)。
 
-- `edgeWidth`（像素）控全局棱线粗细，缩放时线宽恒定；
-- 选中单体的描边默认也走同一套画法（`outlineStyle: 'edges'`），只挑这个单体自己的三角面算折边，`outlineWidthPx` 控粗细；
-- 数据自带的棱线包是原始线段，仍是 1px，只受颜色 / 透明度控制。
+### 3D 物理地表与基坑
 
-> 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺，整片模型变成放射状三角面。
+```ts
+setGroundMode(mode: GroundMode): void
+setGroundOpacity(opacity: number): void
+setExcavationBounds(bounds: [number, number, number, number] | null): void
+```
 
 ### 拾取与空间查询
 
 ```ts
-pick(x: number, y: number): S3MPickResult | null
-pickFromEvent(e): S3MPickResult | null
+pick(x: number, y: number): PickResult | null
 pickPosition(x: number, y: number): { lngLat: [number, number]; altitude: number; point: [number, number, number] } | null
-drillPick(x: number, y: number, limit?: number): S3MPickResult[]
-select(result: S3MPickResult | null, opts?: { silent?: boolean }): void
+drillPick(x: number, y: number, limit?: number): PickResult[]
+getRayAt(x: number, y: number): THREE.Ray | null
+select(result: PickResult | null, opts?: { silent?: boolean }): void
 getFeatureBounds(smid: number): [[number, number], [number, number]] | null
-flyToFeature(smid: number, options?: Record<string, unknown>): boolean
 ```
 
-`pick` 的坐标是**相对 canvas 左上角的 CSS 像素**。`pickFromEvent` 接受 MapLibre 的 `MouseEvent` 或原生事件，自动换算。返回值包含单体属性、中心经纬度、以及精确交点世界坐标（`point: [x,y,z]`, `lngLat: [lng,lat]`, `altitude: number`）。
+坐标是**相对 canvas 左上角的 CSS 像素**（宿主适配层负责把鼠标事件换算过来）。返回值结构见[拾取与属性](#拾取与属性)。
 
-- `pickPosition(x, y)`：拾取指定屏幕像素对应的精确三维世界坐标。优先对命中的建筑网格精确表面求交；未命中建筑时与地表面（z=0）求交。
-- `drillPick(x, y, limit?)`：视线穿透拾取，沿射线命中所有单体，按由近至远距离排序返回。
-- `getFeatureBounds(smid)`：获取指定 SMID 单体的经纬度包围盒 `[[minLng, minLat], [maxLng, maxLat]]`（自动叠加单体平移/拔高）。
-- `flyToFeature(smid, options?)`：聚焦飞向单体，内部自动调用宿主地图的 `map.fitBounds`。
+拾取走 GPU：把「物体编号 + batchId」编码成 RGBA 渲染到 **1×1** 离屏目标再读那一个像素——viewport 仍是整块画布、原点平移到点击点，于是整幅画面按原样光栅化，只有点击点那一格落在目标上。代价与三角面数无关，且天然只命中最前面的可见面。
 
-拾取走 GPU：把「物体编号 + batchId」编码成 RGBA 渲染到离屏目标，再读那一个像素。代价与三角面数无关，且天然只命中最前面的可见面。
-
-离屏目标只有 **1×1**：viewport 尺寸仍是整块画布、原点平移到 `(-px, -(h-1-py))`，于是整幅画面按原样光栅化，只有点击点那一格落在目标上。着色器、矩阵、深度测试全都不变，但每点一次不再渲染一整屏（移动端收益最明显）。
-
-`select` 负责高亮与描边，传 `null` 清除选中。
-
-### 其他
+### LOD 与统计
 
 ```ts
-getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
-setProjection(mode: 'perspective' | 'orthographic'): void  // 投影模式，见[投影](#投影)
-setLodRangeScale(scale: number, datasetId?: string): void  // 缩放 LOD 切换距离阈值（>1 更倾向粗模，<1 提前细化）
+setLodRangeScale(scale: number, datasetId?: string): void
 readonly lodRangeScale: number
-readonly stats: S3MStats
+readonly stats: Stats
 readonly fps: number
-dispose(): void
+getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
 ```
 
 ```ts
-interface S3MStats {
+interface Stats {
   tiles: number; loading: number; failed: number;
   meshes: number; vertices: number; triangles: number; datasets: number;
 }
+```
+
+### 投影
+
+```ts
+setProjection(mode: 'perspective' | 'orthographic'): void  // 运行时切换，下一帧生效
+readonly projection: 'perspective' | 'orthographic'
+```
+
+内核只消费宿主给的 `mvp`；正交 MVP 由宿主在传入前自行替换，数学工具（`buildOrthoMVP` / `extractFovRadians` / `extractNearFar` / `extractProjectionMatrix`）从本包导出，见[投影](#投影)。
+
+### 释放
+
+```ts
+dispose(): void
 ```
 
 ---
@@ -285,7 +346,7 @@ interface S3MStyle {
 
 | 常量 | 值 | 说明 |
 |---|---|---|
-| `STYLE.WHITE` | 0 | 白膜：忽略贴图与顶点色，纯色 + 光照 |
+| `STYLE.WHITE` | 0 | 白模：忽略贴图与顶点色，纯色 + 光照 |
 | `STYLE.TEXTURE` | 1 | 原色：贴图 × 顶点色 |
 | `STYLE.SOLID` | 2 | 单色（`colorA`） |
 | `STYLE.HEIGHT` | 3 | 按高度连续渐变（`colorA` → `colorB`） |
@@ -313,16 +374,16 @@ interface S3MStyle {
 
 ### 关于光照
 
-主光与补光方向**每帧跟随地图 bearing 重算**（主光在镜头后上方偏左 150°、仰角 50°；补光偏右 215°、仰角 30°）。相当于一盏头灯，保证任意旋转角度下白模都是受光的，不会转到背光面就一片死灰。
+主光与补光方向**每帧跟随 `getBearing` 回调重算**（主光在镜头后上方偏左 150°、仰角 50°；补光偏右 215°、仰角 30°）。相当于一盏头灯，保证任意旋转角度下白模都是受光的，不会转到背光面就一片死灰。
 
-如果你需要固定的物理太阳方向，可以自行替换 `layer` 内部的 `_keyLight` / `_fillLight`（非公开 API，升级可能变化）。
+如果你需要固定的物理太阳方向，可以自行替换 viewer 内部的 `_keyLight` / `_fillLight`（非公开 API，升级可能变化）。
 
 ---
 
 ## 拾取与属性
 
 ```ts
-interface S3MPickResult {
+interface PickResult {
   datasetId: string;
   datasetName: string;
   objectId: number;      // 网格在图层内的编号
@@ -349,7 +410,7 @@ interface S3MPickResult {
 需要接业务属性时，用 `onPick` 拿到 `smid` 后自行查询：
 
 ```ts
-new S3MLayer({
+new S3MViewer({
   onPick: async (f) => {
     if (!f?.smid) return;
     const info = await fetch(`/api/building/${f.smid}`).then((r) => r.json());
@@ -362,13 +423,7 @@ new S3MLayer({
 
 ## 投影
 
-```ts
-new S3MLayer({ projection: 'orthographic' })   // 构造时指定
-layer.setProjection('orthographic' | 'perspective')  // 运行时切换，下一帧生效
-layer.projection  // 当前模式
-```
-
-MapLibre 没有正交相机，custom layer 每帧拿到的是透视 MVP。但 MapLibre ≥ 5 的 `render()` 入参会把 `projectionMatrix`（view→clip）和 `modelViewProjectionMatrix`（world→clip）分开给，视图矩阵可以精确解出来：
+内核消费的是宿主给的 `mvp`（Mercator 归一化 → clip），不区分透视 / 正交——**正交 MVP 由宿主在传入前自行替换**。MapLibre 宿主（s3m-maplibre 的 `S3MLayer`）的做法是：MapLibre ≥ 5 的 `render()` 入参会把 `projectionMatrix`（view→clip）和 `modelViewProjectionMatrix`（world→clip）分开给，视图矩阵可以精确解出来：
 
 ```
 V = P⁻¹ × MVP
@@ -377,13 +432,12 @@ V = P⁻¹ × MVP
 
 半高取「目标深度处透视视锥的半高」，于是正交与透视在目标平面上逐点重合；zoom 改的是相机距离，距离减半 = 半高减半 = 放大一倍，pan / pitch / rotate 与透视手感一致。拾取、选中描边、按单体着色 / 隐藏 / 抬高都读同一个相机，自动跟随，不需要额外适配。
 
-**边界**：
+边界：
 
-- 正交只覆盖本层。底图瓦片、地形、DOM Marker / 弹窗仍走 MapLibre 的透视投影，和正交层差 ≈ 楼高 / 相机距（城市尺度几十到上百像素，俯视时屋顶线就能差出 ~90px）。要用正交，App 需自行把这些层退出。
-- 需要 MapLibre ≥ 5（要拿到独立的投影矩阵）。v4 只给合并矩阵，会 `console.warn` 一次并保持透视，不会静默画错。
 - 解出的视图矩阵会做刚体校验（3×3 正交、底行 `[0,0,0,1]`）；校验不过说明两个输入矩阵不同源，同样退回透视并告警。
+- MapLibre < 5 只给合并矩阵，解不出独立投影矩阵，宿主会 `console.warn` 一次并保持透视，不会静默画错。
 
-底层数学在 `packages/s3m-three/src/render/OrthoProjection.ts`，`npm test` 里的 `tools/test-ortho.mjs` 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。
+底层数学在 `packages/s3m-three/src/render/OrthoProjection.ts`，从包入口导出（`buildOrthoMVP` / `extractFovRadians` / `extractNearFar` / `extractProjectionMatrix`），`npm test` 里的 `tools/test-ortho.mjs` 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。
 
 ---
 
@@ -392,8 +446,8 @@ V = P⁻¹ × MVP
 S3M 瓦片里**只有单体 ID**（SMID）和顶点区间，没有任何业务字段；业务属性在 iServer 的**数据服务**里（`data-xxx/rest/data`），和三维服务（`3D-xxx/rest/realspace`）是两个服务。所以按字段着色是「三维 + 数据」的跨服务查询，需要单独配一个数据源。
 
 ```ts
-const layer = new S3MLayer({
-  datasets: [{ id: 'jingmo', configUrl: '.../jingmo.scp' }],
+const viewer = new S3MViewer({
+  configUrl: '.../jingmo.scp',
   attributes: {
     dataServiceUrl: 'https://host/iserver/services/data-xxx/rest/data',
     datasetName: 'DataSource:zhoubian',   // 数据源:数据集，只写数据集名时默认补 DataSource:
@@ -402,11 +456,11 @@ const layer = new S3MLayer({
 });
 
 // 分类字段：同一取值同色
-const result = await layer.colorByField({ field: 'KEYID', type: 'category' });
+const result = await viewer.colorByField({ field: 'KEYID', type: 'category' });
 
 // 数值字段：连续色带 / 按阈值分级
-await layer.colorByField({ field: 'SmMaxZ', type: 'ramp' });
-await layer.colorByField({ field: 'SmMaxZ', type: 'breaks', breaks: [10, 30, 60] });
+await viewer.colorByField({ field: 'SmMaxZ', type: 'ramp' });
+await viewer.colorByField({ field: 'SmMaxZ', type: 'breaks', breaks: [10, 30, 60] });
 
 result.legend;    // [{ label, color, count }]  直接拿去画图例
 result.matched;   // 真正上了色的单体数
@@ -424,14 +478,14 @@ result.matched;   // 真正上了色的单体数
 
 ```ts
 // 自己算好颜色（比如按几何派生量：高度 / 面积 / 楼层）
-layer.setThematicColors(new Map([[423, '#ef4444'], [424, '#22c55e']]));
-layer.clearThematic();
+viewer.setThematicColors(new Map([[423, '#ef4444'], [424, '#22c55e']]));
+viewer.clearThematic();
 ```
 
-`AttributeQuery` 也能单独用（不依赖图层）：
+`AttributeQuery` 也能单独用（不依赖 viewer）：
 
 ```ts
-import { AttributeQuery } from 's3m-maplibre';
+import { AttributeQuery } from 's3m-three';
 
 const query = new AttributeQuery({ dataServiceUrl, datasetName: 'DataSource:zhoubian' });
 const schema = await query.loadSchema();          // [{ name: 'SmID' }, ...]，也能用来判断有没有属性表
@@ -446,29 +500,29 @@ const rows = await query.queryBySmids([423, 424]); // Map<smid, { SmID, ENTITYID
 
 ```ts
 // 只显示 30~80 米之间的建筑
-await layer.filterByField({ field: 'SmMaxZ', min: 30, max: 80 });
+await viewer.filterByField({ field: 'SmMaxZ', min: 30, max: 80 });
 
 // 按编码精确匹配（values 按 String(value) 比）
-await layer.filterByField({ field: 'KEYID', values: ['C10100SVK57YDUALQHRR00'] });
+await viewer.filterByField({ field: 'KEYID', values: ['C10100SVK57YDUALQHRR00'] });
 
 // 反过来：隐藏 20 米以下的
-await layer.filterByField({ field: 'SmMaxZ', max: 20, mode: 'hide' });
+await viewer.filterByField({ field: 'SmMaxZ', max: 20, mode: 'hide' });
 
 // 自定义条件
-await layer.filterByField({ field: 'SmMaxZ', keep: (v) => Number(v) > 100 });
+await viewer.filterByField({ field: 'SmMaxZ', keep: (v) => Number(v) > 100 });
 
-layer.clearFieldFilter();   // 恢复全量，不影响 setFilter() 的规则
+viewer.clearFieldFilter();   // 恢复全量，不影响 setFilter() 的规则
 
 // 抬高：字段值 × 倍率（米）
-await layer.elevateByField({ field: 'SmMaxZ', scale: 0.5 });
+await viewer.elevateByField({ field: 'SmMaxZ', scale: 0.5 });
 
 // 或者自己映射，第二个参数是数据分布
-await layer.elevateByField({
+await viewer.elevateByField({
   field: 'SmMaxZ',
   map: (v, r) => ((v - r.min) / (r.max - r.min)) * 200,
   max: 120, // 封顶
 });
-layer.clearThematicElevation();
+viewer.clearThematicElevation();
 ```
 
 返回值够用：`filterByField` 给 `{ total, matched, missing, hidden }`，`elevateByField` 给 `{ matched, missing, min, max, appliedMax }`。
@@ -526,14 +580,14 @@ attributes: {
 
 ## 纯 three.js 使用
 
-`S3MLayer` 是给地图用的，但下面的三层都是宿主无关的，可以直接塞进任意 three 场景（`demo/three.js` 是一个 150 行的完整例子）：
+`S3MViewer` 之下还有一层完全裸的用法：`core/` 解析与 `tileset/` 瓦片树都是宿主无关的，可以直接塞进任意 three 场景（`demo/three.js` 是一个完整例子，走的就是 `S3MViewer`；下面是不用 viewer 的最底层接法）：
 
 ```ts
 import * as THREE from 'three';
-import { S3MTileset, createSharedUniforms, STYLE, setMaxAnisotropy } from 's3m-maplibre';
+import { S3MTileset, createSharedUniforms, STYLE, setMaxAnisotropy } from 's3m-three';
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-setMaxAnisotropy(renderer.capabilities.getMaxAnisotropy()); // 纹理各向异性，越早越好
+setMaxAnisotropy(renderer.capabilities.getMaxAnisotropy()); // 纹理各向异性，越早调用越好
 
 const uniforms = createSharedUniforms();
 uniforms.uMode.value = STYLE.TEXTURE;  // 切样式就是改这个 int
@@ -559,14 +613,14 @@ tileset.update(
 );
 ```
 
-需要自己补的部分（`S3MLayer` 不代劳）：
+需要自己补的部分（`S3MViewer` 不代劳）：
 
 | 事项 | 说明 |
 |---|---|
 | 光照 | 渲染用的是 `MeshStandardMaterial`，自己加 `HemisphereLight` + `DirectionalLight` |
-| 多数据集对齐 | 每份数据各有锚点，`S3MLayer` 会把锚点差写进数据集的 `Group.position`（米），纯 three 需要自己算一次 |
+| 多数据集对齐 | 每份数据各有锚点，`S3MViewer` 会把锚点差写进数据集的 `Group.position`（米），裸用法需要自己算一次 |
 | 贴地与经纬度 | 没有地图就没有墨卡托那一步，只有局部米制坐标 |
-| 拾取 / 描边 / 样式 UI | `Picker`、等宽棱线、`setStyle` 都在 `S3MLayer` 上，纯 three 用法要直接操作 `uniforms` 和 Mesh |
+| 拾取 / 描边 / 样式 UI | `Picker`、等宽棱线、`setStyle` 都在 `S3MViewer` 上，裸用法要直接操作 `uniforms` 和 Mesh |
 | 瓦片卸载 | 超出 `maxTiles` 时按「最久没进有效范围」淘汰，同帧再比距离 |
 
 ---
@@ -582,7 +636,7 @@ parseS3MB(buffer: ArrayBuffer, options?): Promise<S3MParsedTile>
 纯解析，**不依赖 three**，可在 Node 里跑：
 
 ```ts
-import { parseS3MB } from 's3m-maplibre/core';
+import { parseS3MB } from 's3m-three/core';
 import { inflateSync } from 'node:zlib';
 
 const tile = await parseS3MB(buf, { inflate: inflateSync });
@@ -653,14 +707,14 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 所以内部做了两层合并：
 
 - **按 SMID 定位网格**：维护 `SMID → 网格` 反查表，改一个只重算包含它的那几块；
-- **脏标记 + 微任务合并**：同一个同步块里的多次调用只重算一次。微任务一定在下一帧 `render()` 之前跑完，画面不会看到中间状态。
+- **脏标记 + 微任务合并**：同一个同步块里的多次调用只重算一次。微任务一定在下一帧 `renderFrame()` 之前跑完，画面不会看到中间状态。
 
 ```ts
 // 300 次调用 → 1 次纹理重写
-for (const smid of hits) layer.setFeatureStyle(smid, { color: '#ef4444' });
+for (const smid of hits) viewer.setFeatureStyle(smid, { color: '#ef4444' });
 
 // 需要同步拿到结果（紧接着读纹理、截图、导出）时手动刷
-layer.flushOverrides();
+viewer.flushOverrides();
 ```
 
 `filterByField` / `colorByField` / `elevateByField` / `setThematicColors` 这类**全局**改动会重算所有网格，但同样被合并成一次。
@@ -677,7 +731,6 @@ layer.flushOverrides();
 - **切线顶点流**只跳过不解码（渲染没有法线贴图通道），带 TANGENT 的数据不会被判失败。
 - **KTX2** 不在 S3M 的 `pixelFormat` 枚举里，iServer 也不会发；要支持需自行引入 `basis_transcoder.wasm` 并解析容器，属于「换数据源才需要考虑」的项。
 - **骨骼动画**解析了但未驱动。
-- **地形遮挡**未实现：MapLibre 的地形深度没有写进 custom layer 的深度缓冲，建筑不会被地形裁掉。
 - 跨城市量级的数据集叠加会有 float32 精度问题。
 
 ---

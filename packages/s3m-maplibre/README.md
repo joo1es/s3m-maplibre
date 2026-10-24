@@ -27,6 +27,8 @@ map.addLayer(layer);
 
 多数据集叠加、白膜 / 按高度 / 按单体 / 动态扫描着色、单体级 GPU 拾取与属性查询、选中描边、正交投影等能力的完整文档见 <https://github.com/joo1es/s3m-maplibre>。
 
+完整 API 见 **[docs/API.md](./docs/API.md)**；样式系统、字段着色、底层解析等内核能力见 [`s3m-three` 的 API 文档](../s3m-three/docs/API.md)。
+
 不接地图、只要 three 场景？直接用 `s3m-three` 的 `S3MViewer`。
 
 ## 许可

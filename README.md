@@ -42,7 +42,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 白膜 / 单色 | ✅ | |
 | 按高度 / 按楼层着色 | ✅ | 高度范围自动统计 |
 | 按单体着色 | ✅ | 基于 S3M 单体化信息 |
-| 按业务字段着色 | ✅ | 走 iServer 数据服务查 SMID 属性，分类 / 色带 / 分级，见 [docs/API.md](./docs/API.md#按业务字段着色) |
+| 按业务字段着色 | ✅ | 走 iServer 数据服务查 SMID 属性，分类 / 色带 / 分级，见 [s3m-three API 文档](./packages/s3m-three/docs/API.md#按业务字段着色) |
 | 按业务字段过滤 / 抬高 | ✅ | 区间 / 取值 / 谓词过滤，字段值映射成抬高米数，同样只改一张一维纹理 |
 | 动态扫描 | ✅ | 扫描线沿高度循环 |
 | 透明度 | ✅ | 实时，不重编译着色器 |
@@ -140,7 +140,7 @@ map.on('click', (e) => {
 });
 ```
 
-完整接口见 **[开发指南与 API 文档（在线网页）](https://joo1es.github.io/s3m-maplibre/docs/index.html)** 或本地 **[docs/API.md](./docs/API.md)**。
+完整接口分两份，各管各的：**[s3m-maplibre API 参考（在线网页）](https://joo1es.github.io/s3m-maplibre/docs/index.html)** / [本地](./packages/s3m-maplibre/docs/API.md)，**[s3m-three 内核 API 参考](https://joo1es.github.io/s3m-maplibre/docs/three.html)** / [本地](./packages/s3m-three/docs/API.md)。
 
 ---
 
@@ -376,7 +376,7 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 | 拾取单次 | < 1 ms（与面数无关） |
 | 棱线构建 | 8ms 一帧切片，20 网格约 1.9s 总计，不阻塞交互 |
 
-调优建议见 [docs/API.md#性能调优](./docs/API.md#性能调优)。
+调优建议见 [s3m-three API 文档#性能调优](./packages/s3m-three/docs/API.md#性能调优)。
 
 ---
 
