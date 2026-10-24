@@ -10,6 +10,7 @@
  */
 import * as THREE from 'three';
 import type { StyleUniforms } from '../core/types.js';
+import { DEFAULT_FLOOR_HEIGHT } from '../core/FeatureInfo.js';
 
 /** 着色模式，数值与着色器里的 uMode 一一对应 */
 export const STYLE = {
@@ -57,6 +58,93 @@ export const SELECT_MODE_LABELS: Record<SelectMode, string> = {
   [SELECT_MODE.REPLACE]: '纯色覆盖 (Replace)',
   [SELECT_MODE.MULTIPLY]: '叠乘模式 (Multiply)',
   [SELECT_MODE.GLOW_ONLY]: '仅描边发光 (Glow)',
+};
+
+/* ------------------------------------------------------------------ 样式配置 */
+
+/** 图层整体样式（宿主无关，S3MViewer 与 s3m-maplibre 的 S3MLayer 共用） */
+export interface S3MStyle {
+  /** 着色模式，见 STYLE */
+  mode: StyleMode;
+  /** 主色：白膜 / 单色 / 渐变起点 / 动态扫描底色 */
+  colorA: string;
+  /** 渐变终点 / 楼层高段色 */
+  colorB: string;
+  /** 动态扫描的高亮带颜色 */
+  colorC: string;
+  /** 选中单体的高亮色 */
+  selectColor: string;
+  /** 选中单体的高亮模式：'overlay' 叠加原图 | 'replace' 纯色覆盖 | 'multiply' 叠乘 | 'glowOnly' 仅描边发光 */
+  selectMode?: SelectMode;
+  /** 选中高亮叠色强度 / 透明度（0~1，默认 0.65） */
+  selectOpacity?: number;
+  /** 选中自发光强度（0~1，默认 0.35） */
+  selectEmissive?: number;
+  /** 选中单体垂直拔高高度（米，默认 0） */
+  selectElevation?: number;
+  /** 楼层估算层高（米） */
+  floorHeight: number;
+  /** 动态扫描速度倍率 */
+  speed: number;
+  /** 整体不透明度，< 1 时自动开启混合并关闭深度写入 */
+  opacity: number;
+  /** 'flat' 平面着色（白模更干净） | 'smooth' 平滑着色（倾斜摄影更自然） */
+  shading: 'flat' | 'smooth';
+  /** 选中单体时是否压暗其余建筑 */
+  dimOthers: boolean;
+  /** 未选中建筑压暗系数（0~1，默认 0.42） */
+  dimFactor?: number;
+  /** 是否给选中单体描边 */
+  outline: boolean;
+  /** 选中描边的画法：'edges' 单体棱线（默认）| 'hull' 背面外扩轮廓 */
+  outlineStyle?: 'edges' | 'hull';
+  /** 描边颜色（默认跟随 selectColor） */
+  outlineColor?: string;
+  /** 外扩轮廓的粗细（米，默认 0.9，仅 outlineStyle: 'hull' 生效） */
+  outlineWidth?: number;
+  /** 选中棱线的粗细（像素，默认 3，仅 outlineStyle: 'edges' 生效，缩放时保持恒定） */
+  outlineWidthPx?: number;
+  /** 是否显示几何棱线（CPU 端生成，有开销） */
+  edges: boolean;
+  /** 全局棱线粗细（像素，默认 1.2） */
+  edgeWidth?: number;
+  edgeColor: string;
+  edgeOpacity?: number;
+  roofThreshold?: number;
+  /** 是否与模型原色贴图叠加混合（0 = 纯色覆盖，1 = 叠乘原色贴图） */
+  texMix?: number;
+  /** 半透明时是否保持深度写入（默认 true，保持写入可彻底遮挡背面与内部棱线，避免背面透出） */
+  depthWrite?: boolean;
+}
+
+export const DEFAULT_STYLE: S3MStyle = {
+  mode: STYLE.TEXTURE,
+  colorA: '#dfe6ee',
+  colorB: '#1d4ed8',
+  colorC: '#fbbf24',
+  selectColor: '#22d3ee',
+  selectMode: SELECT_MODE.OVERLAY,
+  selectOpacity: 0.65,
+  selectEmissive: 0.35,
+  selectElevation: 0,
+  floorHeight: DEFAULT_FLOOR_HEIGHT,
+  speed: 1,
+  opacity: 1,
+  shading: 'flat',
+  dimOthers: true,
+  dimFactor: 0.42,
+  outline: true,
+  outlineStyle: 'edges',
+  outlineColor: '#22d3ee',
+  outlineWidth: 0.9,
+  outlineWidthPx: 3,
+  edges: false,
+  edgeWidth: 1.2,
+  edgeColor: '#334155',
+  edgeOpacity: 0.45,
+  roofThreshold: 0.65,
+  texMix: 0,
+  depthWrite: true,
 };
 
 export interface StyledMaterial extends THREE.MeshStandardMaterial {

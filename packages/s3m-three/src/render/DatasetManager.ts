@@ -10,7 +10,7 @@
 import * as THREE from 'three';
 import { S3MTileset } from '../tileset/S3MTileset.js';
 import type { Anchor } from '../core/types.js';
-import { worldFromLngLat, lngLatFromWorld, type MapLike } from './CoordinateHelper.js';
+import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 
 export type DatasetAlignment = 'origin' | 'bottom' | 'top' | 'center';
 
@@ -86,7 +86,7 @@ export class DatasetManager {
   async addDataset(
     ds: S3MDatasetOptions,
     scene: THREE.Scene,
-    map: MapLike | null,
+    geo: GeoAdapter | null,
     uniforms: any,
     defaultLodRangeScale: number,
     buildTile: any,
@@ -153,7 +153,7 @@ export class DatasetManager {
     entry.anchor = tileset.anchor;
     entry.baseAlignOffset = this.computeAlignOffset(tileset, ds.align);
     entry.heightOffset = entry.baseAlignOffset + (ds.heightOffset ?? 0);
-    this.layoutDataset(entry, map);
+    this.layoutDataset(entry, geo);
     callbacks.onReady(entry);
     callbacks.triggerRepaint();
     return entry;
@@ -165,7 +165,7 @@ export class DatasetManager {
   removeDataset(
     id: string,
     scene: THREE.Scene,
-    map: MapLike | null,
+    geo: GeoAdapter | null,
     cleanTileMeshes: (entry: S3MDatasetEntry) => void
   ): boolean {
     const entry = this.datasets.get(id);
@@ -177,7 +177,7 @@ export class DatasetManager {
     this.datasets.delete(id);
 
     if (this.datasets.size > 0) {
-      this.recomputeAnchors(map);
+      this.recomputeAnchors(geo);
     } else {
       this.sceneAnchor = null;
     }
@@ -200,13 +200,13 @@ export class DatasetManager {
   /**
    * 布局数据集局部 ENU 与场景锚点对齐
    */
-  layoutDataset(entry: S3MDatasetEntry, map: MapLike | null): void {
+  layoutDataset(entry: S3MDatasetEntry, geo: GeoAdapter | null): void {
     if (!entry.anchor) return;
     if (!this.sceneAnchor) {
-      this.sceneAnchor = worldFromLngLat(map, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
+      this.sceneAnchor = worldFromLngLat(geo, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     }
     const s = this.sceneAnchor.meterInMercator;
-    const a = worldFromLngLat(map, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
+    const a = worldFromLngLat(geo, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     entry.offset = [
       (a.x - this.sceneAnchor.x) / s,
       -(a.y - this.sceneAnchor.y) / s,
@@ -219,11 +219,11 @@ export class DatasetManager {
   /**
    * 当地图投影或主锚点变化时，重新对齐所有数据集
    */
-  recomputeAnchors(map: MapLike | null): void {
+  recomputeAnchors(geo: GeoAdapter | null): void {
     if (this.datasets.size === 0) return;
     this.sceneAnchor = null;
     for (const entry of this.datasets.values()) {
-      this.layoutDataset(entry, map);
+      this.layoutDataset(entry, geo);
     }
   }
 
@@ -238,24 +238,24 @@ export class DatasetManager {
   /**
    * 设置垂直高程偏移（米）
    */
-  setDatasetHeight(id: string, height: number, map: MapLike | null): void {
+  setDatasetHeight(id: string, height: number, geo: GeoAdapter | null): void {
     const entry = this.datasets.get(id);
     if (!entry) return;
     entry.heightOffset = height;
-    this.layoutDataset(entry, map);
+    this.layoutDataset(entry, geo);
   }
 
   /**
    * 动态设置指定数据集的垂直对齐基准（'origin' | 'bottom' | 'top' | 'center'）
    */
-  setDatasetAlign(id: string, align: DatasetAlignment, map: MapLike | null): void {
+  setDatasetAlign(id: string, align: DatasetAlignment, geo: GeoAdapter | null): void {
     const entry = this.datasets.get(id);
     if (!entry) return;
     const manualOffset = entry.heightOffset - entry.baseAlignOffset;
     entry.baseAlignOffset = this.computeAlignOffset(entry.tileset, align);
     entry.heightOffset = entry.baseAlignOffset + manualOffset;
     entry.options.align = align;
-    this.layoutDataset(entry, map);
+    this.layoutDataset(entry, geo);
   }
 
   /**

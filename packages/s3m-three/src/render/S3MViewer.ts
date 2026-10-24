@@ -1,18 +1,24 @@
 /**
- * S3M × MapLibre / Mapbox 图层
+ * S3M × three 场景查看器（宿主无关渲染内核）
  *
- * 坐标链路：
+ * 这是 s3m-three 的核心：把 S3M 瓦片渲染进一个普通的 three 场景，
+ * 不依赖 MapLibre / Mapbox 或任何地图宿主。坐标链路：
+ *
  *   S3M 顶点（数据集局部 ENU，米）
  *     → 数据集 Group 偏移：把各数据集锚点对齐到「场景锚点」
- *     → L 矩阵：ENU → Web Mercator 归一化坐标
- *     → 宿主传入的 mercator→clip 矩阵
+ *     → L 矩阵：ENU → 世界坐标（由宿主通过 GeoAdapter 定义）
+ *     → 宿主的 world→clip 矩阵（每帧由宿主喂进来）
  *
  * 关键点：three 场景原点固定在**场景锚点**（第一个数据集的位置），
- * 所有顶点只保留「相对锚点的米」，避免 float32 在墨卡托大坐标下的抖动（RTC 思路）。
+ * 所有顶点只保留「相对锚点的米」，避免 float32 在大坐标下的抖动（RTC 思路）。
  * 多数据集叠加时，每个数据集一个 Group，用 position 承担锚点差。
  *
- * 兼容性：图层只依赖 `MapLike` 这组鸭子类型接口，MapLibre GL JS v4/v5 与
- * Mapbox GL JS v2/v3 都可以直接 `map.addLayer(layer)`，不引入任一方的类型依赖。
+ * 与宿主的全部接触点只有三个，都是注入式的：
+ *   - `onRequestRepaint`  宿主需要重画的信号（MapLibre 就是 triggerRepaint）
+ *   - `getBearing`        地图朝向，用来让灯光跟着视角走（可选）
+ *   - `GeoAdapter`        经纬度 ↔ 世界坐标（见 GeoAdapter.ts，有墨卡托兜底）
+ *
+ * MapLibre / Mapbox 的胶水层在 s3m-maplibre 包的 S3MLayer.ts。
  */
 import * as THREE from 'three';
 import { S3MTileset } from '../tileset/S3MTileset.js';
@@ -22,11 +28,11 @@ import {
   STYLE,
   STYLE_LABELS,
   SELECT_MODE,
-  SELECT_MODE_LABELS,
+  DEFAULT_STYLE,
   createSharedUniforms,
   createOutlineMaterial,
 } from './StyleMaterial.js';
-import type { OutlineMaterial, StyledMaterial, StyleMode, SelectMode } from './StyleMaterial.js';
+import type { OutlineMaterial, StyledMaterial, StyleMode, SelectMode, S3MStyle } from './StyleMaterial.js';
 import { Picker } from './Picker.js';
 import {
   buildFeatureEdgeSegments,
@@ -35,13 +41,6 @@ import {
   createThickLineMaterial,
 } from './EdgeLines.js';
 import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
-import {
-  buildOrthoMVP,
-  extractFovRadians,
-  extractNearFar,
-  extractProjectionMatrix,
-  type ProjectionMode,
-} from './OrthoProjection.js';
 import {
   resolveFeature,
   measureSegments,
@@ -64,18 +63,7 @@ import type {
   StyleUniforms,
 } from '../core/types.js';
 
-import {
-  EARTH_RADIUS,
-  DEFAULT_FOV,
-  type MapLike,
-  type WorldCoordinateHelperLike,
-  type MapMouseEventLike,
-  extractWorldCoordinateHelper,
-  mercatorFromLngLat,
-  lngLatFromMercator,
-  worldFromLngLat,
-  lngLatFromWorld,
-} from './CoordinateHelper.js';
+import { lngLatFromWorld, type GeoAdapter } from './GeoAdapter.js';
 
 import {
   DatasetManager,
@@ -106,12 +94,12 @@ import {
 } from './GroundManager.js';
 
 export type {
-  MapLike,
-  WorldCoordinateHelperLike,
-  MapMouseEventLike,
   DatasetAlignment,
   S3MDatasetOptions,
   S3MDatasetEntry,
+} from './DatasetManager.js';
+
+export type {
   FeatureStyle,
   ColorByFieldOptions,
   ThematicLegendEntry,
@@ -123,99 +111,16 @@ export type {
   FieldElevationOptions,
   FieldElevationResult,
   S3MFilter,
+} from './FeatureStyleManager.js';
+
+export type {
   GroundMode,
   GroundOptions,
-};
+} from './GroundManager.js';
 
 export { GroundManager, DatasetManager, FeatureStyleManager };
 
 const MAX_PICK_ID = 65534;
-
-/* ------------------------------------------------------------------ 配置 */
-
-export interface S3MStyle {
-  /** 着色模式，见 STYLE */
-  mode: StyleMode;
-  /** 主色：白膜 / 单色 / 渐变起点 / 动态扫描底色 */
-  colorA: string;
-  /** 渐变终点 / 楼层高段色 */
-  colorB: string;
-  /** 动态扫描的高亮带颜色 */
-  colorC: string;
-  /** 选中单体的高亮色 */
-  selectColor: string;
-  /** 选中单体的高亮模式：'overlay' 叠加原图 | 'replace' 纯色覆盖 | 'multiply' 叠乘 | 'glowOnly' 仅描边发光 */
-  selectMode?: SelectMode;
-  /** 选中高亮叠色强度 / 透明度（0~1，默认 0.65） */
-  selectOpacity?: number;
-  /** 选中自发光强度（0~1，默认 0.35） */
-  selectEmissive?: number;
-  /** 选中单体垂直拔高高度（米，默认 0） */
-  selectElevation?: number;
-  /** 楼层估算层高（米） */
-  floorHeight: number;
-  /** 动态扫描速度倍率 */
-  speed: number;
-  /** 整体不透明度，< 1 时自动开启混合并关闭深度写入 */
-  opacity: number;
-  /** 'flat' 平面着色（白模更干净） | 'smooth' 平滑着色（倾斜摄影更自然） */
-  shading: 'flat' | 'smooth';
-  /** 选中单体时是否压暗其余建筑 */
-  dimOthers: boolean;
-  /** 未选中建筑压暗系数（0~1，默认 0.42） */
-  dimFactor?: number;
-  /** 是否给选中单体描边 */
-  outline: boolean;
-  /** 选中描边的画法：'edges' 单体棱线（默认）| 'hull' 背面外扩轮廓 */
-  outlineStyle?: 'edges' | 'hull';
-  /** 描边颜色（默认跟随 selectColor） */
-  outlineColor?: string;
-  /** 外扩轮廓的粗细（米，默认 0.9，仅 outlineStyle: 'hull' 生效） */
-  outlineWidth?: number;
-  /** 选中棱线的粗细（像素，默认 3，仅 outlineStyle: 'edges' 生效，缩放时保持恒定） */
-  outlineWidthPx?: number;
-  /** 是否显示几何棱线（CPU 端生成，有开销） */
-  edges: boolean;
-  /** 全局棱线粗细（像素，默认 1.2） */
-  edgeWidth?: number;
-  edgeColor: string;
-  edgeOpacity?: number;
-  roofThreshold?: number;
-  /** 是否与模型原色贴图叠加混合（0 = 纯色覆盖，1 = 叠乘原色贴图） */
-  texMix?: number;
-  /** 半透明时是否保持深度写入（默认 true，保持写入可彻底遮挡背面与内部棱线，避免背面透出） */
-  depthWrite?: boolean;
-}
-
-export const DEFAULT_STYLE: S3MStyle = {
-  mode: STYLE.TEXTURE,
-  colorA: '#dfe6ee',
-  colorB: '#1d4ed8',
-  colorC: '#fbbf24',
-  selectColor: '#22d3ee',
-  selectMode: SELECT_MODE.OVERLAY,
-  selectOpacity: 0.65,
-  selectEmissive: 0.35,
-  selectElevation: 0,
-  floorHeight: DEFAULT_FLOOR_HEIGHT,
-  speed: 1,
-  opacity: 1,
-  shading: 'flat',
-  dimOthers: true,
-  dimFactor: 0.42,
-  outline: true,
-  outlineStyle: 'edges',
-  outlineColor: '#22d3ee',
-  outlineWidth: 0.9,
-  outlineWidthPx: 3,
-  edges: false,
-  edgeWidth: 1.2,
-  edgeColor: '#334155',
-  edgeOpacity: 0.45,
-  roofThreshold: 0.65,
-  texMix: 0,
-  depthWrite: true,
-};
 
 export interface PickResult extends FeatureAttributes {
   datasetId: string;
@@ -238,8 +143,7 @@ export interface PickResult extends FeatureAttributes {
   mesh: THREE.Mesh;
 }
 
-export interface S3MLayerOptions {
-  id?: string;
+export interface S3MViewerOptions {
   /** 单数据集简写 */
   configUrl?: string;
   /** 多数据集 */
@@ -261,14 +165,10 @@ export interface S3MLayerOptions {
    * 配上之后才能用 `colorByField()` 按业务字段着色 —— 属性值不在 S3M 瓦片里，只能去数据服务查。
    */
   attributes?: AttributeQueryOptions;
-  /**
-   * 投影模式，默认 `'perspective'`（跟随 MapLibre，与底图严格对齐）。
-   * `'orthographic'` 让本层按正交投影重画：视图矩阵从 MapLibre 每帧输入反推，
-   * pan / zoom / pitch / rotate 与拾取、选中描边全部照常。
-   * 注意正交只覆盖本层——底图、地形、DOM Marker 仍走 MapLibre 的透视投影，
-   * 会与本层对不齐，需要 App 自行退出，详见 README「正交投影」。
-   */
-  projection?: ProjectionMode;
+  /** 宿主请求重画的信号。MapLibre 传 `() => map.triggerRepaint()`；纯 three 宿主传自己的渲染循环 */
+  onRequestRepaint?: () => void;
+  /** 地图朝向（弧度），用于让灯光跟着视角走。不传则灯光方向固定 */
+  getBearing?: () => number;
   onStats?: (stats: Stats) => void;
   onReady?: (entry: S3MDatasetEntry) => void;
   onPick?: (result: PickResult | null) => void;
@@ -313,19 +213,18 @@ function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
 
 /* ------------------------------------------------------------------ 图层 */
 
-export class S3MLayer {
-  readonly id: string;
-  readonly type = 'custom' as const;
-  readonly renderingMode = '3d' as const;
-
-  readonly options: S3MLayerOptions;
+export class S3MViewer {
+  readonly options: S3MViewerOptions;
   readonly pickable: boolean;
   onStats: (stats: Stats) => void;
   onReady: (entry: S3MDatasetEntry) => void;
   onPick: (result: PickResult | null) => void;
   onError: (error: unknown) => void;
 
-  map: MapLike | null = null;
+  /** 宿主地理坐标适配器；mount 前由宿主注入，null = 标准 Web 墨卡托兜底 */
+  geo: GeoAdapter | null = null;
+  /** 宿主画布与 WebGL 上下文，mount() 时绑定 */
+  canvas: HTMLCanvasElement | null = null;
   renderer: THREE.WebGLRenderer | null = null;
   scene: THREE.Scene | null = null;
   camera: THREE.Camera | null = null;
@@ -392,17 +291,22 @@ export class S3MLayer {
 
   private readonly _datasetQueue: S3MDatasetOptions[];
 
-  /** 投影模式；正交不可用时（老版本 MapLibre）自动退回透视并告警一次 */
-  private _projection: ProjectionMode = 'perspective';
-  private _orthoWarned = false;
+  /** 宿主重画信号与地图朝向，构造时注入 */
+  private _onRequestRepaint: () => void = () => {};
+  private _getBearing: (() => number) | undefined;
   private _lodRangeScale = 1.0;
 
-  constructor(options: S3MLayerOptions = {}) {
-    this.id = options.id ?? 's3m';
+  /** 宿主请求重画（MapLibre 传 triggerRepaint，纯 three 宿主传自己的渲染循环） */
+  private _requestRepaint(): void {
+    this._onRequestRepaint();
+  }
+
+  constructor(options: S3MViewerOptions = {}) {
     this.options = options;
     this.pickable = options.pickable !== false;
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
-    this._projection = options.projection === 'orthographic' ? 'orthographic' : 'perspective';
+    this._onRequestRepaint = options.onRequestRepaint ?? (() => {});
+    this._getBearing = options.getBearing;
     this.onStats = options.onStats ?? (() => {});
     this.onReady = options.onReady ?? (() => {});
     this.onPick = options.onPick ?? (() => {});
@@ -411,7 +315,7 @@ export class S3MLayer {
     this.groundManager = new GroundManager(options.ground);
     this._featureStyleManager = new FeatureStyleManager(
       () => this.style.floorHeight,
-      () => this.map?.triggerRepaint(),
+      () => this._requestRepaint(),
       () => {
         if (this._selection) this._syncSelectionStyle();
       },
@@ -440,17 +344,17 @@ export class S3MLayer {
     if (options.attributes) this.attributeQuery = new AttributeQuery(options.attributes);
   }
 
-  private readonly _onProjectionChange = (): void => {
-    this._recomputeAnchors();
-  };
-
   /* ---------------------------------------------------------------- 生命周期 */
 
-  onAdd(map: MapLike, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
-    this.map = map;
+  /**
+   * 绑定宿主画布与 WebGL 上下文，建场景并启动数据集队列。
+   * MapLibre 宿主由 S3MLayer 在 onAdd 里调用；纯 three 宿主直接传自己的 canvas / gl。
+   */
+  mount(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+    this.canvas = canvas;
 
     this.renderer = new THREE.WebGLRenderer({
-      canvas: map.getCanvas(),
+      canvas,
       context: gl as WebGLRenderingContext,
       antialias: true,
     });
@@ -474,22 +378,10 @@ export class S3MLayer {
     for (const ds of this._datasetQueue) void this.addDataset(ds).catch((e) => this.onError(e));
 
     this._recomputeAnchors();
-
-    map.on('click', this._onClick);
-    // MapLibre v6 起 setProjection() 会 fire 'projectiontransition'（style.ts 的
-    // _setProjectionInternal 里触发）。事件名必须是全称，写 'projection' 永远不会触发。
-    // v4 / v5 / Mapbox 没有这个事件，监听一个不存在的事件名是安全的（只是不 fire），
-    // 而 v4/v5 本来也不支持运行时切投影，初始投影在 onAdd 的 _recomputeAnchors 里已覆盖。
-    if (typeof map.on === 'function') {
-      map.on('projectiontransition', this._onProjectionChange);
-    }
   }
 
-  onRemove(): void {
-    this.map?.off('click', this._onClick);
-    if (typeof this.map?.off === 'function') {
-      this.map.off('projectiontransition', this._onProjectionChange);
-    }
+  /** 解绑场景并释放全部 GPU 资源。对应 MapLibre 图层的 onRemove()。 */
+  unmount(): void {
     for (const id of [...this.datasets.keys()]) this.removeDataset(id);
     this.groundManager.dispose();
     this.picker?.dispose();
@@ -509,7 +401,7 @@ export class S3MLayer {
     this._heightMax = -Infinity;
     this.renderer?.dispose();
     this.renderer = null;
-    this.map = null;
+    this.canvas = null;
   }
 
   private _addLights(): void {
@@ -529,7 +421,7 @@ export class S3MLayer {
    * 相当于一盏头灯，看到的立面永远是受光面。
    */
   private _updateLights(): void {
-    const bearing = ((this.map?.getBearing?.() ?? 0) * Math.PI) / 180;
+    const bearing = ((this._getBearing?.() ?? 0) * Math.PI) / 180;
     const place = (light: THREE.DirectionalLight | null, azOffsetDeg: number, elevDeg: number): void => {
       if (!light) return;
       const az = bearing + (azOffsetDeg * Math.PI) / 180;
@@ -543,7 +435,7 @@ export class S3MLayer {
 
   /* ---------------------------------------------------------------- 数据集 */
 
-  private _normalizeDatasets(options: S3MLayerOptions): S3MDatasetOptions[] {
+  private _normalizeDatasets(options: S3MViewerOptions): S3MDatasetOptions[] {
     if (Array.isArray(options.datasets)) return options.datasets.filter((d) => !!d?.configUrl);
     if (options.configUrl) return [{ id: 'default', name: '默认数据集', configUrl: options.configUrl }];
     return [];
@@ -555,7 +447,7 @@ export class S3MLayer {
     const entry = await this._datasetManager.addDataset(
       ds,
       this.scene,
-      this.map,
+      this.geo,
       this.uniforms,
       this._lodRangeScale,
       this.options.buildTile,
@@ -566,17 +458,17 @@ export class S3MLayer {
           this._registerTile(node, e);
           this.onStats(this.stats);
           this._needsRepaint = true;
-          this.map?.triggerRepaint();
+          this._requestRepaint();
         },
         onTileRemoved: (node, e) => {
           this._unregisterTile(node, e);
           this.onStats(this.stats);
           this._needsRepaint = true;
-          this.map?.triggerRepaint();
+          this._requestRepaint();
         },
         onStats: () => {
           this.onStats(this.stats);
-          this.map?.triggerRepaint();
+          this._requestRepaint();
         },
         onError: (e) => {
           this.onError(e);
@@ -590,7 +482,7 @@ export class S3MLayer {
           }
         },
         triggerRepaint: () => {
-          this.map?.triggerRepaint();
+          this._requestRepaint();
         },
       }
     );
@@ -601,14 +493,18 @@ export class S3MLayer {
    * 归一化世界坐标 → 经纬度 [lng, lat]
    */
   private _lngLatFromWorld(x: number, y: number): [number, number] {
-    return lngLatFromWorld(this.map, x, y);
+    return lngLatFromWorld(this.geo, x, y);
   }
 
   /** 当地图 CRS 投影切换或宿主 map 挂载后，重新计算场景锚点与各数据集 offset */
-  private _recomputeAnchors(): void {
-    this._datasetManager.recomputeAnchors(this.map);
+  recomputeAnchors(): void {
+    this._datasetManager.recomputeAnchors(this.geo);
     this._refreshAllHeights();
-    this.map?.triggerRepaint();
+    this._requestRepaint();
+  }
+
+  private _recomputeAnchors(): void {
+    this.recomputeAnchors();
   }
 
   /**
@@ -632,9 +528,9 @@ export class S3MLayer {
       id = idOrHeight;
       h = heightOffset ?? 0;
     }
-    this._datasetManager.setDatasetHeight(id, h, this.map);
+    this._datasetManager.setDatasetHeight(id, h, this.geo);
     this._refreshAllHeights();
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /**
@@ -650,13 +546,18 @@ export class S3MLayer {
       id = idOrAlign as string;
       a = align ?? 'origin';
     }
-    this._datasetManager.setDatasetAlign(id, a, this.map);
+    this._datasetManager.setDatasetAlign(id, a, this.geo);
     this._refreshAllHeights();
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /** @internal 语义高度对齐计算代理，供内部与测试使用 */
   _computeAlignOffset(tileset: S3MTileset | any, align?: DatasetAlignment): number {
+    return this._datasetManager.computeAlignOffset(tileset, align);
+  }
+
+  /** 按语义对齐方式（'top' | 'bottom' | 'center'）和数据源高度范围计算基准高度偏移 */
+  computeAlignOffset(tileset: S3MTileset | null, align?: DatasetAlignment): number {
     return this._datasetManager.computeAlignOffset(tileset, align);
   }
 
@@ -773,19 +674,19 @@ export class S3MLayer {
   /** 设置 3D 物理地表面渲染模式：'none' 关闭 | 'translucent' 半透明透视 | 'excavate' 基坑开挖 */
   setGroundMode(mode: GroundMode): void {
     this.groundManager.setMode(mode);
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /** 设置 3D 物理地表面不透明度 (0~1) */
   setGroundOpacity(opacity: number): void {
     this.groundManager.setOpacity(opacity);
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /** 设置基坑开挖范围 [minX, minY, maxX, maxY]（米，场景 ENU 坐标） */
   setExcavationBounds(bounds: [number, number, number, number] | null): void {
     this.groundManager.setExcavationBounds(bounds);
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /* ---------------------------------------------------------------- 状态纹理同步 */
@@ -843,7 +744,7 @@ export class S3MLayer {
     const entry = this.datasets.get(id);
     if (!entry) return;
     if (this._selection?.datasetId === id) this.select(null);
-    this._datasetManager.removeDataset(id, this.scene!, this.map, (e) => {
+    this._datasetManager.removeDataset(id, this.scene!, this.geo, (e) => {
       e.root.traverse((o) => {
         const mesh = o as THREE.Mesh;
         const ud = mesh.userData as MeshUserData;
@@ -862,7 +763,7 @@ export class S3MLayer {
     });
     for (const [pickId, p] of this._pickables) if (p.datasetId === id) this._pickables.delete(pickId);
     this.onStats(this.stats);
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /** 清空当前所有数据集 */
@@ -873,7 +774,7 @@ export class S3MLayer {
   setDatasetVisible(id: string, visible: boolean): void {
     this._datasetManager.setDatasetVisible(id, visible);
     if (!visible && this._selection?.datasetId === id) this.select(null);
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /* ---------------------------------------------------------------- 瓦片注册 */
@@ -984,7 +885,7 @@ export class S3MLayer {
       if ('outline' in patch || 'outlineStyle' in patch) this.select(this._selection, { silent: true });
       else this._syncSelectionStyle();
     }
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   getStyle(): S3MStyle & { modeLabel: string } {
@@ -1049,7 +950,7 @@ export class S3MLayer {
       m.transparent = transparent;
       m.depthWrite = transparent ? keepDepth : true;
     }
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /** 平面/平滑着色：FLAT_SHADED 是编译期宏，改它必须重编译 */
@@ -1061,7 +962,7 @@ export class S3MLayer {
       m.flatShading = flat;
       m.needsUpdate = true;
     }
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /**
@@ -1180,7 +1081,7 @@ export class S3MLayer {
 
     if (!enabled) {
       for (const p of this._pickables.values()) this._removeEdges(p.mesh);
-      this.map?.triggerRepaint();
+      this._requestRepaint();
       return;
     }
 
@@ -1195,7 +1096,7 @@ export class S3MLayer {
       const t0 = performance.now();
       while (i < pending.length && performance.now() - t0 < 8) this._ensureEdges(pending[i++]);
       if (i < pending.length) setTimeout(step, 0);
-      else this.map?.triggerRepaint();
+      else this._requestRepaint();
     };
     step();
   }
@@ -1267,30 +1168,10 @@ export class S3MLayer {
 
   /* ---------------------------------------------------------------- 拾取 */
 
-  private _onClick = (e: MapMouseEventLike): void => {
-    if (!this.pickable) return;
-    const hit = this.pickFromEvent(e);
-    if (!hit) {
-      this.select(null);
-      return;
-    }
-    this.select(hit);
-    this.onPick(hit);
-  };
-
-  /** 事件对象（宿主 MouseEvent 或原生事件）→ 拾取结果 */
-  pickFromEvent(e: MapMouseEventLike | MouseEvent): PickResult | null {
-    const canvas = this.map?.getCanvas();
-    if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
-    const oe = (e as MapMouseEventLike).originalEvent ?? (e as MouseEvent);
-    return this.pick(oe.clientX - rect.left, oe.clientY - rect.top);
-  }
-
   /** 获取指定屏幕像素对应的场景射线（用于高精度求交与穿透拾取） */
   getRayAt(x: number, y: number): THREE.Ray | null {
-    if (!this.camera || !this.map) return null;
-    const canvas = this.map.getCanvas();
+    if (!this.camera || !this.canvas) return null;
+    const canvas = this.canvas;
     const w = canvas.clientWidth || canvas.width;
     const h = canvas.clientHeight || canvas.height;
     if (!w || !h) return null;
@@ -1474,7 +1355,7 @@ export class S3MLayer {
    * 优先与命中的建筑网格精确求交；未命中建筑时若视线与地表相交则返回地面交点。
    */
   pickPosition(x: number, y: number): { lngLat: [number, number]; altitude: number; point: [number, number, number] } | null {
-    if (!this.camera || !this.sceneAnchor || !this.map) return null;
+    if (!this.camera || !this.sceneAnchor) return null;
 
     const hit = this.pick(x, y);
     if (hit?.point && hit?.lngLat && hit.altitude != null) {
@@ -1508,7 +1389,7 @@ export class S3MLayer {
    * 沿视线方向穿透拾取多个单体，按由近至远排序返回。
    */
   drillPick(x: number, y: number, limit = 10): PickResult[] {
-    if (!this.sceneAnchor || !this.camera || !this.map) return [];
+    if (!this.sceneAnchor || !this.camera) return [];
     const ray = this.getRayAt(x, y);
     if (!ray) return [];
 
@@ -1680,31 +1561,6 @@ export class S3MLayer {
     ];
   }
 
-  /**
-   * 视角聚焦飞向指定 SMID 单体。
-   * @param smid 单体 SMID
-   * @param options 传给宿主 map.fitBounds 的参数（如 padding, maxZoom, duration 等）
-   * @returns 是否成功找到并触发飞向
-   */
-  flyToFeature(smid: number, options?: Record<string, unknown>): boolean {
-    const bounds = this.getFeatureBounds(smid);
-    if (!bounds || !this.map) return false;
-
-    const mapAny = this.map as unknown as {
-      fitBounds?: (bounds: [[number, number], [number, number]], opts?: Record<string, unknown>) => void;
-    };
-    if (typeof mapAny.fitBounds === 'function') {
-      mapAny.fitBounds(bounds, {
-        padding: 50,
-        maxZoom: 19,
-        duration: 1200,
-        ...options,
-      });
-      return true;
-    }
-    return false;
-  }
-
   /** 实例序号 → 所属单体（按网格缓存反查表，实例多的数据不用每次重建） */
   private _instanceFeature(
     mesh: THREE.Mesh,
@@ -1761,7 +1617,7 @@ export class S3MLayer {
       this.outlineMaterial.uniforms.uSelBatch.value = -1;
       this.outlineMaterial.uniforms.uSelWhole.value = 0;
       this.outlineMaterial.uniforms.uElevation.value = 0;
-      this.map?.triggerRepaint();
+      this._requestRepaint();
       if (!silent) this.onPick(null);
       return;
     }
@@ -1805,7 +1661,7 @@ export class S3MLayer {
         this._addSelectionHull(result, targetMeshes);
       }
     }
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
   /**
@@ -1954,79 +1810,6 @@ export class S3MLayer {
     this.lineShared.uDpr.value = Math.max(1, w / cssW);
   }
 
-  /** 从 render 参数里取出 mercator→clip 矩阵，兼容 MapLibre v4 / v5 与 Mapbox 两种签名 */
-  private _extractMatrix(arg: unknown): ArrayLike<number> | null {
-    if (Array.isArray(arg)) return arg as number[];
-    if (arg instanceof Float64Array || arg instanceof Float32Array) return arg;
-    const o = arg as
-      | { defaultProjectionData?: { mainMatrix?: ArrayLike<number> }; modelViewProjectionMatrix?: ArrayLike<number> }
-      | null
-      | undefined;
-    return o?.defaultProjectionData?.mainMatrix ?? o?.modelViewProjectionMatrix ?? null;
-  }
-
-  /**
-   * 正交模式：把透视 MVP 换成同视角正交 MVP。
-   * 返回 null = 本帧保持透视（拿不到独立投影矩阵 / 矩阵不同源），只告警一次。
-   */
-  private _applyOrtho(arg: unknown, mvp: THREE.Matrix4): THREE.Matrix4 | null {
-    const { nearZ, farZ } = extractNearFar(arg);
-    const projectionMatrix = extractProjectionMatrix(arg);
-    if (!projectionMatrix) {
-      this._warnOrtho('render() 输入里没有独立的投影矩阵（需要 MapLibre ≥ 5）');
-      return null;
-    }
-    const built = buildOrthoMVP(
-      { projectionMatrix, mvp: mvp.elements, nearZ, farZ },
-      {
-        distance: this.map?.transform?.cameraToCenterDistance ?? 0,
-        fov: this._frameFov(arg),
-        aspect: this._canvasAspect(),
-      }
-    );
-    if (!built) {
-      this._warnOrtho('拿到的投影矩阵与 MVP 不同源（反推结果不是仿射变换）');
-      return null;
-    }
-    return built.matrix;
-  }
-
-  /** 正交不可用只告警一次，不每帧刷屏 */
-  private _warnOrtho(reason: string): void {
-    if (this._orthoWarned) return;
-    this._orthoWarned = true;
-    console.warn(`[s3m] 正交模式不可用：${reason}，本帧保持透视`);
-  }
-
-  /**
-   * 本帧垂直视场角（弧度）。取 render() 入参的 fov（≥5 直接给弧度），
-   * 退回 transform.fovInRadians。**不用 transform.fov**：v5 起它是「度」。
-   */
-  private _frameFov(arg: unknown): number {
-    return extractFovRadians(arg, this.map?.transform?.fovInRadians) ?? DEFAULT_FOV;
-  }
-
-  private _canvasAspect(): number {
-    const canvas = this.map?.getCanvas?.();
-    if (!canvas || !canvas.height) return 1;
-    return canvas.width / canvas.height;
-  }
-
-  /**
-   * 切换投影模式，下一帧生效。
-   *
-   * 正交只影响本层：底图瓦片、地形、DOM Marker / 弹窗仍走 MapLibre 的透视
-   * 投影，和正交层差 ≈ 楼高 / 相机距（城市尺度几十到上百像素），App 需要
-   * 自行把这些层退出。拾取、选中描边、按单体着色/隐藏/抬高不受影响。
-   */
-  setProjection(mode: ProjectionMode): void {
-    const next = mode === 'orthographic' ? 'orthographic' : 'perspective';
-    if (this._projection === next) return;
-    this._projection = next;
-    this._orthoWarned = false;
-    this.map?.triggerRepaint();
-  }
-
   /** 当前 LOD 切换距离缩放系数 */
   get lodRangeScale(): number {
     return this._lodRangeScale;
@@ -2047,27 +1830,33 @@ export class S3MLayer {
         if (entry.tileset) entry.tileset.lodRangeScale = scale;
       }
     }
-    this.map?.triggerRepaint();
+    this._requestRepaint();
   }
 
-  /** 当前投影模式 */
-  get projection(): ProjectionMode {
-    return this._projection;
-  }
-
-  render(gl: WebGLRenderingContext | WebGL2RenderingContext, arg: unknown): void {
-    if (!this.renderer || !this.scene || !this.camera || !this.sceneAnchor || !this.map) return;
+  /**
+   * 渲染一帧。所有宿主相关量都由调用方喂进来，viewer 不碰任何地图 API：
+   *
+   * @param mvp        宿主本帧的 world→clip 矩阵（列主序 16 元素）
+   * @param cameraEnu  相机在场景 ENU 里的位置（米，相对场景锚点）
+   * @param fovRad     垂直视场角（弧度），用于 LOD 屏幕误差
+   * @param canvasHeight 绘图缓冲高度（像素），LOD 判定用
+   * @returns 是否需要宿主继续驱动下一帧（动态着色 / 瓦片加载中 / LOD 发生变化）
+   */
+  renderFrame(opts: {
+    mvp: ArrayLike<number>;
+    cameraEnu: [number, number, number];
+    fovRad: number;
+    canvasHeight: number;
+  }): boolean {
+    if (!this.renderer || !this.scene || !this.camera || !this.sceneAnchor || !this.canvas) return false;
 
     // 脏标记正常由微任务刷掉；这里再兜一次底，保证「本帧画出来的」一定是最新样式
     this.flushOverrides();
 
-    const matrix = this._extractMatrix(arg);
-    if (!matrix) return;
-
-    const canvas = this.map.getCanvas();
+    const canvas = this.canvas;
     const s = this.sceneAnchor.meterInMercator;
 
-    // ENU → Mercator：x 向东，y 向北（墨卡托 y 朝南，所以取负），z 向上
+    // ENU → 世界坐标：x 向东，y 向北（墨卡托 y 朝南，所以取负），z 向上
     this._enuMatrix.set(
       s, 0, 0, this.sceneAnchor.x,
       0, -s, 0, this.sceneAnchor.y,
@@ -2075,28 +1864,15 @@ export class S3MLayer {
       0, 0, 0, 1
     );
 
-    // 正交模式：把本帧的透视投影换成同视角正交投影。视图矩阵从 MapLibre 输入
-    // 反推（P⁻¹×MVP），不是自建相机，所以不会和宿主的 pan/zoom/pitch 错位。
-    let mvp = new THREE.Matrix4().fromArray(matrix);
-    if (this._projection === 'orthographic') mvp = this._applyOrtho(arg, mvp) ?? mvp;
+    // 正交模式由宿主在传入 mvp 前自行替换（见 s3m-maplibre 的 S3MLayer._applyOrtho），
+    // 视图矩阵是从宿主输入反推的（P⁻¹×MVP），不会和宿主的 pan/zoom/pitch 错位。
+    const mvp = new THREE.Matrix4().fromArray(opts.mvp as number[]);
     mvp.multiply(this._enuMatrix);
     this.camera.projectionMatrix.copy(mvp);
     this.camera.projectionMatrixInverse.copy(mvp).invert();
 
     // 相机在场景 ENU 中的位置
-    let camEnu: [number, number, number] = [0, 0, 0];
-    try {
-      const p = this.map.getFreeCameraOptions?.()?.position;
-      if (p) {
-        camEnu = [
-          (p.x - this.sceneAnchor.x) / s,
-          -(p.y - this.sceneAnchor.y) / s,
-          (p.z - this.sceneAnchor.z) / s,
-        ];
-      }
-    } catch {
-      /* FreeCamera 不可用时退回原点，只影响 LOD 精度 */
-    }
+    const camEnu = opts.cameraEnu;
 
     // 补齐相机的真实场景坐标与世界矩阵逆矩阵，确保依赖 matrixWorldInverse 的场景正常运作
     this.camera.position.set(camEnu[0], camEnu[1], camEnu[2]);
@@ -2106,9 +1882,8 @@ export class S3MLayer {
     // 更新 3D 物理地表面中心随相机延伸
     this.groundManager.update(this.camera);
 
-    // 同上：弧度视场角。MapLibre v5 起 transform.fov 是「度」，当弧度用会让
-    // LOD 屏幕误差算大 20% 以上（提前加载更细的瓦片）
-    const fov = this._frameFov(arg);
+    // 弧度视场角。MapLibre v5 起 transform.fov 是「度」，当弧度用会让
+    // LOD 屏幕误差算大 20% 以上（提前加载更细的瓦片）—— 换算由宿主负责。
     let tilesetChanged = false;
     for (const entry of this.datasets.values()) {
       if (!entry.visible || !entry.tileset) continue;
@@ -2117,7 +1892,7 @@ export class S3MLayer {
         camEnu[1] - entry.offset[1],
         camEnu[2] - entry.offset[2],
       ];
-      if (entry.tileset.update(local, fov, canvas.height)) {
+      if (entry.tileset.update(local, opts.fovRad, opts.canvasHeight)) {
         tilesetChanged = true;
       }
     }
@@ -2135,9 +1910,6 @@ export class S3MLayer {
     this.renderer.resetState();
     this.renderer.render(this.scene, this.camera);
 
-    // 动态着色 / 瓦片加载中 / 瓦片层级或可见性改变，都需要继续驱动下一帧
-    if (this.style.mode === STYLE.DYNAMIC || this.stats.loading > 0 || tilesetChanged) this.map.triggerRepaint();
-
     this._frame++;
     const now = performance.now();
     if (now - this._fps.last > 500) {
@@ -2145,6 +1917,9 @@ export class S3MLayer {
       this._frame = 0;
       this._fps.last = now;
     }
+
+    // 动态着色 / 瓦片加载中 / 瓦片层级或可见性改变，都需要宿主继续驱动下一帧
+    return this.style.mode === STYLE.DYNAMIC || this.stats.loading > 0 || tilesetChanged;
   }
 
   /* ---------------------------------------------------------------- 只读属性 */
@@ -2200,9 +1975,6 @@ export class S3MLayer {
   }
 
   dispose(): void {
-    this.onRemove();
+    this.unmount();
   }
 }
-
-export { STYLE, STYLE_LABELS, SELECT_MODE, SELECT_MODE_LABELS };
-export type { SelectMode };
