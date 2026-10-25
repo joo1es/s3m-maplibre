@@ -4,7 +4,9 @@
  * 覆盖：字节消费完整性、顶点属性布局与跨距、索引类型与越界、
  * 三角形索引数、法线归一化、DXT 纹理块对齐、单体化 batchId 合法性、截断输入报错。
  *
- * 样例仓库是可选依赖：没有就整组跳过（CI 里默认跳过），可用 S3M_SAMPLE_DIR 指定。
+ * 样例仓库是可选依赖：没有就整组跳过（本地默认），可用 S3M_SAMPLE_DIR 指定。
+ * CI 里设 S3M_REQUIRE_SAMPLES=1 —— 那时样例必须存在，缺了就判失败，
+ * 否则「跳过」会让这组断言变成摆设。
  * 每个样例文件是一个独立用例 —— 某个数据集坏了不会掩盖其他数据集的结果。
  */
 import { describe, expect, test } from 'bun:test';
@@ -15,12 +17,19 @@ import { SAMPLE_ROOT, toArrayBuffer, walkS3mb } from '../helpers/sample';
 
 const ROOT = SAMPLE_ROOT;
 const files = existsSync(ROOT) ? walkS3mb(ROOT).sort() : [];
+const REQUIRE_SAMPLES = process.env.S3M_REQUIRE_SAMPLES === '1';
 
 /** DXT 系列：像素格式 → 每 4×4 块的字节数 */
 const DXT_BLOCK: Record<number, number> = { 17: 8, 19: 16, 20: 16, 21: 16 };
 
 if (files.length === 0) {
-  test.skip(`跳过解析单测：没有找到 ${ROOT}（克隆 SuperMap/s3m-spec 到同级目录，或用 S3M_SAMPLE_DIR 指定）`, () => {});
+  if (REQUIRE_SAMPLES) {
+    test('样例目录必须存在（S3M_REQUIRE_SAMPLES=1）', () => {
+      throw new Error(`找不到 ${ROOT}：解析单测不允许被静默跳过，请先拉样例数据`);
+    });
+  } else {
+    test.skip(`跳过解析单测：没有找到 ${ROOT}（克隆 SuperMap/s3m-spec 到同级目录，或用 S3M_SAMPLE_DIR 指定）`, () => {});
+  }
 } else {
   describe(`解析官方样例（${files.length} 个 .s3mb）`, () => {
     for (const file of files) {

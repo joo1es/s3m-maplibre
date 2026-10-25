@@ -13,6 +13,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 解析单测要对官方样例逐项断言。整仓 712MB（HEAD 里塞满转换工具二进制），
+      # 只稀疏拉 data/ 这一小块：9 个 .s3mb + 2 个 .scp，约 1.4MB。
+      # 落在 RUNNER_WORKSPACE 下，正好是测试默认找的 ../s3m-spec。
+      - name: Fetch s3m-spec sample data
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/SuperMap/s3m-spec.git "$RUNNER_WORKSPACE/s3m-spec"
+          git -C "$RUNNER_WORKSPACE/s3m-spec" sparse-checkout set S3M_SDK/S3M_JS/data
+          find "$RUNNER_WORKSPACE/s3m-spec/S3M_SDK/S3M_JS/data" -name '*.s3mb' | wc -l
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
@@ -24,8 +34,11 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      # S3M_REQUIRE_SAMPLES=1：样例没拉到就判失败，而不是悄悄 skip 掉整组解析断言
       - name: Unit tests
         run: bun test
+        env:
+          S3M_REQUIRE_SAMPLES: '1'
 
       - name: Build
         run: bun run build
