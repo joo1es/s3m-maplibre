@@ -87,7 +87,7 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 
 ## 浏览器直接引入（无打包器）
 
-两个包的 `dist/browser/` 下各出两个文件（`npm run build` 时自动生成）：
+两个包的 `dist/browser/` 下各出两个文件（`bun run build` 时自动生成）：
 
 | 文件 | 体积 | 用途 |
 |---|---|---|
@@ -226,13 +226,13 @@ map.on('click', (e) => {
 本地跑：
 
 ```bash
-npm run dev    # 开发：编一次 packages → tsc -w + vite dev（一个端口同时出文档和 demo）
-npm run serve  # 只服务已构建的产物（http://localhost:8123/s3m-maplibre/demo/index.html）
-npm run demo   # 全量构建后起静态服务
-npm run build  # 只产出，不起服务
+bun run dev    # 开发：编一次 packages → tsc -w + vite dev（一个端口同时出文档和 demo）
+bun run serve  # 只服务已构建的产物（http://localhost:8123/s3m-maplibre/demo/index.html）
+bun run demo   # 全量构建后起静态服务
+bun run build  # 只产出，不起服务
 ```
 
-`npm run dev` 起来后：
+`bun run dev` 起来后：
 
 | 地址 | 内容 |
 |---|---|
@@ -242,7 +242,7 @@ npm run build  # 只产出，不起服务
 
 改 `packages/*/src/**/*.ts` 由 `tsc -w` 增量编译，vite 直接读到新产物；改 `site/` 下的组件走 HMR。
 
-`npm run build` 会按 `s3m-three → s3m-maplibre → docs → demo` 的顺序全部产出，其中 docs/ 与 demo/index.html 都由 `site/` 构建（共用一份 `site/vite.config.ts`，只是入口和输出目录不同；产物位置不变，URL 不变）。
+`bun run build` 会按 `s3m-three → s3m-maplibre → docs → demo` 的顺序全部产出，其中 docs/ 与 demo/index.html 都由 `site/` 构建（共用一份 `site/vite.config.ts`，只是入口和输出目录不同；产物位置不变，URL 不变）。
 
 演示自带两份本地样例数据（北京 CBD 的 CCTV、comModel，离线可用），另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并默认勾选第一个。
 
@@ -348,7 +348,7 @@ function tick() {
 验证方式：
 
 ```bash
-npm run probe:crn -- --crn https://host/iserver/services/svc/rest/realspace/datas/<数据集>/config --limit 3
+bun run probe:crn -- --crn https://host/iserver/services/svc/rest/realspace/datas/<数据集>/config --limit 3
 # 也可以先摸底：--service <realspace 根地址> 列出每个数据集的 s3m:TextureCompressionType
 ```
 
@@ -444,7 +444,7 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 ## 验证情况
 
 - **解析正确性**：9 个官方样例（v1 / v2 / v3）全部 `bytesRead === bytesTotal`；并用官方 `S3ModelParser.js` 在 Node 里做逐段偏移对照。
-- **MeshOpt 解码**：`npm run test:meshopt` 跑 60 个真实瓦片（5 个数据集 × 根瓦片 + 一级子瓦片），逐项校验偏移对齐、索引不越界、三角形索引数是 3 的倍数、法线归一化、顶点包围盒与 OBB 尺寸一致 —— 60/60 通过。
+- **MeshOpt 解码**：`bun run test:meshopt` 跑 60 个真实瓦片（5 个数据集 × 根瓦片 + 一级子瓦片），逐项校验偏移对齐、索引不越界、三角形索引数是 3 的倍数、法线归一化、顶点包围盒与 OBB 尺寸一致 —— 60/60 通过。
 - **真实服务**：上海某区 iServer `realspace` 服务，S3M 3.01、`epsg:4326`、DXT 纹理压缩、5 个数据集叠加，20 个瓦片 / 45 万三角面稳定 85~90 fps。
 - **拾取正确性**：以射线求交为真值，对 135 个像素采样，有效像素 96/96 一致（其余 39 个是两个数据集几何完全重合的平局）。
 
@@ -516,7 +516,7 @@ demo/       在线演示产物（index.html 由 site/ 构建）+ 样例数据；
 site/       站点源码（vite + Solid SSG）：docs 正文由 markdown-it + shiki 构建期渲染，demo 面板为 Solid 组件
 tools/      自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
 tests/      类型级用法测试（tests/types/usage.ts）
-docs/       API 文档站产物（`npm run build:docs` 生成，图层 + 内核双页面，勿手改）
+docs/       API 文档站产物（`bun run build:docs` 生成，图层 + 内核双页面，勿手改）
 ```
 
 `S3MViewer` 与 `S3MLayer` 的分界：前者不 import 任何地图 API，后者只做「宿主协议 ↔ 内核」的翻译（矩阵提取、事件、`triggerRepaint` 回调）。
