@@ -35,9 +35,32 @@ import type {
  */
 export const LINE_PRIMITIVE = 13;
 
+/** primitiveType = 1：点云包。索引是点序号，画成三角面就是满屏彩色尖刺。 */
+export const POINT_PRIMITIVE = 1;
+
 function isLinePrimitive(primitiveType: number): boolean {
   // 1 = 点，2 = 线段，3 = 折线，13 = 棱线包
   return primitiveType === LINE_PRIMITIVE || primitiveType === 2 || primitiveType === 3;
+}
+
+function isPointPrimitive(primitiveType: number): boolean {
+  return primitiveType === POINT_PRIMITIVE;
+}
+
+/**
+ * 点云共享材质：顶点色直接上屏，不受光照影响。
+ * 固定像素尺寸（sizeAttenuation: false），远近点大小一致，高空浏览时不会缩成一团。
+ */
+let pointCloudMaterial: THREE.PointsMaterial | null = null;
+function getPointCloudMaterial(): THREE.PointsMaterial {
+  if (!pointCloudMaterial) {
+    pointCloudMaterial = new THREE.PointsMaterial({
+      size: 2,
+      sizeAttenuation: false,
+      vertexColors: true,
+    });
+  }
+  return pointCloudMaterial;
 }
 
 /* ------------------------------------------------------------------ 顶点流 */
@@ -402,7 +425,12 @@ export async function buildTileObjects(
 
       // 如果数据本身没有法线且是三角网格，必须在绑定了 index 之后计算法线
       // 绝不能在未索引的 attributes.position 上算，否则非连续顶点会导致法线朝向错乱甚至越界 NaN 导致死黑面
-      if (!isLinePrimitive(pack.primitiveType) && !geometry.getAttribute('normal')) {
+      // 线 / 点包不需要法线
+      if (
+        !isLinePrimitive(pack.primitiveType) &&
+        !isPointPrimitive(pack.primitiveType) &&
+        !geometry.getAttribute('normal')
+      ) {
         geometry.computeVertexNormals();
       }
 
@@ -654,6 +682,26 @@ export async function buildTileObjects(
       group.userData.hasNativeEdges = true;
       stats.edgeLines++;
       return lines;
+    }
+
+    // 点云包：顶点即点，按 THREE.Points 渲染。索引只是点序号，直接走 drawRange。
+    if (isPointPrimitive(pack.primitiveType)) {
+      // PointsMaterial 的顶点色读内置 'color' 槽位，与 aColor 共享同一份 buffer
+      if (!geometry.getAttribute('color')) {
+        geometry.setAttribute('color', geometry.getAttribute('aColor')!);
+      }
+      const points = new THREE.Points(geometry, getPointCloudMaterial());
+      points.userData.skeletonName = name;
+      points.userData.geoRef = geo;
+      points.userData.tileRef = tile;
+      points.userData.primitiveType = pack.primitiveType;
+      if (matrix && !matrix.equals(IDENTITY)) {
+        matrix.decompose(points.position, points.quaternion, points.scale);
+      }
+      group.add(points);
+      objects.push(points);
+      stats.meshes++;
+      return points;
     }
 
     if (info?.instanced && vp.instanceBuffer && vp.instanceCount > 0) {

@@ -127,13 +127,21 @@ function parsePageLOD(r: BinaryReader, version: number): PageLOD {
   return pageLod;
 }
 
-function parseGroupNode(r: BinaryReader, version: number): GroupNode {
-  r.u32(); // streamSize
+/**
+ * pageLOD 条目序列（无 streamSize 前缀）。
+ * 经典 s3mb 的 groupNode 与 S3MBLOCK 的 shell 段共用这一段。
+ */
+export function parseGroupNodeEntries(r: BinaryReader, version: number): GroupNode {
   const count = r.u32();
   const pageLods: PageLOD[] = [];
   for (let i = 0; i < count; i++) pageLods.push(parsePageLOD(r, version));
   r.align4();
   return { pageLods };
+}
+
+export function parseGroupNode(r: BinaryReader, version: number): GroupNode {
+  r.u32(); // streamSize
+  return parseGroupNodeEntries(r, version);
 }
 
 /* ------------------------------------------------------------ 顶点数据包 */
@@ -336,31 +344,40 @@ function parseIndexPackages(r: BinaryReader, version: number): IndexPackage[] {
  * v3.01 的实际数据在索引包之后、包围盒之前多了一个 4 字节字段（实测恒为 0，
  * 推测是线框几何的长度）。规范里没有写，标准骨架是否也有无法验证，
  * 所以这里做一次「读一遍看像不像包围盒」的判断，不像就跳 4 字节重读。
+ *
+ * 注意「不像」的判定必须只针对垃圾值（非有限 / 超出地球量级）：
+ * 点云叶子瓦片只有一个点，extent 合法地为 0，退化包围盒是正常数据，
+ * 不能因为 extent≈0 就认定错位 —— 否则流会整体偏 4 字节，
+ * 下一个骨架的名字长度会读到 ASCII 数字上（如 858992690 = "2033"），
+ * 直接 RangeError。
  */
 function readV3BoundingBox(r: BinaryReader): void {
   const start = r.offset;
   const box = r.boundingBox();
-  if (isPlausibleBox(box)) return;
+  if (isFiniteBox(box)) return;
   r.offset = start + 4;
   r.boundingBox();
 }
 
-function isPlausibleBox(box: { center: Vec3; xExtent: Vec3; yExtent: Vec3; zExtent: Vec3 }): boolean {
+/** 只排除垃圾值； extent 为 0 的退化包围盒（单点点云）是合法数据 */
+function isFiniteBox(box: { center: Vec3; xExtent: Vec3; yExtent: Vec3; zExtent: Vec3 }): boolean {
   const all = [box.center, box.xExtent, box.yExtent, box.zExtent];
   for (const v of all) {
     if (!Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) return false;
     if (Math.abs(v.x) > 1e7 || Math.abs(v.y) > 1e7 || Math.abs(v.z) > 1e7) return false;
   }
-  const len = (v: Vec3): number => Math.hypot(v.x, v.y, v.z);
-  return len(box.xExtent) > 1e-6 && len(box.yExtent) > 1e-6 && len(box.zExtent) > 1e-6;
+  return true;
 }
 
-async function parseSkeletons(
+/**
+ * 骨架条目序列（count 已由调用方语境决定是否读过）。
+ * 经典 s3mb 与 S3MBLOCK 的骨架段都长这样，区别只是外层有没有 streamSize / 附加流。
+ */
+export async function parseSkeletonEntries(
   r: BinaryReader,
   version: number,
   trace?: ParseOptions['trace']
 ): Promise<Record<string, GeoPackageEntry>> {
-  r.u32(); // streamSize
   const count = r.u32();
   const geoPackage: Record<string, GeoPackageEntry> = {};
 
@@ -405,10 +422,22 @@ async function parseSkeletons(
     geoPackage[name] = { name, vertexPackage: vp, indexPackages };
   }
 
+  return geoPackage;
+}
+
+export async function parseSkeletons(
+  r: BinaryReader,
+  version: number,
+  trace?: ParseOptions['trace']
+): Promise<Record<string, GeoPackageEntry>> {
+  r.u32(); // streamSize
+  const geoPackage = await parseSkeletonEntries(r, version, trace);
+
   // v1/v2 在骨架数组之后还有一段附加流。官方写法是
   //   bytesOffset += secColorSize; bytesOffset += 4;
   // 其中读取 secColorSize 时不推进指针，等价于「起点 + 长度 + 4」。
   // 此时 r.offset 已在长度字段之后，所以只补长度即可。
+  // （S3MBLOCK 没有这一段——secondColor 在段目录里是独立条目）
   if (version < 3) {
     const extra = r.u32();
     r.skip(extra);
@@ -458,7 +487,7 @@ function parseMaterials(r: BinaryReader): unknown {
  * 单体化信息。非实例化数据里每个单体对应一段连续的顶点区间，
  * 这里把它展开成逐顶点的 batchId 属性，渲染层可直接做 GPU picking。
  */
-function parsePickInfo(
+export function parsePickInfo(
   r: BinaryReader,
   options: number,
   geoPackage: Record<string, GeoPackageEntry>,
@@ -471,6 +500,18 @@ function parsePickInfo(
   if ((flags & 1) !== 1) return null;
 
   r.u32(); // streamSize
+  return parsePickInfoEntries(r, geoPackage, version);
+}
+
+/**
+ * 单体化条目序列（无 flags / streamSize 前缀）。
+ * 经典 s3mb 在流内自带 streamSize；S3MBLOCK 的段目录里没有，由调用方按目录切好传入。
+ */
+export function parsePickInfoEntries(
+  r: BinaryReader,
+  geoPackage: Record<string, GeoPackageEntry>,
+  version: number
+): Record<string, unknown> {
   const count = r.u32();
   const result: Record<string, unknown> = {};
 
