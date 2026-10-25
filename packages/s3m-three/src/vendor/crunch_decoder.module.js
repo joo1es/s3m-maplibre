@@ -2,8 +2,14 @@
 // crunch / CRN 解码器（wasm 内联为 base64，无外部资源）
 // 来源：SuperMap iClient3D S3M SDK · S3MTiles/ThirdParty/crunch.{js,wasm}
 // 许可：Apache-2.0（与 s3m-spec 一致）
-// 改动：只把 wasm 加载方式从「按 URL fetch」换成「内联字节」——在 wasmBinary
-//       赋值处注入 __s3mCrunchWasmBytes()，其余原样保留。
+// 改动（相对官方 SDK 原件）：
+//   1. wasm 加载从「按 URL fetch」换成「内联字节」——在 wasmBinary 赋值处注入
+//      __s3mCrunchWasmBytes()；
+//   2. Node 分支的 read_ 原来用裸 require("fs"/"path")，ESM 里取不到（Node ESM 没有
+//      require），且 wasm 已内联、这条路径根本不会走 —— 改成直接抛错；
+//   3. 删掉 `module["exports"] = Module`：本文件有 export default，在任何环境下都是
+//      ESM，裸 module 只会让打包器报 COMMONJS_VARIABLE_IN_ESM，实际是死代码。
+// 其余原样保留。
 // 用法：import 后等 Module.calledRun / onRuntimeInitialized，再调 _malloc / _crn_*。
 // ---------------------------------------------------------------------------
 
@@ -521,32 +527,20 @@ if (typeof WebAssembly !== 'undefined') {
 		return scriptDirectory + path
 	}
 	var read_, readAsync, readBinary, setWindowTitle;
-	var nodeFS;
-	var nodePath;
 	if (ENVIRONMENT_IS_NODE) {
-		// wasm 已内联，不需要按路径读文件；Node ESM 下也没有 __dirname
+		// wasm 已内联，不需要按路径读文件；Node ESM 下也没有 __dirname、没有 require。
+		// 保留签名只为兼容调用点，真走到这里说明用法不对，直接抛。
 		scriptDirectory = typeof __dirname !== "undefined" ? __dirname + "/" : "";
 		read_ = function shell_read(filename, binary) {
-			if (!nodeFS)nodeFS = require("fs");
-			if (!nodePath)nodePath = require("path");
-			filename = nodePath["normalize"](filename);
-			return nodeFS["readFileSync"](filename, binary ? null : "utf8")
+			throw new Error("crunch_decoder: wasm 已内联，不支持按路径读取（" + filename + "）")
 		};
 		readBinary = function readBinary(filename) {
-			var ret = read_(filename, true);
-			if (!ret.buffer) {
-				ret = new Uint8Array(ret)
-			}
-			assert(ret.buffer);
-			return ret
+			return read_(filename, true)
 		};
 		if (process["argv"].length > 1) {
 			thisProgram = process["argv"][1].replace(/\\/g, "/")
 		}
 		arguments_ = process["argv"].slice(2);
-		if (typeof module !== "undefined") {
-			module["exports"] = Module
-		}
 		process["on"]("uncaughtException", function (ex) {
 			if (!(ex instanceof ExitStatus)) {
 				throw ex
