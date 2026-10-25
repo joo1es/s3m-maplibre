@@ -61,7 +61,10 @@ function siteDev(): Plugin {
           );
           res.end(body);
         } catch {
-          next();
+          // 别落到 SPA fallback：缺失的瓦片会拿到一份 index.html（200 text/html），
+          // 前端只能报「瓦片请求返回了 HTML 页面」，看不出到底是文件不存在
+          res.statusCode = 404;
+          res.end('not found');
         }
       });
 
