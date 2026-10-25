@@ -14,7 +14,7 @@ SuperMap S3M 三维模型格式的 **three.js 渲染内核**（宿主无关）�
 npm install s3m-three three
 ```
 
-`three` 是 peer 依赖（`>=0.168.0`）。
+`three` 是 peer 依赖（`>=0.155.0`）。
 
 ## 30 秒上手
 

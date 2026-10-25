@@ -22,7 +22,7 @@
 npm install s3m-maplibre three
 ```
 
-`three` 是 peer 依赖，需要宿主项目自己提供（要求 `>=0.168.0`，该版本起自带 TypeScript 类型）。
+`three` 是 peer 依赖，需要宿主项目自己提供（要求 `>=0.155.0`）。下限取 0.155 是因为该版本把光照默认值切成物理单位，更早的 three 会把方向光放大约 π 倍，白模直接过曝。
 
 `maplibre-gl` **不是**本包的依赖：图层只是一个符合 `CustomLayerInterface` 的普通对象，你通过 `map.addLayer()` 挂上去即可。
 
@@ -30,7 +30,7 @@ npm install s3m-maplibre three
 
 ### TypeScript
 
-包内置类型声明（`dist/index.d.ts`），由 TS 源码直接编译产出，开箱可用。公开 API 会暴露 `THREE.Mesh` / `THREE.Group` 等对象，three `>=0.168` 自带类型；更老的版本需要 `@types/three`。
+包内置类型声明（`dist/index.d.ts`），由 TS 源码直接编译产出，开箱可用。公开 API 会暴露 `THREE.Mesh` / `THREE.Group` 等对象，three 自身不带类型声明，需要另装 `@types/three`。
 
 ```ts
 import { S3MLayer, STYLE, type PickResult } from 's3m-maplibre';

@@ -10,7 +10,7 @@ SuperMap S3M 三维模型格式的 **MapLibre / Mapbox 原生渲染图层**。
 npm install s3m-maplibre three
 ```
 
-`three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre GL JS v4/v5 与 Mapbox GL JS v2/v3 都能挂。
+`three` 是 peer 依赖（`>=0.155.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre GL JS v4/v5 与 Mapbox GL JS v2/v3 都能挂。
 
 ## 30 秒上手
 

@@ -79,9 +79,74 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 
 两包**版本各自独立**：内核修 bug 只发 `s3m-three` 的新 patch，图层包靠 `^` 范围自动获得，不必重复发；只有图层自己改了才需要发 `s3m-maplibre`。
 
-`three` 是 peer 依赖（`>=0.168.0`）。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂；不用地图时直接用 `s3m-three` 的 `S3MViewer`（见「纯 three.js 使用」）。
+`three` 是 peer 依赖（`>=0.155.0`）。下限取 0.155 而不是更早的版本，是因为 0.152 换掉了 `outputEncoding`（改叫 `outputColorSpace`）、0.155 又把光照默认值切成物理单位——再往前的 three 会把方向光放大约 π 倍，白模会直接过曝。`maplibre-gl` 不是依赖——图层只是一个符合 `CustomLayerInterface` 的普通对象，MapLibre / Mapbox 都能挂；不用地图时直接用 `s3m-three` 的 `S3MViewer`（见「纯 three.js 使用」）。
 
-类型随包发布（各包 `dist/index.d.ts`，由源码直接生成）。three `>=0.168` 自带类型，更老的版本需要自己装 `@types/three`。
+类型随包发布（各包 `dist/index.d.ts`，由源码直接生成）。three 自身不带类型，需要另装 `@types/three`。
+
+---
+
+## 浏览器直接引入（无打包器）
+
+两个包的 `dist/browser/` 下各出两个文件（`npm run build` 时自动生成）：
+
+| 文件 | 体积 | 用途 |
+|---|---|---|
+| `s3m-maplibre.iife.js` | 887 KB（gzip 248 KB） | 内置 three + s3m-three，一行 script 开箱即用 |
+| `s3m-maplibre.iife.ext-three.js` | 212 KB（gzip 76 KB） | three 外置，用页面上的 `window.THREE` |
+| `s3m-three.iife.js` / `s3m-three.iife.ext-three.js` | 879 / 204 KB | 同上，只要渲染内核 |
+
+### 一行 script
+
+```html
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5/dist/maplibre-gl.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.0/dist/browser/s3m-maplibre.iife.js"></script>
+<script>
+  const layer = new S3MMapLibre.S3MLayer({ configUrl: './data/CBD/cbd.scp' });
+  map.addLayer(layer);
+</script>
+```
+
+全局名：图层是 `S3MMapLibre`，内核是 `S3M`。
+
+内置版加载时会顺手把那份 three 挂到 `window.THREE`（页面里已经有就不覆盖），所以你要自己搭场景时直接用 `window.THREE` 就行——**不要再另外引一份 three**，两份实例会让 `instanceof` 判断失效。
+
+### 自带 three
+
+`three` 从 r160 起不再发布 UMD，页面上没有现成的 `window.THREE`，所以自己引时必须先把 three 放到全局、再加载外置版：
+
+```html
+<script type="module">
+  import * as THREE from 'https://esm.sh/three@0.169.0';
+  window.THREE = THREE;
+  await import('https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.0/dist/browser/s3m-maplibre.iife.ext-three.js');
+</script>
+```
+
+顺序不能反：外置版执行时就去读 `window.THREE`。
+
+### 原生 ESM（和 `import * as THREE from 'https://…'` 同一种写法）
+
+不用 IIFE，直接吃包的 ESM 产物，bare specifier 交给 importmap 解析：
+
+```html
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "s3m-three": "https://cdn.jsdelivr.net/npm/s3m-three@0.3.0/dist/index.js",
+    "s3m-maplibre": "https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.0/dist/index.js"
+  }
+}
+</script>
+<script type="module">
+  import * as THREE from 'three';
+  import { S3MLayer } from 's3m-maplibre';
+</script>
+```
+
+这条路上 `three` 只有一份（就是你 importmap 里那个），也不需要 `window.THREE`。代价是 dist 是逐文件 ESM（90+ 个文件），首屏请求数比单文件多；在意请求数就用上面的 IIFE。
+
+esm.sh 也能直接吃：`import { S3MLayer } from 'https://esm.sh/s3m-maplibre@0.4.0'`。注意它会为 `three` 生成自己的 URL，你如果同时引 `https://esm.sh/three@0.169.0`，两边不一定是同一个构建——用 `?deps=three@0.169.0` 对齐，或 `?external=three` 配 importmap。
 
 ---
 

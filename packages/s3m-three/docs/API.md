@@ -28,13 +28,13 @@
 npm install s3m-three three
 ```
 
-`three` 是 peer 依赖，需要宿主项目自己提供（要求 `>=0.168.0`，该版本起自带 TypeScript 类型）。
+`three` 是 peer 依赖，需要宿主项目自己提供（要求 `>=0.155.0`）。下限取 0.155 是因为该版本把光照默认值切成物理单位，更早的 three 会把方向光放大约 π 倍，白模直接过曝。
 
 本包**不 import 任何地图 API**，宿主无关：可以单独用于任意 three 场景，也可以被上层适配层驱动（MapLibre / Mapbox 用法见 [s3m-maplibre](../s3m-maplibre/docs/API.md)，它内部就是在用本包）。
 
 ### TypeScript
 
-包内置类型声明（`dist/index.d.ts`），由 TS 源码直接编译产出，开箱可用。公开 API 会暴露 `THREE.Mesh` / `THREE.Group` 等对象，three `>=0.168` 自带类型；更老的版本需要 `@types/three`。
+包内置类型声明（`dist/index.d.ts`），由 TS 源码直接编译产出，开箱可用。公开 API 会暴露 `THREE.Mesh` / `THREE.Group` 等对象，three 自身不带类型声明，需要另装 `@types/three`。
 
 ```ts
 import { S3MViewer, S3MTileset, STYLE, type PickResult } from 's3m-three';
