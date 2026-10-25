@@ -55,13 +55,42 @@ function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
   return tex;
 }
 
+/** 行序翻转（原地）。S3MBLOCK 图集按 GL 方向存储（v=0 在最后一行），解码后要翻一次行 */
+function flipRows(rgba: Uint8Array, width: number, height: number): void {
+  const row = width * 4;
+  const tmp = new Uint8Array(row);
+  for (let y = 0; y < height >> 1; y++) {
+    const a = y * row;
+    const b = (height - 1 - y) * row;
+    tmp.set(rgba.subarray(a, a + row));
+    rgba.copyWithin(a, b, b + row);
+    rgba.set(tmp, b);
+  }
+}
+
+/** 该像素格式自带 alpha 通道（DXT1 的 1bit alpha 不算，历史上没开过 alphaTest） */
+function hasAlphaChannel(pixelFormat: number): boolean {
+  return (
+    pixelFormat === PixelFormat.DXT3 ||
+    pixelFormat === PixelFormat.DXT4 ||
+    pixelFormat === PixelFormat.DXT5 ||
+    pixelFormat === PixelFormat.ARGB ||
+    pixelFormat === PixelFormat.ABGR ||
+    pixelFormat === PixelFormat.BGRA ||
+    pixelFormat === PixelFormat.RGBA
+  );
+}
+
 /** 解 DXT 到 RGBA8。DXT5 是 1 字节/像素，DXT1 是 0.5 字节/像素。 */
 /** DXT 解码只需要尺寸 / 格式 / 字节，CRN 转码出来的结果也走这条路 */
-function decodeDXT(tex: Pick<S3MTexture, 'width' | 'height' | 'pixelFormat' | 'data'>): THREE.DataTexture {
+function decodeDXT(tex: Pick<S3MTexture, 'width' | 'height' | 'pixelFormat' | 'data' | 'flipY'>): THREE.DataTexture {
   const { width, height, pixelFormat, data } = tex;
   const out = new Uint8Array(width * height * 4);
   DXTTextureDecode.decode(out, width, height, data, pixelFormat);
-  return new THREE.DataTexture(out, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+  if (tex.flipY) flipRows(out, width, height);
+  const dt = new THREE.DataTexture(out, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+  if (hasAlphaChannel(pixelFormat)) dt.userData.s3mHasAlpha = true;
+  return dt;
 }
 
 function fromRawRGB(tex: S3MTexture): THREE.DataTexture {
@@ -83,7 +112,10 @@ function fromRawRGB(tex: S3MTexture): THREE.DataTexture {
     out[d + 2] = swapRB ? data[p] : data[p + 2];
     out[d + 3] = hasAlpha ? data[alphaFirst ? s : s + 3] : 255;
   }
-  return new THREE.DataTexture(out, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+  if (tex.flipY) flipRows(out, width, height);
+  const dt = new THREE.DataTexture(out, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
+  if (hasAlphaChannel(pixelFormat)) dt.userData.s3mHasAlpha = true;
+  return dt;
 }
 
 export async function createTexture(tex: S3MTexture | null | undefined): Promise<DecodedTexture> {

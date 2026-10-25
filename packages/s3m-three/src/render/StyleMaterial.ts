@@ -454,6 +454,8 @@ export interface StyledMaterialOptions {
   opacity?: number;
   roughness?: number;
   flatShading?: boolean;
+  /** >0 时开启 alphaTest：镂空贴图（S3MBLOCK 图集）的透明片元直接丢弃，避免渲染成黑面 */
+  alphaTest?: number;
 }
 
 /**
@@ -476,6 +478,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
     flatShading: opts.flatShading !== false,
     // 顶点色、贴图全部在自定义 chunk 里处理，不让 three 插手
     vertexColors: false,
+    alphaTest: opts.alphaTest ?? 0,
   }) as StyledMaterial;
 
   // 选中单体编号：每个 Mesh 独立，默认 -1 表示无选中

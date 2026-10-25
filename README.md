@@ -37,9 +37,9 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| S3MB 解析 | ✅ | v1.0 / v2.0 / v3.0，9 个官方样例字节级对齐 |
+| S3MB 解析 | ✅ | v2.0 / v3.0 / v3.01，官方样例与线上服务字节级对齐；v1.x（OSGB 缓存）见下方「未支持的格式」 |
 | MeshOpt 几何压缩 | ✅ | v3 默认压缩方式，浏览器内 wasm 解码，按需加载 |
-| LOD 渐进加载 | ✅ | 支持 `Distance_From_EyePoint` / `Pixel_Size_OnScreen` |
+| LOD 渐进加载 | ✅ | 支持 `Distance_From_EyePoint` / `Pixel_Size_OnScreen`；线上高斯泼溅与点云用的 `rangeMode = 2`（规范枚举里没有这一档）按屏幕尺寸近似处理，可用 `lodRangeScale` 收放 |
 | 多数据集叠加 | ✅ | 各数据集独立锚点，自动对齐到统一场景原点 |
 | 白膜 / 单色 | ✅ | |
 | 按高度 / 按楼层着色 | ✅ | 高度范围自动统计 |
@@ -63,6 +63,8 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 骨骼动画 | ❌ | 未实现：LODPackage 上的 animations JSON 直接跳过不解析，官方 JS SDK 同样只读偏移不驱动 |
 | 深度遮挡 | ✅ | **深度来源可替换**：本层全程不清深度缓冲（`autoClear = false`），谁写了更近的深度谁就遮挡建筑。地形只是其中一个来源（宿主 `setTerrain` + DEM，山体挡楼）；自带物理地表代理（`ground.occlude`）是另一个来源，能把地下结构真正切掉，两者可叠加 |
 | Draco 压缩几何 | ❌ | 能识别、不能解码，遇到抛明确错误；接法见[未支持的格式](#未支持的格式draco--crn--ktx2) |
+| 高斯泼溅服务（`3DGaussianSplatting`） | ✅ 按点 | 加载 / 细化 / 显示全通，画的是逐点带色的点集（`THREE.Points`）；真泼溅还差 scale/rotation 的量化标定，见[未支持的格式](#线上服务的三种发布形态) |
+| OSGB 倾斜摄影缓存（`.s3m` v1.x） | ❌ | 位置与范围解析已可用，瓦片认得出来但**不解码**，会明确报错。原因见[未支持的格式](#线上服务的三种发布形态) |
 | CRN 纹理（`compressType` 26 / 27 / 38001 / 50000） | ✅ | 内联 crunch wasm 转 DXT 后走同一套解码，只在遇到时懒加载；已在 SuperMap Online 公有服务实测 |
 | KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
 
@@ -359,6 +361,27 @@ bun run probe:crn -- --crn https://host/iserver/services/svc/rest/realspace/data
 
 共同前提：**要有样例数据**。手头有 Draco 压缩的瓦片，把 `.s3mb` 给我，就能按 MeshOpt 那套方式标定 + 实现 + 回归（CRN 的代码已经接好，只差真样本验一遍熵解码）。
 
+### 线上服务的三种发布形态
+
+`supermapol.com/realspace/services/3D-xxx/` 这类公有服务看着同一个 URL 样式，底下其实是三种完全不同的数据。先摸清形态再排查，比在渲染层猜快得多——**判断只看两处**：`…/rest/realspace/datas.json` 列出的数据源名，和 `…/datas/<数据源>/config` 返回的是 JSON 还是 XML。
+
+| 形态 | config | 瓦片 | 本库支持 |
+|:---|:---|:---|:---|
+| S3M 瓦片缓存（主流） | JSON（`rootTiles` / `position.point3D` / `geoBounds`） | `.s3mb` v2 / v3 / v3.01，或 `.s3mblock` | ✅ 完整 |
+| OSGB 倾斜摄影原生缓存 | **XML**（`<SuperMapCache>`，`sml:FileType = OSGBFile`） | `.s3m`（S3M 1.x 容器），下一级 LOD 指向 `.osgb` | ⚠️ 位置与范围可用，几何不解码 |
+| 高斯泼溅 | JSON，`dataType = "3DGaussianSplatting"` | `.s3mb` v3.01 + MeshOpt，**没有索引包**（顶点即点） | ✅ 按点渲染，加载与细化全通 |
+
+几个已经踩过、已经修掉的坑，记在这里免得再踩：
+
+- **`config` 不带后缀**。`datas/<名>/config.xml` 会 406「当前资源不支持请求体中的媒体类型」，`datas/<名>/config` 才对。数据源名可以是中文（如 `寿宁阁`），走 `new URL()` 会自动百分号编码。
+- **OSGB 的 XML 里没有经纬度范围**，只有 `<sml:Position>`（经纬度原点）和 `<sml:BoundingBox>`（以该原点为中心的**米制**局部盒）。直接读 `Left/Right/Top/Bottom` 会得到全 0，于是视角甩到几内亚湾，锚点校验还会把唯一正确的 `position` 判成异常。现在按等距圆柱近似反算（`Δlon = x / (111320·cos φ)`、`Δlat = y / 110540`）。
+- **OSGB 的瓦片名带 `+`**（`Tile_+002_+001`）。iServer 的 Java 侧按 `URLDecoder` 解路径，未编码的 `+` 会变成空格 → 404「瓦片数据不存在」；`new URL()` 又认为 `+` 在 path 里合法而不编码。所以拼出来的每个瓦片 URL 都得把 `+` 补成 `%2B`（同一个地址实测：裸 `+` 404，`%2B` 200）。
+- **v3.01 的 `position` 换成了 `position.point3D` + `unit`**（老数据是 `position.x/y/z` + `units`），两个键名都得认，否则投影单位是米的数据会被当成度。
+- **S3M 1.x 的识别**：头 4 字节是魔数 `73 33 6D 00`（`"s3m\0"`），紧接 `78 da` 的 zlib。不当场识别的话，头 4 字节会被 float32 读成 1e-38 的「版本号」，再把 zlib 头当长度，报出来的是 `RangeError: Invalid typed array length` 这种彻底误导人的错。现在识别后抛 `S3MFormatError`（带 `permanent`，调度不再重试、同类错误只报一次）。解压后的结构也已标定：`uint32 xmlSize + XML + byte[3]（恒 "000"） + (uint32 size + data) × 3`（几何流 / 4 字节小段 / 纹理流，内含 JPEG），三段长度严丝合缝落到解压末尾。
+- **为什么不干脆把 1.x 画出来**：它的下一级 LOD 指向 `.osgb`（OpenSceneGraph Binary），要另一整套 OSG 反序列化 + `metadata.xml` 里的 SRS 配准，而 REST 的 config 并不提供这些信息。硬画只能得到每块瓦片一层的粗模，位置还无法保证正确。**正解在数据侧**：iServer 重新发布成 S3M 瓦片缓存（`.s3mb`），或桌面端导出 S3M 格式而不是 OSGB 原生缓存。
+- **高斯泼溅还画不出「泼溅」**：数据里每条骨架带 `gsScale` / `gsRotation` 两条 MeshOpt 自定义流（各 4 字节/顶点，槽位映射来自 `vertexAttributeDescript = {"GS_Rotation":1,"GS_Scale":0}`），本库已经把它们保留成顶点属性（以前直接丢弃），但**这 4 字节的量化格式还没标定**——既不像 3 个 float，也不像明显四元数。要上真正的 EWA splatting（协方差 + 深度排序 alpha 混合），得先拿多个深度层级的样例把这两条流对准，或者拿到 SuperMap 的导出文档。
+
+
 ---
 
 ## 工作原理
@@ -465,7 +488,7 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 ## 已知限制
 
 - **Draco 压缩几何**未实现（可解，缺样例数据），见[未支持的格式](#未支持的格式draco--ktx2)。
-- **纹理分包（`s3m:TextureSharing`）未支持**：这类数据集的 `tiles` 全是 `.s3mblock`（纹理块文件），不是 `.s3mb` 瓦片，加载会直接失败，例如 SuperMap Online 的 `3D-CBD/Xiaopin@CBD`。目前会如实报错，不做静默降级。
+- **纹理分包（`s3m:TextureSharing` / S3MBLOCK 单文件）已支持**：这类数据集的 `tiles` 是 `.s3mblock`（例 SuperMap Online 的 `3D-CBD/Xiaopin@CBD`），容器内是 zlib 压缩的 v2 瓦片体 + 内嵌纹理图集；几何顶点区间绑定到图集子区域，解析时把 UV 重映射进图集空间，材质按图集 id 直接绑定。图集数据未内嵌的块会按 `requestNames` 如实报错（当前样本数据全部内嵌）。
 - **多块 MeshOpt 骨架已支持**（`blockCount > 1`）：这类骨架是「每块后面紧跟自己的索引包」，索引是块内局部编号。解析时按块合并顶点流、并把各块索引加上顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包。实测 `3D-WorkSpace_pbr1/pbrmodel` 的 `blockCount=2/3` 瓦片已可正常加载。
 - **遮挡取决于「谁写了深度」而不是「开没开地形」**：地形网格与本层共用主 framebuffer 的同一深度缓冲、同一 `depthRangeFor3D`，所以山体能挡建筑；但 S3M 数据通常按海拔 0 建模，开地形时必须用 `setDatasetHeight()` 抬到真实地面高程，否则模型会陷在山体下面（另外地形网格的贴图来自 raster / hillshade 层，没有这两层时地形面是空白的）。不想接 DEM 时，可以用自带物理地表当遮挡源（`ground: { occlude: true }` 或 `setGroundOcclude()`），但它只能表达 `z = 高程` 的一刀切：没有起伏，山体那种「半山腰挡住后面楼」表达不了；两者叠加时，凡是地形已经写了更近深度的像素，平面代理写不进去，山后的建筑仍会露出来。
 - 跨城市量级的数据集叠加会重新引入 float32 精度问题。

@@ -10,7 +10,7 @@
  */
 
 // —— 解析层（Node 可用，不依赖 three / WebGL）
-export { parseS3MB, S3M_VERSION, VertexTag, VertexTagV3 } from './core/S3MBParser.js';
+export { parseS3MB, S3MFormatError, S3M_VERSION, VertexTag, VertexTagV3 } from './core/S3MBParser.js';
 export type { ParseOptions, InflateFn } from './core/S3MBParser.js';
 export { BinaryReader } from './core/BinaryReader.js';
 export { resolveFeature, measureSegments, buildAttributes, DEFAULT_FLOOR_HEIGHT } from './core/FeatureInfo.js';

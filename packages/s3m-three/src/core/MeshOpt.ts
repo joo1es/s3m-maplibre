@@ -383,8 +383,18 @@ export async function parseMeshOptGeometry(
           }
         }
         pushSink(sinks, slot === 0 ? 'uv' : 'uv2', 'f32', 2, uv);
+      } else if (
+        semantic === MeshOptSemantic.CUSTOM0 ||
+        semantic === MeshOptSemantic.CUSTOM1 ||
+        semantic === MeshOptSemantic.GS_SCALE ||
+        semantic === MeshOptSemantic.GS_ROTATION
+      ) {
+        // 自定义属性流 / 高斯泼溅的逐点参数：原样保留解码结果（每点 stride 字节），
+        // 语义由 vp.customVertexAttribute 的名字→槽位映射给出。
+        // 以前这里直接丢掉，导致 3DGaussianSplatting 数据只剩「点 + 颜色」，
+        // 上层永远拿不到泼溅尺寸与朝向。
+        pushSink(sinks, SEMANTIC_NAME[semantic]!, 'u8', stride, out);
       }
-      // custom / GS 系列暂不使用
     }
 
     const descript = r.string();
@@ -412,6 +422,8 @@ export async function parseMeshOptGeometry(
 
   info.vertexCount = baseVertex;
   vp.verticesCount = baseVertex;
+  // 留下原始流清单：诊断用，也是接自定义属性 / 高斯泼溅属性的入口
+  vp.meshOptInfo = info;
 
   // 跨块拼接：属性流长度按理各块一致，缺块时补 0，宁可少一块颜色也不整块不可见
   for (const [semantic, sink] of sinks) {

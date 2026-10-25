@@ -21,7 +21,7 @@
  * MapLibre / Mapbox 的胶水层在 s3m-maplibre 包的 S3MLayer.ts。
  */
 import * as THREE from 'three';
-import { S3MTileset } from '../tileset/S3MTileset.js';
+import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import { setMaxAnisotropy } from './TextureFactory.js';
 import {
@@ -33,6 +33,7 @@ import {
   createOutlineMaterial,
 } from './StyleMaterial.js';
 import type { OutlineMaterial, StyledMaterial, StyleMode, SelectMode, S3MStyle } from './StyleMaterial.js';
+import { applyPointCloudStyle, isOwnedPointCloudMaterial } from './PointCloudMaterial.js';
 import { Picker } from './Picker.js';
 import {
   buildFeatureEdgeSegments,
@@ -191,6 +192,8 @@ interface MeshUserData {
   geoRef?: GeoPackageEntry;
   tileRef?: ParsedTile;
   primitiveType?: number;
+  /** 点云对象（THREE.Points）：不吃面着色，也没有棱可描 */
+  isPointCloud?: boolean;
   /** CPU 端现算的棱线对象（等宽线 Mesh） */
   edges?: THREE.Object3D | null;
   /** 数据自带棱线包（此时不再用 EdgesGeometry 现算） */
@@ -209,6 +212,11 @@ function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
   const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
   const styled = m as StyledMaterial | undefined;
   return styled?.userData?.isStyled ? styled : null;
+}
+
+/** 点云是 THREE.Points 不是 Mesh，样式 / 拾取 / 卸载链路都靠这个判定放行 */
+function isPointCloudObject(o: THREE.Object3D): o is THREE.Points {
+  return (o as unknown as THREE.Points).isPoints === true;
 }
 
 /* ------------------------------------------------------------------ 图层 */
@@ -272,7 +280,7 @@ export class S3MViewer {
   private _heightMax = -Infinity;
   private readonly _boxScratch = new THREE.Box3();
   private _selection: PickResult | null = null;
-  private _selectedMeshes: THREE.Mesh[] = [];
+  private _selectedMeshes: THREE.Object3D[] = [];
   private _outlineMesh: THREE.Mesh | null = null;
   private _outlineMeshes: THREE.Mesh[] = [];
   private _selectionEdges: THREE.Mesh | null = null;
@@ -785,6 +793,7 @@ export class S3MViewer {
         mesh.geometry?.dispose?.();
         const styled = styledMaterialOf(mesh);
         if (styled) styled.dispose();
+        if (isOwnedPointCloudMaterial(mesh.material)) (mesh.material as THREE.Material).dispose();
         this._featureStyleManager.disposeMesh(mesh);
       });
     });
@@ -820,8 +829,10 @@ export class S3MViewer {
         continue;
       }
 
+      // 点云是 THREE.Points 不是 Mesh，但同样要进拾取表、吃不透明度、跟着着色模式走
+      const isPoints = isPointCloudObject(child);
       const mesh = child as THREE.Mesh;
-      if (!mesh.isMesh) continue;
+      if (!mesh.isMesh && !isPoints) continue;
       const ud = mesh.userData as MeshUserData;
       ud.pickId = this._allocPickId();
       ud.datasetId = entry.id;
@@ -834,18 +845,23 @@ export class S3MViewer {
       });
       this._indexMeshSmids(mesh);
       this._addMeshHeight(mesh);
-      if (this._edgesEnabled && !hasNativeEdges) this._ensureEdges(mesh);
+      // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义
+      if (this._edgesEnabled && !hasNativeEdges && !isPoints) this._ensureEdges(mesh);
 
       // 新瓦片要继承当前的不透明度与着色方式
-      const mat = styledMaterialOf(mesh);
-      if (mat) {
-        const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
-        mat.opacity = o;
-        mat.transparent = o < 0.999;
-        mat.depthWrite = o >= 0.999;
-        mat.flatShading = this.style.shading !== 'smooth';
-        mat.needsUpdate = true;
-        this._featureStyleManager.applyOverridesToMesh(mesh);
+      if (isPoints) {
+        this._applyPointCloudStyle(child as THREE.Points);
+      } else {
+        const mat = styledMaterialOf(mesh);
+        if (mat) {
+          const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
+          mat.opacity = o;
+          mat.transparent = o < 0.999;
+          mat.depthWrite = o >= 0.999;
+          mat.flatShading = this.style.shading !== 'smooth';
+          mat.needsUpdate = true;
+          this._featureStyleManager.applyOverridesToMesh(mesh);
+        }
       }
     }
   }
@@ -867,6 +883,8 @@ export class S3MViewer {
       this._featureStyleManager.disposeMesh(mesh);
       const styled = styledMaterialOf(mesh);
       styled?.dispose?.();
+      // 点云材质是本模块按模式建的，不走 styled 那条链
+      if (isOwnedPointCloudMaterial(mesh.material)) (mesh.material as THREE.Material).dispose();
       mesh.geometry?.dispose?.();
     }
     entry.root.remove(node.group);
@@ -902,6 +920,8 @@ export class S3MViewer {
     this.style = { ...this.style, ...patch };
     this._applyStyleUniforms();
     if ('opacity' in patch || 'depthWrite' in patch) this._applyOpacity();
+    // 点云不走 StyleMaterial 的 uMode，模式切换要单独同步它的材质
+    if ('mode' in patch) this._applyPointCloudStyles();
     if ('shading' in patch) this._applyShading();
     if ('edges' in patch) this.setEdges(!!this.style.edges);
     else if ('edgeColor' in patch || 'edgeWidth' in patch || 'opacity' in patch || 'edgeOpacity' in patch) {
@@ -971,11 +991,28 @@ export class S3MViewer {
     // 关键：若 depthWrite 开启（默认开启），即使半透明也保持深度写入，完美遮挡背面棱线，防止背面线条透出
     const keepDepth = this.style.depthWrite !== false;
     for (const p of this._pickables.values()) {
+      if (isPointCloudObject(p.mesh)) {
+        this._applyPointCloudStyle(p.mesh);
+        continue;
+      }
       const m = styledMaterialOf(p.mesh);
       if (!m) continue;
       m.opacity = o;
       m.transparent = transparent;
       m.depthWrite = transparent ? keepDepth : true;
+    }
+    this._requestRepaint();
+  }
+
+  /** 单个点云对象同步当前样式（着色模式 + 不透明度 + 选中高亮） */
+  private _applyPointCloudStyle(points: THREE.Points, selected = this._selectedMeshes.includes(points)): void {
+    applyPointCloudStyle(points, this.style, this.uniforms, selected);
+  }
+
+  /** 全部点云刷新：着色模式切换时用（uniform 是共享引用，改色不用走这里） */
+  private _applyPointCloudStyles(): void {
+    for (const p of this._pickables.values()) {
+      if (isPointCloudObject(p.mesh)) this._applyPointCloudStyle(p.mesh);
     }
     this._requestRepaint();
   }
@@ -1116,7 +1153,8 @@ export class S3MViewer {
       .map((p) => p.mesh)
       .filter((m) => {
         const ud = m.userData as MeshUserData;
-        return !ud.edges && !ud.nativeEdges;
+        // 点云没有棱可描
+        return !ud.edges && !ud.nativeEdges && !isPointCloudObject(m);
       });
     let i = 0;
     const step = (): void => {
@@ -1626,8 +1664,13 @@ export class S3MViewer {
   select(result: PickResult | null, { silent = false }: { silent?: boolean } = {}): void {
     // 清掉上一次
     if (this._selection) {
-      for (const mesh of this._selectedMeshes) {
-        const mat = styledMaterialOf(mesh);
+      for (const obj of this._selectedMeshes) {
+        // 点云：恢复成当前着色模式（去掉选中混色）
+        if (isPointCloudObject(obj)) {
+          this._applyPointCloudStyle(obj, false);
+          continue;
+        }
+        const mat = styledMaterialOf(obj as THREE.Mesh);
         if (mat) {
           mat.userData.uSelBatch.value = -1;
           mat.userData.uSelWhole.value = 0;
@@ -1678,14 +1721,22 @@ export class S3MViewer {
       mat.userData.uSelWhole.value = batchId < 0 ? 1 : 0;
       this._selectedMeshes.push(mesh);
     }
+    // 点云没有单体粒度：整块混成 selectColor，让选中至少看得见
+    for (const mesh of this._selectedMeshes) {
+      if (isPointCloudObject(mesh)) this._applyPointCloudStyle(mesh, true);
+    }
     this.uniforms.uSelMix.value = 1;
     this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
 
     if (this.style.outline) {
-      if ((this.style.outlineStyle ?? 'edges') === 'edges') {
-        this._addSelectionEdges(result, targetMeshes);
-      } else {
-        this._addSelectionHull(result, targetMeshes);
+      // 棱线 / 外扩轮廓都是按「面」设计的，点云画不出来也不该画
+      const decoMeshes = [...targetMeshes].filter((m) => !isPointCloudObject(m));
+      if (decoMeshes.length) {
+        if ((this.style.outlineStyle ?? 'edges') === 'edges') {
+          this._addSelectionEdges(result, decoMeshes);
+        } else {
+          this._addSelectionHull(result, decoMeshes);
+        }
       }
     }
     this._requestRepaint();
@@ -1985,9 +2036,8 @@ export class S3MViewer {
     let maxLon = -Infinity;
     let maxLat = -Infinity;
     for (const entry of this.datasets.values()) {
-      const b = entry.tileset?.config?.geoBounds as
-        | { left: number; bottom: number; right: number; top: number }
-        | undefined;
+      // 同 DatasetManager.getBounds：退化 / 越界的 geoBounds 不参与，避免视角甩到 (0,0)
+      const b = usableGeoBounds(entry.tileset?.config?.geoBounds);
       if (!b) continue;
       minLon = Math.min(minLon, b.left);
       maxLon = Math.max(maxLon, b.right);

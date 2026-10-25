@@ -33,6 +33,7 @@
     "prepublishOnly:maplibre": "cd packages/s3m-maplibre && npm publish"
   },
   "devDependencies": {
+    "@supermapgis/s3m-content-loader": "^1.0.5",
     "@types/markdown-it": "^14.2.0",
     "@types/three": "^0.169.0",
     "maplibre-gl": "^5.0.0",

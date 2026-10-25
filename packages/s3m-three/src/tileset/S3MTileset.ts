@@ -7,6 +7,7 @@
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
+import { parseS3MBlock } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { Group, Texture } from 'three';
 
@@ -33,29 +34,100 @@ function toAbsolute(url: string): string {
 function resolveUrl(base: string, rel: string | null | undefined): string | null {
   if (!rel) return null;
   try {
-    return new URL(rel, base).href;
+    return fixPathEncoding(new URL(rel, base).href);
   } catch {
     // base 不是合法绝对地址时，退化为手工拼接，避免静默拿到错误路径
-    return `${dirOf(base)}${rel}`;
+    return fixPathEncoding(`${dirOf(base)}${rel}`);
   }
 }
 
-/** 兼容解析 JSON 与 XML 格式的 SuperMap .scp / config 配置文件 */
-function parseConfigText(text: string): Record<string, unknown> {
+/**
+ * 修补路径里没被编码、但会被服务端改写的字符。
+ *
+ * 最典型的是 `+`：OSGB 转 S3M 的缓存瓦片名就是 `Tile_+002_+001`，而 iServer 的 Java 侧
+ * 按 URLDecoder 解路径，未编码的 `+` 会变成空格 → 404「瓦片数据不存在」。
+ * new URL() 的序列化器认为 `+` 在 path 里是合法字符，所以不会替我们编码，必须自己补上。
+ * 只动 path，不动 query/hash：query 里的 `+` 本来就是空格的约定，改了反而换味。
+ */
+export function fixPathEncoding(url: string): string {
+  if (!/[+ ]/.test(url)) return url;
+  const hashAt = url.indexOf('#');
+  const hash = hashAt < 0 ? '' : url.slice(hashAt);
+  const body = hashAt < 0 ? url : url.slice(0, hashAt);
+  const queryAt = body.indexOf('?');
+  const path = queryAt < 0 ? body : body.slice(0, queryAt);
+  const query = queryAt < 0 ? '' : body.slice(queryAt);
+  return `${path.replace(/\+/g, '%2B').replace(/ /g, '%20')}${query}${hash}`;
+}
+
+/** 每度对应的米数（等距圆柱近似），与 demo 里量测瓦片尺寸用的是同一套系数 */
+const METERS_PER_DEG_LAT = 110540;
+const METERS_PER_DEG_LON_EQUATOR = 111320;
+
+/** 配置文件里的经纬度范围 */
+export interface GeoBounds {
+  left: number;
+  bottom: number;
+  right: number;
+  top: number;
+}
+
+/**
+ * 判断 config.geoBounds 是不是一张「真的能用」的经纬度范围。
+ *
+ * 挡掉三种情况：字段缺失 / 非有限值；超出经纬度量级（OSGB 那类只给米制局部坐标的，
+ * 反算不出来就是这种）；以及退化成一条线或一个点的全 0 框。
+ * 退化框尤其危险：拿它去 fitBounds 会把视角甩到几内亚湾 (0,0)，
+ * 拿它去校验 position 又会把唯一正确的 position 判成异常。
+ */
+export function usableGeoBounds(b: unknown): GeoBounds | null {
+  if (!b || typeof b !== 'object') return null;
+  const g = b as Partial<GeoBounds>;
+  const v = [g.left, g.bottom, g.right, g.top];
+  if (!v.every((n) => typeof n === 'number' && Number.isFinite(n))) return null;
+  const { left, bottom, right, top } = g as GeoBounds;
+  if (Math.abs(left) > 180 || Math.abs(right) > 180 || Math.abs(top) > 90 || Math.abs(bottom) > 90) return null;
+  if (right === left && top === bottom) return null;
+  return { left, bottom, right, top };
+}
+
+/** 兼容解析 JSON 与 XML 格式的 SuperMap .scp / config 配置文件（导出以便单测与自建数据集列表复用） */
+export function parseConfigText(text: string): Record<string, unknown> {
   const trimmed = text.trim();
   if (trimmed.startsWith('<')) {
     const tagVal = (tag: string): string | null => {
       const m = new RegExp(`<(?:[a-zA-Z0-9_-]+:)?${tag}[^>]*>([^<]+)<\\/`, 'i').exec(trimmed);
       return m ? m[1].trim() : null;
     };
-    const posX = parseFloat(tagVal('X') ?? '0');
-    const posY = parseFloat(tagVal('Y') ?? '0');
-    const posZ = parseFloat(tagVal('Z') ?? '0');
+    const num = (tag: string): number => parseFloat(tagVal(tag) ?? '');
+    const posX = num('X') || 0;
+    const posY = num('Y') || 0;
+    const posZ = num('Z') || 0;
 
-    const left = parseFloat(tagVal('Left') ?? '0');
-    const right = parseFloat(tagVal('Right') ?? '0');
-    const top = parseFloat(tagVal('Top') ?? '0');
-    const bottom = parseFloat(tagVal('Bottom') ?? '0');
+    let left = num('Left');
+    let right = num('Right');
+    let top = num('Top');
+    let bottom = num('Bottom');
+
+    // SuperMapCache（OSGB 转出来的那类 XML）压根不给经纬度范围，只给
+    // 「以 Position 为原点、局部 ENU 米制」的 BoundingBox。不反算的话 geoBounds 就是
+    // 全 0：getBounds() 会把视角甩到几内亚湾，_resolveAnchor 还会反过来把正确的
+    // position 判成「与 geoBounds 不一致」而退回 (0,0)，位置错得彻彻底底。
+    if (![left, right, top, bottom].every(Number.isFinite)) {
+      const minX = num('MinX');
+      const maxX = num('MaxX');
+      const minY = num('MinY');
+      const maxY = num('MaxY');
+      if ([minX, maxX, minY, maxY].every(Number.isFinite) && posX && posY) {
+        const kx = METERS_PER_DEG_LON_EQUATOR * Math.cos((posY * Math.PI) / 180);
+        if (kx > 1e-6) {
+          left = posX + minX / kx;
+          right = posX + maxX / kx;
+          bottom = posY + minY / METERS_PER_DEG_LAT;
+          top = posY + maxY / METERS_PER_DEG_LAT;
+        }
+      }
+    }
 
     const fileMatches = trimmed.matchAll(/<(?:[a-zA-Z0-9_-]+:)?FileName[^>]*>([^<]+)<\//gi);
     const tiles: Array<{ url: string }> = [];
@@ -64,6 +136,7 @@ function parseConfigText(text: string): Record<string, unknown> {
     }
 
     return {
+      fileType: tagVal('FileType') ?? undefined,
       position: { x: posX, y: posY, z: posZ, units: 'Degree' },
       geoBounds: { left, right, top, bottom },
       rootTiles: tiles,
@@ -119,6 +192,12 @@ export interface S3MTilesetOptions {
 export class S3MTileset {
   configUrl: string;
   config: Record<string, unknown> | null = null;
+  /**
+   * S3MBLOCK 数据集的完整瓦片清单（config.tiles 解析成绝对 URL）。
+   * 这类数据的 pageLOD 会引用服务端并不存在的子块（LOD 树占位），
+   * 按清单过滤可以避免成片的 404。经典 scp 不建这个索引，行为不变。
+   */
+  private _blockTileIndex: Set<string> | null = null;
   anchor: Anchor = { lon: 0, lat: 0, height: 0 };
 
   readonly rootUrls: string[] = [];
@@ -152,6 +231,8 @@ export class S3MTileset {
   /** 子瓦片 URL → 父瓦片 URL，用于淘汰后补洞 */
   private readonly _parentOf = new Map<string, string>();
   private _frame = 0;
+  /** 格式类永久错误只向上报一次，避免整棵瓦片树刷同样的日志 */
+  private _permanentReported = false;
   private _buildTile: BuildTileFn | null;
   private readonly _uniforms: StyleUniforms | null;
   private _queue: string[] = [];
@@ -193,6 +274,28 @@ export class S3MTileset {
     for (const r of roots) {
       const u = resolveUrl(this.configUrl, r.url);
       if (u) this.rootUrls.push(u);
+    }
+
+    // OSGB 原生缓存（SuperMapCache / S3M 1.x）早点说清楚，别等几十块瓦片全失败才看出来。
+    // 位置与范围是按配置反算出来的，所以视角会正确落到模型上，只是没有内容可渲染。
+    const isV1OSGB =
+      /OSGB/i.test(String(config.fileType ?? '')) ||
+      /OSGB/i.test(String(config.dataType ?? '')) ||
+      (this.rootUrls.length > 0 && this.rootUrls.every((u) => /\.s3m($|\?)/i.test(u)));
+    if (isV1OSGB) {
+      console.warn(
+        '[s3m] 这是 OSGB 原生缓存（SuperMapCache，瓦片为 S3M 1.x 的 .s3m，下一级 LOD 是 .osgb），' +
+          '本库只支持 S3MB 2.x / 3.x，不会渲染出内容。请把数据重新导出/发布成 S3M 瓦片缓存（.s3mb）。'
+      );
+    }
+
+    // S3MBLOCK：config.tiles 就是全部瓦片，子引用超出清单的一律不请求
+    if (this.rootUrls.every((u) => /\.s3mblock($|\?)/i.test(u))) {
+      this._blockTileIndex = new Set(this.rootUrls);
+      for (const r of roots) {
+        const u = resolveUrl(this.configUrl, r.url);
+        if (u) this._blockTileIndex.add(u);
+      }
     }
 
     // 首棵树同步加载，保证 init 返回时已有内容可渲染
@@ -295,23 +398,37 @@ export class S3MTileset {
    * 定位锚点。规范里 position 是局部 ENU 坐标系原点，
    * 但实际数据里 position 偶尔是生产时的占位值（与 geoBounds 不符），
    * 所以这里做一次一致性检查，不一致就退回 geoBounds 中心。
+   *
+   * 前提是 geoBounds 真的可用：OSGB/SuperMapCache 这类配置只给米制局部包围盒，
+   * 全 0 的退化框不能反过来否定一个正常的 position —— 那等于把模型甩到 (0,0)。
    */
   private _resolveAnchor(config: Record<string, unknown>): Anchor {
-    const raw = config.position as { point3D?: { x: number; y: number; z?: number }; x?: number; y?: number; z?: number } | undefined;
+    const raw = config.position as
+      | {
+          point3D?: { x: number; y: number; z?: number };
+          x?: number;
+          y?: number;
+          z?: number;
+          units?: string;
+          unit?: string;
+        }
+      | undefined;
     const p = raw?.point3D ?? (raw as { x: number; y: number; z?: number } | undefined);
-    const b = config.geoBounds as { left: number; bottom: number; right: number; top: number } | undefined;
+    const okP = !!p && Number.isFinite(p.x) && Number.isFinite(p.y);
+    const b = usableGeoBounds(config.geoBounds);
     const centerLon = b ? (b.left + b.right) / 2 : undefined;
     const centerLat = b ? (b.bottom + b.top) / 2 : undefined;
     // ENU 原点在椭球面上，position.z 就是它的高度；用 heightRange.min 会引入垂直偏移
     const z = p?.z ?? 0;
 
-    if (!p) return { lon: centerLon ?? 0, lat: centerLat ?? 0, height: 0 };
+    if (!okP) return { lon: centerLon ?? 0, lat: centerLat ?? 0, height: 0 };
 
-    const units = (config.position as { units?: string } | undefined)?.units ?? 'Degree';
-    if (units !== 'Degree') return { lon: p.x!, lat: p.y!, height: z };
+    // 两种写法都得认：老数据是 position.units，v3.01 起改成了 position.unit
+    const units = raw?.units ?? raw?.unit ?? 'Degree';
+    if (units !== 'Degree') return { lon: p!.x!, lat: p!.y!, height: z };
 
-    const offLon = centerLon === undefined ? 0 : Math.abs(p.x! - centerLon);
-    const offLat = centerLat === undefined ? 0 : Math.abs(p.y! - centerLat);
+    const offLon = centerLon === undefined ? 0 : Math.abs(p!.x! - centerLon);
+    const offLat = centerLat === undefined ? 0 : Math.abs(p!.y! - centerLat);
     if (offLon > 0.5 || offLat > 0.5) {
       console.warn('[s3m] position 与 geoBounds 不一致，改用 geoBounds 中心作为锚点', {
         position: p,
@@ -319,7 +436,7 @@ export class S3MTileset {
       });
       return { lon: centerLon!, lat: centerLat!, height: z };
     }
-    return { lon: p.x!, lat: p.y!, height: z };
+    return { lon: p!.x!, lat: p!.y!, height: z };
   }
 
   private _pickLod(tile: ParsedTile) {
@@ -352,7 +469,10 @@ export class S3MTileset {
         throw new Error(`瓦片请求返回了 HTML 页面（通常为 404/500 服务端拦截）: ${url}`);
       }
       const buffer = await res.arrayBuffer();
-      const tile = await parseS3MB(buffer);
+      // S3MBLOCK（TextureSharing / 单文件存储）走专用解析：容器 + 内嵌 v2 瓦片体 + 图集纹理
+      const tile = /\.s3mblock($|\?)/i.test(url)
+        ? await parseS3MBlock(buffer)
+        : await parseS3MB(buffer);
 
       const build = await this._builder();
       const { group, stats } = await build(tile, { textureCache: this.textureCache, uniforms: this._uniforms });
@@ -362,6 +482,7 @@ export class S3MTileset {
       for (const l of tile.groupNode?.pageLods ?? []) {
         const u = resolveUrl(dirOf(url), l.childTile);
         if (u && u !== url && !childUrls.includes(u)) {
+          if (this._blockTileIndex && !this._blockTileIndex.has(u)) continue;
           childUrls.push(u);
         }
       }
@@ -387,9 +508,12 @@ export class S3MTileset {
 
       this._onTile(node);
     } catch (e) {
+      // 格式层面的永久错误（例如 S3M 1.x 容器）重试一万次也不会变好，
+      // 直接判失败，免得反复重下一整块瓦片还拖慢首屏
+      const permanent = (e as { permanent?: boolean } | null)?.permanent === true;
       const attempts = (this._retryCount.get(url) ?? 0) + 1;
       this._retryCount.set(url, attempts);
-      if (attempts <= this._maxRetries) {
+      if (!permanent && attempts <= this._maxRetries) {
         // 退避重试：不进 failed，下一帧 update() 会重新入队，避免网络抖一下就留个永久空洞
         this._retryAt.set(url, performance.now() + 800 * attempts);
       } else {
@@ -399,7 +523,16 @@ export class S3MTileset {
         this.failed.add(url);
         this._retryAt.delete(url);
       }
-      this._onError(e);
+      // 同一类永久错误只报一次：OSGB 服务一上来几十块瓦片都是同一个原因，
+      // 刷屏会把真正值得看的日志埋掉
+      if (permanent) {
+        if (!this._permanentReported) {
+          this._permanentReported = true;
+          this._onError(e);
+        }
+      } else {
+        this._onError(e);
+      }
     } finally {
       this.pending.delete(url);
       this.stats.loading--;
@@ -431,7 +564,15 @@ export class S3MTileset {
       node.distance = dist;
 
       let metric: number;
-      if (node.rangeMode === 0) {
+      // RangeMode 语义（规范只写了 0/1）：
+      //   0 Distance_From_EyePoint —— rangeValue 是米，离得越近越该细化
+      //   1 Pixel_Size_OnScreen     —— rangeValue 是屏幕像素，投影半径超过它就细化
+      //   2 规范枚举里没有这一档（文档里记作 Geometric_Error）。实测高斯泼溅 / 点云服务用的是
+      //     这一档，且 rangeValue ≈ 包围球半径的固定比例（根瓦片 0.664/10.455，子瓦片
+      //     0.332/3.7，比例都约 0.064），像是「相对屏幕尺寸的几何误差」而非绝对像素。
+      //     这里先按 1 处理：方向是对的（近处细化），只是阈值偏小会多下几层，靠 lodRangeScale 收着。
+      const byDistance = node.rangeMode === 0;
+      if (byDistance) {
         metric = dist; // Distance_From_EyePoint：距离越小越该细化
       } else {
         // 屏幕像素半径
@@ -441,11 +582,11 @@ export class S3MTileset {
       // 在有效范围内（留一倍余量）的算「正在用」，淘汰时按这个帧号排优先级
       const scale = this.lodRangeScale > 0 ? this.lodRangeScale : 1.0;
       const threshold = node.rangeValue * scale;
-      const inRange = node.rangeMode === 0 ? dist < threshold * 2 : metric > threshold * 0.5;
+      const inRange = byDistance ? dist < threshold * 2 : metric > threshold * 0.5;
       if (inRange) node.lastSeen = this._frame;
 
       const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
-      const needRefine = childUrls.length > 0 && (node.rangeMode === 0 ? metric < threshold : metric > threshold);
+      const needRefine = childUrls.length > 0 && (byDistance ? metric < threshold : metric > threshold);
       node.needRefine = needRefine;
 
       if (needRefine) {

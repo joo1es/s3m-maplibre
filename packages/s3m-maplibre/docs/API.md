@@ -140,11 +140,19 @@ setDatasetVisible(id: string, visible: boolean): void
 interface S3MDatasetOptions {
   id: string;           // 唯一标识
   name?: string;        // 展示名
-  configUrl: string;    // .scp 地址
+  configUrl: string;    // .scp 地址，或 iServer 的数据源 config（见下）
   visible?: boolean;    // 默认 true
   maxTiles?: number;    // 覆盖图层级配置
 }
 ```
+
+`configUrl` 接受三种形态：本地 / 静态托管的 `.scp`；`.s3mb` 瓦片地址；以及 iServer realspace 服务的**数据源 config**：
+
+```
+https://host/iserver/services/3D-xxx/rest/realspace/datas/<数据源名>/config
+```
+
+三个容易踩的点（详见 [s3m-three 的 S3MTileset 一节](../../s3m-three/docs/API.md#s3mtileset)）：后缀只能写 `config`，写成 `config.xml` 会 406；`<数据源名>` 可以是中文，直接给到 `…/datas` 拿到的是资源清单而不是配置；OSGB 倾斜摄影那类服务的 `config` 返回 XML 且瓦片是 S3M 1.x，位置能定准但几何不支持，会明确报错。
 
 `addDataset` 在图层 `onAdd` 之前调用会抛错（此时还没有 WebGL 上下文）。
 
@@ -293,7 +301,7 @@ V = P⁻¹ × MVP
 - **正交投影**需要 MapLibre ≥ 5；v4 / v5 以下（含 Mapbox v2）只给合并矩阵，会告警一次并保持透视，见[投影](#投影)。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
 
-解析 / 几何 / 纹理 / 单体化相关的已知限制（Draco、实例化单体、CRN 判定、纹理分包、切线流、KTX2、骨骼动画）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。
+解析 / 几何 / 纹理 / 单体化相关的已知限制（Draco、实例化单体、CRN 判定、切线流、KTX2、骨骼动画）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。
 
 ---
 

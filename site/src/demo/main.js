@@ -49,6 +49,22 @@ const PRESETS = [
     pitch: 68,
     bearing: -35,
   },
+  {
+    id: 'gs',
+    // SuperMap 的 3DGaussianSplatting 服务：v3.01 + MeshOpt 多骨架，
+    // 瓦片没有索引包（顶点即点），LOD 用的是规范枚举里没有的 rangeMode = 2
+    name: '寿宁阁 (高斯泼溅)',
+    url:
+      'https://www.supermapol.com/realspace/services/3D-ShouNingGe' +
+      '/rest/realspace/datas/寿宁阁/config',
+    color: '#7c3aed',
+    tip: 'SuperMap Online 公有服务 · 高斯泼溅按点渲染，靠近会自动细化',
+    align: 'origin',
+    heightOffset: 0,
+    underground: false,
+    pitch: 72,
+    bearing: -20,
+  },
 ];
 
 const DEFAULT_URL = PRESETS[0].url; // 默认使用 CCTV CBD 模型
@@ -182,6 +198,19 @@ const map = new maplibregl.Map({
   attributionControl: { compact: true },
 });
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
+
+/**
+ * 用户是否手动动过镜头。
+ *
+ * 数据集是异步加载的，`loadSource` 里的 fitLayerBounds 要等所有数据集 await 完才执行；
+ * 大服务（几十张瓦片）能拖到好几秒。没有这个标记的话，用户刚把镜头怼到某栋楼，
+ * 加载队列一收尾就被 fitBounds 拽回全局视角——特写根本停不住。
+ * 只有真实手势（拖拽 / 滚轮 / 双指 / 键盘）会置位，程序触发的 fitBounds 不带 originalEvent。
+ */
+let userMovedCamera = false;
+map.on('movestart', (e) => {
+  if (e.originalEvent) userMovedCamera = true;
+});
 
 const layer = new S3MLayer({
   id: 's3m',
@@ -361,6 +390,8 @@ async function loadSource(rawUrl) {
 
   setStatus('正在解析数据源…', 'busy');
   layer.clearDatasets();
+  // 切换数据源是明确意图，允许重新取景（否则用户手动动过一次镜头后就再也不会自动对齐新数据）
+  userMovedCamera = false;
 
   currentDatasets = await resolveUrlToDatasets(url);
   renderDatasetUI();
@@ -402,7 +433,9 @@ function updateDatasetTag(id) {
   }
 }
 
-function fitLayerBounds(customOptions) {
+function fitLayerBounds(customOptions, force = false) {
+  // 用户已经自己取景 ⇒ 不再抢镜头（force 用于「切换数据源」这类明确意图）
+  if (userMovedCamera && !force) return;
   const bounds = layer.getBounds();
   if (bounds) {
     const opts = Object.assign(

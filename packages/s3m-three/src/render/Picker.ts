@@ -68,6 +68,9 @@ const PICK_VERT = /* glsl */ `
     #else
       gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
     #endif
+    // 点云也用这条着色器：不写 gl_PointSize 时光栅化出来只有 1px，
+    // 跟显示尺寸（2px）不匹配，点云会很难点中。对 Mesh 图元这行被忽略。
+    gl_PointSize = 2.0;
   }
 `;
 
@@ -129,6 +132,11 @@ function createPickMaterial(objectId: number): THREE.ShaderMaterial {
     depthWrite: true,
     toneMapped: false,
   });
+}
+
+/** 点云是 THREE.Points 不是 Mesh，拾取链路要放行 */
+function isPointsObject(o: THREE.Object3D): o is THREE.Points {
+  return (o as unknown as THREE.Points).isPoints === true;
 }
 
 export class Picker {
@@ -194,12 +202,13 @@ export class Picker {
     const prevClearAlpha = renderer.getClearAlpha();
 
     // ---- 换材质
-    const swapped: Array<[THREE.Mesh, THREE.Material | THREE.Material[]]> = [];
+    const swapped: Array<[THREE.Object3D, THREE.Material | THREE.Material[]]> = [];
     /** 这次拾取里哪些网格是实例化的（它们的 vBatch 编码的是实例序号） */
     const instancedPickIds = new Set<number>();
     scene.traverseVisible((o) => {
       const mesh = o as THREE.Mesh;
-      if (!mesh.isMesh) return;
+      // 点云是 THREE.Points，同样要参与拾取
+      if (!mesh.isMesh && !isPointsObject(mesh)) return;
       const ud = mesh.userData as PickUserData;
       if (ud.pickId === undefined) return;
       if (!ud.pickMaterial) ud.pickMaterial = createPickMaterial(ud.pickId);
@@ -236,7 +245,7 @@ export class Picker {
     const hidden: THREE.Object3D[] = [];
     scene.traverseVisible((o) => {
       const mesh = o as THREE.Mesh;
-      if (mesh.isMesh && (mesh.userData as PickUserData).pickId === undefined) {
+      if ((mesh.isMesh || isPointsObject(mesh)) && (mesh.userData as PickUserData).pickId === undefined) {
         hidden.push(mesh);
         mesh.visible = false;
       }
@@ -272,7 +281,7 @@ export class Picker {
           : { objectId, batchId: rawId };
       }
     } finally {
-      for (const [mesh, mat] of swapped) mesh.material = mat;
+      for (const [obj, mat] of swapped) (obj as THREE.Mesh).material = mat;
       for (const o of hidden) o.visible = true;
       renderer.setRenderTarget(prevTarget);
       renderer.setViewport(prevViewport);

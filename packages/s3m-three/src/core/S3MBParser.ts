@@ -7,12 +7,14 @@
  * 与官方实现的差异：
  *   1. 不依赖 Cesium —— 输出纯数据对象，几何上传交给渲染层。
  *   2. 修复了官方 v3 非压缩分支把整个 ArrayBuffer（含文件头）当数据流的缺陷。
- *   3. Draco / MeshOpt 几何压缩只做识别，不做解码（需要额外的 wasm 解码器）。
+ *   3. Draco 点云 / MeshOpt 几何压缩都用内联 wasm 解码器还原，与标准骨架同路输出。
  */
 import { BinaryReader } from './BinaryReader.js';
+import { parseDracoGeometry } from './Draco.js';
 import { parseMeshOptGeometry } from './MeshOpt.js';
 import type {
   AttrDType,
+  BoundingBox,
   GeoPackageEntry,
   Geode,
   GroupNode,
@@ -338,12 +340,18 @@ function parseIndexPackages(r: BinaryReader, version: number): IndexPackage[] {
 
 /* ------------------------------------------------------------------ 骨架 */
 
+/** v3 骨架条目末尾的包围盒大小：center + xExtent/yExtent/zExtent 各 3 个 float64 */
+const OBB_V3_SIZE = 96;
+
 /**
  * v3 骨架末尾的包围盒。
  *
  * v3.01 的实际数据在索引包之后、包围盒之前多了一个 4 字节字段（实测恒为 0，
- * 推测是线框几何的长度）。规范里没有写，标准骨架是否也有无法验证，
- * 所以这里做一次「读一遍看像不像包围盒」的判断，不像就跳 4 字节重读。
+ * 推测是线框几何的长度）。规范里没有写，标准骨架是否也有无法验证。
+ *
+ * 首选路径是 parseSkeletonEntries 里按 skeletonStreamSize 直接定位到「条目末尾
+ * 96 字节」——那是生产端写死的权威边界，不用猜。这里只保留 streamSize 不可用时
+ * （S3MBLOCK 内层、末条越界）的启发式兜底：读一遍看像不像包围盒，不像就跳 4 字节重读。
  *
  * 注意「不像」的判定必须只针对垃圾值（非有限 / 超出地球量级）：
  * 点云叶子瓦片只有一个点，extent 合法地为 0，退化包围盒是正常数据，
@@ -351,12 +359,12 @@ function parseIndexPackages(r: BinaryReader, version: number): IndexPackage[] {
  * 下一个骨架的名字长度会读到 ASCII 数字上（如 858992690 = "2033"），
  * 直接 RangeError。
  */
-function readV3BoundingBox(r: BinaryReader): void {
+function readV3BoundingBox(r: BinaryReader): BoundingBox {
   const start = r.offset;
   const box = r.boundingBox();
-  if (isFiniteBox(box)) return;
+  if (isFiniteBox(box)) return box;
   r.offset = start + 4;
-  r.boundingBox();
+  return r.boundingBox();
 }
 
 /** 只排除垃圾值； extent 为 0 的退化包围盒（单点点云）是合法数据 */
@@ -382,7 +390,16 @@ export async function parseSkeletonEntries(
   const geoPackage: Record<string, GeoPackageEntry> = {};
 
   for (let i = 0; i < count; i++) {
-    if (version >= 3) r.u32(); // skeletonStreamSize
+    // v3 起每块骨架自带 streamSize，覆盖「本字段之后 → 下一条记录开头」整段。
+    // 这是唯一可靠的条目边界：几何段与末尾 OBB 之间可能还有对齐填充
+    // （实测高斯泼溅/点云的多块瓦片里，第 3 块就比别块多 4 字节 pad），
+    // 靠「读够固定长度」往后推会整条流错位。
+    let entryEnd = -1;
+    if (version >= 3) {
+      const streamSize = r.u32();
+      const end = r.offset + streamSize;
+      if (streamSize >= OBB_V3_SIZE && end <= r.view.byteLength) entryEnd = end;
+    }
 
     const name = r.string();
     r.align4();
@@ -411,15 +428,30 @@ export async function parseSkeletonEntries(
         indexPackages = parseIndexPackages(r, version);
       }
     } else if (tag === VertexTag.DRACO) {
-      throw new Error(`[s3m] 骨架 "${name}" 使用 Draco 几何压缩，需接入 draco3d 解码器`);
+      // 点云分支：容器自带属性 uid 表，解出来的顶点即点，索引包由解析器合成
+      indexPackages = await parseDracoGeometry(r, vp);
     } else {
       throw new Error(`[s3m] 未知骨架标记 ${tag}（${name}）`);
     }
 
-    if (version >= 3) readV3BoundingBox(r);
+    let obb: BoundingBox | undefined;
+    if (version >= 3) {
+      if (entryEnd >= 0 && entryEnd - r.offset >= OBB_V3_SIZE) {
+        // OBB 恒定在条目末尾 96 字节：中间多出来的按填充丢掉，
+        // 这样即使几何段里还有个我们没认出来的字段，也不会波及后面的记录
+        const pad = entryEnd - r.offset - OBB_V3_SIZE;
+        if (pad > 0) trace?.('  skelPad', pad, r.offset);
+        r.offset = entryEnd - OBB_V3_SIZE;
+        obb = readV3BoundingBox(r);
+        r.offset = entryEnd;
+      } else {
+        // 没有可用的 streamSize（S3MBLOCK 内层、或末条越界），只能按启发式读
+        obb = readV3BoundingBox(r);
+      }
+    }
     trace?.('  skel', name, r.offset);
 
-    geoPackage[name] = { name, vertexPackage: vp, indexPackages };
+    geoPackage[name] = { name, vertexPackage: vp, indexPackages, obb };
   }
 
   return geoPackage;
@@ -571,7 +603,58 @@ export function parsePickInfoEntries(
 
 /* ------------------------------------------------------------------ 入口 */
 
+/**
+ * 容器层面的永久错误（格式不认识、重试一万次也不会变好）。
+ * 瓦片调度看到 permanent 就不再退避重试，免得反复重下一整块瓦片。
+ */
+export class S3MFormatError extends Error {
+  readonly permanent = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'S3MFormatError';
+  }
+}
+
+/** S3M 1.x 的魔数：ASCII "s3m" + 结尾 0 */
+const S3M_V1_MAGIC = 0x006d3373; // 小端读到的 uint32
+
+/**
+ * S3M 1.x 容器（OSGB 转出来的 SuperMapCache 瓦片，文件名 .s3m）
+ *
+ * 结构标定（实测 supermapol `3D-suofeiya_church` 的 Tile_+002_+001.s3m）：
+ * ```
+ * byte[4]  's3m\0'                // 魔数，不是版本号
+ * byte[]   zlib                   // 78 da 开头
+ *   解压后：
+ *   uint32 xmlSize
+ *   byte[] XML                    // <Group><PageLods><PagedLOD>…<Material3Ds>
+ *   byte[3]  未知（实测恒为 "000"）
+ *   uint32 size; byte[size]       // 几何流：开头就是 f32 包围盒，与 XML 的 BoundingSphere 对得上
+ *   uint32 size; byte[size]       // 4 字节小段
+ *   uint32 size; byte[size]       // 纹理流（内含 JPEG）
+ *   —— 三段的 size 链严丝合缝落到解压末尾
+ * ```
+ * 这里只做到「认出来并说清为什么不能用」，没有实现几何解码，原因有两层：
+ * 1. XML 的 RangeDataList 指向的是 `*_L16_0.osgb` —— 下一级 LOD 是 OpenSceneGraph
+ *    Binary，需要另一整套 OSG 反序列化 + SRS/局部变换配准，不是这个容器能兜住的；
+ * 2. 就算只画根级粗模，OSGB 成果的坐标系信息在切出来的 metadata.xml 里，
+ *    REST 的 config 并不提供，摆到地图上的位置无法保证正确。
+ * 正解是数据侧重新导出：iServer 发布成 S3M 瓦片缓存（.s3mb / 2.x、3.x），
+ * 或桌面端「导出 → S3M 格式」而不是 OSGB 原生缓存。
+ */
+function checkNotV1(arrayBuffer: ArrayBuffer): void {
+  if (arrayBuffer.byteLength < 8) return;
+  const head = new DataView(arrayBuffer, 0, 8);
+  if (head.getUint32(0, true) !== S3M_V1_MAGIC) return;
+  throw new S3MFormatError(
+    '[s3m] 这是 S3M 1.x 容器（.s3m，OSGB 转的 SuperMapCache 瓦片），本库只支持 S3MB 2.x / 3.x：' +
+      '它的下一级 LOD 指向 .osgb（OpenSceneGraph Binary），无法在浏览器里配准渲染。' +
+      '请把数据重新导出成 S3M 瓦片缓存（.s3mb）后再加载。'
+  );
+}
+
 export async function parseS3MB(arrayBuffer: ArrayBuffer, options: ParseOptions = {}): Promise<ParsedTile> {
+  checkNotV1(arrayBuffer);
   const inflate = options.inflate ?? defaultInflate;
   const trace = options.trace;
   const r = new BinaryReader(arrayBuffer);

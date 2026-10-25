@@ -47,11 +47,27 @@ export interface IndexPackage {
   passNames: string[];
 }
 
+/** MeshOpt 块解码后的原始流清单（语义名 + 每顶点字节数），来自 parseMeshOptGeometry */
+export interface MeshOptInfo {
+  vertexCount: number;
+  compressOptions: number;
+  minVertices: [number, number, number];
+  vertScale: number;
+  texCoordScale: number[][];
+  texCoordOffset: number[][];
+  streams: Array<{ semantic: string; bytes: number; stride: number }>;
+}
+
 export interface VertexPackage {
   verticesCount: number;
   vertexAttributes: VertexAttribute[];
   /** semantic → 在 vertexAttributes 中的下标 */
   attrLocation: Record<string, number>;
+  /**
+   * MeshOpt 骨架的原始流清单（诊断用，也是接自定义属性 / 高斯泼溅属性的入口）：
+   * 每条流解码后每个顶点占 stride 字节，压缩前的字节数在 bytes 里。
+   */
+  meshOptInfo?: MeshOptInfo;
   instanceCount: number;
   /** 16 = 只有矩阵，17/29 = 矩阵 + 颜色 */
   instanceMode: number;
@@ -89,6 +105,12 @@ export interface GeoPackageEntry {
   indexPackages: IndexPackage[];
   /** SMID → batchId + 顶点区间（单体化信息） */
   pickInfo?: Record<number, PickEntry>;
+  /**
+   * v3 骨架条目末尾自带的 OBB（局部 ENU 系，中心/三个半轴都是 float64）。
+   * 多骨架瓦片里每块 geode 的范围各不相同，pageLOD 的包围球只取自其中一块，
+   * 要做按块的剔除/贴地就得用它。v2 没有这个字段。
+   */
+  obb?: BoundingBox;
 }
 
 /* ------------------------------------------------------------------ LOD 树 */
@@ -123,6 +145,11 @@ export interface S3MTexture {
   compressType: number;
   pixelFormat: number;
   data: Uint8Array;
+  /**
+   * S3MBLOCK 图集为真：数据按 GL 纹理方向（v=0 在最后一行）存储，
+   * 解码成 RGBA 后要翻一次行再上传，rect 坐标（offsetY 从 v=0 起）才对得上。
+   */
+  flipY?: boolean;
 }
 
 /* ------------------------------------------------------------------ 瓦片 */

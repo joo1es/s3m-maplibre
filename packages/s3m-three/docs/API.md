@@ -97,6 +97,12 @@ three 场景原点固定在**场景锚点**（第一个成功加载的数据集�
 
 锚点来自数据集配置的 `position`，但会做一致性校验：若 `position` 与 `geoBounds` 中心偏差超过 0.5°，判定为生产时的占位脏数据，回退到 `geoBounds` 中心。
 
+回退的前提是 `geoBounds` 本身可用（`usableGeoBounds()`）：字段缺失、非有限值、超出经纬度量级、或**退化成全 0 / 一个点**的都算不可用。这条是踩过坑加的——OSGB 那类配置根本没有经纬度范围，全 0 的框反过来把唯一正确的 `position` 判成异常，结果是视角和模型一起跑到几内亚湾。`getBounds()` 同样只统计可用的框，宁可不移动视角，也不甩到 `(0,0)`。
+
+`position` 有两种写法都认：老数据是 `position.x/y/z` + `units`，v3.01 起改成 `position.point3D.{x,y,z}` + `unit`。第二个键名必须认，否则投影单位是米的数据会被当成度。
+
+OSGB（`SuperMapCache` XML）的配置只给 `<sml:Position>`（经纬度原点）和 `<sml:BoundingBox>`（以原点为中心的**米制**局部盒），解析时按等距圆柱近似反算成 `geoBounds`：`Δlon = x / (111320·cos φ)`、`Δlat = y / 110540`。
+
 ### 瓦片与 LOD
 
 配置里的 `tiles`（桌面导出）或 `rootTiles`（iServer，可多棵）是瓦片树入口。LOD 按规范里的 `RangeMode` 判定：
@@ -105,7 +111,11 @@ three 场景原点固定在**场景锚点**（第一个成功加载的数据集�
 |---|---|---|
 | 0 | `Distance_From_EyePoint` | 相机到包围球中心距离 < rangeValue 时细化 |
 | 1 | `Pixel_Size_OnScreen` | 包围球投影像素半径 > rangeValue 时细化 |
-| 2 | `Geometric_Error` | 按屏幕像素半径近似处理 |
+| 2 | `Geometric_Error` | 规范枚举里没有这一档。按屏幕像素半径近似处理 |
+
+关于 2：线上高斯泼溅与点云服务的 pageLOD 全是这一档，且 `rangeValue` 与包围球半径成固定比例（实测根瓦片 `0.664 / 10.455`、子瓦片 `0.332 / 3.7`，比例都约 0.064），更像「相对屏幕的几何误差」而不是绝对像素。按 1 处理方向是对的（近处细化），只是阈值偏小时会多下几层，用 `lodRangeScale` 收。
+
+多骨架瓦片（每块 geode 一个 pageLOD）的 `sphere` / `rangeValue` 取自其中一块，细化判定是整块瓦片共用的；子引用则会把**每个 pageLOD 的 `childTile` 都收集**进 `childUrls`，所以一层细化会正确扇出到 N 块子瓦。
 
 ### 单体化
 
@@ -670,6 +680,25 @@ console.log(tile.version, Object.keys(tile.geoPackage));
 
 解析结果可用 `bytesRead === bytesTotal` 自检——不等说明偏移算错了。
 
+**v3 骨架条目额外暴露 `obb`**（`GeoPackageEntry.obb`，局部 ENU 系的中心 + 三个半轴）。多骨架瓦片里每块 geode 范围各不相同，而 pageLOD 的包围球只取自其中一块，做按块剔除 / 贴地要用条目自带的这个。它是按 `skeletonStreamSize` 定位到「条目末尾 96 字节」读出来的，而不是靠猜——几何段与 OBB 之间可能还有对齐填充（实测高斯泼溅 / 点云多块瓦片里就有块比别的块多 4 字节），靠固定长度往后推会整条流错位，下一块骨架的名字长度会读到垃圾，报出来是「未知骨架标记」。
+
+**S3M 1.x 容器会被识别并抛错**，而不是抛一个看不懂的类型错误：
+
+```ts
+import { parseS3MB, S3MFormatError } from 's3m-three/core';
+
+try {
+  await parseS3MB(buf);
+} catch (e) {
+  if (e instanceof S3MFormatError) {
+    // e.permanent === true：格式层面的永久错误，重试没有意义
+    // 典型是 .s3m（OSGB 转的 SuperMapCache 瓦片，头 4 字节是魔数 "s3m\0" 而不是版本号）
+  }
+}
+```
+
+不识别的话，`s3m\0` 会被 float32 读成 1e-38 的「版本号」，接着把 zlib 头 `78 da cc bd` 当压缩长度，最终报 `RangeError: Invalid typed array length: 3184319096`——完全看不出是格式问题。`S3MTileset` 见到 `permanent` 就不退避重试，同类错误也只上报一次。
+
 ### MeshOpt 压缩几何
 
 v3 瓦片默认用 MeshOpt 压几何。解析器内部按需 `import` 内联的 meshoptimizer wasm 解码器（约 22KB），只有真的遇到 MeshOpt 瓦片才会加载，v1/v2 与未压缩的 v3 不受影响。
@@ -690,6 +719,12 @@ bun run test:meshopt
 
 需要 WebAssembly；不支持 wasm 的环境会在遇到 MeshOpt 瓦片时抛明确错误。
 
+**自定义属性流与高斯泼溅属性不再被丢弃**：`CUSTOM0` / `CUSTOM1` / `GS_SCALE` / `GS_ROTATION` 四条语义会原样保留成顶点属性（`custom0` / `custom1` / `gsScale` / `gsRotation`，每点 4 字节），名字到槽位的映射来自数据自带的 `vertexAttributeDescript`（实测高斯服务是 `{"GS_Rotation":1,"GS_Scale":0}`）。以前这几条流解码后直接扔掉，于是 `3DGaussianSplatting` 数据到渲染层只剩「位置 + 颜色」，上层拿不到泼溅的尺寸与朝向。
+
+每块骨架还带一份原始流清单 `vertexPackage.meshOptInfo`（各语义的压缩字节数与解码后每点 stride），排查新数据时先看它，比对着十六进制猜快得多。
+
+**这两条 GS 流的量化格式还没标定**（4 字节 / 点，既不像 3 个 float，也不像明显四元数），所以渲染层目前只是把它们带到顶点属性上备用，没有接进真正的 splat 着色器。
+
 ### `S3MTileset`
 
 单个数据集的瓦片树。不依赖 three，可以用注入的 `buildTile` 在 Node 里跑通完整链路（URL 解析 → 解析 → LOD 调度），适合做数据体检。
@@ -699,6 +734,26 @@ const ts = new S3MTileset({ configUrl, buildTile: async () => ({ group: null, st
 await ts.init();
 ts.update([0, 0, 500], 0.64, 900); // 相机在局部 ENU 的位置
 ```
+
+`configUrl` 必须指向**某个数据源的 config**，不是 `datas` 目录：
+
+```
+https://host/iserver/services/3D-xxx/rest/realspace/datas/<数据源名>/config
+```
+
+数据源名可以是中文（如 `寿宁阁`），`new URL()` 会自动百分号编码；后缀只能写 `config`，写 `config.xml` 会 406。只给到 `…/realspace/datas` 时拿到的是一个资源清单数组，`JSON.parse` 不报错但没有 `position` / `rootTiles`，表现为「视角跳到 (0,0) + 一句缺少 root tile」——先用 `…/datas.json` 列出数据源，再逐个拼 `/config`。
+
+配套导出的三个纯函数，方便自建数据集列表与做体检：
+
+```ts
+parseConfigText(text)      // JSON 与 SuperMapCache XML 两种配置统一成同一种形状（含 fileType）
+usableGeoBounds(bounds)    // 判断 geoBounds 是否真的可用；不可用返回 null（见「锚点」）
+fixPathEncoding(url)       // 补路径里没编码但服务端会改写的字符：+ → %2B、空格 → %20
+```
+
+`fixPathEncoding` 这条是硬需求：OSGB 转出来的瓦片名就是 `Tile_+002_+001`，而 iServer 按 `URLDecoder` 解路径，未编码的 `+` 会变成空格 → 404「瓦片数据不存在」。`new URL()` 认为 `+` 在 path 里合法，不会替我们编码，所以拼完 URL 必须补这一刀（query 里的 `+` 不动，那本来就是空格约定）。
+
+失败处理分两类：**网络类**错误退避重试（`maxRetries`，默认 2 次）；**格式类**错误（`e.permanent === true`，例如 S3M 1.x 容器）直接判失败不重试，并且整棵瓦片树里同类错误只回调一次 `onError`，避免几十块瓦片刷同样的日志。
 
 ### 单体属性工具
 
@@ -751,9 +806,11 @@ viewer.flushOverrides();
 - **Draco 压缩几何**能识别、不能解码，遇到会抛明确错误。接法与 MeshOpt 相同（内联 wasm、按需 `import`、解码后走同一套 attribute 组装），但必须先拿 Draco 瓦片标定容器结构。MeshOpt 已支持，且是逐字节对过 60 个真实瓦片才做对的。
 - **实例化单体**（`pickInfo` 里给的是 `instanceIds` 而不是 `batchId`，白模常见）只做了渲染，没做按单体控制：`setFeatureStyle` / `filterByField` / `elevateByField` / GPU 拾取走的都是 `aBatchId`，这条路径对实例化几何不生效。要支持得把每个实例单独上色，得改 InstancedMesh 的 instanceColor + 拾取编码。
 - **CRN 纹理**已支持，且已在真实服务上验证：内联的 crunch wasm 转回 DXT 后走现成解码，DXT 具体格式看 CRN 头，wasm 约 76KB、只有真遇到 CRN 时才动态加载。**判定看 `compressType` 而不是 `pixelFormat`**——实测 v3.00 是 `ct=26 / pf=13`、行标是 `ct=50000 / pf=32856`，按 `pixelFormat` 26 / 27 判断会把真实 CRN 整包丢掉（模型变灰模）。判定收敛在 `packages/s3m-three/src/core/TextureFormat.ts`（`resolveTextureKind` / `TextureCompress` / `dxtPixelFormatOf`，已从包入口导出）。用 `bun run probe:crn -- --crn <数据集 config 地址>` 可以对任意服务跑「尺寸吻合 / 色数 / 粗糙度 / ASCII 预览」的实测。
-- **纹理分包（`s3m:TextureSharing`）未支持**：这类数据集的 `tiles` 全是 `.s3mblock`，不是 `.s3mb`，加载会失败（例：SuperMap Online `3D-CBD/Xiaopin@CBD`）。
+- **纹理分包（`s3m:TextureSharing` / S3MBLOCK）已支持**：`.s3mblock` 容器 = 若干 RO 组，每组一段 pageLOD 元信息 + zlib 压缩的 v2 瓦片体（段目录：groupNode / 骨架 / secondColor / 图集 / 材质 / 单体化）；纹理是内嵌图集（`isSaveData`），材质按图集 id（`-N.texblock`）引用，几何顶点区间绑定到图集子区域。解析端把顶点 UV 用 `fract` 平铺语义重映射进图集空间，下游材质直接绑定整张图集。图集未内嵌数据时按 `requestNames` 如实报错。实现见 `core/S3MBlockParser.ts`，与官方 `@supermapgis/s3m-content-loader` 交叉验证（`tests/unit/s3mblock.test.ts`）。
 - **多块 MeshOpt 骨架**（`blockCount > 1`）已支持。这类骨架里**每块后面紧跟自己的索引包**（不是所有块之后再统一放一份），索引是块内局部编号；解析时按块顺序合并顶点流，再把每块索引加上顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包。实测 `3D-WorkSpace_pbr1/pbrmodel` 的 `blockCount=2` / `3` 瓦片可正常加载。
 - **切线顶点流**只跳过不解码（渲染没有法线贴图通道），带 TANGENT 的数据不会被判失败。
+- **OSGB 倾斜摄影原生缓存（`.s3m`，S3M 1.x 容器）不支持渲染**。这类服务的 `config` 返回 `SuperMapCache` XML（`sml:FileType = OSGBFile`），位置与范围本库已能正确反算（见「锚点」），但瓦片本身只识别不解码，会抛 `S3MFormatError`。原因是它的下一级 LOD 指向 `.osgb`（OpenSceneGraph Binary），需要另一整套 OSG 反序列化 + `metadata.xml` 里的 SRS 配准，而 REST 的 config 并不提供这些信息；只画根级粗模的话位置也无法保证正确。**解法在数据侧**：iServer 重新发布成 S3M 瓦片缓存（`.s3mb`），或桌面端导出 S3M 格式。容器结构已标定：`73 33 6D 00` 魔数 + zlib，解压后是 `uint32 xmlSize + XML + byte[3]（恒 "000"）+ (uint32 size + data) × 3`（几何流 / 4 字节小段 / 纹理流），三段长度严丝合缝落到解压末尾，随时可以接着往下做。
+- **高斯泼溅（`3DGaussianSplatting`）只按点渲染**。加载、细化、出图整条链路是通的（这类瓦片没有索引包，顶点即点，`GeometryBuilder` 会补一个「顶点即点」的伪包走 `THREE.Points`；不补的话整块瓦片落到「无可用几何」被丢掉，这是之前"加载不出来"的第二个原因）。但画出来的是带顶色的点集，不是真正的泼溅：`gsScale` / `gsRotation` 两条自定义流的量化格式还没标定，而且颜色是 RGBA（A 通道是泼溅不透明度），现在的顶点色路径会丢掉 alpha。要上 EWA splatting 得先按深度层级取样把这两条流对准，再补协方差 + 深度排序的 alpha 混合。
 - **KTX2** 不在 S3M 的 `pixelFormat` 枚举里，iServer 也不会发；要支持需自行引入 `basis_transcoder.wasm` 并解析容器，属于「换数据源才需要考虑」的项。
 - **骨骼动画**解析了但未驱动。
 - 跨城市量级的数据集叠加会有 float32 精度问题。

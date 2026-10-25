@@ -8,7 +8,7 @@
  * 4. 多数据集全局经纬度包围盒计算（getBounds）
  */
 import * as THREE from 'three';
-import { S3MTileset } from '../tileset/S3MTileset.js';
+import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { Anchor } from '../core/types.js';
 import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 
@@ -291,10 +291,10 @@ export class DatasetManager {
 
     for (const entry of this.datasets.values()) {
       if (!entry.visible || !entry.tileset?.config) continue;
-      const b = entry.tileset.config.geoBounds as
-        | { left: number; bottom: number; right: number; top: number }
-        | undefined;
-      if (b && Number.isFinite(b.left)) {
+      // 只认「确实是一张经纬度范围」的 geoBounds：OSGB/SuperMapCache 那类配置只给米制
+      // 局部包围盒，全 0 的退化框拿去 fitBounds 会把视角甩到几内亚湾
+      const b = usableGeoBounds(entry.tileset.config.geoBounds);
+      if (b) {
         minLon = Math.min(minLon, b.left);
         minLat = Math.min(minLat, b.bottom);
         maxLon = Math.max(maxLon, b.right);

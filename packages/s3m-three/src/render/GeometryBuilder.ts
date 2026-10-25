@@ -180,6 +180,7 @@ interface RawMaterialDef {
   diffuse?: { r?: number; g?: number; b?: number; a?: number };
   shininess?: number;
   alphaMode?: string;
+  alphaCutoff?: number;
   cullMode?: string;
   transparentsorting?: boolean;
   textureStates?: RawMaterialUnit[];
@@ -366,6 +367,12 @@ export async function buildTileObjects(
     const roughness =
       typeof m?.shininess === 'number' && m.shininess > 0 ? Math.max(0.15, 1 - m.shininess / 128) : 0.95;
 
+    // 镂空图集（S3MBLOCK）：建筑照片是异形 alpha 抠图，轮廓顶点会采到 alpha=0 的像素，
+    // 不丢弃的话就是成片的黑面。cutoff 取材质自带的 alphaCutoff（实测 0.01）。
+    const alphaTest = (map as THREE.Texture | null)?.userData?.s3mHasAlpha
+      ? Math.max((m?.alphaCutoff as number) ?? 0, 0.01)
+      : 0;
+
     const mat = createStyledMaterial({
       uniforms,
       map,
@@ -374,6 +381,7 @@ export async function buildTileObjects(
       transparent,
       opacity: diffuse.a ?? 1,
       roughness,
+      alphaTest,
     });
     return mat;
   };
@@ -413,10 +421,27 @@ export async function buildTileObjects(
 
     const instanced = vp.instanceIndex !== -1 && (vp.instanceMode === 16 || vp.instanceMode === 17);
     // 注意：indexPackages 属于 Skeleton（geoPackage[name]），不在 vertexPackage 里
-    skeletonInfo.set(name, { indexPackages: geo.indexPackages ?? [], instanced });
+    //
+    // 一个索引包都没有的骨架 = 纯点集：高斯泼溅（3DGaussianSplatting）和无索引点云
+    // 都是这种——顶点就是点，没有任何三角形可画。不补一个「顶点即点」的伪包，
+    // 下面就不会产出任何对象，整块瓦片最后落到「tile 无可用几何」被丢掉。
+    let packs = geo.indexPackages ?? [];
+    if (packs.length === 0 && vertexCount > 0) {
+      packs = [
+        {
+          indexCount: 0,
+          indexType: 0,
+          useIndex: 0,
+          primitiveType: POINT_PRIMITIVE,
+          indices: null,
+          passNames: [],
+        },
+      ];
+    }
+    skeletonInfo.set(name, { indexPackages: packs, instanced });
     stats.vertices += vertexCount;
 
-    (geo.indexPackages ?? []).forEach((pack, pi) => {
+    packs.forEach((pack, pi) => {
       const geometry = new THREE.BufferGeometry();
       for (const [k, v] of Object.entries(attributes)) geometry.setAttribute(k, v);
       const idx = toIndex(pack);
@@ -691,6 +716,8 @@ export async function buildTileObjects(
         geometry.setAttribute('color', geometry.getAttribute('aColor')!);
       }
       const points = new THREE.Points(geometry, getPointCloudMaterial());
+      // 点云不是 Mesh：viewer 的样式 / 拾取 / 卸载链路都靠这个标记放行
+      points.userData.isPointCloud = true;
       points.userData.skeletonName = name;
       points.userData.geoRef = geo;
       points.userData.tileRef = tile;
