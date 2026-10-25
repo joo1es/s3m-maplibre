@@ -9,6 +9,7 @@
         "@types/three": "^0.169.0",
         "maplibre-gl": "^5.0.0",
         "markdown-it": "^15.0.3",
+        "meshoptimizer": "0.18.1",
         "shiki": "^4.5.0",
         "solid-js": "^1.9.17",
         "three": "^0.169.0",
@@ -19,19 +20,19 @@
     },
     "packages/s3m-maplibre": {
       "name": "s3m-maplibre",
-      "version": "0.3.1",
+      "version": "0.4.0",
       "dependencies": {
         "s3m-three": "workspace:*",
       },
       "peerDependencies": {
-        "three": ">=0.168.0",
+        "three": ">=0.155.0",
       },
     },
     "packages/s3m-three": {
       "name": "s3m-three",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "peerDependencies": {
-        "three": ">=0.168.0",
+        "three": ">=0.155.0",
       },
     },
   },

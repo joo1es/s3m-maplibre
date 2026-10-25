@@ -169,13 +169,57 @@ const SEMANTIC_NAME: Record<number, string> = {
   [MeshOptSemantic.GS_ROTATION]: 'gsRotation',
 };
 
+/** 单块解码出来的属性，最后按语义跨块拼成一条 */
+interface AttrSink {
+  dtype: 'f32' | 'u8';
+  components: number;
+  chunks: Array<Float32Array | Uint8Array>;
+  /** 已累计的标量个数（不是顶点数） */
+  length: number;
+}
+
+function pushSink(
+  sinks: Map<string, AttrSink>,
+  semantic: string,
+  dtype: 'f32' | 'u8',
+  components: number,
+  chunk: Float32Array | Uint8Array,
+): void {
+  let sink = sinks.get(semantic);
+  if (!sink) {
+    sink = { dtype, components, chunks: [], length: 0 };
+    sinks.set(semantic, sink);
+  }
+  sink.chunks.push(chunk);
+  sink.length += chunk.length;
+}
+
 /**
- * 读取一个 MeshOpt 压缩的 Skeleton。
+ * 索引是块内局部编号（实测 max index 恰为所在块的 vertexCount - 1），
+ * 多块合并成一份顶点缓冲后要整体加上该块的顶点基数。
+ *
+ * 用 DataView 而不是 Uint32Array：未压缩索引那段是底层 buffer 的 subarray，
+ * byteOffset 未必 4 字节对齐，直接建 Uint32Array 会抛 RangeError。
+ */
+function offsetIndices(packs: IndexPackage[], base: number): void {
+  for (const pack of packs) {
+    const buf = pack.indices;
+    if (!buf || pack.indexCount <= 0 || buf.byteLength < pack.indexCount * 4) continue;
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    for (let i = 0; i < pack.indexCount; i++) {
+      dv.setUint32(i * 4, dv.getUint32(i * 4, true) + base, true);
+    }
+  }
+}
+
+/**
+ * 读取一个 MeshOpt 压缩的 Skeleton，以及**内嵌在块之间的索引包**。
  *
  * 二进制布局（v3.01 实测）：
  * ```
  * uint32  compressOptions            // 0x13 = Position | Normal | TexCoord
- * uint32  blockCount                 // 实测恒为 1
+ * uint32  blockCount                 // 实测 1 或 2
+ *   ↑ 下面整段重复 blockCount 次：
  *   uint32  vertexCount
  *   float32 vertCompressConstant
  *   float64 minVerticesValue.xyz
@@ -191,14 +235,27 @@ const SEMANTIC_NAME: Record<number, string> = {
  *     pad4
  *   String  descript                // {"TextureCoordMatrix":1,"VertexWeight":0}
  *   pad4
+ *   IndexPackage[]                  // ← 每块各带一份，不是所有块之后再统一放
  * ```
+ *
+ * 注意最后一行：blockCount > 1 时索引包夹在块与块之间。之前按「读完所有块再读索引包」
+ * 处理，会把第一块的索引包当成第二块的块头，读出天文数字的 compressedSize。
+ *
+ * 多块是同一份几何的拆分，这里把各块属性按顺序拼成一条流，并把各块索引加上
+ * 顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包，下游无需改动。
  */
-export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): Promise<MeshOptBlockInfo> {
+export async function parseMeshOptGeometry(
+  r: BinaryReader,
+  vp: VertexPackage,
+): Promise<{ info: MeshOptBlockInfo; indexPackages: IndexPackage[] }> {
   const decoder = await loadMeshoptDecoder();
 
   const compressOptions = r.u32();
   vp.compressOptions = compressOptions;
   const blockCount = r.u32();
+  if (blockCount > 64) {
+    throw new Error(`[s3m] MeshOpt 块数异常：blockCount=${blockCount}`);
+  }
 
   const info: MeshOptBlockInfo = {
     vertexCount: 0,
@@ -215,6 +272,11 @@ export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): 
     ],
     streams: [],
   };
+
+  const sinks = new Map<string, AttrSink>();
+  const indexPackages: IndexPackage[] = [];
+  let baseVertex = 0;
+  let hasCustomAttribute = false;
 
   for (let bi = 0; bi < blockCount; bi++) {
     const vertexCount = r.u32();
@@ -234,15 +296,12 @@ export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): 
     }
 
     const attrCount = r.i32();
-    const decodeThisBlock = bi === 0;
 
-    if (decodeThisBlock) {
-      info.vertexCount = vertexCount;
-      info.vertScale = vertScale;
+    if (bi === 0) {
       info.minVertices = [minX, minY, minZ];
+      info.vertScale = vertScale;
       info.texCoordScale = texCoordScale;
       info.texCoordOffset = texCoordOffset;
-      vp.verticesCount = vertexCount;
     }
 
     for (let ai = 0; ai < attrCount; ai++) {
@@ -259,8 +318,6 @@ export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): 
       const compressedSize = r.i32();
       const data = r.bytes(compressedSize);
       r.align4();
-
-      if (!decodeThisBlock) continue;
 
       // 切线流我们不用（渲染里没有法线贴图通道），解不出来也不该拖垮整个瓦片：
       // 真实服务里带 PBR 的数据（如 SubwayStationCombined）都带这条流，之前直接抛错导致整套数据不可见
@@ -297,18 +354,18 @@ export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): 
           pos[i * 3 + 1] = minY + u16[i * 4 + 1] * vertScale;
           pos[i * 3 + 2] = minZ + u16[i * 4 + 2] * vertScale;
         }
-        vp.vertexAttributes.push(f32Attribute('position', pos, 3));
+        pushSink(sinks, 'position', 'f32', 3, pos);
       } else if (semantic === MeshOptSemantic.NORMAL) {
         const i16 = new Int16Array(out.buffer, out.byteOffset, vertexCount * 2);
         const nrm = new Float32Array(vertexCount * 3);
         for (let i = 0; i < vertexCount; i++) {
           octDecode(i16[i * 2] / 32767, i16[i * 2 + 1] / 32767, nrm, i * 3);
         }
-        vp.vertexAttributes.push(f32Attribute('normal', nrm, 3));
+        pushSink(sinks, 'normal', 'f32', 3, nrm);
       } else if (semantic === MeshOptSemantic.COLOR) {
-        vp.vertexAttributes.push(u8Attribute('color', out, 4));
+        pushSink(sinks, 'color', 'u8', 4, out);
       } else if (semantic === MeshOptSemantic.COLOR1) {
-        vp.vertexAttributes.push(u8Attribute('color2', out, 4));
+        pushSink(sinks, 'color2', 'u8', 4, out);
       } else if (semantic === MeshOptSemantic.TEXCOORD0 || semantic === MeshOptSemantic.TEXCOORD1) {
         const slot = semantic === MeshOptSemantic.TEXCOORD0 ? 0 : 1;
         const scale = texCoordScale[slot] ?? [0, 0];
@@ -325,19 +382,56 @@ export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): 
             uv[i * 2 + 1] = offset[1] + u16[i * 2 + 1] * scale[1];
           }
         }
-        vp.vertexAttributes.push(f32Attribute(slot === 0 ? 'uv' : 'uv2', uv, 2));
+        pushSink(sinks, slot === 0 ? 'uv' : 'uv2', 'f32', 2, uv);
       }
-      // tangent / custom / GS 系列暂不使用
+      // custom / GS 系列暂不使用
     }
 
     const descript = r.string();
     r.align4();
-    if (decodeThisBlock && descript) {
+    if (descript && !hasCustomAttribute) {
+      hasCustomAttribute = true;
       try {
         vp.customVertexAttribute = JSON.parse(descript);
       } catch {
         vp.customVertexAttribute = descript;
       }
+    }
+
+    // 每块后面紧跟自己的索引包（blockCount = 1 时等价于「骨架之后读索引包」）
+    const packs = await parseMeshOptIndexPackages(r);
+    if (baseVertex > 0) offsetIndices(packs, baseVertex);
+    indexPackages.push(...packs);
+    baseVertex += vertexCount;
+  }
+
+  // blockCount = 0 的老数据：索引包仍然跟在骨架后面
+  if (blockCount === 0) {
+    indexPackages.push(...(await parseMeshOptIndexPackages(r)));
+  }
+
+  info.vertexCount = baseVertex;
+  vp.verticesCount = baseVertex;
+
+  // 跨块拼接：属性流长度按理各块一致，缺块时补 0，宁可少一块颜色也不整块不可见
+  for (const [semantic, sink] of sinks) {
+    const expected = baseVertex * sink.components;
+    if (sink.dtype === 'f32') {
+      const out = new Float32Array(expected);
+      let off = 0;
+      for (const chunk of sink.chunks) {
+        out.set(chunk as Float32Array, off);
+        off += chunk.length;
+      }
+      vp.vertexAttributes.push(f32Attribute(semantic, out, sink.components));
+    } else {
+      const out = new Uint8Array(expected);
+      let off = 0;
+      for (const chunk of sink.chunks) {
+        out.set(chunk as Uint8Array, off);
+        off += chunk.length;
+      }
+      vp.vertexAttributes.push(u8Attribute(semantic, out, sink.components));
     }
   }
 
@@ -346,7 +440,7 @@ export async function parseMeshOptSkeleton(r: BinaryReader, vp: VertexPackage): 
     vp.attrLocation[`a${vp.vertexAttributes[i].semantic}`] = i;
   }
 
-  return info;
+  return { info, indexPackages };
 }
 
 /* ------------------------------------------------------------------ 索引包 */

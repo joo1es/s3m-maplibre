@@ -10,7 +10,7 @@
  *   3. Draco / MeshOpt 几何压缩只做识别，不做解码（需要额外的 wasm 解码器）。
  */
 import { BinaryReader } from './BinaryReader.js';
-import { parseMeshOptSkeleton, parseMeshOptIndexPackages } from './MeshOpt.js';
+import { parseMeshOptGeometry } from './MeshOpt.js';
 import type {
   AttrDType,
   GeoPackageEntry,
@@ -387,8 +387,8 @@ async function parseSkeletons(
       indexPackages = parseIndexPackages(r, version);
     } else if (tag === VertexTag.COMPRESSED) {
       if (version >= 3) {
-        await parseMeshOptSkeleton(r, vp);
-        indexPackages = await parseMeshOptIndexPackages(r);
+        // 索引包夹在块之间，不能拆成「先骨架后索引」两步读
+        indexPackages = (await parseMeshOptGeometry(r, vp)).indexPackages;
       } else {
         parseCompressedSkeleton(r, vp, version);
         indexPackages = parseIndexPackages(r, version);
