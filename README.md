@@ -514,8 +514,8 @@ packages/
       MapLibreGeoAdapter.ts WorldCoordinateHelper 提取 → GeoAdapter
 demo/       在线演示产物（index.html 由 site/ 构建）+ 样例数据；three.html 仍是单文件版
 site/       站点源码（vite + Solid SSG）：docs 正文由 markdown-it + shiki 构建期渲染，demo 面板为 Solid 组件
-tools/      自检脚本（解析校验、MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
-tests/      类型级用法测试（tests/types/usage.ts）
+tools/      自检脚本（MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
+tests/      单元测试（bun test）：unit/ 纯逻辑与合成数据，e2e/ 需静态服务；types/ 类型级用法测试
 docs/       API 文档站产物（`bun run build:docs` 生成，图层 + 内核双页面，勿手改）
 ```
 

@@ -24,14 +24,8 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
+      - name: Unit tests
+        run: bun test
+
       - name: Build
         run: bun run build
-
-      - name: Unit tests
-        run: |
-          node tools/test-batch-texmatrix.mjs
-          node tools/test-texture-format.mjs
-          node tools/test-ortho.mjs
-          node tools/test-instanced.mjs
-          node tools/test-regressions.mjs
-          node tools/test-new-features.mjs
