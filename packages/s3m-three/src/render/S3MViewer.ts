@@ -540,8 +540,11 @@ export class S3MViewer {
   /**
    * 物理地表网格的高度跟随「主数据集的应用层抬升量」，
    * 保证贴地后地表覆盖 / 地下透视的物理关系与被抬升的模型一致。
+   * `ground.trackHeight = false` 时不跟随：地表钉在当前高度，
+   * 高程调整只动模型不动切割面。
    */
   private _syncGroundHeight(): void {
+    if (!this.groundManager.trackHeight) return;
     const primaryId = this.datasets.keys().next().value;
     if (!primaryId) return;
     const userOffset = this._datasetManager.getDatasetHeight(primaryId);
@@ -701,6 +704,15 @@ export class S3MViewer {
   /** 设置基坑开挖范围 [minX, minY, maxX, maxY]（米，场景 ENU 坐标） */
   setExcavationBounds(bounds: [number, number, number, number] | null): void {
     this.groundManager.setExcavationBounds(bounds);
+    this._requestRepaint();
+  }
+
+  /**
+   * 开关「物理地表作为深度遮挡源」：开启后地表以下的几何被真正切掉。
+   * 不依赖宿主是否开启 MapLibre terrain——深度缓冲是共用的，谁更近谁遮挡。
+   */
+  setGroundOcclude(enabled: boolean): void {
+    this.groundManager.setOcclude(enabled);
     this._requestRepaint();
   }
 

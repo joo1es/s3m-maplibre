@@ -538,6 +538,14 @@ export class S3MLayer {
     this.viewer.setExcavationBounds(bounds);
   }
 
+  /**
+   * 开关「物理地表作为深度遮挡源」：开启后地表以下的几何被真正切掉，
+   * 而不是透过半透明地表显露。与 MapLibre terrain 共用同一深度缓冲，互不冲突。
+   */
+  setGroundOcclude(enabled: boolean): void {
+    this.viewer.setGroundOcclude(enabled);
+  }
+
   /** @internal 3D 物理地表面管理器（GroundManager 由 viewer 持有） */
   get groundManager(): S3MViewer['groundManager'] {
     return this.viewer.groundManager;

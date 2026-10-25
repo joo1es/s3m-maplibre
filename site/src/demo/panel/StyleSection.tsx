@@ -84,6 +84,12 @@ export default function StyleSection() {
         <label class="chk">
           <input type="checkbox" id="optUnderground" /> 地下透视模式（半透明地表）
         </label>
+        <label
+          class="chk"
+          title="把物理地表当深度遮挡源：地面以下的几何被真正切掉。不需要 DEM 地形，与地下透视互相独立"
+        >
+          <input type="checkbox" id="optGroundOcclude" /> 地表遮挡（切掉地面以下）
+        </label>
         <label class="chk">
           <input type="checkbox" id="optHideBasemap" /> 隐藏地图底图
         </label>

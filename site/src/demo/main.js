@@ -676,6 +676,24 @@ $('optUnderground')?.addEventListener('change', (e) => {
   setStatus(on ? '3D 物理地表与地下透视已开启' : '已恢复标准地表模式');
 });
 
+/* ---------------------------------------------------------------- 地表遮挡（独立开关）
+
+   深度缓冲是共用的：谁写了更近的深度，谁就遮挡。MapLibre terrain 是一个来源（需要 DEM），
+   物理地表那块平面是另一个来源 —— 开启后地面以下的几何被真正切掉，不需要任何 DEM。
+   「切掉」由 s3m-three 里一块 colorWrite=false 的纯深度代理完成，半透明覆盖网格本身不参与。
+   与「地下透视」互相独立：不开透视时它就是一块不显示的隐形地面，纯粹把地面以下切掉。 */
+
+$('optGroundOcclude')?.addEventListener('change', (e) => {
+  const on = e.target.checked;
+  layer.setGroundOcclude(on);
+  // 遮挡开启时把地表钉在 z=0：高程滑杆只动模型不动切割面，
+  // 变成直观的「控制埋深 / 切掉多少」；关闭后恢复跟随（贴地工作流不受影响）
+  const gm = layer.groundManager;
+  gm.trackHeight = !on;
+  gm.setGroundHeight(on ? 0 : layer.getDatasetHeight());
+  setStatus(on ? '地表遮挡已开启：地面以下被切掉（地表钉在 z=0，高程滑杆控制埋深）' : '地表遮挡已关闭：地下几何恢复显示');
+});
+
 $('optHideBasemap').addEventListener('change', (e) => {
   updateBasemapVisibility();
   setStatus(e.target.checked ? '已隐藏地图底图' : '已恢复地图底图');
