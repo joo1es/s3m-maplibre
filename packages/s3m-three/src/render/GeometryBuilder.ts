@@ -80,12 +80,27 @@ export function buildScaledUVs(
   const gidOf = new Int32Array(giCount);
   const dimW = new Float32Array(giCount);
   const dimH = new Float32Array(giCount);
+  const wide = new Uint8Array(giCount);
   for (let g = 0; g < giCount; g++) {
     const src = index[g]!;
     gidOf[g] = groups[src] ?? -1;
-    dimW[g] = expandedDim[src * 2] ?? 1;
-    dimH[g] = expandedDim[src * 2 + 1] ?? 1;
+    dimW[g] = expandedDim[src * 3] ?? 1;
+    dimH[g] = expandedDim[src * 3 + 1] ?? 1;
+    wide[g] = expandedDim[src * 3 + 2] ? 1 : 0;
   }
+
+  // 整块网格的 uv 包围盒：给「精灵 = 整张图集」那类顶点用
+  let mu0 = Infinity, mu1 = -Infinity, mv0 = Infinity, mv1 = -Infinity;
+  for (let g = 0; g < giCount; g++) {
+    const u = uv[g * stride]!;
+    const v = uv[g * stride + 1]!;
+    if (u < mu0) mu0 = u;
+    if (u > mu1) mu1 = u;
+    if (v < mv0) mv0 = v;
+    if (v > mv1) mv1 = v;
+  }
+  const groupWide = new Uint8Array(giCount);
+  for (let g = 0; g < giCount; g++) if (wide[g]) groupWide[gidOf[g]! >= 0 ? gidOf[g]! : 0] = 1;
 
   // 逐组统计 uv 包围盒
   const box = new Map<number, { u0: number; u1: number; v0: number; v1: number; w: number; h: number }>();
@@ -108,7 +123,16 @@ export function buildScaledUVs(
 
   // 预计算每组 (起点, 跨度, 重复次数)
   const calc = new Map<number, { u0: number; v0: number; su: number; sv: number; ru: number; rv: number }>();
+  const meshSu = mu1 - mu0;
+  const meshSv = mv1 - mv0;
   for (const [gid, b] of box) {
+    // 精灵几乎等于整张图集 = 这是「整块街区的一张照片」：每面墙都归一化到 0..1
+    // 就等于每栋楼都贴同一张照片（实测所有楼都出现同一个招牌）。
+    // 这类必须按**整个网格**的 uv 包围盒来归一化，每面墙只取自己那一块。
+    if (groupWide[gid] && meshSu > 1e-6 && meshSv > 1e-6) {
+      calc.set(gid, { u0: mu0, v0: mv0, su: meshSu, sv: meshSv, ru: 1, rv: 1 });
+      continue;
+    }
     const su = b.u1 - b.u0;
     const sv = b.v1 - b.v0;
     // 一个周期 = 精灵宽（像素）个 uv 单位；至少 1 次，四舍五入到整数保持接缝对齐
@@ -914,10 +938,11 @@ export async function buildTileObjects(
         if (groups && dims && expUv) {
           // groupDim 是「原顶点」维度的，按 index 展开一份给 UV 重算用
           const idxArr = idx.array as ArrayLike<number>;
-          const expDim = new Float32Array(idxArr.length * 2);
+          const expDim = new Float32Array(idxArr.length * 3);
           for (let i = 0; i < idxArr.length; i++) {
-            expDim[i * 2] = dims[idxArr[i]! * 2] ?? 1;
-            expDim[i * 2 + 1] = dims[idxArr[i]! * 2 + 1] ?? 1;
+            expDim[i * 3] = dims[idxArr[i]! * 3] ?? 1;
+            expDim[i * 3 + 1] = dims[idxArr[i]! * 3 + 1] ?? 1;
+            expDim[i * 3 + 2] = dims[idxArr[i]! * 3 + 2] ?? 0;
           }
           faceUv = buildScaledUVs(expUv, expDim, idxArr, groups);
         }

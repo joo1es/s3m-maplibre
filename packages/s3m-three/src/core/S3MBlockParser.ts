@@ -276,6 +276,9 @@ function buildAtlasRects(
     tex.subTexInfos.forEach((sub, si) => {
       groupId++;
       const lr = locals[si] ?? { x: sub.offsetX, y: sub.offsetY, w: sub.width, h: sub.height };
+      const src = (tex as { origin?: { width: number; height: number } }).origin;
+      const srcArea = src ? src.width * src.height : tex.width * tex.height;
+      const wideSprite = srcArea > 0 && (sub.width * sub.height) / srcArea >= 0.5;
       const fit = {
         x: (off.x + lr.x) / tex.width,
         y: (off.y + lr.y) / tex.height,
@@ -287,18 +290,30 @@ function buildAtlasRects(
         if (!geo) continue;
         const key = b.texUnitIndex === 0 ? 'uv' : 'uv2';
         const arr = rectOf(b.geoName, key);
-        const garr = (rects[b.geoName]!.group ??= new Float32Array(geo.vertexPackage.verticesCount));
-        const darr = (rects[b.geoName]!.groupDim ??= new Float32Array(geo.vertexPackage.verticesCount * 2));
+        // group / groupDim 只认 **基色单元（unit0）**。
+        // 一个顶点可以同时出现在 unit0（立面）和 unit1（烘焙图）的 binding 里，
+        // 两边都写的话后写的会覆盖前者 —— 实测就是拿烘焙图的分组去算立面 UV，
+        // 整块街区的烘焙照片被贴到每一面墙上。
+        const garr =
+          b.texUnitIndex === 0
+            ? (rects[b.geoName]!.group ??= new Float32Array(geo.vertexPackage.verticesCount))
+            : null;
+        const darr =
+          b.texUnitIndex === 0
+            ? (rects[b.geoName]!.groupDim ??= new Float32Array(geo.vertexPackage.verticesCount * 3))
+            : null;
         const end = Math.min(b.vertexOffset + b.vertexCount, geo.vertexPackage.verticesCount);
         for (let v = b.vertexOffset; v < end; v++) {
           arr[v * 4] = fit.x;
           arr[v * 4 + 1] = fit.y;
           arr[v * 4 + 2] = fit.w;
           arr[v * 4 + 3] = fit.h;
+          if (!garr || !darr) continue;
           garr[v] = groupId;
           // 精灵的原始像素尺寸（不是裁切后的）：决定平铺时一个周期该有多大
-          darr[v * 2] = sub.width;
-          darr[v * 2 + 1] = sub.height;
+          darr[v * 3] = sub.width;
+          darr[v * 3 + 1] = sub.height;
+          darr[v * 3 + 2] = wideSprite ? 1 : 0;
         }
       }
     });
