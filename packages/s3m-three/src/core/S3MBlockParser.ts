@@ -70,6 +70,8 @@ import { BinaryReader } from './BinaryReader.js';
 import type { InflateFn, ParseOptions } from './S3MBParser.js';
 import type { GeoPackageEntry, GroupNode, PageLOD, ParsedTile, S3MAtlasRects, S3MTexture } from './types.js';
 import { parseGroupNodeEntries, parseSkeletonEntries, parsePickInfoEntries } from './S3MBParser.js';
+import { atlasAlphaMask, shrinkRectToOpaque } from './AtlasAlpha.js';
+import { packAtlases } from './AtlasPack.js';
 
 /** 图集子区域，以及它绑定的几何顶点区间 */
 export interface S3MSubTextureBinding {
@@ -213,27 +215,93 @@ function buildAtlasRects(
     return arr;
   };
 
-  for (const tex of Object.values(texturePackage)) {
+  // 一个 geo 的顶点可能分散绑定在多张图集上（官方用纹理数组按 batch 取）。
+  // 这里先把它们拼成一张大图，rect 全部换算到拼图坐标系，单张 map 就能覆盖全部顶点。
+  //
+  // 顺序很重要：**先在各自图集里做 alpha 收缩，再拼**。
+  // 收缩要读的是「这张图集自己的 alpha 掩码」，拼成大图之后坐标与掩码都对不上了。
+  const localRects = new Map<string, { x: number; y: number; w: number; h: number }[]>();
+  for (const [key, tex] of Object.entries(texturePackage)) {
     if (!tex.width || !tex.height) continue;
-    for (const sub of tex.subTexInfos) {
-      const x = sub.offsetX / tex.width;
-      const y = sub.offsetY / tex.height;
-      const w = sub.width / tex.width;
-      const h = sub.height / tex.height;
+    const mask = atlasAlphaMask(tex);
+    const W = tex.width;
+    const H = tex.height;
+    localRects.set(
+      key,
+      tex.subTexInfos.map((sub) => {
+        let lx = sub.offsetX;
+        let ly = sub.offsetY;
+        let lw = sub.width;
+        let lh = sub.height;
+        if (mask) {
+          // 图集里的精灵是「立面 + 上方天空」的整块照片，天空 alpha=0。
+          // 裁到不透明包围盒后，一个 uv 周期只重复立面本体，不再每格带一段天空。
+          const nf = shrinkRectToOpaque({ x: lx / W, y: ly / H, w: lw / W, h: lh / H }, mask, W, H);
+          lx = nf.x * W;
+          ly = nf.y * H;
+          lw = nf.w * W;
+          lh = nf.h * H;
+        }
+        return { x: lx, y: ly, w: lw, h: lh };
+      })
+    );
+  }
+
+  const packed = packAtlases(texturePackage);
+  if (packed) {
+    for (const tex of Object.values(texturePackage)) {
+      // 拼合会覆盖 width/height/data，把解析出来的原始元信息留一份，便于排查与测试
+      (tex as { origin?: unknown }).origin = {
+        width: tex.width,
+        height: tex.height,
+        pixelFormat: tex.pixelFormat,
+        compressType: tex.compressType,
+        dataLength: tex.data?.length ?? 0,
+      };
+      tex.width = packed.width;
+      tex.height = packed.height;
+      tex.data = packed.data;
+      tex.compressType = 0;
+      tex.pixelFormat = 28; // RGBA
+      (tex as { flipY?: boolean }).flipY = false; // 拼图按自上而下存，v=0 就是顶行
+      (tex as { packed?: boolean }).packed = true;
+    }
+  }
+
+  let groupId = 0;
+  for (const [key0, tex] of Object.entries(texturePackage)) {
+    if (!tex.width || !tex.height) continue;
+    const off = packed ? (packed.offsets.get(key0) ?? { x: 0, y: 0 }) : { x: 0, y: 0 };
+    const locals = localRects.get(key0) ?? [];
+    tex.subTexInfos.forEach((sub, si) => {
+      groupId++;
+      const lr = locals[si] ?? { x: sub.offsetX, y: sub.offsetY, w: sub.width, h: sub.height };
+      const fit = {
+        x: (off.x + lr.x) / tex.width,
+        y: (off.y + lr.y) / tex.height,
+        w: lr.w / tex.width,
+        h: lr.h / tex.height,
+      };
       for (const b of sub.bindings) {
         const geo = geoPackage[b.geoName];
         if (!geo) continue;
         const key = b.texUnitIndex === 0 ? 'uv' : 'uv2';
         const arr = rectOf(b.geoName, key);
+        const garr = (rects[b.geoName]!.group ??= new Float32Array(geo.vertexPackage.verticesCount));
+        const darr = (rects[b.geoName]!.groupDim ??= new Float32Array(geo.vertexPackage.verticesCount * 2));
         const end = Math.min(b.vertexOffset + b.vertexCount, geo.vertexPackage.verticesCount);
         for (let v = b.vertexOffset; v < end; v++) {
-          arr[v * 4] = x;
-          arr[v * 4 + 1] = y;
-          arr[v * 4 + 2] = w;
-          arr[v * 4 + 3] = h;
+          arr[v * 4] = fit.x;
+          arr[v * 4 + 1] = fit.y;
+          arr[v * 4 + 2] = fit.w;
+          arr[v * 4 + 3] = fit.h;
+          garr[v] = groupId;
+          // 精灵的原始像素尺寸（不是裁切后的）：决定平铺时一个周期该有多大
+          darr[v * 2] = sub.width;
+          darr[v * 2 + 1] = sub.height;
         }
       }
-    }
+    });
   }
   return rects;
 }
@@ -309,6 +377,39 @@ export async function parseS3MBlockTextureFile(
 /* ------------------------------------------------------------------ 容器 */
 
 export async function parseS3MBlock(arrayBuffer: ArrayBuffer, options: ParseBlockOptions = {}): Promise<S3MBlockTile> {
+  const { tiles } = await parseS3MBlockGroups(arrayBuffer, options);
+  return tiles[0]!;
+}
+
+export interface S3MBlockGroupSet {
+  /** 每组 = 一层 LOD 瓦片（最粗在前） */
+  tiles: S3MBlockTile[];
+  /** 每组的瓦片名（去掉 .s3mblock 后缀），与 tiles 一一对应 */
+  names: string[];
+}
+
+/**
+ * 解析 S3MBLOCK 容器里的**全部**组。
+ *
+ * 一个 `.s3mblock` 文件不是"一块瓦片"，而是**一整棵 LOD 子树的打包**。实测
+ * `6_01.s3mblock`（549 KB）里有 5 组：
+ *
+ * ```
+ * 组0 6_01.s3mblock       rv=586.8  r=293.4  child=6_0100.s3mblock
+ * 组1 6_0100.s3mblock     rv=1024.0 r=293.4  child=6_010000.s3mblock
+ * 组2 6_010000.s3mblock   rv=1024.0 r=338.2  child=6_01000000.s3mblock / 6_01000001.s3mblock
+ * 组3 6_01000000.s3mblock rv=1024.0 r=278.2
+ * 组4 6_01000001.s3mblock rv=1024.0 r=278.2
+ * ```
+ *
+ * childTile 指向的下一层**就在同一个文件里**，不是独立文件。只取第 0 组的话，
+ * 4/5 的几何与它们那份精细图集全被丢掉 —— 画面上永远只有最粗一层的
+ * "整栋楼缩略图"图集，这正是"官方是窗格立面、我们是整楼照片重复"的根源。
+ */
+export async function parseS3MBlockGroups(
+  arrayBuffer: ArrayBuffer,
+  options: ParseBlockOptions = {}
+): Promise<S3MBlockGroupSet> {
   const inflate = options.inflate ?? defaultInflate;
   const r = new BinaryReader(arrayBuffer);
 
@@ -318,125 +419,132 @@ export async function parseS3MBlock(arrayBuffer: ArrayBuffer, options: ParseBloc
     throw new Error(`[s3m] S3MBLOCK 组数异常：${groupCount}`);
   }
 
-  // 当前实现取第一组（与官方 iClient3D 一致：一个块文件一个渲染组）
-  const name = r.string().replace(/\.s3mblock$/i, '');
+  const tiles: S3MBlockTile[] = [];
+  const names: string[] = [];
 
-  const pageLods: S3MBlockPageLod[] = [];
-  if (blockVersion <= 3.0) {
-    const pageLodCount = r.u32();
-    for (let i = 0; i < pageLodCount; i++) {
-      const rangeValue = r.f32();
-      const rangeMode = r.u16();
-      const boundingSphere = {
-        center: { x: r.f64(), y: r.f64(), z: r.f64() },
-        radius: r.f64(),
-      };
-      const childTile = r.string();
-      pageLods.push({ rangeValue, rangeMode, boundingSphere, childTile });
+  for (let g = 0; g < groupCount; g++) {
+    const name = r.string().replace(/\.s3mblock$/i, '');
+    names.push(name);
+
+    const pageLods: S3MBlockPageLod[] = [];
+    if (blockVersion <= 3.0) {
+      const pageLodCount = r.u32();
+      for (let i = 0; i < pageLodCount; i++) {
+        const rangeValue = r.f32();
+        const rangeMode = r.u16();
+        const boundingSphere = {
+          center: { x: r.f64(), y: r.f64(), z: r.f64() },
+          radius: r.f64(),
+        };
+        const childTile = r.string();
+        pageLods.push({ rangeValue, rangeMode, boundingSphere, childTile });
+      }
     }
-  }
 
-  const version = Number(r.f32().toFixed(2));
-  let compressedType = 0;
-  if (version >= 3) compressedType = r.u32();
-  const unzipSize = r.u32();
-  const zipSize = r.u32();
-  const zipData = r.bytesCopy(zipSize);
-  const raw = await inflate(zipData);
-  if (raw.length !== unzipSize) {
-    throw new Error(`[s3m] S3MBLOCK 解压长度不符：声明 ${unzipSize}，实际 ${raw.length}`);
-  }
-
-  // ---- 内层：段目录 ----
-  const t = new BinaryReader(raw.buffer as ArrayBuffer, raw.byteOffset, raw.byteLength);
-  const fileOptions = t.u32();
-
-  let size = t.u32();
-  const groupNode: GroupNode = parseGroupNodeEntries(new BinaryReader(t.buffer, t.base + t.offset, size), version);
-  t.skip(size);
-
-  size = t.u32();
-  const geoPackage = await parseSkeletonEntries(new BinaryReader(t.buffer, t.base + t.offset, size), version);
-  t.skip(size);
-
-  if (version < 3) {
-    size = t.u32();
-    t.skip(size); // secondColor 独立段，渲染用不到
-  }
-
-  size = t.u32();
-  const texturePackage = parseBlockTextures(new BinaryReader(t.buffer, t.base + t.offset, size));
-  t.skip(size);
-
-  const materialsJson = t.string();
-  let materials: unknown = [];
-  if (materialsJson) {
-    try {
-      materials = JSON.parse(materialsJson.replace(/\n\0/, ''));
-    } catch {
-      materials = materialsJson;
+    const version = Number(r.f32().toFixed(2));
+    let compressedType = 0;
+    if (version >= 3) compressedType = r.u32();
+    const unzipSize = r.u32();
+    const zipSize = r.u32();
+    const zipData = r.bytesCopy(zipSize);
+    const raw = await inflate(zipData);
+    if (raw.length !== unzipSize) {
+      throw new Error(`[s3m] S3MBLOCK 解压长度不符：声明 ${unzipSize}，实际 ${raw.length}`);
     }
-  }
 
-  let pickInfo: unknown = null;
-  let extensions: unknown;
-  if ((fileOptions & 1) === 1) {
-    if (version >= 3) t.u32(); // IDInfoOption
-    size = t.u32();
-    pickInfo = parsePickInfoEntries(new BinaryReader(t.buffer, t.base + t.offset, size), geoPackage, version);
+    // ---- 内层：段目录 ----
+    const t = new BinaryReader(raw.buffer as ArrayBuffer, raw.byteOffset, raw.byteLength);
+    const fileOptions = t.u32();
+
+    let size = t.u32();
+    const groupNode: GroupNode = parseGroupNodeEntries(new BinaryReader(t.buffer, t.base + t.offset, size), version);
     t.skip(size);
-  }
-  if (version >= 3) {
-    const ext = t.string();
-    extensions = ext ? JSON.parse(ext) : undefined;
+
+    size = t.u32();
+    const geoPackage = await parseSkeletonEntries(new BinaryReader(t.buffer, t.base + t.offset, size), version);
+    t.skip(size);
+
+    if (version < 3) {
+      size = t.u32();
+      t.skip(size); // secondColor 独立段，渲染用不到
+    }
+
+    size = t.u32();
+    const texturePackage = parseBlockTextures(new BinaryReader(t.buffer, t.base + t.offset, size));
+    t.skip(size);
+
+    const materialsJson = t.string();
+    let materials: unknown = [];
+    if (materialsJson) {
+      try {
+        materials = JSON.parse(materialsJson.replace(/\n\0/, ''));
+      } catch {
+        materials = materialsJson;
+      }
+    }
+
+    let pickInfo: unknown = null;
+    let extensions: unknown;
+    if ((fileOptions & 1) === 1) {
+      if (version >= 3) t.u32(); // IDInfoOption
+      size = t.u32();
+      pickInfo = parsePickInfoEntries(new BinaryReader(t.buffer, t.base + t.offset, size), geoPackage, version);
+      t.skip(size);
+    }
+    if (version >= 3) {
+      const ext = t.string();
+      extensions = ext ? JSON.parse(ext) : undefined;
+    }
+
+    // ---- 图集 → 纹理表 ----
+    const textures: Record<string, S3MTexture> = {};
+    for (const tex of Object.values(texturePackage)) {
+      if (!tex.data) continue;
+      textures[tex.id] = {
+        code: tex.id,
+        level: tex.level,
+        width: tex.width,
+        height: tex.height,
+        compressType: tex.compressType,
+        pixelFormat: tex.pixelFormat,
+        data: tex.data,
+        flipY: true,
+      };
+    }
+    const atlasRects = buildAtlasRects(geoPackage, texturePackage);
+
+    // pageLOD：容器提供的 LOD/子瓦片信息是权威；geodes 在内层 groupNode 里
+    const innerLods = groupNode.pageLods;
+    const mergedLods: PageLOD[] = pageLods.map((lod, i) => {
+      const inner = innerLods[i];
+      return {
+        rangeValue: lod.rangeValue,
+        rangeMode: lod.rangeMode,
+        boundingSphere: lod.boundingSphere,
+        childTile: lod.childTile,
+        geodes: inner?.geodes ?? [],
+        ...(inner?.obb ? { obb: inner.obb } : {}),
+      };
+    });
+
+    tiles.push({
+      version,
+      compressedType,
+      options: fileOptions,
+      groupNode: { pageLods: mergedLods } as GroupNode,
+      geoPackage,
+      textures,
+      materials,
+      pickInfo,
+      extensions,
+      bytesRead: t.offset,
+      bytesTotal: raw.byteLength,
+      blockVersion,
+      blockName: name,
+      texturePackage,
+      atlasRects,
+    });
   }
 
-  // ---- 图集 → 纹理表 + UV 重映射 ----
-  const textures: Record<string, S3MTexture> = {};
-  for (const tex of Object.values(texturePackage)) {
-    if (!tex.data) continue;
-    textures[tex.id] = {
-      code: tex.id,
-      level: tex.level,
-      width: tex.width,
-      height: tex.height,
-      compressType: tex.compressType,
-      pixelFormat: tex.pixelFormat,
-      data: tex.data,
-      flipY: true,
-    };
-  }
-  const atlasRects = buildAtlasRects(geoPackage, texturePackage);
-
-  // pageLOD：容器提供的 LOD/子瓦片信息是权威；geodes 在内层 groupNode 里
-  const innerLods = groupNode.pageLods;
-  const mergedLods: PageLOD[] = pageLods.map((lod, i) => {
-    const inner = innerLods[i];
-    return {
-      rangeValue: lod.rangeValue,
-      rangeMode: lod.rangeMode,
-      boundingSphere: lod.boundingSphere,
-      childTile: lod.childTile,
-      geodes: inner?.geodes ?? [],
-      ...(inner?.obb ? { obb: inner.obb } : {}),
-    };
-  });
-
-  return {
-    version,
-    compressedType,
-    options: fileOptions,
-    groupNode: { pageLods: mergedLods } as GroupNode,
-    geoPackage,
-    textures,
-    materials,
-    pickInfo,
-    extensions,
-    bytesRead: t.offset,
-    bytesTotal: raw.byteLength,
-    blockVersion,
-    blockName: name,
-    texturePackage,
-    atlasRects,
-  };
+  return { tiles, names };
 }

@@ -120,6 +120,227 @@ color = texture2D(tex, texcoord);              // 官方也是 texture2D(...,0.0
 2. 官方在同一机位也只到 `6_01`，所以「更细 LOD」这条解释不成立，问题更可能是
    我们**取错了图集**（父子瓦片各自的图集不同，根块图集是整楼缩略图）。
 
+### 第五轮（2026-10-25 深夜）：三个真正的根因，其中两个是"工作量级"的
+
+#### 根因 A：一个 `.s3mblock` 文件是一整棵 LOD 子树，不是一块瓦片 —— 我们只解析了第 0 组
+
+`6_01.s3mblock`（549 KB）的容器头 `groupCount = 5`，五组各是一层 LOD，链成一条树：
+
+```
+组0 6_01.s3mblock        rv=586.8  r=293.4  child=6_0100.s3mblock
+组1 6_0100.s3mblock      rv=1024.0 r=293.4  child=6_010000.s3mblock
+组2 6_010000.s3mblock    rv=1024.0 r=338.2  child=6_01000000 / 6_01000001
+组3 6_01000000.s3mblock  rv=1024.0 r=278.2
+组4 6_01000001.s3mblock  rv=1024.0 r=278.2
+```
+
+`childTile` 指向的下一层**就在同一个文件里**（不是独立 URL）。旧实现 `parseS3MBlock` 读完第一组就
+return，于是 **4/5 的几何和它们那份更细的图集全部丢失**，子瓦片请求还指向不存在的
+`6_0100.s3mblock` 文件。
+
+已改：新增 `parseS3MBlockGroups()` 解析全部组；`S3MTileset._load` 用 `url#N` 表示「同一文件的第
+N 组」，组内 LOD 直接命中缓存，不发网络请求。日志实测已经能看到
+`childUrls: ["41_00.s3mblock#1","#3","#5"]` 且 `needRefine=true`。
+
+#### 根因 B（最坑的一个）：demo 读的是 `dist/`，不 build 等于没改代码
+
+`site/src/demo/main.js` 里 `import ... from 's3m-maplibre'`，包入口是 `dist/index.js`。
+本轮前面十几张截图**全是旧产物**，所有源码改动（rrect 翻转、UV 重算、多组解析）都没进画面 ——
+这就是"改了半天画面一模一样"的原因。规矩：**改完源码先
+`bun run build:three && bun run build:maplibre`，再截图**，并用
+`grep 新符号 packages/s3m-three/dist/**` 断言产物已更新。
+
+#### 根因 C：rect 的归一化 y 必须从图集另一端量
+
+纹理上传时 `flipY = true`，`offsetY / height` 会让 rect 落到图集的空白/天空区 ——
+实测 `(96,0,24,16)` 这块在图集里**全透明**，整面墙因此被 alphaTest 抠成窟窿。
+改成 `y = 1 - (offsetY + height) / height`，`tests/unit/s3mblock.test.ts` 的期望值同步更新。
+
+#### 图集 UV 的三条路都试过（有截图对照）
+
+| 做法 | 结果 | 图 |
+|---|---|---|
+| 原始世界 uv，片元 `fract(uv)` | 一个周期 1.65 m，整段立面被压进两米重复几百遍 | 历史 X2-final |
+| `fract(uv / 精灵像素尺寸)` | 平铺密度变正常，但仍是一格格"整楼照片" | `_tmp/og/X4-atlaslod.png` |
+| 按 binding 分组、逐面 0..1（现默认） | 得到**连续的真实立面照片**（KOHLER 广告牌、窗、门面一次成型），不再重复小楼 | `_tmp/og/X6-groups.png` / `X8-wide.png` |
+
+按 binding 分组的依据是数据本身：`subTexInfos` 的每条 binding 都写明
+「geoName + vertexOffset + vertexCount → 这张子纹理」，与官方 batch 表同义。
+新增 `S3MAtlasRects.group`（逐顶点组 id）+ `buildGroupUVs()`；着色器加
+`S3M_ATLAS_UV_NORM` 宏区分「已是归一化 UV」和「需要按精灵像素尺寸换算」。
+
+#### 现在的差距（诚实记录）
+
+`X6-groups.png` 已经把"一栋楼贴一栋楼的立面照"做出来了，但：
+
+1. **长墙的重复次数偏少**：现在用 `round(墙宽/墙高)`，一栋 100 m 板楼只重复 2~3 次，
+   而官方是十几到几十次（窗格级）。需要按「该 binding 的原始 uv 跨度 / 精灵像素尺寸」
+   算重复数 —— 这个信息是齐的（原始 uv + rect.zw × 图集尺寸），只是还没接上。
+2. **精灵本身含天空**：图集里每个精灵是"立面 + 上方天空（alpha=0）"，alphaTest 一丢就是洞。
+   官方材质 `alphaMode` 全是 `opaque`，说明官方根本不用 alpha —— 但那就得让精灵本身
+   不含天空，也就是 **rect 必须只框住立面本体**，这块还没对上。
+3. 远景（`X8-wide.png`）仍能看到"楼贴了别处的立面"，说明有些 binding 覆盖的顶点区间
+   不止一面墙，需要按「uv 空间连续性」再切一刀。
+
+### 第六轮（2026-10-25 23:00）：对比基准一直是错的 —— 官方场景是 6 个图层
+
+这是本轮最重要的发现，之前所有"我们的画面跟官方差很远"的判断都建立在一个错误前提上。
+
+官方对照页 `scene.open('.../rest/realspace')` 打开的是**整个场景**，而场景配置
+（`rest/realspace/scenes/OlympicGreen.json`）里有 6 个图层：
+
+```
+BirdNest@OlympicGreen   Waters@OlympicGreen   Tree@OlympicGreen
+Road@OlympicGreen       Ground@OlympicGreen   Building@OlympicGreen
+```
+
+我们 demo 一直只加载 `datas/Building@OlympicGreen/config` —— **只有建筑，没有地面、操场、
+树、水、路、鸟巢**。官方截图里那些"干净的连续窗格立面"，有相当一部分观感来自完整环境
+（地面/阴影/树）衬托；而我们的画面是悬空的一堆楼贴图，怎么看都"不对"。
+
+已修：`site/src/demo/main.js` 支持 `?all=1`，把服务下列出的数据集全部勾选。
+
+```
+http://localhost:5174/demo/?all=1&url=https%3A%2F%2Fwww.supermapol.com%2Frealspace%2Fservices%2F3D-OlympicGreen-2%2Frest%2Frealspace
+```
+
+加载后 `stats.datasets = 6`、顶点 445,455，画面里草地、树、道路、水面、建筑都出来了
+（`_tmp/og/Z1-alllayers.png`）。**后续一切对比都必须用这个 URL。**
+
+#### 另一处修正：rect 按图集 alpha 收缩到立面本体
+
+图集里的每个精灵是「建筑立面 + 上方天空」一整个照片块，天空 alpha=0。
+- 开 alphaTest → 墙被抠成空壳，能看见楼内壁；
+- 关 alphaTest（实测 `_tmp/og/Z2-noalphatest.png`）→ 天空部分的 RGB 糊满整面墙，楼变纯灰白。
+
+两条路都不对，说明 **rect 只该框立面本体**。官方材质 `alphaMode` 全是 `opaque` 也印证
+这一点（它拿到的精灵根本没有天空）。
+
+实现：新增 `core/AtlasAlpha.ts` —— 解析阶段用 DXT 解出图集的 alpha 掩码，把每条
+subTexInfo 的 rect 收缩到其内部的不透明包围盒（内缩 0.5 px 避开边缘混色）。
+见 `_tmp/og/Z3-opaque.png`：楼变实体、KOHLER 广告牌完整成型、不再有镂空网格。
+
+#### 现在的画面还剩什么
+
+`Z3-opaque.png` 与官方 `O6-exactcam.png` 相比：
+
+1. **有一层半透明灰白雾罩在半空**，压在建筑和地面上 —— 疑似多图层叠加时某个图层
+   （Ground / Waters）被渲染成了大面片，需要逐层开关定位。
+2. 建筑贴图仍是"同一栋楼的立面照贴到多栋楼上"，说明 binding → 精灵的归属在**跨瓦片**
+   层面还有偏差（同一图集被多个瓦片共用时，rect 与几何的配对没按瓦片隔离）。
+3. 楼顶/楼板仍然缺（看到的还是"墙壳"），需要确认 Building 图层的屋顶是否在别的 geo 里
+   被我们跳过了。
+
+### 第七轮：贴错图的真凶 —— 一个块里有**多张图集**，单张 map 装不下
+
+#### 证据链（全部可复现）
+
+1. `41_00.s3mblock` 的 `texturePackage` 有 **6 张图集**：`120x144 / 192x128 / 216x288 /
+   120x160 / 192x128 / 192x128`，每张的 `subTexInfos` 各自绑定**不同的 vertexOffset 区间**。
+2. 点开其中任一 geo 看，一个网格（一个材质、一个 `map`）里同时出现来自不同图集的 binding。
+3. 官方着色器用的是纹理**数组**：`atlas_batchTable_xywh(aTextureBatchId0, batchTextureAtlas, …)`
+   + `uTexAtlasDim`（复数），每个 batch 自带图集序号 —— 它一次能取多张图集。
+4. 我们只绑一张 `map`，于是「其它图集」那部分顶点拿着自己图集里的归一化坐标去采另一张图，
+   采到的是完全无关的内容。**这就是墙上贴别处立面 / 满墙小楼缩略图的真正来源。**
+
+#### 做法：解析阶段把图集拼成一张（`core/AtlasPack.ts`）
+
+- 用 `DXTTextureDecode` 把块里每张图集解成 RGBA；
+- 货架式装箱拼进一张大图（上限 1024 宽），记录每张图集的 `(x, y)` 偏移；
+- 所有 `subTexInfo` 的 rect 全部换算到拼图坐标系（`(off + subOffset) / packedSize`）；
+- 把 `texturePackage` 里的每个条目都指向这张拼图（`width/height/data` 覆盖，
+  `compressType=0 / pixelFormat=28(RGBA) / flipY=false`），并标 `packed=true`；
+  原始尺寸留在 `origin` 上，测试与排查都能查到；
+- `S3MTileset` 对 `packed` 的块跳过 `.texblock` 高清替换（像素是我们重排过的，
+  再拿单张高清图覆盖会整张错位）。
+
+效果对照：`_tmp/og/I1-face-hd.png`（拼合前，墙上是别处的楼）→
+`_tmp/og/K1-all.png`（拼合后，每面墙是连贯的一整套立面：窗、幕墙、KOHLER 广告牌）。
+
+#### 顺带修掉的一个真 bug：纹理缓存把高清图集挡住了
+
+`GeometryBuilder` 里纹理按 id 全局缓存，`if (textureByCode.has(code)) continue`。
+同一个图集 id 会被很多瓦片共用，先到的那块只拿到内嵌缩略图（120x184），
+后面的块换成高清版（240x304）却被这行直接跳过 —— 所以画面一直是马赛克。
+现在尺寸变大就重解码覆盖。
+
+#### uv 的两条路都量过了
+
+| 做法 | 结果 | 图 |
+|---|---|---|
+| 原始 uv0 直接 `fract`（官方 calculateTexCoord 原样） | 窗格尺度对了，但地面/墙面变成「整片街区」重复铺 | `_tmp/og/L1-packed-raw.png` |
+| 按 binding 分组、逐面 0..1（现默认） | 每面墙一张完整立面，连贯但偏糊 | `_tmp/og/K1-all.png` |
+
+原始 uv 的世界周期实测 ≈ 11.4 m（`11.s3mblock`：几何 x 跨度 199.8 m / uv 跨度 17.5），
+这说明作者就是按「一张精灵覆盖 11 m 左右立面」排的；它现在看着像「整片街区」重复，
+是因为块内精灵本身是「立面 + 天空」的照片块，天空部分在平铺时被一起重复了。
+下一步要做的只有一件：**平铺前把精灵按 alpha 裁到立面本体，并让 rect 的缩放跟着裁切同步**
+（`core/AtlasAlpha.ts` 已有掩码，现在的用法是「裁切」而不是「缩放对齐」，需要改成后者）。
+
+### 第八轮：裁切顺序 + 满宽采样 + **LOD 深度才是清晰度的开关**
+
+#### 1. alpha 裁切必须在拼图之前
+
+上一轮的拼图把 `texturePackage` 的 `width/height/data` 全换成了大图，`atlasAlphaMask()`
+再读就是「大图的掩码 + 小图的坐标」，必然错。现在顺序改成：
+
+```
+每张图集各自算 mask → 在自己的像素坐标里把 sub 裁到不透明包围盒 → 再装箱拼合
+```
+
+#### 2. 去掉 2/3 宽度系数
+
+官方 shader 的 `width *= 2/3` 是为了避开精灵右侧那条内联 mip 链。
+我们的图集是自己在解析阶段重新装箱的，每格只有本体、没有内联链，
+继续乘 2/3 等于把每个精灵裁掉三分之一。现在按 rect 满宽采样。
+
+#### 3. `lodRangeScale` 1.0 → 3.0：这是本轮最大的视觉变化
+
+| 指标 | 1.0 | 3.0 |
+|---|---|---|
+| 瓦片数 | 71 | **237** |
+| 网格数 | 77 | **279** |
+| 顶点 | 116,363 | **561,157** |
+| 画面 | 24x16 像素的糊图 | 招牌 "KOHLER"、窗格可读 |
+
+`_tmp/og/P1-deeplod.png`：同一机位下立面已经能看清窗格和招牌笔画，
+说明**之前"糊"的主因不是 UV，而是压根没细化到有高清图集的那一层**。
+根 LOD 的图集就是 24x16 的缩略图，再怎么调采样也是糊的。
+
+#### 4. 白板不是 UV 问题（已排除）
+
+深层 LOD 下逐顶点统计 `aAtlasRect`：**零退化矩形**
+（Ground 180,261 / Tree 158,916 / Building 165,249 顶点全有有效 rect）。
+画面里那些大面积灰白平面来自**没有贴图的图层**：Waters 的 6 个网格
+`map === null`、material 是普通 `MeshStandardMaterial`（`_tmp/og/A3-planes.json`），
+水面用的特殊材质我们没接，于是按 diffuse 白色渲染。
+
+#### 现在剩下的两件事
+
+1. **同一张 KOHLER 立面被贴到所有楼上**：深层 LOD 下每块图集往往是「一整张立面」
+   （192x128 覆盖整个图集），而逐面 UV 又给每面墙铺一次，于是同一块图集的照片
+   被所有墙共用。需要按 binding 的子区域编号取精灵，而不是按块取整张图集。
+2. **水面 / 无贴图材质**：`map === null` 时至少要按材质 diffuse 上色（水是蓝色），
+   现在一律白板。
+
+### 第九轮：白板已定性 —— 是 SuperMap 内置水面，不是贴图错
+
+`Waters@OlympicGreen` 走的是普通 `.s3mb`（不是 block）。抓一块下来看：
+
+```
+Tile_-7284_21188.s3mb   1081 字节
+textures = 0
+material: alphaMode=opaque  diffuse={r:1,g:1,b:1,a:1}
+textureunitstates = ["103.water"]
+```
+
+**块里根本没有像素**，材质引用的是 SuperMap 的保留 id `103.water`（官方引擎里的内置水面，
+由引擎自己程序化生成）。我们以前拿它的白色 diffuse 当普通材质画，于是整片湖是白板。
+
+已改（`GeometryBuilder`）：纹理单元 id 以 `.water` 结尾且没有贴图时，用内置水面外观渲染
+——基色 `#1d4e63`、roughness 0.12、opacity 0.86。真正的波纹/反射需要单独实现水面着色器，
+但至少不再是一块白板。
+
 ### 仍然没解决的那一件事
 
 画面依旧是「一栋楼的照片被重复十几遍」。现在能定量解释了：

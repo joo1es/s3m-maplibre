@@ -7,8 +7,8 @@
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
-import { parseS3MBlock, parseS3MBlockTextureFile } from '../core/S3MBlockParser.js';
-import type { S3MBlockAtlasImage, S3MBlockTexture } from '../core/S3MBlockParser.js';
+import { parseS3MBlock, parseS3MBlockGroups, parseS3MBlockTextureFile } from '../core/S3MBlockParser.js';
+import type { S3MBlockAtlasImage, S3MBlockGroupSet, S3MBlockTexture } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { Group, Texture } from 'three';
 
@@ -255,6 +255,8 @@ export class S3MTileset {
   atlasLod: boolean;
   /** 根图集 id → 已拉到的清晰版子图集；null = 正在请求或确认没有，避免重复发请求 */
   readonly atlasLodCache = new Map<string, S3MBlockAtlasImage | null>();
+  /** 块 URL → 该文件里的全部 LOD 组（一个 .s3mblock 是一棵子树，不是一块瓦片） */
+  private readonly _groupCache = new Map<string, S3MBlockGroupSet>();
   /** 独立 `.texblock` 图集缓存：id → 图像；null 表示正在请求或确认不可用 */
   readonly externalAtlasCache = new Map<string, S3MBlockAtlasImage | null>();
   readonly stats: Stats = { tiles: 0, loading: 0, failed: 0, meshes: 0, vertices: 0, triangles: 0, datasets: 1 };
@@ -283,6 +285,7 @@ export class S3MTileset {
   /** 子瓦片 URL → 父瓦片 URL，用于淘汰后补洞 */
   private readonly _parentOf = new Map<string, string>();
   private _frame = 0;
+  private _lodDbgOnce = false;
   /** 格式类永久错误只向上报一次，避免整棵瓦片树刷同样的日志 */
   private _permanentReported = false;
   /** 请求量的硬上限（软上限 maxTiles 的超额余量），见构造函数注释 */
@@ -296,7 +299,7 @@ export class S3MTileset {
 
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
-    this.lodRangeScale = options.lodRangeScale ?? 1.0;
+    this.lodRangeScale = options.lodRangeScale ?? 3.0;
     this._onTile = options.onTile ?? (() => {});
     this._onTileRemoved = options.onTileRemoved ?? (() => {});
     this._onError = options.onError ?? ((e) => console.warn(e));
@@ -314,7 +317,8 @@ export class S3MTileset {
     // 硬上限 = 软上限 + 余量。淘汰只在「新瓦片已经落地并接管显示」之后做（make-before-break），
     // 所以中间态允许临时超出 maxTiles；硬上限只用来挡住失控的请求量，不用于挤掉正在显示的内容。
     this.hardCap = this.maxTiles + Math.max(8, Math.ceil(this.maxTiles * 0.5));
-    this.atlasLod = options.atlasLod === true;
+    // 默认开启清晰版子图集：根图集是 level=0 的低清代理，拿它平铺就是一堆马赛克
+    this.atlasLod = options.atlasLod !== false;
   }
 
   async init(): Promise<this> {
@@ -565,6 +569,22 @@ export class S3MTileset {
   }
 
   /**
+   * 记住一个块文件里解析出来的全部 LOD 组。
+   *
+   * 一棵 LOD 子树的几层几何加图集动辄好几 MB，全数据集都留着会把内存吃光，
+   * 所以只保留最近 24 个块（LRU 足够：相机在附近移动时命中的永远是同几个块）。
+   */
+  private _rememberGroups(baseUrl: string, set: S3MBlockGroupSet): void {
+    this._groupCache.delete(baseUrl);
+    this._groupCache.set(baseUrl, set);
+    while (this._groupCache.size > 24) {
+      const oldest = this._groupCache.keys().next().value;
+      if (oldest === undefined) break;
+      this._groupCache.delete(oldest);
+    }
+  }
+
+  /**
    * 把 S3MBLOCK 根图集换成同排布的清晰版（`.texblock` 子图集）。
    *
    * 根图集只是 level=0 的低清代理：实测一张 48×64 的槽位在子图集里是 96×128，
@@ -592,6 +612,8 @@ export class S3MTileset {
     const jobs: Promise<void>[] = [];
 
     for (const [id, tex] of Object.entries(tp)) {
+      // 已经拼合成一张大图的块：像素是我们自己重新排过的，再拿单张高清图覆盖会整张错位
+      if ((tex as { packed?: boolean }).packed) continue;
       // 高清子图集：requestNames 是子瓦片「像素在独立文件里」的情形，
       // childTexNames 才是根图集挂的「同一套排布的清晰版」。
       // 根块常常自带一份内嵌 data，但它是低分辨率缩略图（实测 120x184 对高清 300x304）——
@@ -659,6 +681,7 @@ export class S3MTileset {
     const jobs: Promise<void>[] = [];
 
     for (const [id, tex] of Object.entries(tp)) {
+      if ((tex as { packed?: boolean }).packed) continue;
       const childName = (tex.childTexNames ?? [])[0];
       const apply = (best: S3MBlockAtlasImage) => {
         const t = tile.textures[id];
@@ -709,22 +732,44 @@ export class S3MTileset {
     this.stats.loading++;
 
     try {
-      const res = await fetch(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status} 加载瓦片失败: ${url}`);
+      // URL 里的 `#N` 表示「同一个 .s3mblock 文件里的第 N 个 LOD 组」。
+      // 一个块文件打包的是一整棵 LOD 子树（6_01 → 6_0100 → 6_010000 → …），
+      // 这些下层瓦片**不是独立文件**，用 `#N` 直接命中已缓存的组，不再发请求。
+      const hashAt = url.indexOf('#');
+      const baseUrl = hashAt >= 0 ? url.slice(0, hashAt) : url;
+      const groupIndex = hashAt >= 0 ? Number(url.slice(hashAt + 1)) || 0 : 0;
+      const isBlock = /\.s3mblock($|\?)/i.test(baseUrl);
+
+      let tile: ParsedTile;
+      let groupNames: string[] = [];
+      const cachedSet = this._groupCache.get(baseUrl);
+      if (cachedSet) {
+        groupNames = cachedSet.names;
+        tile = cachedSet.tiles[groupIndex] ?? cachedSet.tiles[0]!;
+      } else {
+        const res = await fetch(baseUrl);
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status} 加载瓦片失败: ${baseUrl}`);
+        }
+        const ctype = res.headers.get('content-type') || '';
+        if (ctype.includes('text/html')) {
+          throw new Error(`瓦片请求返回了 HTML 页面（通常为 404/500 服务端拦截）: ${baseUrl}`);
+        }
+        const buffer = await res.arrayBuffer();
+        // S3MBLOCK（TextureSharing / 单文件存储）走专用解析：容器 + 内嵌 v2 瓦片体 + 图集纹理
+        if (isBlock) {
+          const set = await parseS3MBlockGroups(buffer);
+          this._rememberGroups(baseUrl, set);
+          groupNames = set.names;
+          tile = set.tiles[groupIndex] ?? set.tiles[0]!;
+        } else {
+          tile = await parseS3MB(buffer);
+        }
       }
-      const ctype = res.headers.get('content-type') || '';
-      if (ctype.includes('text/html')) {
-        throw new Error(`瓦片请求返回了 HTML 页面（通常为 404/500 服务端拦截）: ${url}`);
-      }
-      const buffer = await res.arrayBuffer();
-      // S3MBLOCK（TextureSharing / 单文件存储）走专用解析：容器 + 内嵌 v2 瓦片体 + 图集纹理
-      const isBlock = /\.s3mblock($|\?)/i.test(url);
-      const tile = isBlock ? await parseS3MBlock(buffer) : await parseS3MB(buffer);
       if (isBlock) {
         // 子瓦片的图集像素在独立 .texblock 里，必须先补齐，否则整块无贴图
-        await this._fillExternalAtlases(tile, url);
-        await this._upgradeAtlasLod(tile, url);
+        await this._fillExternalAtlases(tile, baseUrl);
+        await this._upgradeAtlasLod(tile, baseUrl);
       }
 
       const build = await this._builder();
@@ -733,9 +778,16 @@ export class S3MTileset {
 
       const childUrls: string[] = [];
       for (const l of tile.groupNode?.pageLods ?? []) {
-        const u = this.isS3MV1
-          ? s3m1ChildUrl(url, l.childTile)
-          : resolveUrl(dirOf(url), l.childTile);
+        // 下一层如果就在本文件里（实测 6_01 的 5 个组是连成一条链的），直接指向 `#index`，
+        // 不产生任何网络请求；只有真正的外部文件才走 URL 解析。
+        const childName = String(l.childTile ?? '').replace(/\.s3mblock$/i, '');
+        const sameFile = isBlock && childName ? groupNames.indexOf(childName) : -1;
+        const u =
+          sameFile >= 0
+            ? `${baseUrl}#${sameFile}`
+            : this.isS3MV1
+              ? s3m1ChildUrl(url, l.childTile)
+              : resolveUrl(dirOf(url), l.childTile);
         // 注意：不能拿 rootTiles 清单去筛子瓦片。S3MBLOCK 的 config.tiles 只是**根**瓦片，
         // 实测 6.s3mblock 的 pageLOD 指向 6_00/6_01.s3mblock（HTTP 200，37 KB / 549 KB），
         // 都在清单之外。按清单筛的后果是 childUrls 恒为空 → update() 永远不细化 →
@@ -862,6 +914,18 @@ export class S3MTileset {
       const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
       const needRefine = childUrls.length > 0 && (byDistance ? metric < threshold : metric > threshold);
       node.needRefine = needRefine;
+
+      const dbgSeen = ((globalThis as { __S3M_LOD_SEEN?: Set<string> }).__S3M_LOD_SEEN ??= new Set<string>());
+      if ((globalThis as { __S3M_LOD_DEBUG?: boolean }).__S3M_LOD_DEBUG && !dbgSeen.has(node.url) && dbgSeen.size < 260) {
+        dbgSeen.add(node.url);
+        // eslint-disable-next-line no-console
+        console.log('[LOD]', JSON.stringify({
+          url: node.url.split('/').pop(), mode: node.rangeMode, rangeValue: node.rangeValue,
+          radius: node.sphere.radius, dist: +dist.toFixed(1), metric: +metric.toFixed(1),
+          threshold: +threshold.toFixed(1), needRefine, childUrls: childUrls.map((u) => u.split('/').pop()),
+          parent: node.parentUrl ? node.parentUrl.split('/').pop() : null,
+        }));
+      }
 
       if (needRefine) {
         for (const childUrl of childUrls) {

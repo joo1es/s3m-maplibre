@@ -413,6 +413,11 @@ async function loadSource(rawUrl) {
   userMovedCamera = false;
 
   currentDatasets = await resolveUrlToDatasets(url);
+  // ?all=1：把该服务下的所有数据集全部勾选（官方场景是 6 层：鸟巢/水/树/路/地面/建筑，
+  // 只加载 Building 一层做出来的画面根本没法跟官方对照）
+  if (new URLSearchParams(window.location.search).get('all') === '1') {
+    for (const d of currentDatasets) d.checked = true;
+  }
   renderDatasetUI();
 
   // 添加默认勾选的数据集

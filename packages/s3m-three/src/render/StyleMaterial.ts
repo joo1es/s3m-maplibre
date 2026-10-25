@@ -344,8 +344,13 @@ const FRAG_PARS = /* glsl */ `
       // 退化矩形 = 官方 batchId < 0：该纹理单元不参与合成
       if ( rect.z <= 0.0 || rect.w <= 0.0 ) return vec4( 1.0 );
       vec2 dim = vec2( rect.z * atlasDim.x, rect.w * atlasDim.y );
+      // 官方 getTexAtlasParameter 里的 width *= 2/3 是为了避开精灵右侧那条内联 mip 链。
+      // 我们自己的图集是解析阶段重新装箱拼出来的（core/AtlasPack.ts），每格只有本体、
+      // 没有内联链，所以按 rect 满宽采样；再乘 2/3 会把每个精灵裁掉三分之一。
       vec2 scale = dim / atlasDim;
       vec2 translate = rect.xy;
+      // 官方 calculateTexCoord 就是 fract(uv) —— uv 是几何自带的 set0 世界尺度坐标，
+      // 一个周期正好铺一张精灵。不再做任何额外缩放。
       return texture2D( tex, s3mBatchUV( uv, translate, scale, dim, 0.0 ) );
     }
   #endif
@@ -541,6 +546,8 @@ export interface StyledMaterialOptions {
   atlas?: boolean;
   /** 图集材质的第二套纹理（官方 BakeTex，光照烘焙），与 base 相乘 */
   secMap?: THREE.Texture | null;
+  /** 几何已按绑定组生成 0..1 逐面 UV（不再按精灵像素尺寸换算） */
+  atlasUvNormalized?: boolean;
 }
 
 /**
@@ -579,6 +586,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   const secMap = atlas ? (opts.secMap ?? null) : null;
   if (atlas) mat.defines = { ...(mat.defines as Record<string, string>), S3M_ATLAS: '' };
   if (secMap) mat.defines = { ...mat.defines, S3M_ATLAS_SEC: '' };
+  if (atlas && opts.atlasUvNormalized) mat.defines = { ...mat.defines, S3M_ATLAS_UV_NORM: '' };
   // 官方 uTextureDim = (base宽, base高, bake宽, bake高)，取实际绑定纹理的像素尺寸
   const uAtlasDim = { value: new THREE.Vector2(opts.map?.image?.width || 1, opts.map?.image?.height || 1) };
   const uAtlasDim1 = { value: new THREE.Vector2(secMap?.image?.width || 1, secMap?.image?.height || 1) };
@@ -619,7 +627,8 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
 
   // 不同材质共用同一段注入代码，必须让 three 认为它们的 program 可复用；
   // 但图集 / 烘焙两套宏会改注入结果，必须进 cacheKey，否则会复用错 program。
-  mat.customProgramCacheKey = () => `s3m-styled${atlas ? '-atlas' : ''}${secMap ? '-bake' : ''}`;
+  mat.customProgramCacheKey = () =>
+    `s3m-styled${atlas ? '-atlas' : ''}${secMap ? '-bake' : ''}${atlas && opts.atlasUvNormalized ? '-uvn' : ''}`;
 
   mat.userData.uSelBatch = uSelBatch;
   mat.userData.uSelWhole = uSelWhole;

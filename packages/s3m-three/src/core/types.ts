@@ -162,6 +162,13 @@ export interface S3MTexture {
 export interface S3MAtlasRects {
   uv?: Float32Array;
   uv2?: Float32Array;
+  /**
+   * 每个顶点所属的绑定组 id（= 块文件里「哪段顶点用哪张子纹理」）。
+   * 生成 UV 时按它分组，一组一面墙 → 一张精灵，跟官方 batch 表的语义一致。
+   */
+  group?: Float32Array;
+  /** 每个顶点所属子区域的像素尺寸 (w, h)：决定这段 uv 该怎么平铺 */
+  groupDim?: Float32Array;
 }
 
 export interface ParsedTile {
