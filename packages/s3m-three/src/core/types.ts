@@ -154,6 +154,16 @@ export interface S3MTexture {
 
 /* ------------------------------------------------------------------ 瓦片 */
 
+/**
+ * S3MBLOCK 图集：每个顶点所属子区域的归一化矩形 (x, y, w, h)。
+ * 未被绑定覆盖的顶点是 (0, 0, 1, 1)，即整张图集。
+ * uv 对应材质 textureunit 0，uv2 对应 unit 1（官方叫 BaseTex / BakeTex）。
+ */
+export interface S3MAtlasRects {
+  uv?: Float32Array;
+  uv2?: Float32Array;
+}
+
 export interface ParsedTile {
   version: number;
   compressedType: number;
@@ -161,6 +171,8 @@ export interface ParsedTile {
   groupNode: GroupNode;
   geoPackage: Record<string, GeoPackageEntry>;
   textures: Record<string, S3MTexture>;
+  /** 仅 S3MBLOCK：图集子区域矩形（按骨架名） */
+  atlasRects?: Record<string, S3MAtlasRects>;
   materials: unknown;
   pickInfo: unknown;
   extensions?: unknown;

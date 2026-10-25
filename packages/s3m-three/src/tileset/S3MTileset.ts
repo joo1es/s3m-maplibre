@@ -7,7 +7,8 @@
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
-import { parseS3MBlock } from '../core/S3MBlockParser.js';
+import { parseS3MBlock, parseS3MBlockTextureFile } from '../core/S3MBlockParser.js';
+import type { S3MBlockAtlasImage, S3MBlockTexture } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { Group, Texture } from 'three';
 
@@ -91,6 +92,34 @@ export function usableGeoBounds(b: unknown): GeoBounds | null {
   return { left, bottom, right, top };
 }
 
+/**
+ * S3M 1.x（SuperMapCache）的子瓦地址。
+ *
+ * XML 的 RangeDataList 写的是切片时的原始文件名（`Tile_+002_+001_L16_0.osgb`），
+ * 而 iServer 实际发布的是**同名换 .s3m 后缀**、并且插在 `datas/<数据源>/data/path/` 下：
+ *   .../datas/Config/Tile_+002_+001/Tile_+002_+001.s3m                     ← 根
+ *   .../datas/Config/data/path/Tile_+002_+001/Tile_+002_+001_L16_0.s3m     ← 子
+ * 实测 L16/L17/L18 都是 200，`?sceneName=` 不参与寻址。
+ */
+export function s3m1ChildUrl(tileUrl: string, child: string | null | undefined): string | null {
+  if (!child) return null;
+  const name = child.replace(/\.(osgb|s3mb|s3m)$/i, '.s3m');
+  // 根瓦地址：  <前缀>/datas/<数据源>/<瓦片目录>/<文件名>.s3m
+  // 子瓦地址：  <前缀>/datas/<数据源>/data/path/<瓦片目录>/<子瓦名>.s3m
+  const parts = tileUrl.split('/');
+  const file = parts.pop() ?? '';
+  const dir = parts.pop() ?? '';
+  const datasIdx = parts.lastIndexOf('datas');
+  if (!file || !dir || datasIdx < 1) {
+    // 不像 datas/<ds>/<dir>/<file> 的结构，退回按父目录解析
+    return resolveUrl(dirOf(tileUrl), name);
+  }
+  // 父瓦自己就已经在 data/path 下面了（再往下细化），那只换文件名，别再插一层
+  const alreadyPath = parts[parts.length - 1] === 'path' && parts[parts.length - 2] === 'data';
+  const base = alreadyPath ? `${parts.join('/')}/${dir}` : `${parts.join('/')}/data/path/${dir}`;
+  return fixPathEncoding(`${base}/${name}`);
+}
+
 /** 兼容解析 JSON 与 XML 格式的 SuperMap .scp / config 配置文件（导出以便单测与自建数据集列表复用） */
 export function parseConfigText(text: string): Record<string, unknown> {
   const trimmed = text.trim();
@@ -135,10 +164,17 @@ export function parseConfigText(text: string): Record<string, unknown> {
       tiles.push({ url: m[1].trim() });
     }
 
+    // SuperMapCache 用 MinHeight/MaxHeight 声明成果的高程范围（米）。
+    // 不读出来的话 align: 'bottom' 无从计算 —— 这类 OSGB 数据的 z 是从 120m 起飞的，
+    // 不贴地就会整片悬在地图上方，斜视下看起来像散在别处的碎片。
+    const minH = num('MinHeight');
+    const maxH = num('MaxHeight');
+
     return {
       fileType: tagVal('FileType') ?? undefined,
       position: { x: posX, y: posY, z: posZ, units: 'Degree' },
       geoBounds: { left, right, top, bottom },
+      heightRange: Number.isFinite(minH) || Number.isFinite(maxH) ? { min: minH, max: maxH } : undefined,
       rootTiles: tiles,
       tiles,
     };
@@ -187,6 +223,16 @@ export interface S3MTilesetOptions {
   maxRetries?: number;
   /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
   lodRangeScale?: number;
+  /**
+   * 是否请求 `.texblock` 子图集（S3MBLOCK 根图集的清晰版）。**默认关**。
+   *
+   * 不是没实现，而是「换图不换归一化 rect」这条规则只在部分链上成立：实测三对样本里
+   * 有一对的比例是 2.000×1.579（不成比例），打开后整场景建筑会碎成满屏空洞
+   * （错裁到 alpha=0 的区域被 alphaTest 丢弃）。要安全启用必须先做逐图集一致性自检
+   * （把子图集按归一化 rect 裁回来与根槽位比 alpha 轮廓 IoU + 色差），通过才换。
+   * 度量方式见 `_tmp/atlas/rule2.mts`。
+   */
+  atlasLod?: boolean;
 }
 
 export class S3MTileset {
@@ -205,6 +251,12 @@ export class S3MTileset {
   readonly failed = new Set<string>();
   readonly textureCache = new Map<string, Texture>();
   readonly pending = new Set<string>();
+  /** 是否请求 `.texblock` 子图集，默认关，见 S3MTilesetOptions.atlasLod */
+  atlasLod: boolean;
+  /** 根图集 id → 已拉到的清晰版子图集；null = 正在请求或确认没有，避免重复发请求 */
+  readonly atlasLodCache = new Map<string, S3MBlockAtlasImage | null>();
+  /** 独立 `.texblock` 图集缓存：id → 图像；null 表示正在请求或确认不可用 */
+  readonly externalAtlasCache = new Map<string, S3MBlockAtlasImage | null>();
   readonly stats: Stats = { tiles: 0, loading: 0, failed: 0, meshes: 0, vertices: 0, triangles: 0, datasets: 1 };
 
   maxConcurrent: number;
@@ -233,6 +285,10 @@ export class S3MTileset {
   private _frame = 0;
   /** 格式类永久错误只向上报一次，避免整棵瓦片树刷同样的日志 */
   private _permanentReported = false;
+  /** 请求量的硬上限（软上限 maxTiles 的超额余量），见构造函数注释 */
+  private hardCap = 96;
+  /** 本数据集是 S3M 1.x（SuperMapCache，.s3m）：子瓦地址规则与 3.x 不同 */
+  private isS3MV1 = false;
   private _buildTile: BuildTileFn | null;
   private readonly _uniforms: StyleUniforms | null;
   private _queue: string[] = [];
@@ -255,6 +311,10 @@ export class S3MTileset {
     // 并发与总量限制：iServer 公开服务上别把人家打爆
     this.maxConcurrent = options.maxConcurrent ?? 4;
     this.maxTiles = options.maxTiles ?? 64;
+    // 硬上限 = 软上限 + 余量。淘汰只在「新瓦片已经落地并接管显示」之后做（make-before-break），
+    // 所以中间态允许临时超出 maxTiles；硬上限只用来挡住失控的请求量，不用于挤掉正在显示的内容。
+    this.hardCap = this.maxTiles + Math.max(8, Math.ceil(this.maxTiles * 0.5));
+    this.atlasLod = options.atlasLod === true;
   }
 
   async init(): Promise<this> {
@@ -276,18 +336,12 @@ export class S3MTileset {
       if (u) this.rootUrls.push(u);
     }
 
-    // OSGB 原生缓存（SuperMapCache / S3M 1.x）早点说清楚，别等几十块瓦片全失败才看出来。
-    // 位置与范围是按配置反算出来的，所以视角会正确落到模型上，只是没有内容可渲染。
-    const isV1OSGB =
+    // S3M 1.x（SuperMapCache，.s3m）容器：早点说清楚，别等几十块瓦片全失败才看出来。
+    // 位置与范围是按配置反算出来的，所以视角会正确落到模型上，只是这种容器还没接解码。
+    this.isS3MV1 =
       /OSGB/i.test(String(config.fileType ?? '')) ||
       /OSGB/i.test(String(config.dataType ?? '')) ||
       (this.rootUrls.length > 0 && this.rootUrls.every((u) => /\.s3m($|\?)/i.test(u)));
-    if (isV1OSGB) {
-      console.warn(
-        '[s3m] 这是 OSGB 原生缓存（SuperMapCache，瓦片为 S3M 1.x 的 .s3m，下一级 LOD 是 .osgb），' +
-          '本库只支持 S3MB 2.x / 3.x，不会渲染出内容。请把数据重新导出/发布成 S3M 瓦片缓存（.s3mb）。'
-      );
-    }
 
     // S3MBLOCK：config.tiles 就是全部瓦片，子引用超出清单的一律不请求
     if (this.rootUrls.every((u) => /\.s3mblock($|\?)/i.test(u))) {
@@ -313,10 +367,11 @@ export class S3MTileset {
     // 失败退避期间不重入队，等 update() 下一轮再来
     const retryAt = this._retryAt.get(url);
     if (retryAt !== undefined && performance.now() < retryAt) return;
-    // 满了就淘汰最久没被用到的，而不是干等着永远不再出图
-    while (this.nodes.size + this.pending.size >= this.maxTiles) {
-      if (!this._evictOne()) return;
-    }
+    // 不在这里淘汰！「为了塞新的先删旧的」会立刻在画面上开一个洞 —— 旧的已经没了、
+    // 新的还没下载完，而洞那块地下一帧又要靠它回补，于是「删 → 补 → 再删」就是闪烁。
+    // 改成 make-before-break：新瓦片落地并接管显示之后，再由 update() 末尾的
+    // _trimBudget() 统一裁。这里只用硬上限挡住失控的请求量。
+    if (this.nodes.size + this.pending.size + this._queue.length >= this.hardCap) return;
     this._queue.push(url);
     this._pump();
   }
@@ -333,8 +388,9 @@ export class S3MTileset {
    * 两轮都按「最久没进有效范围」排，同帧再比距离。
    * 淘汰最细一级时，如果上一级也不在内存里，顺手把上一级排回队列补洞。
    */
-  private _evictOne(): boolean {
-    const victim = this._pickVictim(false) ?? this._pickVictim(true);
+  private _evictOne(allowUncovered = false): boolean {
+    // 只挑安全候选：叶子 → 已被子瓦接手的父瓦。allowUncovered 仅在超出硬上限时开启（内存兜底）
+    const victim = this._pickVictim(false, allowUncovered) ?? this._pickVictim(true, allowUncovered);
     if (!victim) return false;
 
     const parentUrl = victim.parentUrl ?? this._parentOf.get(victim.url);
@@ -346,6 +402,31 @@ export class S3MTileset {
     this._onTileRemoved(victim);
     this._parentOf.delete(victim.url);
 
+    // 淘汰的是中间层时，把已加载的子孙改挂到它的父级上：
+    // 不然它们瞬间"无父"，父级那边还留着指向 victim 的 childUrls，
+    // 于是 allChildrenReady 永远为假 —— 既显示不对，也白占预算。
+    const kids = childUrls.filter((u) => u !== victim.url && this.nodes.has(u));
+    if (kids.length) {
+      for (const k of kids) {
+        const kn = this.nodes.get(k);
+        if (!kn) continue;
+        kn.parentUrl = parentUrl ?? undefined;
+        if (parentUrl) this._parentOf.set(k, parentUrl);
+        else this._parentOf.delete(k);
+      }
+      if (parentUrl) {
+        const pn = this.nodes.get(parentUrl);
+        if (pn) {
+          const merged = new Set<string>(pn.childUrls ?? []);
+          if (pn.childUrl) merged.add(pn.childUrl);
+          merged.delete(victim.url);
+          for (const k of kids) merged.add(k);
+          pn.childUrls = [...merged];
+          pn.childUrl = pn.childUrls[0] ?? null;
+        }
+      }
+    }
+
     // 删的是最细一级、而上一级又不在内存里 → 把上一级排回去，别让那块地空着
     if (isLeaf && parentUrl && !this.nodes.has(parentUrl) && !this.pending.has(parentUrl)) {
       this._enqueue(parentUrl);
@@ -354,15 +435,44 @@ export class S3MTileset {
   }
 
   /**
-   * 挑淘汰候选。
-   * @param allowRefined false = 只挑叶子；true = 只挑「子节点已全部加载」的父瓦片
+   * 预算裁剪 —— 必须在可见性算完之后调用（make-before-break）：
+   * 新瓦片已经落地、也已经决定由谁负责显示，这时候才把没人依赖的那块裁掉。
+   * 只踢「当前不显示」或「位置已被可见子瓦接手」的瓦片；挑不出安全候选时允许
+   * 暂时超出 maxTiles，等下一帧再裁 —— 宁可多占一会儿内存，也不在画面上开洞。
    */
-  private _pickVictim(allowRefined: boolean): TileNode | null {
+  private _trimBudget(): boolean {
+    let removed = false;
+    let guard = 0;
+    // 在途的也算进"预期驻留数"：不然一批瓦片同时落地时会先把画面撑爆再疯狂裁
+    while (this.nodes.size + this.pending.size > this.maxTiles && guard++ <= this.maxTiles + 8) {
+      if (!this._evictOne(this.nodes.size + this.pending.size > this.hardCap)) break;
+      removed = true;
+    }
+    return removed;
+  }
+
+  /**
+   * 挑淘汰候选。
+   * @param allowRefined false = 只挑叶子；true = 也允许挑「子节点已全部加载」的父瓦片
+   * @param allowUncovered true = 允许淘汰「正在显示、但位置还没被子瓦接手」的瓦片。
+   *   默认 false：这种瓦片一踢，画面上立刻是一个洞，下一帧调度又会把它请回来补洞，
+   *   于是「淘汰 → 开洞 → 回补 → 再淘汰」无限循环 = 屏幕不停闪烁。
+   *   只有在实在挑不出安全候选时才允许（否则预算满死锁、相机移到哪都不出图）。
+   */
+  private _pickVictim(allowRefined: boolean, allowUncovered = false): TileNode | null {
     let victim: TileNode | null = null;
     for (const node of this.nodes.values()) {
       const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
       const refined = childUrls.length > 0 && childUrls.some((u) => u !== node.url && this.nodes.has(u));
       if (refined !== allowRefined) continue;
+      // 正在显示且没有可见子瓦接手 → 踢了就是洞
+      if (!allowUncovered && node.group.visible) {
+        const covered = childUrls.some((u) => {
+          const c = this.nodes.get(u);
+          return !!c && c.group.visible;
+        });
+        if (!covered) continue;
+      }
       if (!victim) {
         victim = node;
         continue;
@@ -454,6 +564,145 @@ export class S3MTileset {
     return this._buildTile;
   }
 
+  /**
+   * 把 S3MBLOCK 根图集换成同排布的清晰版（`.texblock` 子图集）。
+   *
+   * 根图集只是 level=0 的低清代理：实测一张 48×64 的槽位在子图集里是 96×128，
+   * 拿它平铺几十次就是一堆棕色马赛克。子图集文件里没有自己的 subTexInfos，
+   * 官方（`requestSubTextures`）的做法就是整体换图、rect 照旧——因为两者是同一套
+   * 排布的等比放大（归一化 rect 直接搬，alpha 轮廓 IoU 0.85~1.00）。
+   *
+   * 只认「更大且字节能完整解析」的子图集；请求失败/尺寸不合法就保留根图集。
+   */
+  /**
+   * 补齐「图集像素不在块文件里」的那一半。
+   *
+   * 根瓦片（如 6.s3mblock）的图集是内嵌的（isSaveData=1）；但**子瓦片**（6_00 / 6_01）
+   * 的图集段只有元信息：`data = null` + `requestNames = ['-704919438.texblock']`，
+   * 像素在同目录的独立 `.texblock` 文件里（实测尺寸与声明逐字一致：192×128 / 204×384，
+   * 内容按 1 B/px 的 DXT5 排布）。
+   *
+   * 不补这一步的后果不是「糊一点」，而是子瓦片整块无贴图：`tile.textures` 里根本没有
+   * 这条纹理，材质拿不到 map，建筑变成纯白几何——精细 LOD 一旦真的加载进来就会显露。
+   */
+  private async _fillExternalAtlases(tile: ParsedTile, url: string): Promise<void> {
+    const blockTile = tile as ParsedTile & { texturePackage?: Record<string, S3MBlockTexture> };
+    const tp = blockTile.texturePackage;
+    if (!tp) return;
+    const jobs: Promise<void>[] = [];
+
+    for (const [id, tex] of Object.entries(tp)) {
+      // 高清子图集：requestNames 是子瓦片「像素在独立文件里」的情形，
+      // childTexNames 才是根图集挂的「同一套排布的清晰版」。
+      // 根块常常自带一份内嵌 data，但它是低分辨率缩略图（实测 120x184 对高清 300x304）——
+      // 一张 120x184 的图集装 26 个槽位，每个槽位只能画一整栋楼的缩略图，
+      // 贴到墙上就是「满墙小楼照片」。官方一律用 childTexNames 指向的清晰版。
+      const names = [...(tex.requestNames ?? []), ...(tex.childTexNames ?? [])];
+      if (!names.length) continue;
+
+      const cached = this.externalAtlasCache.get(id);
+      const apply = (img: S3MBlockAtlasImage) => {
+        // 覆盖解析阶段按内嵌缩略图填好的那份；请求失败时不会走到这里，原样保留
+        tex.data = img.data;
+        tex.compressType = img.compressType;
+        tex.pixelFormat = img.pixelFormat;
+        tile.textures[id] = {
+          code: id,
+          level: tex.level,
+          // 必须用清晰版自己的尺寸：块里声明的 120x184 只是缩略图大小，
+          // 拿它去解码 300x304 的像素会整张错位。subTexInfos 的 rect 是归一化的，
+          // 换图不换归一化坐标，所以不受影响。
+          width: img.width || tex.width,
+          height: img.height || tex.height,
+          compressType: img.compressType,
+          pixelFormat: img.pixelFormat,
+          data: img.data,
+          flipY: true,
+        };
+      };
+
+      if (cached === null) continue; // 正在请求 / 确认不可用
+      if (cached) {
+        apply(cached);
+        continue;
+      }
+      this.externalAtlasCache.set(id, null);
+      jobs.push(
+        (async () => {
+          for (const name of names) {
+            const u = resolveUrl(dirOf(url), name);
+            if (!u) continue;
+            try {
+              const res = await fetch(u);
+              if (!res.ok) continue;
+              const imgs = await parseS3MBlockTextureFile(await res.arrayBuffer());
+              const img = imgs[0];
+              if (!img) continue;
+              this.externalAtlasCache.set(id, img);
+              apply(img);
+              return;
+            } catch {
+              // 换下一个候选名；全失败就保持无贴图，由上层照常渲染几何
+            }
+          }
+        })()
+      );
+    }
+    if (jobs.length) await Promise.all(jobs);
+  }
+
+  private async _upgradeAtlasLod(tile: ParsedTile, url: string): Promise<void> {
+    if (!this.atlasLod) return; // 默认关，见 S3MTilesetOptions.atlasLod
+    const blockTile = tile as ParsedTile & { texturePackage?: Record<string, { childTexNames?: string[]; width: number; height: number }> };
+    const tp = blockTile.texturePackage;
+    if (!tp) return;
+    const jobs: Promise<void>[] = [];
+
+    for (const [id, tex] of Object.entries(tp)) {
+      const childName = (tex.childTexNames ?? [])[0];
+      const apply = (best: S3MBlockAtlasImage) => {
+        const t = tile.textures[id];
+        if (!t) return;
+        t.width = best.width;
+        t.height = best.height;
+        t.compressType = best.compressType;
+        t.pixelFormat = best.pixelFormat;
+        t.data = best.data;
+        // 换了像素就得重解码：缓存里那份是按旧尺寸解的
+        this.textureCache.delete(id);
+      };
+
+      // 同一张图集会被很多瓦片引用：拉过就复用，没拉过才发请求
+      const cached = this.atlasLodCache.get(id);
+      if (cached === null) continue; // 正在请求 / 已确认没有清晰版
+      if (cached) {
+        if (cached.width * cached.height > tex.width * tex.height) apply(cached);
+        continue;
+      }
+      if (!childName) continue;
+      this.atlasLodCache.set(id, null);
+      const childUrl = resolveUrl(url, childName);
+      if (!childUrl) continue;
+      jobs.push(
+        (async () => {
+          try {
+            const res = await fetch(childUrl);
+            if (!res.ok) return;
+            const imgs = await parseS3MBlockTextureFile(await res.arrayBuffer());
+            const best = imgs.reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a), imgs[0]!);
+            // 只接受清晰版：像素数必须严格大于根图集，否则宁可保留原图
+            if (best.width * best.height <= tex.width * tex.height) return;
+            this.atlasLodCache.set(id, best);
+            apply(best);
+          } catch {
+            // 子图集是增强项，拿不到就用根图集，不该拖垮整块瓦片
+          }
+        })()
+      );
+    }
+    if (jobs.length) await Promise.all(jobs);
+  }
+
   private async _load(url: string): Promise<void> {
     if (this.nodes.has(url) || this.pending.has(url) || this.failed.has(url)) return;
     this.pending.add(url);
@@ -470,9 +719,13 @@ export class S3MTileset {
       }
       const buffer = await res.arrayBuffer();
       // S3MBLOCK（TextureSharing / 单文件存储）走专用解析：容器 + 内嵌 v2 瓦片体 + 图集纹理
-      const tile = /\.s3mblock($|\?)/i.test(url)
-        ? await parseS3MBlock(buffer)
-        : await parseS3MB(buffer);
+      const isBlock = /\.s3mblock($|\?)/i.test(url);
+      const tile = isBlock ? await parseS3MBlock(buffer) : await parseS3MB(buffer);
+      if (isBlock) {
+        // 子瓦片的图集像素在独立 .texblock 里，必须先补齐，否则整块无贴图
+        await this._fillExternalAtlases(tile, url);
+        await this._upgradeAtlasLod(tile, url);
+      }
 
       const build = await this._builder();
       const { group, stats } = await build(tile, { textureCache: this.textureCache, uniforms: this._uniforms });
@@ -480,11 +733,15 @@ export class S3MTileset {
 
       const childUrls: string[] = [];
       for (const l of tile.groupNode?.pageLods ?? []) {
-        const u = resolveUrl(dirOf(url), l.childTile);
-        if (u && u !== url && !childUrls.includes(u)) {
-          if (this._blockTileIndex && !this._blockTileIndex.has(u)) continue;
-          childUrls.push(u);
-        }
+        const u = this.isS3MV1
+          ? s3m1ChildUrl(url, l.childTile)
+          : resolveUrl(dirOf(url), l.childTile);
+        // 注意：不能拿 rootTiles 清单去筛子瓦片。S3MBLOCK 的 config.tiles 只是**根**瓦片，
+        // 实测 6.s3mblock 的 pageLOD 指向 6_00/6_01.s3mblock（HTTP 200，37 KB / 549 KB），
+        // 都在清单之外。按清单筛的后果是 childUrls 恒为空 → update() 永远不细化 →
+        // 任何机位都只渲染最粗一级的根图集（一栋楼只剩十几像素，再按 uv 平铺几十遍），
+        // 表现为「整栋微缩建筑照片贴满立面」。是否可取由服务器 404 + failed 退避来兜。
+        if (u && u !== url && !childUrls.includes(u)) childUrls.push(u);
       }
 
       const node: TileNode = {
@@ -494,7 +751,7 @@ export class S3MTileset {
         sphere: lod?.boundingSphere ?? null,
         rangeValue: lod?.rangeValue ?? 0,
         rangeMode: lod?.rangeMode ?? 1,
-        childUrl: childUrls[0] ?? resolveUrl(dirOf(url), lod?.childTile),
+        childUrl: childUrls[0] ?? (this.isS3MV1 ? s3m1ChildUrl(url, lod?.childTile) : resolveUrl(dirOf(url), lod?.childTile)),
         childUrls,
         parentUrl: this._parentOf.get(url),
         state: 'ready',
@@ -522,6 +779,15 @@ export class S3MTileset {
         this.stats.failed++;
         this.failed.add(url);
         this._retryAt.delete(url);
+        // 从父瓦片的子列表里摘掉：S3MBLOCK 里有些 pageLOD 的 childTile 在服务器上根本不存在
+        // （实测 64_0000 / 65_0200 全是 404）。留着会让父瓦片永远「子未全就绪」→ 永不细化，
+        // 症状就是贴着看也一直渲染最粗一级。
+        const pUrl = this._parentOf.get(url);
+        const pNode = pUrl ? this.nodes.get(pUrl) : undefined;
+        if (pNode?.childUrls) {
+          pNode.childUrls = pNode.childUrls.filter((u) => u !== url);
+          pNode.childUrl = pNode.childUrls[0] ?? null;
+        }
       }
       // 同一类永久错误只报一次：OSGB 服务一上来几十块瓦片都是同一个原因，
       // 刷屏会把真正值得看的日志埋掉
@@ -575,8 +841,16 @@ export class S3MTileset {
       if (byDistance) {
         metric = dist; // Distance_From_EyePoint：距离越小越该细化
       } else {
-        // 屏幕像素半径
-        metric = ((node.sphere.radius / dist) / Math.tan(fovRad / 2)) * screenHeight * 0.5;
+        // 屏幕像素尺寸。照抄官方 PageLod.calcPixFromCam（SourceRelease/_3437c37f.js）：
+        //   pix = (drawingBufferHeight/2) / tan(PI_OVER_FOUR * 0.5) * radius / distance * 2
+        //       = drawingBufferHeight * 2.4142 * radius / distance
+        // 两个要点：① 视场角是**写死的 45°**（tan(22.5°)），不取渲染器实际 fov；
+        // ② 末尾那个 *2（即用直径量屏幕尺寸）。少这个 *2 会让 metric 只有官方的一半，
+        //    needRefine 的门槛就永远差一级 —— 表现就是「贴着看也一直在渲染最粗的根图集，
+        //    一张整楼雪碧被 uv 平铺几十遍」。实测瓦片 6_01：radius 293.4、rangeValue 586.8，
+        //    distance ≈ 824 m、H = 854 → 官方算 734 > 586.8 该细化，我们旧公式只有 326。
+        metric = ((screenHeight * 0.5) / Math.tan(Math.PI / 8)) * (node.sphere.radius / dist) * 2;
+        void fovRad;
       }
 
       // 在有效范围内（留一倍余量）的算「正在用」，淘汰时按这个帧号排优先级
@@ -601,12 +875,15 @@ export class S3MTileset {
 
     // 树状递归更新所有瓦片的可见性（确保每个位置只渲染一层最适合的 LOD，避免父子瓦片重叠 Z-fighting）
     const visited = new Set<string>();
-    const roots = this.rootUrls.length > 0
-      ? this.rootUrls
-      : [...this.nodes.keys()].filter((u) => {
-          const p = this.nodes.get(u)?.parentUrl;
-          return !p || !this.nodes.has(p);
-        });
+    // 根集合 = 配置里的入口瓦片 + 所有「父瓦已不在档」的瓦片。
+    // 后者必须有：淘汰掉一块中间层瓦片后，它下面的子孙会瞬间变成"无父"状态，
+    // 如果只按 rootUrls 走，它们全部不可达，会被下面那条防御规则一起隐藏 ——
+    // 症状就是「进去先渲染出来，然后整片消失，偶尔闪一下」。
+    const roots = new Set<string>(this.rootUrls);
+    for (const [url, node] of this.nodes) {
+      const p = node.parentUrl ?? this._parentOf.get(url);
+      if (!p || !this.nodes.has(p)) roots.add(url);
+    }
 
     for (const rootUrl of roots) {
       if (this._updateNodeVisibility(rootUrl, true, visited)) {
@@ -624,12 +901,46 @@ export class S3MTileset {
       }
     }
 
+    // 显示职责已经分配完毕，现在才裁预算（make-before-break）：
+    // 此时「谁在负责显示这块地」是确定的，只踢没人依赖的那块，不会开出洞来
+    if (this._trimBudget()) hasChanges = true;
+
+    // 兜底：绝不允许空场。
+    // 可见性递归是按「先访问先决定」处理的，而 LOD 图不一定是严格的树 —— 同一个子瓦可能
+    // 被多个父瓦引用（不同层级指向同一份数据），它可能先在某条"隐藏分支"里被访问掉，
+    // 之后就再也拿不到显示机会，最终出现「一块都不显示」的整片消失。
+    // 这里做最后一次校正：凡是位置没有被任何可见子瓦接手的瓦片，一律自己显示。
+    let anyVisible = false;
+    for (const node of this.nodes.values()) {
+      if (node.group.visible) {
+        anyVisible = true;
+        break;
+      }
+    }
+    if (!anyVisible && this.nodes.size > 0) {
+      for (const node of this.nodes.values()) {
+        const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+        const covered = childUrls.some((u) => {
+          const c = this.nodes.get(u);
+          return !!c && c !== node && c.group.visible;
+        });
+        if (!covered && !node.group.visible) {
+          node.group.visible = true;
+          hasChanges = true;
+        }
+      }
+    }
+
     return hasChanges;
   }
 
   private _updateNodeVisibility(url: string, parentInBranch: boolean, visited: Set<string>): boolean {
     const node = this.nodes.get(url);
     if (!node) return false;
+    // 必须挡住重复访问：可见性图不是严格的树 —— 同一个子瓦可能被多个父瓦引用（不同 LOD 源
+    // 指向同一份数据）、淘汰后重挂父级也可能临时造出交叉引用。没有这道守卫，
+    // 递归会指数级展开甚至成环，直接 RangeError: Maximum call stack size exceeded。
+    if (visited.has(url)) return false;
     visited.add(url);
 
     let changed = false;
@@ -647,11 +958,13 @@ export class S3MTileset {
     }
 
     const hasChildren = childUrls.length > 0;
-    const allChildrenReady = hasChildren && childUrls.every((cUrl) => this.nodes.has(cUrl));
-    const anyChildFailed = childUrls.some((cUrl) => this.failed.has(cUrl));
+    // 「就绪」= 已加载；失败的已经从 childUrls 里摘掉，剩下的只要都到了就能接手显示
+    const readyChildren = childUrls.filter((cUrl) => this.nodes.has(cUrl));
+    const allResolved = childUrls.every((cUrl) => this.nodes.has(cUrl) || this.failed.has(cUrl));
 
-    // 细化前提：需要细化、拥有子瓦片、子瓦片全部加载就绪且没有任何一个子瓦片失败
-    const shouldRefine = !!node.needRefine && allChildrenReady && !anyChildFailed;
+    // 细化前提：需要细化、至少有一个子瓦片就绪、且没有还在下载途中的子瓦片
+    // （不等「全部就绪」是因为个别 childTile 在服务器上就是 404，等它等于永远不细化）
+    const shouldRefine = !!node.needRefine && hasChildren && readyChildren.length > 0 && allResolved;
 
     if (shouldRefine) {
       // 子节点接替当前节点渲染，当前父节点隐藏

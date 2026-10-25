@@ -62,13 +62,13 @@
  *       uint32 vertexOffset; vertexCount; texUnitIndex
  * ```
  *
- * 渲染侧的处理是 CPU 重映射：把每个顶点区间的 UV 从子区域空间
- * 变换到图集空间 (offsetX + u·subW) / W，这样下游材质直接绑定整张图集即可，
- * 不需要官方那套 aTextureBatchId + 着色器采样数组。
+ * 渲染侧不做 UV 烘焙，而是给每个顶点输出一份「所属子区域矩形」（ParsedTile.atlasRects），
+ * 由着色器逐片元算 `rect.xy + fract(uv) * rect.zw`——与官方 aTextureBatchId + batch 表
+ * 等价，但不需要官方的采样数组。顶点上取 fract 会让跨平铺边界的三角形反向扫纹理，别那样做。
  */
 import { BinaryReader } from './BinaryReader.js';
 import type { InflateFn, ParseOptions } from './S3MBParser.js';
-import type { GeoPackageEntry, GroupNode, PageLOD, ParsedTile, S3MTexture } from './types.js';
+import type { GeoPackageEntry, GroupNode, PageLOD, ParsedTile, S3MAtlasRects, S3MTexture } from './types.js';
 import { parseGroupNodeEntries, parseSkeletonEntries, parsePickInfoEntries } from './S3MBParser.js';
 
 /** 图集子区域，以及它绑定的几何顶点区间 */
@@ -184,46 +184,126 @@ function parseBlockTextures(r: BinaryReader): Record<string, S3MBlockTexture> {
 }
 
 /**
- * 把顶点 UV 从子纹理空间重映射到图集空间。
+ * 生成「每顶点的图集子区域矩形」，而不是把图集坐标烘进 UV。
  *
- * 原始 UV 是子纹理的归一化坐标，材质允许平铺（addressmode u/v = 0 即 repeat），
- * 所以用 fract 取平铺周期内的位置，再落到子区域上——三个实测样本
- * （UV 分别是「全覆盖图集的 [0,1]」和「平铺到 47 / 510 个周期」）全部自洽。
- * 不覆盖任何绑定的顶点保持原值，落在整张图集上。
+ * 原始 UV 是子纹理坐标，材质允许平铺（addressmode u/v = 0 即 repeat），实测很多立面
+ * 平铺到 ±20 个周期。官方是在**片元**里做 `xywh.xy + fract(uv) * xywh.wh`；如果在顶点
+ * 上取 fract，跨整数边界的三角形会反向扫过整个周期（Building@CBD 实测 17% 的三角形受影响，
+ * 部分子纹理 100%），表现为拉丝与错位。所以这里只输出矩形，fract 留给着色器逐片元做。
+ *
+ * 矩形是图集归一化坐标 (x, y, w, h)；未被任何绑定覆盖的顶点写成退化矩形 (0, 0, 0, 0)，
+ * 对应官方 `getTextureBatchId(...) < 0 → maxMipLevel = -1 → 该纹理单元返回 vec4(1.0)`
+ * （不参与合成）。**不能**默认成 (0,0,1,1)：那等于拿整张图集当贴图，配上世界尺度的
+ * 野 UV 就是一屏重复的微缩照片。
  */
-/**
- * 【临时实验开关】图集朝向两种约定，用于 A/B 对拍，验证完删除：
- *  A flip   = 解码后翻行 + offsetY 原值（当前实现）
- *  B noflip = 不翻行 + offsetY 从图集另一端起算
- */
-const atlasMode = (): 'flip' | 'noflip' =>
-  ((globalThis as any).__s3mAtlasMode === 'noflip' ? 'noflip' : 'flip') as 'flip' | 'noflip';
+function buildAtlasRects(
+  geoPackage: Record<string, GeoPackageEntry>,
+  texturePackage: Record<string, S3MBlockTexture>
+): Record<string, S3MAtlasRects> {
+  const rects: Record<string, S3MAtlasRects> = {};
+  const rectOf = (name: string, key: 'uv' | 'uv2'): Float32Array => {
+    const geo = geoPackage[name];
+    if (!geo) return new Float32Array(0);
+    const entry = (rects[name] ??= {});
+    let arr = entry[key];
+    if (!arr) {
+      const n = geo.vertexPackage.verticesCount;
+      arr = entry[key] = new Float32Array(n * 4); // 全 0 = 退化矩形 = 该单元不参与
+    }
+    return arr;
+  };
 
-function remapAtlasUVs(geoPackage: Record<string, GeoPackageEntry>, texturePackage: Record<string, S3MBlockTexture>, mirrorV: boolean): void {
-  const fract = (x: number) => x - Math.floor(x);
   for (const tex of Object.values(texturePackage)) {
     if (!tex.width || !tex.height) continue;
     for (const sub of tex.subTexInfos) {
-      const baseY = mirrorV ? tex.height - sub.offsetY - sub.height : sub.offsetY;
+      const x = sub.offsetX / tex.width;
+      const y = sub.offsetY / tex.height;
+      const w = sub.width / tex.width;
+      const h = sub.height / tex.height;
       for (const b of sub.bindings) {
         const geo = geoPackage[b.geoName];
         if (!geo) continue;
-        const semantic = b.texUnitIndex === 0 ? 'uv' : 'uv2';
-        const attr = geo.vertexPackage.vertexAttributes.find((a) => a.semantic === semantic);
-        if (!attr || attr.dtype !== 'f32') continue;
-        const floats = new Float32Array(attr.data.buffer, attr.data.byteOffset, attr.data.byteLength / 4);
-        const stride = attr.stride / 4;
+        const key = b.texUnitIndex === 0 ? 'uv' : 'uv2';
+        const arr = rectOf(b.geoName, key);
         const end = Math.min(b.vertexOffset + b.vertexCount, geo.vertexPackage.verticesCount);
         for (let v = b.vertexOffset; v < end; v++) {
-          const base = v * stride;
-          floats[base] = (sub.offsetX + fract(floats[base]) * sub.width) / tex.width;
-          if (attr.components > 1) {
-            floats[base + 1] = (baseY + fract(floats[base + 1]) * sub.height) / tex.height;
-          }
+          arr[v * 4] = x;
+          arr[v * 4 + 1] = y;
+          arr[v * 4 + 2] = w;
+          arr[v * 4 + 3] = h;
         }
       }
     }
   }
+  return rects;
+}
+
+/* ------------------------------------------------------------------ 子图集（.texblock） */
+
+/** `.texblock` 里的一张图集图像（同一套排布的清晰版，没有自己的 subTexInfos） */
+export interface S3MBlockAtlasImage {
+  id: string;
+  width: number;
+  height: number;
+  compressType: number;
+  pixelFormat: number;
+  data: Uint8Array;
+}
+
+/**
+ * 解析独立的 `.texblock` 子图集文件。
+ *
+ * S3MBLOCK 的每张根图集（level=0）都挂一个 `childTexNames`，指向同一套排布的**清晰版**：
+ * 实测三对样本里，把子图集按归一化 rect 裁回来，与根图集槽位的 alpha 轮廓 IoU 0.85~1.00、
+ * 色差也更低（例：48×64 槽位 37.9 vs 像素同位的 88.3），即「换图不换归一化 rect」。
+ * 官方 `requestSubTextures` 里那句 `_oriTexture.arrayBufferView = tex.arrayBufferView`
+ * 就是整体换图。
+ *
+ * 容器（与 .s3mblock 不同，实测字节严丝合缝）：
+ * ```
+ * uint32 count                     // 组数，实测 1
+ * uint32 nameLen; String name      // "911305599.texblock"，即本文件的图集 id
+ * uint32 unzipSize; uint32 zipSize
+ * byte   zipData[zipSize]          // zlib
+ * ```
+ * 内层每条记录：
+ * ```
+ * uint32 compressType              // 14
+ * uint32 width; uint32 height
+ * uint32 pixelFormat               // 实测 13；像素数按 1 B/px 与 DXT5 吻合
+ * uint32 size; byte data[size]
+ * ```
+ */
+export async function parseS3MBlockTextureFile(
+  arrayBuffer: ArrayBuffer,
+  options: ParseBlockOptions = {}
+): Promise<S3MBlockAtlasImage[]> {
+  const inflate = options.inflate ?? defaultInflate;
+  const r = new BinaryReader(arrayBuffer);
+  const count = r.u32();
+  if (count < 1 || count > 64) throw new Error(`[s3m] .texblock 组数异常：${count}`);
+  const name = r.string();
+  const unzipSize = r.u32();
+  const zipSize = r.u32();
+  if (r.remaining < zipSize) throw new Error(`[s3m] .texblock 声明长度 ${zipSize} 超出文件剩余 ${r.remaining}`);
+  const raw = await inflate(r.bytesCopy(zipSize));
+  if (raw.length !== unzipSize) {
+    throw new Error(`[s3m] .texblock 解压长度不符：声明 ${unzipSize}，实际 ${raw.length}`);
+  }
+
+  const t = new BinaryReader(raw.buffer as ArrayBuffer, raw.byteOffset, raw.byteLength);
+  const out: S3MBlockAtlasImage[] = [];
+  while (t.remaining >= 20) {
+    const compressType = t.u32();
+    const width = t.u32();
+    const height = t.u32();
+    const pixelFormat = t.u32();
+    const size = t.u32();
+    if (!width || !height || size > t.remaining) break;
+    out.push({ id: name, width, height, compressType, pixelFormat, data: t.bytesCopy(size) });
+  }
+  if (!out.length) throw new Error(`[s3m] .texblock ${name} 内没有可用图集`);
+  return out;
 }
 
 /* ------------------------------------------------------------------ 容器 */
@@ -312,7 +392,6 @@ export async function parseS3MBlock(arrayBuffer: ArrayBuffer, options: ParseBloc
   }
 
   // ---- 图集 → 纹理表 + UV 重映射 ----
-  const mode = atlasMode();
   const textures: Record<string, S3MTexture> = {};
   for (const tex of Object.values(texturePackage)) {
     if (!tex.data) continue;
@@ -324,10 +403,10 @@ export async function parseS3MBlock(arrayBuffer: ArrayBuffer, options: ParseBloc
       compressType: tex.compressType,
       pixelFormat: tex.pixelFormat,
       data: tex.data,
-      flipY: mode === 'flip',
+      flipY: true,
     };
   }
-  remapAtlasUVs(geoPackage, texturePackage, mode === 'noflip');
+  const atlasRects = buildAtlasRects(geoPackage, texturePackage);
 
   // pageLOD：容器提供的 LOD/子瓦片信息是权威；geodes 在内层 groupNode 里
   const innerLods = groupNode.pageLods;
@@ -358,5 +437,6 @@ export async function parseS3MBlock(arrayBuffer: ArrayBuffer, options: ParseBloc
     blockVersion,
     blockName: name,
     texturePackage,
+    atlasRects,
   };
 }

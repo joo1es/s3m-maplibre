@@ -65,6 +65,22 @@ const PRESETS = [
     pitch: 72,
     bearing: -20,
   },
+  {
+    id: 's3mv1',
+    // S3M 1.x（SuperMapCache）容器：config 返回 XML，瓦片是 .s3m（魔数 s3m\0 + zlib）。
+    // 成果高程从 119.84m 起，不对齐就会整片悬在空中，斜视下像散在别处的碎片。
+    name: '索菲亚教堂 (S3M 1.x 倾斜摄影)',
+    url:
+      'https://www.supermapol.com/realspace/services/3D-suofeiya_church' +
+      '/rest/realspace/datas/Config/config',
+    color: '#0891b2',
+    tip: 'SuperMap Online 公有服务 · .s3m 容器，底部贴地；粗模要靠近才逐层细化',
+    align: 'bottom', // 按 heightRange.min（119.84m）落地
+    heightOffset: 0,
+    underground: false,
+    pitch: 62,
+    bearing: -20,
+  },
 ];
 
 const DEFAULT_URL = PRESETS[0].url; // 默认使用 CCTV CBD 模型
@@ -214,7 +230,10 @@ map.on('movestart', (e) => {
 
 const layer = new S3MLayer({
   id: 's3m',
-  maxTiles: 64,
+  // 预算要能装下「近处所有可见瓦片」。这个数据集光是根瓦片就有 79 块，
+  // 预算给 64 时每帧都在淘汰-重下-再淘汰，子瓦片永远挤不进显示，纹理就永远停在
+  // 最粗一级的雪碧图（一栋楼只剩十几像素、再被 uv 平铺几十遍）。
+  maxTiles: 4096,
   maxConcurrent: 4,
   style: {
     mode: STYLE.TEXTURE,

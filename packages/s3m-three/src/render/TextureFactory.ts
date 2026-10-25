@@ -47,10 +47,29 @@ function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
   tex.magFilter = THREE.LinearFilter;
   tex.minFilter = THREE.LinearMipmapLinearFilter;
   tex.generateMipmaps = true;
-  // 建筑立面大多是斜视角，各向异性过滤对清晰度的提升比提高分辨率更直接
+  // 各向异性过滤对斜视角立面清晰度的提升比提高分辨率更直接
   tex.anisotropy = maxAnisotropy;
   if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
   tex.flipY = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
+ * S3MBLOCK 图集专用：关掉 GPU mip。
+ *
+ * 官方 `sampleLod` 是显式 `textureLod(tex, uv, 0.0)`，层级靠「把子区域 rect 平移 +
+ * 内缩」自己算（见 StyleMaterial 的 s3mAtlasUnit）。若让 GPU 对整张图集生成 mip，
+ * 自动选的层级会把相邻子区域混进来，远处就是一糊串色 —— 实测照抄公式但留着 GPU mip
+ * 时，画面反而比不改更糟，就是因为这两个变量叠在一起了。
+ */
+function configureAtlas<T extends THREE.Texture>(tex: T): T {
+  configure(tex);
+  tex.wrapS = THREE.ClampToEdgeWrapping;
+  tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.minFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.anisotropy = 1;
   tex.needsUpdate = true;
   return tex;
 }
@@ -143,8 +162,10 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
   }
 
   if (kind === 'dxt1' || kind === 'dxt3' || kind === 'dxt4' || kind === 'dxt5') {
+    const decoded = decodeDXT({ ...tex, pixelFormat: dxtPixelFormatOf(kind) });
+    // flipY 为真即 S3MBLOCK 图集（见 core/types.ts），必须无 mip
     return {
-      texture: configure(decodeDXT({ ...tex, pixelFormat: dxtPixelFormatOf(kind) })),
+      texture: tex.flipY ? configureAtlas(decoded) : configure(decoded),
       decoded: kind,
     };
   }
@@ -158,7 +179,8 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
   }
 
   if (kind === 'raw') {
-    return { texture: configure(fromRawRGB(tex)), decoded: 'raw' };
+    const decoded = fromRawRGB(tex);
+    return { texture: tex.flipY ? configureAtlas(decoded) : configure(decoded), decoded: 'raw' };
   }
 
   // KTX2 / ETC 需要额外解码器，先如实上报而不是静默出错

@@ -218,8 +218,10 @@ function DecompressImage(rgba: Uint8Array, width: number, height: number, blocks
           const sx = x + px;
           const sy = y + py;
           if (sx < width && sy < height) {
-            // flip Y
-            let nBegin = 4 * (width * (height - sy) + sx);
+            // flip Y：squish 的原式是 height - 1 - sy。写成 height - sy 会让 sy = 0
+            // 落到 row = height 越界（TypedArray 越界写是静默丢弃），于是缓冲区第 0 行
+            // 永远是全 0（透明黑），其余行整体错位一行。
+            let nBegin = 4 * (width * (height - 1 - sy) + sx);
 
             for (let i = 0; i < 4; ++i) rgba[nBegin++] = targetRgba[nOffsetTarget++];
           } else {
@@ -245,11 +247,31 @@ const DXTTextureDecode = {
   decode(out: Uint8Array, width: number, height: number, block: Uint8Array, format: number): void {
     if (out == null || block == null || height === 0 || width === 0) return;
 
-    // 有 alpha 通道 → RGBA，否则走 rgb565
-    // S3MPixelFormat.BGR -> 11 / LUMINANCE_ALPHA -> 5
-    const flags = format > 11 || format === 5 ? kDxt5 : kDxt1 | krgb565;
+    // 块大小与 alpha 编码只由压缩格式决定：DXT1 = 8 B/块，DXT3/4/5 = 16 B/块。
+    //
+    // 不能再靠「format > 11」判有没有 alpha：S3MPixelFormat 里 DXT1 = 17 也 > 11，
+    // 那样会把 DXT1 当 16 字节块读——512×512 的 DXT1 实际只有 131072 B（0.5 B/px），
+    // 按 16 字节块要 262144 B，正好差一倍，越界部分解成全 0。
+    // 官方 JS 那个判断是在「无 alpha 时纹理标成 RGB(10)/BGR(11)」的前提下才成立。
+    let flags: number;
+    switch (format) {
+      case 17: // DXT1
+        flags = kDxt1;
+        break;
+      case 18:
+      case 19: // DXT3
+        flags = kDxt3;
+        break;
+      case 20: // DXT4
+      case 21: // DXT5
+        flags = kDxt5;
+        break;
+      default:
+        // 老数据只在 RGB / BGR / LUMINANCE_ALPHA 里出现：无 alpha 时走 DXT1 + rgb565 快路径
+        flags = format > 11 || format === 5 ? kDxt5 : kDxt1 | krgb565;
+    }
 
-    if (flags & kDxt1 && flags & krgb565) {
+    if ((flags & kDxt1) !== 0 && (flags & krgb565) !== 0) {
       DecompressImage565(asU16(out), width, height, asU16(block));
     } else {
       DecompressImage(out, width, height, block, flags);

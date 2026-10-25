@@ -113,8 +113,8 @@ describe('1. 同材质码的多个 mesh 必须各持一份材质', () => {
   });
 });
 
-describe('2. 超过 maxTiles 时淘汰最久没用的瓦片，而不是停止加载', () => {
-  test('淘汰 lastSeen 最旧的瓦片并回调，最近使用的保留', () => {
+describe('2. 预算满时不停止加载，但绝不踢「正在显示且没人接手」的瓦片', () => {
+  test('入队不淘汰（make-before-break）；超额部分等子瓦接手显示后由 update() 裁', () => {
     const removed: string[] = [];
     const ts = mkTileset({ maxTiles: 2, onTileRemoved: (node: any) => removed.push(node.url) });
 
@@ -124,10 +124,28 @@ describe('2. 超过 maxTiles 时淘汰最久没用的瓦片，而不是停止加
     stallFetch();
     ts._enqueue('http://example.com/new.s3mb');
 
-    expect(removed).toEqual(['old']);
-    // 新瓦片还在 pending（fetch 永不 resolve），所以「驻留 + 在途」应回到 maxTiles
-    expect(ts.nodes.size + ts.pending.size).toBe(2);
-    expect(ts.nodes.has('recent')).toBe(true);
+    // 旧策略在这里就会为了塞新瓦片删掉 lastSeen 最旧的「old」—— 而它正在显示、
+    // 位置没有任何子瓦接手，删掉立刻是一个洞，下一帧还得回补 → 反复就是闪烁。
+    expect(removed).toEqual([]);
+    expect(ts.nodes.has('old')).toBe(true);
+    // 新瓦片照常进入加载队列，预算不再靠「先删后加」来腾地方
+    expect(ts.pending.size + ts._queue.length).toBeGreaterThan(0);
+  });
+
+  test('子瓦接手显示后，父瓦才是安全候选（由 _trimBudget 裁掉）', () => {
+    const removed: string[] = [];
+    const ts = mkTileset({ maxTiles: 1, onTileRemoved: (node: any) => removed.push(node.url) });
+    const parent = mkNode('p', 'c', 1, 10) as any;
+    const child = mkNode('c', null, 9, 5) as any;
+    ts.nodes.set('p', parent);
+    ts.nodes.set('c', child);
+    // 现状：子瓦在显示、父瓦已交棒（不可见）→ 父瓦没人依赖，可以裁
+    parent.group.visible = false;
+    child.group.visible = true;
+
+    ts._trimBudget();
+    expect(removed).toEqual(['p']);
+    expect(ts.nodes.has('c')).toBe(true); // 正在显示的绝不动
   });
 });
 
@@ -393,31 +411,42 @@ describe('9. CRN 解码器：魔数先拦、非法数据能明确拒绝', () => 
   });
 });
 
-describe('10. 叶子优先；脏数据（childTile 指回自己）时不会永久卡住', () => {
-  test('有叶子时优先淘汰叶子；无叶子可挑时退一步淘汰已细化的父瓦片', () => {
-    const makeSet = (removed: string[]) => mkTileset({ maxTiles: 2, onTileRemoved: (n: any) => removed.push(n.url) });
-
+describe('10. 淘汰选择：只裁「已交棒的父瓦」；脏数据（childTile 指回自己）不得永久卡住', () => {
+  test('父瓦已把显示交给子瓦 → 裁父瓦；正在显示的叶子不动', () => {
+    const makeSet = (removed: string[]) => mkTileset({ maxTiles: 1, onTileRemoved: (n: any) => removed.push(n.url) });
     stallFetch();
 
-    // A. 正常父子：父瓦片已细化，子瓦片是叶子 → 优先淘汰叶子，父瓦片留着兜底
     const removedA: string[] = [];
     const tsA = makeSet(removedA);
-    tsA.nodes.set('parent', mkNode('parent', 'child', 1, 900) as never);
-    tsA.nodes.set('child', mkNode('child', null, 9, 10) as never);
-    tsA._enqueue('http://example.com/new1.s3mb');
-    expect(removedA).toEqual(['child']);
-    expect(tsA.nodes.has('parent')).toBe(true); // 父瓦片保留，视觉上不留洞
-    expect(tsA.nodes.size + tsA.pending.size).toBe(2);
+    const parent = mkNode('parent', 'child', 1, 900) as any;
+    const child = mkNode('child', null, 9, 10) as any;
+    parent.group.visible = false; // 已交棒
+    child.group.visible = true;
+    tsA.nodes.set('parent', parent);
+    tsA.nodes.set('child', child);
 
-    // B. 脏数据：childTile 指回自己，谁都「不是叶子」——曾经会在这里永久拒绝加载
+    tsA._trimBudget();
+    expect(removedA).toEqual(['parent']); // 裁掉没人依赖的父瓦
+    expect(tsA.nodes.has('child')).toBe(true); // 正在显示的叶子保留
+
+    // 脏数据：childTile 指回自己，历史上会在这里永久拒绝加载
     const removedB: string[] = [];
     const tsB = makeSet(removedB);
     tsB.nodes.set('self', mkNode('self', 'self', 1, 900) as never);
     tsB.nodes.set('other', mkNode('other', 'other', 5, 500) as never);
-    tsB._enqueue('http://example.com/new2.s3mb');
-    expect(removedB.length).toBe(1); // 应淘汰一块，而不是拒绝加载
-    expect(tsB.nodes.size + tsB.pending.size).toBe(2);
-    expect(tsB.pending.size).toBe(1); // 新瓦片进入了加载队列
+    tsB._trimBudget();
+    expect(removedB.length).toBe(1); // 至少能裁一块，不会卡死
+  });
+
+  test('入队不再靠「先删旧的」腾位置', () => {
+    const removed: string[] = [];
+    const ts = mkTileset({ maxTiles: 2, onTileRemoved: (n: any) => removed.push(n.url) });
+    stallFetch();
+    ts.nodes.set('a', mkNode('a', null, 1, 900) as never);
+    ts.nodes.set('b', mkNode('b', null, 5, 500) as never);
+    ts._enqueue('http://example.com/new2.s3mb');
+    expect(removed).toEqual([]);
+    expect(ts.pending.size + ts._queue.length).toBe(1); // 新瓦片正常进队列
   });
 });
 
@@ -447,8 +476,9 @@ describe('11. 瓦片层级可见性切换（HLOD 互斥，防止父子重叠 Z-f
     ts.nodes.set(parent.url, parent as never);
     ts.rootUrls.push(parent.url);
 
-    // 1. 视距较远（视深 1000m，屏幕像素 < rangeValue 20）：父瓦片可见
-    ts.update([0, 0, 1000], Math.PI / 3, 1000);
+    // 1. 视距较远（视深 20000m，屏幕像素 ≈ 4.3 < rangeValue 20）：父瓦片可见
+    //    像素公式与官方一致：pix = ((H/2)/tan(22.5°)) * (r/d) * 2
+    ts.update([0, 0, 20000], Math.PI / 3, 1000);
     expect(parent.group.visible).toBe(true);
 
     // 2. 靠近（视深 100m，像素放大 > 20）但子瓦片尚未载入：父瓦片必须保持显示以防破洞
@@ -461,8 +491,8 @@ describe('11. 瓦片层级可见性切换（HLOD 互斥，防止父子重叠 Z-f
     expect(parent.group.visible).toBe(false);
     expect(child.group.visible).toBe(true);
 
-    // 4. 再次拉远（dist 5000m，metric ≈ 8.66 < 20）：父瓦片恢复、子瓦片隐藏
-    ts.update([0, 0, 5000], Math.PI / 3, 1000);
+    // 4. 再次拉远（dist 20000m，metric ≈ 4.3 < 20）：父瓦片恢复、子瓦片隐藏
+    ts.update([0, 0, 20000], Math.PI / 3, 1000);
     expect(parent.group.visible).toBe(true);
     expect(child.group.visible).toBe(false);
   });

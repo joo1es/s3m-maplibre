@@ -208,6 +208,16 @@ export function createSharedUniforms(): StyleUniforms {
 const VERT_PARS = /* glsl */ `
   attribute float aBatchId;
   attribute vec3 aColor;
+  #ifdef S3M_ATLAS
+    attribute vec4 aAtlasRect;
+    #ifdef S3M_ATLAS_SEC
+      attribute vec4 aAtlasRect1;
+      attribute vec2 aSecUv;
+      varying vec2 vSecUv;
+      varying vec4 vSecRect;
+    #endif
+    varying vec4 vAtlasRect;
+  #endif
   // 实例化几何没有逐顶点 batchId：顶点是 base mesh 的，单体粒度落在实例上
   #ifdef USE_INSTANCING
     attribute float aInstanceBatchId;
@@ -267,6 +277,14 @@ const VERT_WORLD = /* glsl */ `
   vBatchId = s3mBatchRaw();
   vVertColor = aColor;
 
+  #ifdef S3M_ATLAS
+    vAtlasRect = aAtlasRect;
+    #ifdef S3M_ATLAS_SEC
+      vSecUv = aSecUv;
+      vSecRect = aAtlasRect1;
+    #endif
+  #endif
+
   #ifdef USE_INSTANCING
     mat3 s3mNormMat = mat3( modelMatrix ) * mat3( instanceMatrix );
   #else
@@ -276,6 +294,57 @@ const VERT_WORLD = /* glsl */ `
 `;
 
 const FRAG_PARS = /* glsl */ `
+  #ifdef S3M_ATLAS
+    varying vec4 vAtlasRect;
+    uniform vec2 uAtlasDim;
+    #ifdef S3M_ATLAS_SEC
+      uniform sampler2D uSecMap;
+      uniform vec2 uAtlasDim1;
+      varying vec2 vSecUv;
+      varying vec4 vSecRect;
+    #endif
+    /**
+     * S3MBLOCK 图集采样 —— 照抄官方 iClient3D 12.1.1 的片元实现
+     * （着色器原文截获自 gl.shaderSource，存 _tmp/og/full.txt）。
+     *
+     * 官方 sampleLod 永远传 LOD 0，层级靠「把子区域 rect 平移 + 内缩」选出来；
+     * 因此图集必须关掉 GPU mip（见 TextureFactory.configureAtlas），否则自动层级
+     * 会把相邻子区域混进来。
+     * 注：官方 width *= 2/3 只是算 maxMip 的收缩系数 —— 实测子区域右侧邻着的是
+     * 另一张子纹理（1094_3 旁边是 1130_3），不是它的内联 mip，别照字面理解成 mip 链。
+     */
+    vec2 s3mBatchUV( vec2 uv, vec2 translate, vec2 scale, vec2 dim, float mip ) {
+      vec2 t = translate;
+      if ( mip > 0.0 ) {
+        t.x = translate.x + scale.x;
+        float temp = pow( 2.0, mip - 1.0 );
+        t.y = translate.y + scale.y * ( temp - 1.0 ) / temp;
+      }
+      float texScale = 1.0 / pow( 2.0, mip );
+      vec2 o = fract( uv );
+      vec2 off = vec2( pow( 2.0, mip ) / dim.x, pow( 2.0, mip ) / dim.y );
+      o = clamp( o, off, vec2( 1.0 ) - off );
+      return o * texScale * scale + t;
+    }
+    vec4 s3mAtlasUnit( vec2 uv, vec4 rect, vec2 atlasDim, sampler2D tex ) {
+      // 退化矩形 = 官方 batchId < 0：该纹理单元不参与合成
+      if ( rect.z <= 0.0 || rect.w <= 0.0 ) return vec4( 1.0 );
+      vec2 dim = vec2( rect.z * atlasDim.x * ( 2.0 / 3.0 ), rect.w * atlasDim.y );
+      vec2 scale = dim / atlasDim;
+      vec2 translate = rect.xy;
+      float maxMip = log2( min( dim.x, dim.y ) );
+      vec2 dx = dFdx( uv * dim.x );
+      vec2 dy = dFdy( uv * dim.y );
+      float dX = dot( dx, dx ), dY = dot( dy, dy );
+      float dMax = max( dX, dY ), dMin = min( dX, dY );
+      float offset = clamp( ( dMax - dMin ) / max( dMax + dMin, 1e-8 ), 0.0, 1.0 );
+      float d = dMax * ( 1.0 - offset ) + dMin * offset;
+      float mip = clamp( 0.5 * log2( max( d, 1e-20 ) ), 0.0, max( maxMip - 1.62, 0.0 ) );
+      vec4 hi = texture2D( tex, s3mBatchUV( uv, translate, scale, dim, ceil( mip ) ) );
+      vec4 lo = texture2D( tex, s3mBatchUV( uv, translate, scale, dim, floor( mip ) ) );
+      return hi * 0.5 + lo * 0.5;
+    }
+  #endif
   uniform int uMode;
   uniform vec3 uColorA;
   uniform vec3 uColorB;
@@ -445,6 +514,14 @@ const FRAG_EMISSIVE = /* glsl */ `
   }
 `;
 
+const FRAG_BAKE = /* glsl */ `
+  #ifdef S3M_ATLAS_SEC
+    // 官方 getTextureColorForS3M = firstColor(base) * secColor(bake)，
+    // 两套独立的 rect / 尺寸（实测 base 11 条、bake 1 条，条数并不相同）
+    diffuseColor *= s3mAtlasUnit( vSecUv, vSecRect, uAtlasDim1, uSecMap );
+  #endif
+`;
+
 export interface StyledMaterialOptions {
   uniforms: StyleUniforms;
   map?: THREE.Texture | null;
@@ -456,6 +533,10 @@ export interface StyledMaterialOptions {
   flatShading?: boolean;
   /** >0 时开启 alphaTest：镂空贴图（S3MBLOCK 图集）的透明片元直接丢弃，避免渲染成黑面 */
   alphaTest?: number;
+  /** 贴图为 S3MBLOCK 图集：几何需带 aAtlasRect，平铺改由片元按子区域做 */
+  atlas?: boolean;
+  /** 图集材质的第二套纹理（官方 BakeTex，光照烘焙），与 base 相乘 */
+  secMap?: THREE.Texture | null;
 }
 
 /**
@@ -489,6 +570,15 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   const uBatchTexWidth = { value: 1.0 };
   const uBatchTexActive = { value: 0 };
 
+  // 图集材质：只有几何确实带了 aAtlasRect 才开这个宏，否则缺属性会采到 (0,0) 的默认值
+  const atlas = !!opts.atlas && !!opts.map;
+  const secMap = atlas ? (opts.secMap ?? null) : null;
+  if (atlas) mat.defines = { ...(mat.defines as Record<string, string>), S3M_ATLAS: '' };
+  if (secMap) mat.defines = { ...mat.defines, S3M_ATLAS_SEC: '' };
+  // 官方 uTextureDim = (base宽, base高, bake宽, bake高)，取实际绑定纹理的像素尺寸
+  const uAtlasDim = { value: new THREE.Vector2(opts.map?.image?.width || 1, opts.map?.image?.height || 1) };
+  const uAtlasDim1 = { value: new THREE.Vector2(secMap?.image?.width || 1, secMap?.image?.height || 1) };
+
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms, {
       uSelBatch,
@@ -496,6 +586,9 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       uBatchTex,
       uBatchTexWidth,
       uBatchTexActive,
+      uSecMap: { value: secMap },
+      uAtlasDim,
+      uAtlasDim1,
     });
 
     shader.vertexShader = shader.vertexShader
@@ -507,10 +600,22 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       .replace('#include <common>', `#include <common>\n${FRAG_PARS}`)
       .replace('#include <color_fragment>', `#include <color_fragment>\n${FRAG_COLOR}`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${FRAG_EMISSIVE}`);
+
+    if (atlas) {
+      // map_fragment 里是 `vec4 sampledDiffuseColor = texture2D( map, vMapUv );`
+      shader.fragmentShader = shader.fragmentShader.replace(
+        'texture2D( map, vMapUv )',
+        's3mAtlasUnit( vMapUv, vAtlasRect, uAtlasDim, map )'
+      );
+    }
+    if (secMap) {
+      shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', `#include <map_fragment>\n${FRAG_BAKE}`);
+    }
   };
 
-  // 不同材质共用同一段注入代码，必须让 three 认为它们的 program 可复用
-  mat.customProgramCacheKey = () => 's3m-styled';
+  // 不同材质共用同一段注入代码，必须让 three 认为它们的 program 可复用；
+  // 但图集 / 烘焙两套宏会改注入结果，必须进 cacheKey，否则会复用错 program。
+  mat.customProgramCacheKey = () => `s3m-styled${atlas ? '-atlas' : ''}${secMap ? '-bake' : ''}`;
 
   mat.userData.uSelBatch = uSelBatch;
   mat.userData.uSelWhole = uSelWhole;

@@ -12,6 +12,7 @@
 import { BinaryReader } from './BinaryReader.js';
 import { parseDracoGeometry } from './Draco.js';
 import { parseMeshOptGeometry } from './MeshOpt.js';
+import { isS3M1Buffer, parseS3M1 } from './S3M1Parser.js';
 import type {
   AttrDType,
   BoundingBox,
@@ -615,46 +616,12 @@ export class S3MFormatError extends Error {
   }
 }
 
-/** S3M 1.x 的魔数：ASCII "s3m" + 结尾 0 */
-const S3M_V1_MAGIC = 0x006d3373; // 小端读到的 uint32
-
-/**
- * S3M 1.x 容器（OSGB 转出来的 SuperMapCache 瓦片，文件名 .s3m）
- *
- * 结构标定（实测 supermapol `3D-suofeiya_church` 的 Tile_+002_+001.s3m）：
- * ```
- * byte[4]  's3m\0'                // 魔数，不是版本号
- * byte[]   zlib                   // 78 da 开头
- *   解压后：
- *   uint32 xmlSize
- *   byte[] XML                    // <Group><PageLods><PagedLOD>…<Material3Ds>
- *   byte[3]  未知（实测恒为 "000"）
- *   uint32 size; byte[size]       // 几何流：开头就是 f32 包围盒，与 XML 的 BoundingSphere 对得上
- *   uint32 size; byte[size]       // 4 字节小段
- *   uint32 size; byte[size]       // 纹理流（内含 JPEG）
- *   —— 三段的 size 链严丝合缝落到解压末尾
- * ```
- * 这里只做到「认出来并说清为什么不能用」，没有实现几何解码，原因有两层：
- * 1. XML 的 RangeDataList 指向的是 `*_L16_0.osgb` —— 下一级 LOD 是 OpenSceneGraph
- *    Binary，需要另一整套 OSG 反序列化 + SRS/局部变换配准，不是这个容器能兜住的；
- * 2. 就算只画根级粗模，OSGB 成果的坐标系信息在切出来的 metadata.xml 里，
- *    REST 的 config 并不提供，摆到地图上的位置无法保证正确。
- * 正解是数据侧重新导出：iServer 发布成 S3M 瓦片缓存（.s3mb / 2.x、3.x），
- * 或桌面端「导出 → S3M 格式」而不是 OSGB 原生缓存。
- */
-function checkNotV1(arrayBuffer: ArrayBuffer): void {
-  if (arrayBuffer.byteLength < 8) return;
-  const head = new DataView(arrayBuffer, 0, 8);
-  if (head.getUint32(0, true) !== S3M_V1_MAGIC) return;
-  throw new S3MFormatError(
-    '[s3m] 这是 S3M 1.x 容器（.s3m，OSGB 转的 SuperMapCache 瓦片），本库只支持 S3MB 2.x / 3.x：' +
-      '它的下一级 LOD 指向 .osgb（OpenSceneGraph Binary），无法在浏览器里配准渲染。' +
-      '请把数据重新导出成 S3M 瓦片缓存（.s3mb）后再加载。'
-  );
-}
-
 export async function parseS3MB(arrayBuffer: ArrayBuffer, options: ParseOptions = {}): Promise<ParsedTile> {
-  checkNotV1(arrayBuffer);
+  // S3M 1.x（SuperMapCache，.s3m）不是「float32 版本号开头」的容器：头 4 字节是魔数
+  // s3m\0，紧接 zlib。不当场分流的话，这 4 字节会被读成 1e-38 的「版本号」，再把 zlib
+  // 头当压缩长度，最后报出 RangeError: Invalid typed array length 这种看不出根因的错。
+  // 容器与结构标定见 S3M1Parser.ts。
+  if (isS3M1Buffer(arrayBuffer)) return parseS3M1(arrayBuffer, options);
   const inflate = options.inflate ?? defaultInflate;
   const trace = options.trace;
   const r = new BinaryReader(arrayBuffer);

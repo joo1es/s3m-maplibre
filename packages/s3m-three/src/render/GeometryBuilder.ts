@@ -323,12 +323,15 @@ export async function buildTileObjects(
   // 材质对象本身很轻（program 由 customProgramCacheKey 复用），一栋一个不心疼。
   const materialList = resolveMaterialList(tile.materials);
 
-  const makeMaterial = (code?: string): StyledMaterial => {
+  const makeMaterial = (code?: string, hasAtlasRect = false): StyledMaterial => {
     const entry = materialList.find((e) => materialName(unwrapMaterial(e)) === code);
     const m = unwrapMaterial(entry);
     const units = materialUnits(m);
     const unit0 = units[0];
     let map = unit0 ? (textureByCode.get(materialName(unit0) ?? unit0.id ?? '') ?? null) : null;
+    // S3MBLOCK 的烘焙图（unit1 / BakeTex）是光照烘焙，官方与 base 相乘；缺它建筑就是一片平白
+    const unit1 = units[1];
+    const secMap = hasAtlasRect && unit1 ? (textureByCode.get(materialName(unit1) ?? unit1.id ?? '') ?? null) : null;
 
     // 检查并应用 texmodmatrix 纹理变换矩阵
     const texMod = unit0?.texmodmatrix ?? unit0?.matrix;
@@ -382,6 +385,8 @@ export async function buildTileObjects(
       opacity: diffuse.a ?? 1,
       roughness,
       alphaTest,
+      atlas: hasAtlasRect && !!map,
+      secMap,
     });
     return mat;
   };
@@ -418,6 +423,22 @@ export async function buildTileObjects(
     attributes.aBatchId = batchAttr
       ? toBufferAttribute(batchAttr)
       : new THREE.BufferAttribute(new Float32Array(vertexCount).fill(-1), 1);
+
+    // S3MBLOCK 图集：逐顶点带子区域矩形，平铺的 fract 交给片元做（顶点上做会画反）。
+    // 烘焙图（材质 unit1）用第二套原始 UV，这里另开一个 aSecUv 槽位，不跟 three 的 uv1 语义纠缠。
+    const rects = tile.atlasRects?.[name];
+    if (rects) {
+      attributes.aAtlasRect = new THREE.BufferAttribute(rects.uv ?? new Float32Array(vertexCount * 4), 4);
+      // 没有第二套 UV 的骨架不做烘焙：给一个退化矩形，片元里据此跳过
+      const uv1 = attributes.uv1 as THREE.BufferAttribute | undefined;
+      if (rects.uv2 && uv1) {
+        attributes.aAtlasRect1 = new THREE.BufferAttribute(rects.uv2, 4);
+        attributes.aSecUv = uv1;
+      } else {
+        attributes.aAtlasRect1 = new THREE.BufferAttribute(new Float32Array(vertexCount * 4), 4);
+        attributes.aSecUv = (attributes.uv as THREE.BufferAttribute) ?? new THREE.BufferAttribute(new Float32Array(vertexCount * 2), 2);
+      }
+    }
 
     const instanced = vp.instanceIndex !== -1 && (vp.instanceMode === 16 || vp.instanceMode === 17);
     // 注意：indexPackages 属于 Skeleton（geoPackage[name]），不在 vertexPackage 里
@@ -488,6 +509,7 @@ export async function buildTileObjects(
     let hasUv1 = false;
     let hasAColor = false;
     let hasABatchId = false;
+    let hasAtlas = false;
 
     for (const c of candidates) {
       const g = c.cached.geometry;
@@ -499,6 +521,7 @@ export async function buildTileObjects(
       if (g.attributes.uv1) hasUv1 = true;
       if (g.attributes.aColor) hasAColor = true;
       if (g.attributes.aBatchId) hasABatchId = true;
+      if (g.attributes.aAtlasRect) hasAtlas = true;
     }
 
     const mergedPos = new Float32Array(totalVertices * 3);
@@ -507,6 +530,31 @@ export async function buildTileObjects(
     const mergedUv1 = hasUv1 ? new Float32Array(totalVertices * 2) : null;
     const mergedColor = hasAColor ? new Float32Array(totalVertices * 3) : null;
     const mergedBatchId = hasABatchId ? new Float32Array(totalVertices) : null;
+    const mergedRect0 = hasAtlas ? new Float32Array(totalVertices * 4) : null;
+    const mergedRect1 = hasAtlas ? new Float32Array(totalVertices * 4) : null;
+    const mergedSecUv = hasAtlas ? new Float32Array(totalVertices * 2) : null;
+
+    /** 逐顶点拷一个 n 分量的浮点属性；缺失时用 fallbackRect / 0 兜底 */
+    const copyAttr = (
+      dst: Float32Array,
+      attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute | undefined,
+      comp: number,
+      vCount: number,
+      vertexOffset: number,
+      fallback?: (i: number, out: number[]) => void
+    ) => {
+      if (attr) {
+        const src = attr.array as ArrayLike<number>;
+        for (let i = 0; i < vCount; i++)
+          for (let k = 0; k < comp; k++) dst[(vertexOffset + i) * comp + k] = src[i * comp + k] ?? 0;
+        return;
+      }
+      for (let i = 0; i < vCount; i++) {
+        const out: number[] = [];
+        fallback ? fallback(i, out) : out.push(...new Array(comp).fill(0));
+        for (let k = 0; k < comp; k++) dst[(vertexOffset + i) * comp + k] = out[k] ?? 0;
+      }
+    };
 
     const IndexArrayType = totalVertices > 65535 ? Uint32Array : Uint16Array;
     const mergedIndices = new IndexArrayType(totalIndices);
@@ -635,7 +683,14 @@ export async function buildTileObjects(
         }
       }
 
-      // 7. Indices
+      // 7. 图集矩形（S3MBLOCK）
+      if (mergedRect0) {
+        copyAttr(mergedRect0, g.attributes.aAtlasRect, 4, vCount, vertexOffset, (_i, out) => out.push(0, 0, 0, 0));
+        copyAttr(mergedRect1!, g.attributes.aAtlasRect1, 4, vCount, vertexOffset, (_i, out) => out.push(0, 0, 0, 0));
+        copyAttr(mergedSecUv!, g.attributes.aSecUv, 2, vCount, vertexOffset);
+      }
+
+      // 8. Indices
       if (g.index) {
         const idxArr = g.index.array as ArrayLike<number>;
         const iCount = g.index.count;
@@ -660,6 +715,11 @@ export async function buildTileObjects(
     if (mergedUv1) mergedGeo.setAttribute('uv1', new THREE.BufferAttribute(mergedUv1, 2));
     if (mergedColor) mergedGeo.setAttribute('aColor', new THREE.BufferAttribute(mergedColor, 3));
     if (mergedBatchId) mergedGeo.setAttribute('aBatchId', new THREE.BufferAttribute(mergedBatchId, 1));
+    if (mergedRect0) {
+      mergedGeo.setAttribute('aAtlasRect', new THREE.BufferAttribute(mergedRect0, 4));
+      mergedGeo.setAttribute('aAtlasRect1', new THREE.BufferAttribute(mergedRect1!, 4));
+      mergedGeo.setAttribute('aSecUv', new THREE.BufferAttribute(mergedSecUv!, 2));
+    }
     mergedGeo.setIndex(new THREE.BufferAttribute(mergedIndices, 1));
     mergedGeo.computeBoundingBox();
     mergedGeo.computeBoundingSphere();
@@ -685,7 +745,7 @@ export async function buildTileObjects(
     matrix: THREE.Matrix4 | null
   ): THREE.Object3D => {
     const { geometry, pack } = cached;
-    const material = makeMaterial(pack.passNames?.[0]);
+    const material = makeMaterial(pack.passNames?.[0], !!geometry.getAttribute('aAtlasRect'));
     let object: THREE.Mesh | THREE.InstancedMesh;
 
     const info = skeletonInfo.get(name);
@@ -897,7 +957,8 @@ export async function buildTileObjects(
       if (list.length === 1) {
         placeObject(list[0].cached, list[0].name, list[0].geo, list[0].matrix);
       } else {
-        const material = makeMaterial(matKey === '__default__' ? undefined : matKey);
+        const hasAtlasRect = !!list[0].cached.geometry.getAttribute('aAtlasRect');
+        const material = makeMaterial(matKey === '__default__' ? undefined : matKey, hasAtlasRect);
         const batchedMesh = mergeBatchGeometries(list, material, tile);
         group.add(batchedMesh);
         objects.push(batchedMesh);

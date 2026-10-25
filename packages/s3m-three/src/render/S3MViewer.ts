@@ -863,7 +863,44 @@ export class S3MViewer {
           this._featureStyleManager.applyOverridesToMesh(mesh);
         }
       }
+
+      // 选中状态也要跟着继承：LOD 细化 / 瓦片重载会换掉 mesh，
+      // 不重放就出现「点中的那栋楼一拉近就没高亮了」
+      this._replaySelectionOnto(mesh);
     }
+  }
+
+  /**
+   * 把「当前选中」重放到一块新登记的 mesh 上。
+   *
+   * 为什么需要：选中高亮是直接写在各 mesh 材质的 uSelBatch / uSelWhole 上的，
+   * 而 LOD 细化、瓦片重载、淘汰回补都会换掉 mesh —— 不重放的话，用户点中的那栋楼
+   * 一细化就失去高亮（状态还在 _selection.smid 里，只是没人往新 mesh 上刷）。
+   */
+  private _replaySelectionOnto(mesh: THREE.Mesh): void {
+    const sel = this._selection;
+    if (!sel) return;
+    const mat = styledMaterialOf(mesh);
+    if (!mat) return;
+
+    const ud = mesh.userData as MeshUserData;
+    let batchId = -1;
+    if (sel.smid != null) {
+      const pickInfo = ud.geoRef?.pickInfo as Record<string | number, unknown> | undefined;
+      const entry = pickInfo?.[sel.smid] ?? pickInfo?.[String(sel.smid)];
+      batchId = entry ? pickEntryId(entry as any) : -1;
+    }
+    // 拾取命中的那块 mesh 用原始 batchId；同一 smid 散在别的几何里时按各自的区间算
+    if (mesh === sel.mesh) batchId = sel.batchId;
+    // 这块几何里根本没有这个单体 → 不动它（否则会把无关瓦片一起点亮）
+    if (batchId < 0 && mesh !== sel.mesh) return;
+
+    mat.userData.uSelBatch.value = batchId;
+    mat.userData.uSelWhole.value = batchId < 0 ? 1 : 0;
+    if (!this._selectedMeshes.includes(mesh)) this._selectedMeshes.push(mesh);
+    if (isPointCloudObject(mesh)) this._applyPointCloudStyle(mesh, true);
+    this.uniforms.uSelMix.value = 1;
+    this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
   }
 
   /** 瓦片被淘汰：从拾取表和场景里摘掉，并释放它自己的 GPU 资源 */
@@ -872,7 +909,24 @@ export class S3MViewer {
       const mesh = child as THREE.Mesh;
       if (!mesh.isMesh) continue;
       const ud = mesh.userData as MeshUserData;
-      if (this._selection?.mesh === mesh || this._selectedMeshes.includes(mesh)) this.select(null);
+      // 「这块 mesh 没了」≠「用户不再选中」：LOD 细化 / 淘汰回补都会换掉 mesh。
+      // 以前这里一律 select(null)，于是点中的那栋楼一拉近，选中状态就整个被清掉。
+      const wasSelected = this._selectedMeshes.includes(mesh);
+      if (wasSelected) {
+        this._selectedMeshes = this._selectedMeshes.filter((m) => m !== mesh);
+      }
+      if (this._selection?.mesh === mesh) {
+        const smid = this._selection.smid;
+        const carrier =
+          smid != null ? [...(this._smidMeshes.get(smid) ?? [])].find((m) => m !== mesh && m.parent) : undefined;
+        if (carrier) {
+          // 选中身份交给承载同一 smid 的另一块 mesh（通常是接替显示的子瓦）
+          this._selection = { ...this._selection, mesh: carrier };
+          this._replaySelectionOnto(carrier);
+        } else {
+          this.select(null);
+        }
+      }
       if (ud.pickId != null) {
         this._pickables.delete(ud.pickId);
         this._releasePickId(ud.pickId);

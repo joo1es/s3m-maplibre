@@ -65,6 +65,12 @@ function kindOfPixelFormat(pf: number): TextureKind | null {
 
 function kindOfCompress(ct: number): TextureKind | null {
   switch (ct) {
+    // 实测 iClient3D 数据里 compressType = 14 恒为 DXT5：
+    //   · 块内嵌图集   ct=14 pf=21（DXT5），512×512 恰好 0.5 B/px 对应 DXT1、1 B/px 对应 DXT5
+    //   · 独立 .texblock 里的图集 ct=14 pf=13，192×128 = 24576 B，正是 1 B/px 的 DXT5
+    // 后者 pf=13 会被 kindOfPixelFormat 判成 raw（ABGR 4 B/px）→ 按 1/4 长度读，整图碎掉。
+    case 14:
+      return 'dxt5';
     case TextureCompress.DXT1_RGB:
     case TextureCompress.DXT1_RGBA:
       return 'dxt1';
@@ -97,7 +103,19 @@ export function resolveTextureKind(compressType: number, pixelFormat: number): T
   return kindOfPixelFormat(pixelFormat) ?? 'unknown';
 }
 
-/** DXT 族对应的 pixelFormat（喂给 DXTTextureDecode，>11 即按 16 字节块解） */
+/**
+ * DXT 族对应的 pixelFormat，喂给 DXTTextureDecode 选块大小 / alpha 编码。
+ *
+ * 必须逐格式给回真实值：以前除 dxt1 之外一律给 21，DXT3 就被按 DXT5 的插值 alpha 解了
+ * （块大小同为 16 B，所以不会越界，但 alpha 是错的）。
+ */
+const DXT_PIXEL_FORMAT: Partial<Record<TextureKind, number>> = {
+  dxt1: 17,
+  dxt3: 19,
+  dxt4: 20,
+  dxt5: 21,
+};
+
 export function dxtPixelFormatOf(kind: TextureKind): number {
-  return kind === 'dxt1' ? 17 : 21;
+  return DXT_PIXEL_FORMAT[kind] ?? 21;
 }
