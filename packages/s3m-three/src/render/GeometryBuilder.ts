@@ -135,9 +135,12 @@ export function buildScaledUVs(
     }
     const su = b.u1 - b.u0;
     const sv = b.v1 - b.v0;
-    // 一个周期 = 精灵宽（像素）个 uv 单位；至少 1 次，四舍五入到整数保持接缝对齐
+    // 水平：精灵左右接缝实测差为 0（完全连续），所以可以平铺。
+    // 一个周期 = 精灵宽（像素）个 uv 单位；至少 1 次，四舍五入到整数保持接缝对齐。
     const ru = su > 1e-6 ? Math.max(1, Math.round(su / Math.max(b.w, 1))) : 1;
-    const rv = sv > 1e-6 ? Math.max(1, Math.round(sv / Math.max(b.h, 1))) : 1;
+    // 垂直：精灵上下接缝差 150+，而相邻行只差 10 上下 —— 它**不可平铺**。
+    // 竖直方向永远只铺一次，把整张立面拉伸到墙高；按比例取整会得到一条条横向错位。
+    const rv = 1;
     calc.set(gid, { u0: b.u0, v0: b.v0, su, sv, ru, rv });
   }
 
