@@ -61,7 +61,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
 | DXT / WebP 纹理 | ✅ | |
 | 骨骼动画 | ❌ | 未实现：LODPackage 上的 animations JSON 直接跳过不解析，官方 JS SDK 同样只读偏移不驱动 |
-| 地形遮挡 | ✅ | 与 MapLibre terrain 共用同一深度缓冲，山体可遮挡建筑；需宿主开启 `setTerrain` 并提供 DEM 源 |
+| 深度遮挡 | ✅ | **深度来源可替换**：本层全程不清深度缓冲（`autoClear = false`），谁写了更近的深度谁就遮挡建筑。地形只是其中一个来源（宿主 `setTerrain` + DEM，山体挡楼）；自带物理地表代理（`ground.occlude`）是另一个来源，能把地下结构真正切掉，两者可叠加 |
 | Draco 压缩几何 | ❌ | 能识别、不能解码，遇到抛明确错误；接法见[未支持的格式](#未支持的格式draco--crn--ktx2) |
 | CRN 纹理（`compressType` 26 / 27 / 38001 / 50000） | ✅ | 内联 crunch wasm 转 DXT 后走同一套解码，只在遇到时懒加载；已在 SuperMap Online 公有服务实测 |
 | KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
@@ -466,8 +466,8 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 
 - **Draco 压缩几何**未实现（可解，缺样例数据），见[未支持的格式](#未支持的格式draco--ktx2)。
 - **纹理分包（`s3m:TextureSharing`）未支持**：这类数据集的 `tiles` 全是 `.s3mblock`（纹理块文件），不是 `.s3mb` 瓦片，加载会直接失败，例如 SuperMap Online 的 `3D-CBD/Xiaopin@CBD`。目前会如实报错，不做静默降级。
-- **多块 MeshOpt 骨架尚未对齐**：`3D-WorkSpace_pbr1/pbrmodel` 里有根瓦片是 `blockCount=2`，第二块的头按现有布局读会错位。单个属性流尺寸会先拦一道、给出可定位的报错，不会抛「Invalid typed array length」。
-- **地形遮挡需要宿主把模型贴到真实地面高程**：深度测试本身是通的（地形网格与本层共用主 framebuffer 的同一深度缓冲、同一 `depthRangeFor3D`），但 S3M 数据通常按海拔 0 建模，必须用 `setDatasetHeight()` 抬到真实地面高程，否则模型会陷在地形下面。另外地形网格的贴图来自 raster / hillshade 层，没有这两层时地形面是空白的。
+- **多块 MeshOpt 骨架已支持**（`blockCount > 1`）：这类骨架是「每块后面紧跟自己的索引包」，索引是块内局部编号。解析时按块合并顶点流、并把各块索引加上顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包。实测 `3D-WorkSpace_pbr1/pbrmodel` 的 `blockCount=2/3` 瓦片已可正常加载。
+- **遮挡取决于「谁写了深度」而不是「开没开地形」**：地形网格与本层共用主 framebuffer 的同一深度缓冲、同一 `depthRangeFor3D`，所以山体能挡建筑；但 S3M 数据通常按海拔 0 建模，开地形时必须用 `setDatasetHeight()` 抬到真实地面高程，否则模型会陷在山体下面（另外地形网格的贴图来自 raster / hillshade 层，没有这两层时地形面是空白的）。不想接 DEM 时，可以用自带物理地表当遮挡源（`ground: { occlude: true }` 或 `setGroundOcclude()`），但它只能表达 `z = 高程` 的一刀切：没有起伏，山体那种「半山腰挡住后面楼」表达不了；两者叠加时，凡是地形已经写了更近深度的像素，平面代理写不进去，山后的建筑仍会露出来。
 - 跨城市量级的数据集叠加会重新引入 float32 精度问题。
 - 卸载只做了「超上限淘汰」：`maxTiles` 满了会淘汰最久没用的瓦片，但没有做预算式（按显存占用）的主动回收。
 - **切线（TANGENT）顶点流不参与渲染**：没有法线贴图通道，所以这条流只跳过不解码；但带它的数据（PBR 一类）不会因此失败。
@@ -527,6 +527,6 @@ docs/       API 文档站产物（`bun run build:docs` 生成，图层 + 内核�
 
 - 本项目 [Apache-2.0](./LICENSE)。
 - `packages/s3m-three/src/core/DXTTextureDecode.ts` 来自 [SuperMap/s3m-spec](https://github.com/supermap/s3m-spec)（Apache-2.0）。
-- `packages/s3m-three/src/vendor/crunch_decoder.module.js` 是 [crunch](https://github.com/BinomialLLC/crunch) 的 emscripten 构建（经 SuperMap SDK 转发，Apache-2.0）；只改了两处：wasm 改为内联字节、Node ESM 下 `__dirname` 兜底。
+- `packages/s3m-three/src/vendor/crunch_decoder.module.js` 是 [crunch](https://github.com/BinomialLLC/crunch) 的 emscripten 构建（经 SuperMap SDK 转发，Apache-2.0）；改动三处：wasm 改为内联字节、Node ESM 下 `__dirname` 兜底、去掉 ESM 里的裸 `require("fs"/"path")` 与 `module["exports"]`（wasm 已内联所以那条读文件路径不会走，留着只会让打包器报 COMMONJS_VARIABLE_IN_ESM）。
 - `packages/s3m-three/src/vendor/meshopt_decoder.module.js` 是 [meshoptimizer](https://github.com/zeux/meshoptimizer) 官方解码器（MIT，© Arseny Kapoulkine），未做修改。
 - S3M 规范文本遵循 CC BY-ND 4.0，不得修改规范文本后再发布。

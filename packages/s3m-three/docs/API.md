@@ -276,15 +276,20 @@ clearFilter(): void
 ```ts
 setGroundMode(mode: GroundMode): void
 setGroundOpacity(opacity: number): void
+setGroundOcclude(enabled: boolean): void
 setExcavationBounds(bounds: [number, number, number, number] | null): void
 ```
 
 自带的物理地表网格锚定在**场景 ENU 高程**，解决的是「模型自身地上 / 地下结构的物理覆盖与透视关系」（地铁站、基坑这类数据没有真实地表 DEM 可用）：
 
-- `'translucent'` 半透明地表 + `depthWrite = false` ⇒ 地下结构透过地表显现
-- `'excavate'` 基坑范围内片元 `discard` ⇒ 挖空井口
+- `'translucent'` 半透明地表，地下结构透过地表显现（遮挡默认关闭）
+- `'excavate'` 基坑范围内片元 `discard` ⇒ 挖空井口，坑外地下部分被地表挡住（遮挡默认开启）
 
-它与 MapLibre terrain 是**两个正交维度**，不存在替代关系：terrain 解决「真实世界地面的起伏与遮挡」，物理地表解决「模型自身的地上 / 地下语义」。贴地（`setDatasetHeight`）后物理地表网格的高度会跟随主数据集的抬升量自动同步，保证覆盖关系不错位。
+**遮挡是独立开关**（`ground.occlude` / `setGroundOcclude`），且**与地表模式解耦**：`mode: 'none'` 时也可以单独开启 —— 不显示任何地表，只留一块隐形地面把地面以下切掉。它由一块 `colorWrite = false`、`renderOrder = -1000` 的纯深度代理完成——遮挡是在片元绘制那一刻由深度测试决定的，半透明覆盖网格排在 transparent 队列末尾，写不写深度都挡不住已经画完的建筑。开挖模式下代理会在坑口同步开洞，否则井口就白挖了。
+
+**地表高度默认跟随主数据集抬升量**（`ground.trackHeight`，默认 `true`）：贴地时模型整体抬到地面高程，切割面必须跟到同一高程，否则整个模型被齐根切掉。设为 `false` 则钉死在当前高度——高程调整只动模型不动切割面，适合「调埋深 / 控制切掉多少」的交互。
+
+它与 MapLibre terrain 不存在替代关系，但也不是互斥的两套机制：两者都只是往同一个深度缓冲里写深度，谁更近谁赢。terrain 表达「真实世界地面的起伏遮挡」，物理地表代理表达「模型自身的一刀切地上 / 地下语义」——平面表达不了山体那种半山腰遮挡，而地形已写入更近深度的像素上，平面代理也写不进去。贴地（`setDatasetHeight`）后物理地表网格的高度会跟随主数据集的抬升量自动同步，保证覆盖关系不错位。
 
 ### 拾取与空间查询
 
@@ -747,7 +752,7 @@ viewer.flushOverrides();
 - **实例化单体**（`pickInfo` 里给的是 `instanceIds` 而不是 `batchId`，白模常见）只做了渲染，没做按单体控制：`setFeatureStyle` / `filterByField` / `elevateByField` / GPU 拾取走的都是 `aBatchId`，这条路径对实例化几何不生效。要支持得把每个实例单独上色，得改 InstancedMesh 的 instanceColor + 拾取编码。
 - **CRN 纹理**已支持，且已在真实服务上验证：内联的 crunch wasm 转回 DXT 后走现成解码，DXT 具体格式看 CRN 头，wasm 约 76KB、只有真遇到 CRN 时才动态加载。**判定看 `compressType` 而不是 `pixelFormat`**——实测 v3.00 是 `ct=26 / pf=13`、行标是 `ct=50000 / pf=32856`，按 `pixelFormat` 26 / 27 判断会把真实 CRN 整包丢掉（模型变灰模）。判定收敛在 `packages/s3m-three/src/core/TextureFormat.ts`（`resolveTextureKind` / `TextureCompress` / `dxtPixelFormatOf`，已从包入口导出）。用 `bun run probe:crn -- --crn <数据集 config 地址>` 可以对任意服务跑「尺寸吻合 / 色数 / 粗糙度 / ASCII 预览」的实测。
 - **纹理分包（`s3m:TextureSharing`）未支持**：这类数据集的 `tiles` 全是 `.s3mblock`，不是 `.s3mb`，加载会失败（例：SuperMap Online `3D-CBD/Xiaopin@CBD`）。
-- **多块 MeshOpt 骨架**（`blockCount > 1`）暂未对齐：例 `3D-WorkSpace_pbr1/pbrmodel`，第二块头部按现有布局读会错位，会给出「流尺寸异常」的可定位报错而不是底层 RangeError。
+- **多块 MeshOpt 骨架**（`blockCount > 1`）已支持。这类骨架里**每块后面紧跟自己的索引包**（不是所有块之后再统一放一份），索引是块内局部编号；解析时按块顺序合并顶点流，再把每块索引加上顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包。实测 `3D-WorkSpace_pbr1/pbrmodel` 的 `blockCount=2` / `3` 瓦片可正常加载。
 - **切线顶点流**只跳过不解码（渲染没有法线贴图通道），带 TANGENT 的数据不会被判失败。
 - **KTX2** 不在 S3M 的 `pixelFormat` 枚举里，iServer 也不会发；要支持需自行引入 `basis_transcoder.wasm` 并解析容器，属于「换数据源才需要考虑」的项。
 - **骨骼动画**解析了但未驱动。

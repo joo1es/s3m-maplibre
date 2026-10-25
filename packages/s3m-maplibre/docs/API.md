@@ -288,12 +288,12 @@ V = P⁻¹ × MVP
 
 ## 宿主兼容与已知限制
 
-- **地形遮挡**已支持：MapLibre 的地形网格与本层（`renderingMode: '3d'`）共用主 framebuffer 的同一深度缓冲、同一 `depthRangeFor3D`、同一 `LEQUAL + ReadWrite` 深度模式，所以地形可以遮挡建筑。前提是宿主开启 `map.setTerrain({ source: 'dem' })` 并提供 DEM 源，且地形网格需要有 raster / hillshade 层供图（否则地形面空白）。另外 S3M 数据通常按海拔 0 建模，需要用 `setDatasetHeight()` 把模型抬到真实地面高程，否则深度虽可比但空间位置对不上。
-- **物理地表（地下透视 / 基坑）**与 terrain 是两个正交维度：前者表达模型自身的地上 / 地下结构覆盖关系，后者表达真实地面的起伏遮挡，地铁站 / 基坑这类数据没有真实 DEM 时只能靠前者。
+- **遮挡靠的是深度来源，不是「开没开地形」**：本层全程不清深度缓冲（`autoClear = false`），凡是往同一深度缓冲写了更近深度的东西都能遮挡建筑。MapLibre 地形网格与本层（`renderingMode: '3d'`）共用主 framebuffer、同一 `depthRangeFor3D`、同一 `LEQUAL + ReadWrite` 深度模式，所以地形可以遮挡；前提是宿主开启 `map.setTerrain({ source: 'dem' })`、提供 DEM 源，且地形需要有 raster / hillshade 层供图（否则地形面空白）。另外 S3M 数据通常按海拔 0 建模，需要用 `setDatasetHeight()` 把模型抬到真实地面高程，否则深度虽可比但空间位置对不上。不想接 DEM 时用 `setGroundOcclude(true)` 让自带物理地表充当遮挡源（平面一刀切）。
+- **物理地表（地下透视 / 基坑）**与 terrain 是两个维度但不是两套机制：前者表达模型自身的地上 / 地下结构覆盖关系，后者表达真实地面的起伏遮挡；两者只是都往同一个深度缓冲写深度。平面代理表达不了山体起伏，而地形已写入更近深度的像素上平面也写不进去，所以地铁站 / 基坑这类没有真实 DEM 的数据靠前者，有 DEM 的山地靠后者。
 - **正交投影**需要 MapLibre ≥ 5；v4 / v5 以下（含 Mapbox v2）只给合并矩阵，会告警一次并保持透视，见[投影](#投影)。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
 
-解析 / 几何 / 纹理 / 单体化相关的已知限制（Draco、实例化单体、CRN 判定、纹理分包、多块 MeshOpt、切线流、KTX2、骨骼动画）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。
+解析 / 几何 / 纹理 / 单体化相关的已知限制（Draco、实例化单体、CRN 判定、纹理分包、切线流、KTX2、骨骼动画）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。
 
 ---
 
