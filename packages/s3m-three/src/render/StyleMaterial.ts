@@ -326,23 +326,27 @@ const FRAG_PARS = /* glsl */ `
       o = clamp( o, off, vec2( 1.0 ) - off );
       return o * texScale * scale + t;
     }
+    /**
+     * 图集采样（S3MBLOCK 共享纹理）。
+     *
+     * 公式照抄官方 SDK 的着色器（s3m-spec 仓库
+     * S3M_SDK/S3M_JS/S3M_module/S3MTiles/Shaders/S3MTilesFS.js 里的
+     * getTextureAtlasColor / calculateMipLevel）：fract 取平铺周期内的位置，
+     * 再按子区域 rect 平移缩放进去。
+     *
+     * 与官方唯一的差异：官方把 width 乘 2.0 / 3.0，因为它的图集在精灵右侧
+     * 三分之一内联了一整条 mip 链，采样 mip > 0 时会平移到那块区域。我们解出来的
+     * 图集里没有这条内联链（放大单个槽位看不到逐级缩小的副本），一旦按官方
+     * 公式采样 mip > 0，就会采到邻居槽位 —— 整面墙碎成拼贴。
+     * 所以这里：精灵按 rect 的满宽取，mip 固定 0。
+     */
     vec4 s3mAtlasUnit( vec2 uv, vec4 rect, vec2 atlasDim, sampler2D tex ) {
       // 退化矩形 = 官方 batchId < 0：该纹理单元不参与合成
       if ( rect.z <= 0.0 || rect.w <= 0.0 ) return vec4( 1.0 );
-      vec2 dim = vec2( rect.z * atlasDim.x * ( 2.0 / 3.0 ), rect.w * atlasDim.y );
+      vec2 dim = vec2( rect.z * atlasDim.x, rect.w * atlasDim.y );
       vec2 scale = dim / atlasDim;
       vec2 translate = rect.xy;
-      float maxMip = log2( min( dim.x, dim.y ) );
-      vec2 dx = dFdx( uv * dim.x );
-      vec2 dy = dFdy( uv * dim.y );
-      float dX = dot( dx, dx ), dY = dot( dy, dy );
-      float dMax = max( dX, dY ), dMin = min( dX, dY );
-      float offset = clamp( ( dMax - dMin ) / max( dMax + dMin, 1e-8 ), 0.0, 1.0 );
-      float d = dMax * ( 1.0 - offset ) + dMin * offset;
-      float mip = clamp( 0.5 * log2( max( d, 1e-20 ) ), 0.0, max( maxMip - 1.62, 0.0 ) );
-      vec4 hi = texture2D( tex, s3mBatchUV( uv, translate, scale, dim, ceil( mip ) ) );
-      vec4 lo = texture2D( tex, s3mBatchUV( uv, translate, scale, dim, floor( mip ) ) );
-      return hi * 0.5 + lo * 0.5;
+      return texture2D( tex, s3mBatchUV( uv, translate, scale, dim, 0.0 ) );
     }
   #endif
   uniform int uMode;

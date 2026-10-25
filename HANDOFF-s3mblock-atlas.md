@@ -67,6 +67,59 @@ aTexCoord0 = 上面三套里的一套。官方画面「一面墙=一张立面、
 被拉伸的照片（`_tmp/og/R13-uvswap.png`）——说明「不平铺」这一步是对的，缺的就是
 水平方向那几份整数重复。
 
+### 第四轮：官方 spec 仓库给了权威实现，两处关键修正
+
+用户提示 https://github.com/supermap/s3m-spec 。仓库里没有 texblock / subName / offsetX
+的文档（`Specification/S3MB/*.md` 只描述 2019 版 CAGIS 标准，共享纹理是未公开扩展），
+**但 `S3M_SDK/S3M_JS/S3M_module/S3MTiles/Shaders/` 是官方着色器原文**，这才是权威。
+
+官方 FS 的图集采样（`getTextureAtlasColor`）：
+
+```glsl
+// VS 里 getTexAtlasParameter：
+float width = xywh.z;  float height = xywh.w;
+width *= 2.0 / 3.0;                           // ★ 精灵右侧 1/3 是内联 mip 链
+maxMipLevel = log2(min(width, height));
+scale = (width, height) / textureDim;  translate = (xywh.x, xywh.y) / textureDim;
+
+// FS：
+mip = clamp(0.5*log2(d), 0.0, maxMip - 1.62);   // d 由 dFdx/dFdy(uv*texDim) 求得
+translate += (scale.x, scale.y*(2^(m-1)-1)/2^(m-1));   // m>0 时平移到 mip 区
+texcoord = fract(uv); clamp(texcoord, 2^m/texDim, 1-2^m/texDim);
+texcoord = texcoord * scale/2^m + translate;
+color = texture2D(tex, texcoord);              // 官方也是 texture2D(...,0.0)
+```
+
+我们此前已把这段公式照抄进 `StyleMaterial.s3mAtlasUnit` / `s3mBatchUV`，
+逐行一致。**差异只在 `2/3` 这个系数**：
+
+- 官方图集把每个精灵的 mip 链内联在它右侧 1/3（所以采样要按 2/3 收窄宽度）；
+- 我们从 `.texblock` 解出来的图集**没有这条内联链**（放大单个槽位 24x32 看不到
+  逐级缩小的副本，右侧 1/3 仍是图案本身的延续）。
+- 于是按官方公式走 mip>0 时，采样点被平移到「本该放 mip」的位置 → 采到邻居槽位，
+  整面墙碎成拼贴。这就是 confetti 的机制。
+
+改成「rect 满宽 + mip 固定 0」后（`_tmp/og/X2-final.png`）：整楼照片重复消失，
+墙面变成窗格级立面 —— 这是目前最接近官方的一版。
+
+#### 与「刚支持 block 那个版本」（753fc9f）的对比
+
+把 753fc9f 的源码临时切回来同机位截图（`_tmp/og/BASE-753fc9f-z192.png`）：
+
+- 那一版在 CPU 上把 rect **烘进顶点 uv**（`remapAtlasUVs`），且每个顶点各自
+  `fract()` —— 一个面的四个角被折到同一点，整面墙被抹成一条平滑色带 + alpha 黑边。
+  用户记得的「只有黑边和 uv 对不上」就是这一版。
+- 试过去掉那个 `fract()`（`_tmp/og/BASE-nofract.png`）：色带消失、出现立面条纹，
+  但因为精灵仍是「整楼缩略图 + 天空 alpha」，大面积是天空蓝 + 镂空。
+- 现行版本（rect 逐顶点 + 满宽 + mip0）比两版都更接近真实立面。
+
+#### 仍未解决
+
+1. 墙面仍有白/黑镂空 —— 部分条带的精灵是「整栋楼 + 天空」的缩略图，alpha 把天空
+   抠掉了。也就是 LOD 太粗：可见瓦片几乎全是层级 1，图集只有 48x40 / 96x128。
+2. 官方在同一机位也只到 `6_01`，所以「更细 LOD」这条解释不成立，问题更可能是
+   我们**取错了图集**（父子瓦片各自的图集不同，根块图集是整楼缩略图）。
+
 ### 仍然没解决的那一件事
 
 画面依旧是「一栋楼的照片被重复十几遍」。现在能定量解释了：
