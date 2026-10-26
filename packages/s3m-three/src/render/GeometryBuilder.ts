@@ -15,28 +15,16 @@ import * as THREE from 'three';
 import { createTexture } from './TextureFactory.js';
 import { createSharedUniforms, createStyledMaterial } from './StyleMaterial.js';
 import type { StyledMaterial } from './StyleMaterial.js';
+import { assembleTileGeometry, LINE_PRIMITIVE, POINT_PRIMITIVE } from '../core/TileGeometry.js';
+import type { TileGeometryData, PrimitiveData } from '../core/TileGeometry.js';
 import type {
-  AttrDType,
   GeoPackageEntry,
-  IndexPackage,
   ParsedTile,
   StyleUniforms,
-  VertexAttribute,
 } from '../core/types.js';
 
-/* ------------------------------------------------------------------ 索引包类型 */
-
-/**
- * S3M 规范里 `DrawPrimitiveType` 只到 10（多边形），但 iServer 实际发布的 v3 瓦片里
- * 会出现 **13**：它是数据自带的「棱线包」—— 索引是线段对，不是三角形。
- *
- * 这条是踩过坑才认出来的：把 13 当三角形画，每条棱线都会被连成一根几十上百米的尖刺，
- * 满屏都是放射状的三角面。按 LineSegments 画出来，正好是整片建筑轮廓线。
- */
-export const LINE_PRIMITIVE = 13;
-
-/** primitiveType = 1：点云包。索引是点序号，画成三角面就是满屏彩色尖刺。 */
-export const POINT_PRIMITIVE = 1;
+// 组装层下沉 core 后的对外 API 兼容：常量原住本文件
+export { LINE_PRIMITIVE, POINT_PRIMITIVE };
 
 function isLinePrimitive(primitiveType: number): boolean {
   // 1 = 点，2 = 线段，3 = 折线，13 = 棱线包
@@ -86,103 +74,7 @@ function getPointCloudMaterial(): THREE.PointsMaterial {
 
 /* ------------------------------------------------------------------ 顶点流 */
 
-function bytesPerElement(dtype: AttrDType): number {
-  return dtype === 'u8' ? 1 : dtype === 'u16' ? 2 : 4;
-}
-
-function typedArray(dtype: AttrDType, buffer: ArrayBufferLike): Float32Array | Uint8Array | Uint16Array | Uint32Array {
-  switch (dtype) {
-    case 'u8':
-      return new Uint8Array(buffer);
-    case 'u16':
-      return new Uint16Array(buffer);
-    case 'u32':
-      return new Uint32Array(buffer);
-    default:
-      return new Float32Array(buffer);
-  }
-}
-
-function typedArrayOf(dtype: AttrDType, length: number): Float32Array | Uint8Array | Uint16Array | Uint32Array {
-  switch (dtype) {
-    case 'u8':
-      return new Uint8Array(length);
-    case 'u16':
-      return new Uint16Array(length);
-    case 'u32':
-      return new Uint32Array(length);
-    default:
-      return new Float32Array(length);
-  }
-}
-
-function toBufferAttribute(attr: VertexAttribute): THREE.BufferAttribute {
-  const { data, stride, offsetInBytes, dtype = 'f32' } = attr;
-  const components = attr.components ?? (attr as unknown as { comp?: number }).comp ?? 3;
-  const bpe = bytesPerElement(dtype);
-  const itemBytes = components * bpe;
-  const actualStride = stride ?? itemBytes;
-  const actualOffset = offsetInBytes ?? 0;
-  const normalized = dtype === 'u8';
-
-  // 非交错：整段直接铺开
-  if (actualStride === itemBytes && actualOffset === 0) {
-    const view = typedArray(dtype, data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
-    return new THREE.BufferAttribute(view, components, normalized);
-  }
-
-  // 交错：逐元素抽取
-  const count = Math.floor(data.byteLength / actualStride);
-  const out = typedArrayOf(dtype, count * components);
-  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  for (let i = 0; i < count; i++) {
-    const base = i * actualStride + actualOffset;
-    for (let c = 0; c < components; c++) {
-      const o = base + c * bpe;
-      out[i * components + c] =
-        dtype === 'u8'
-          ? dv.getUint8(o)
-          : dtype === 'u16'
-            ? dv.getUint16(o, true)
-            : dtype === 'u32'
-              ? dv.getUint32(o, true)
-              : dv.getFloat32(o, true);
-    }
-  }
-  return new THREE.BufferAttribute(out, components, normalized);
-}
-
-function toIndex(indexPack: IndexPackage): THREE.BufferAttribute | null {
-  const { indices, indexType, indexCount } = indexPack;
-  if (!indices || indexCount === 0) return null;
-  // 以字节宽度为准：S3M 的 indexType 在 MeshOpt 包里恒为 0，靠它会读错一半索引。
-  const width = Math.floor(indices.byteLength / indexCount);
-  const wide = width === 4 || (width !== 2 && (indexType === 1 || indexType === 3));
-  const n = indexCount * (wide ? 4 : 2);
-  if (n > indices.byteLength) return null;
-  const buf = indices.buffer.slice(indices.byteOffset, indices.byteOffset + n);
-  const view = wide ? new Uint32Array(buf) : new Uint16Array(buf);
-  return new THREE.BufferAttribute(view, 1);
-}
-
-/** 把 u8 顶点色转成 float vec3，供着色器直接相乘 */
-function toColorAttribute(attr: VertexAttribute | null, vertexCount: number): THREE.BufferAttribute {
-  const out = new Float32Array(vertexCount * 3);
-  if (!attr) {
-    out.fill(1);
-    return new THREE.BufferAttribute(out, 3);
-  }
-  const src = attr.data;
-  const comp = attr.components ?? 4;
-  const scale = attr.dtype === 'u8' ? 1 / 255 : 1;
-  for (let i = 0; i < vertexCount; i++) {
-    const o = i * comp;
-    out[i * 3] = (src[o] ?? 255) * scale;
-    out[i * 3 + 1] = (src[o + 1] ?? 255) * scale;
-    out[i * 3 + 2] = (src[o + 2] ?? 255) * scale;
-  }
-  return new THREE.BufferAttribute(out, 3);
-}
+/** 顶点流解交错 / 法线 / 合批已下沉 core/TileGeometry.ts（Worker / 主线程共用） */
 
 /** SuperMap 内置水面（`103.water`）的基色：偏深的青蓝，配合低粗糙度出一点天光反射 */
 const WATER_COLOR = new THREE.Color(0x1d4e63);
@@ -282,6 +174,11 @@ export interface BuildTileOptions {
    * 对倾斜摄影、大网格切片瓦片可减少 90%+ DrawCall，显著提高渲染帧率。
    */
   batching?: boolean;
+  /**
+   * Worker 侧已完成的纯数据几何组装（经典 .s3mb 路径由解析 Worker 顺带产出）。
+   * 缺省时在主线程现场组装（core/TileGeometry 的同一份实现），两条路径产物一致。
+   */
+  assembled?: TileGeometryData;
 }
 
 export interface BuildTileResult {
@@ -289,16 +186,6 @@ export interface BuildTileResult {
   stats: TileBuildStats;
   objects: THREE.Object3D[];
   textureKeys?: string[];
-}
-
-interface CachedGeometry {
-  geometry: THREE.BufferGeometry;
-  pack: IndexPackage;
-}
-
-interface SkeletonInfo {
-  indexPackages: IndexPackage[];
-  instanced: boolean;
 }
 
 export async function buildTileObjects(
@@ -448,388 +335,62 @@ export async function buildTileObjects(
     return mat;
   };
 
-  // 3) 骨架 → 几何。顶点是「骨架局部坐标」，真正位置由引用它的 Geode 矩阵决定。
-  const geoCache = new Map<string, CachedGeometry>();
-  const skeletonInfo = new Map<string, SkeletonInfo>();
-
-  for (const [name, geo] of Object.entries(tile.geoPackage ?? {})) {
-    const vp = geo.vertexPackage;
-    const positionAttr = vp.vertexAttributes.find((a) => a.semantic === 'position');
-    if (!positionAttr) {
-      stats.skipped.push(`${name} 无 position`);
-      continue;
-    }
-
-    const vertexCount = vp.verticesCount || 0;
-    const attributes: Record<string, THREE.BufferAttribute> = { position: toBufferAttribute(positionAttr) };
-    let colorAttr: VertexAttribute | null = null;
-    let batchAttr: VertexAttribute | null = null;
-
-    for (const attr of vp.vertexAttributes) {
-      if (attr.divisor !== undefined) continue; // 实例属性不进顶点流
-      if (attr.semantic === 'position') continue;
-      if (attr.semantic === 'color') colorAttr = attr;
-      else if (attr.semantic === 'batchId') batchAttr = attr;
-      else if (attr.semantic === 'normal') attributes.normal = toBufferAttribute(attr);
-      else if (attr.semantic === 'uv') attributes.uv = toBufferAttribute(attr);
-      else if (attr.semantic === 'uv2') attributes.uv1 = toBufferAttribute(attr);
-    }
-
-    // 着色器强依赖这两个 attribute，缺了就补默认值
-    attributes.aColor = toColorAttribute(colorAttr, vertexCount);
-    attributes.aBatchId = batchAttr
-      ? toBufferAttribute(batchAttr)
-      : new THREE.BufferAttribute(new Float32Array(vertexCount).fill(-1), 1);
-
-    // S3MBLOCK 图集：逐顶点带子区域矩形，平铺的 fract 交给片元做（顶点上做会画反）。
-    // 烘焙图（材质 unit1）用第二套原始 UV，这里另开一个 aSecUv 槽位，不跟 three 的 uv1 语义纠缠。
-    const rects = tile.atlasRects?.[name];
-    if (rects) {
-      attributes.aAtlasRect = new THREE.BufferAttribute(rects.uv ?? new Float32Array(vertexCount * 4), 4);
-      // 没有第二套 UV 的骨架不做烘焙：给一个退化矩形，片元里据此跳过
-      const uv1 = attributes.uv1 as THREE.BufferAttribute | undefined;
-      if (rects.uv2 && uv1) {
-        attributes.aAtlasRect1 = new THREE.BufferAttribute(rects.uv2, 4);
-        attributes.aSecUv = uv1;
-      } else {
-        attributes.aAtlasRect1 = new THREE.BufferAttribute(new Float32Array(vertexCount * 4), 4);
-        attributes.aSecUv = (attributes.uv as THREE.BufferAttribute) ?? new THREE.BufferAttribute(new Float32Array(vertexCount * 2), 2);
-      }
-    }
-
-    const instanced = vp.instanceIndex !== -1 && (vp.instanceMode === 16 || vp.instanceMode === 17);
-    // 注意：indexPackages 属于 Skeleton（geoPackage[name]），不在 vertexPackage 里
-    //
-    // 一个索引包都没有的骨架 = 纯点集：高斯泼溅（3DGaussianSplatting）和无索引点云
-    // 都是这种——顶点就是点，没有任何三角形可画。不补一个「顶点即点」的伪包，
-    // 下面就不会产出任何对象，整块瓦片最后落到「tile 无可用几何」被丢掉。
-    let packs = geo.indexPackages ?? [];
-    if (packs.length === 0 && vertexCount > 0) {
-      packs = [
-        {
-          indexCount: 0,
-          indexType: 0,
-          useIndex: 0,
-          primitiveType: POINT_PRIMITIVE,
-          indices: null,
-          passNames: [],
-        },
-      ];
-    }
-    skeletonInfo.set(name, { indexPackages: packs, instanced });
-    stats.vertices += vertexCount;
-
-    packs.forEach((pack, pi) => {
-      let geometry = new THREE.BufferGeometry();
-      for (const [k, v] of Object.entries(attributes)) geometry.setAttribute(k, v);
-      const idx = toIndex(pack);
-      if (idx) geometry.setIndex(idx);
-      else geometry.setDrawRange(0, vertexCount);
-
-
-
-      // 如果数据本身没有法线且是三角网格，必须在绑定了 index 之后计算法线
-      // 绝不能在未索引的 attributes.position 上算，否则非连续顶点会导致法线朝向错乱甚至越界 NaN 导致死黑面
-      // 线 / 点包不需要法线
-      if (
-        !isLinePrimitive(pack.primitiveType) &&
-        !isPointPrimitive(pack.primitiveType) &&
-        !geometry.getAttribute('normal')
-      ) {
-        geometry.computeVertexNormals();
-      }
-
-      geometry.computeBoundingBox();
-      geometry.computeBoundingSphere();
-      geoCache.set(`${name}|${pi}`, { geometry, pack });
-    });
-  }
+  // 3) 纯数据几何组装：Worker 解析时已顺带产出就直接用，否则主线程现场组装
+  //    （core/TileGeometry 的同一份实现，两条路径产物一致）
+  const assembled = options.assembled ?? assembleTileGeometry(tile, { batching: options.batching !== false });
+  stats.vertices = assembled.stats.vertices;
+  stats.edgeLines = assembled.stats.edgeLines;
+  stats.instanced = assembled.stats.instanced;
+  if (assembled.stats.originalMeshes != null) stats.originalMeshes = assembled.stats.originalMeshes;
+  stats.skipped.push(...assembled.stats.skipped);
 
   const IDENTITY = new THREE.Matrix4();
 
-  interface CandidateMesh {
-    cached: CachedGeometry;
-    name: string;
-    geo: GeoPackageEntry;
-    matrix: THREE.Matrix4 | null;
-  }
-
-  const batchGroups = new Map<string, CandidateMesh[]>();
-
-  const mergeBatchGeometries = (
-    candidates: CandidateMesh[],
-    material: StyledMaterial,
-    tileRef: ParsedTile
-  ): THREE.Mesh => {
-    let totalVertices = 0;
-    let totalIndices = 0;
-    let hasNormal = false;
-    let hasUv = false;
-    let hasUv1 = false;
-    let hasAColor = false;
-    let hasABatchId = false;
-    let hasAtlas = false;
-
-    for (const c of candidates) {
-      const g = c.cached.geometry;
-      const vCount = g.attributes.position?.count ?? 0;
-      totalVertices += vCount;
-      totalIndices += g.index ? g.index.count : vCount;
-      if (g.attributes.normal) hasNormal = true;
-      if (g.attributes.uv) hasUv = true;
-      if (g.attributes.uv1) hasUv1 = true;
-      if (g.attributes.aColor) hasAColor = true;
-      if (g.attributes.aBatchId) hasABatchId = true;
-      if (g.attributes.aAtlasRect) hasAtlas = true;
+  const packPrimitive = (prim: PrimitiveData): THREE.BufferGeometry => {
+    const geometry = new THREE.BufferGeometry();
+    for (const [k, a] of Object.entries(prim.attributes)) {
+      if (a) geometry.setAttribute(k, new THREE.BufferAttribute(a.array, a.components, a.normalized));
     }
-
-    const mergedPos = new Float32Array(totalVertices * 3);
-    const mergedNorm = hasNormal ? new Float32Array(totalVertices * 3) : null;
-    const mergedUv = hasUv ? new Float32Array(totalVertices * 2) : null;
-    const mergedUv1 = hasUv1 ? new Float32Array(totalVertices * 2) : null;
-    const mergedColor = hasAColor ? new Float32Array(totalVertices * 3) : null;
-    const mergedBatchId = hasABatchId ? new Float32Array(totalVertices) : null;
-    const mergedRect0 = hasAtlas ? new Float32Array(totalVertices * 4) : null;
-    const mergedRect1 = hasAtlas ? new Float32Array(totalVertices * 4) : null;
-    const mergedSecUv = hasAtlas ? new Float32Array(totalVertices * 2) : null;
-
-    /** 逐顶点拷一个 n 分量的浮点属性；缺失时用 fallbackRect / 0 兜底 */
-    const copyAttr = (
-      dst: Float32Array,
-      attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute | undefined,
-      comp: number,
-      vCount: number,
-      vertexOffset: number,
-      fallback?: (i: number, out: number[]) => void
-    ) => {
-      if (attr) {
-        const src = attr.array as ArrayLike<number>;
-        for (let i = 0; i < vCount; i++)
-          for (let k = 0; k < comp; k++) dst[(vertexOffset + i) * comp + k] = src[i * comp + k] ?? 0;
-        return;
-      }
-      for (let i = 0; i < vCount; i++) {
-        const out: number[] = [];
-        fallback ? fallback(i, out) : out.push(...new Array(comp).fill(0));
-        for (let k = 0; k < comp; k++) dst[(vertexOffset + i) * comp + k] = out[k] ?? 0;
-      }
-    };
-
-    const IndexArrayType = totalVertices > 65535 ? Uint32Array : Uint16Array;
-    const mergedIndices = new IndexArrayType(totalIndices);
-
-    let vertexOffset = 0;
-    let indexOffset = 0;
-
-    const tmpVec = new THREE.Vector3();
-    const normalMatrix = new THREE.Matrix3();
-    const geoByBatchId = new Map<number, GeoPackageEntry>();
-
-    for (const c of candidates) {
-      const g = c.cached.geometry;
-      const vCount = g.attributes.position.count;
-      const m = c.matrix;
-      const hasTransform = m && !m.equals(IDENTITY);
-      if (hasTransform && hasNormal) {
-        normalMatrix.getNormalMatrix(m);
-      }
-
-      if (c.geo.pickInfo) {
-        for (const entry of Object.values(c.geo.pickInfo)) {
-          if (typeof entry.batchId === 'number' && entry.batchId >= 0) {
-            geoByBatchId.set(entry.batchId, c.geo);
-          }
-        }
-      }
-
-      // 1. Position
-      const posArr = g.attributes.position.array as ArrayLike<number>;
-      for (let i = 0; i < vCount; i++) {
-        const srcIdx = i * 3;
-        const dstIdx = (vertexOffset + i) * 3;
-        if (hasTransform) {
-          tmpVec.set(posArr[srcIdx], posArr[srcIdx + 1], posArr[srcIdx + 2]).applyMatrix4(m);
-          mergedPos[dstIdx] = tmpVec.x;
-          mergedPos[dstIdx + 1] = tmpVec.y;
-          mergedPos[dstIdx + 2] = tmpVec.z;
-        } else {
-          mergedPos[dstIdx] = posArr[srcIdx];
-          mergedPos[dstIdx + 1] = posArr[srcIdx + 1];
-          mergedPos[dstIdx + 2] = posArr[srcIdx + 2];
-        }
-      }
-
-      // 2. Normal
-      if (mergedNorm) {
-        const normAttr = g.attributes.normal;
-        if (normAttr) {
-          const normArr = normAttr.array as ArrayLike<number>;
-          for (let i = 0; i < vCount; i++) {
-            const srcIdx = i * 3;
-            const dstIdx = (vertexOffset + i) * 3;
-            if (hasTransform) {
-              tmpVec
-                .set(normArr[srcIdx], normArr[srcIdx + 1], normArr[srcIdx + 2])
-                .applyMatrix3(normalMatrix)
-                .normalize();
-              mergedNorm[dstIdx] = tmpVec.x;
-              mergedNorm[dstIdx + 1] = tmpVec.y;
-              mergedNorm[dstIdx + 2] = tmpVec.z;
-            } else {
-              mergedNorm[dstIdx] = normArr[srcIdx];
-              mergedNorm[dstIdx + 1] = normArr[srcIdx + 1];
-              mergedNorm[dstIdx + 2] = normArr[srcIdx + 2];
-            }
-          }
-        }
-      }
-
-      // 3. UV
-      if (mergedUv) {
-        const uvAttr = g.attributes.uv;
-        if (uvAttr) {
-          const uvArr = uvAttr.array as ArrayLike<number>;
-          for (let i = 0; i < vCount; i++) {
-            mergedUv[(vertexOffset + i) * 2] = uvArr[i * 2];
-            mergedUv[(vertexOffset + i) * 2 + 1] = uvArr[i * 2 + 1];
-          }
-        }
-      }
-
-      // 4. UV1
-      if (mergedUv1) {
-        const uv1Attr = g.attributes.uv1;
-        if (uv1Attr) {
-          const uvArr = uv1Attr.array as ArrayLike<number>;
-          for (let i = 0; i < vCount; i++) {
-            mergedUv1[(vertexOffset + i) * 2] = uvArr[i * 2];
-            mergedUv1[(vertexOffset + i) * 2 + 1] = uvArr[i * 2 + 1];
-          }
-        }
-      }
-
-      // 5. aColor
-      if (mergedColor) {
-        const colAttr = g.attributes.aColor;
-        if (colAttr) {
-          const colArr = colAttr.array as ArrayLike<number>;
-          for (let i = 0; i < vCount; i++) {
-            mergedColor[(vertexOffset + i) * 3] = colArr[i * 3];
-            mergedColor[(vertexOffset + i) * 3 + 1] = colArr[i * 3 + 1];
-            mergedColor[(vertexOffset + i) * 3 + 2] = colArr[i * 3 + 2];
-          }
-        } else {
-          for (let i = 0; i < vCount; i++) {
-            mergedColor[(vertexOffset + i) * 3] = 1;
-            mergedColor[(vertexOffset + i) * 3 + 1] = 1;
-            mergedColor[(vertexOffset + i) * 3 + 2] = 1;
-          }
-        }
-      }
-
-      // 6. aBatchId
-      if (mergedBatchId) {
-        const bAttr = g.attributes.aBatchId;
-        if (bAttr) {
-          const bArr = bAttr.array as ArrayLike<number>;
-          for (let i = 0; i < vCount; i++) {
-            mergedBatchId[vertexOffset + i] = bArr[i];
-          }
-        } else {
-          for (let i = 0; i < vCount; i++) {
-            mergedBatchId[vertexOffset + i] = -1;
-          }
-        }
-      }
-
-      // 7. 图集矩形（S3MBLOCK）
-      if (mergedRect0) {
-        copyAttr(mergedRect0, g.attributes.aAtlasRect, 4, vCount, vertexOffset, (_i, out) => out.push(0, 0, 0, 0));
-        copyAttr(mergedRect1!, g.attributes.aAtlasRect1, 4, vCount, vertexOffset, (_i, out) => out.push(0, 0, 0, 0));
-        copyAttr(mergedSecUv!, g.attributes.aSecUv, 2, vCount, vertexOffset);
-      }
-
-      // 8. Indices
-      if (g.index) {
-        const idxArr = g.index.array as ArrayLike<number>;
-        const iCount = g.index.count;
-        for (let k = 0; k < iCount; k++) {
-          mergedIndices[indexOffset + k] = idxArr[k] + vertexOffset;
-        }
-        indexOffset += iCount;
-      } else {
-        for (let k = 0; k < vCount; k++) {
-          mergedIndices[indexOffset + k] = k + vertexOffset;
-        }
-        indexOffset += vCount;
-      }
-
-      vertexOffset += vCount;
-    }
-
-    const mergedGeo = new THREE.BufferGeometry();
-    mergedGeo.setAttribute('position', new THREE.BufferAttribute(mergedPos, 3));
-    if (mergedNorm) mergedGeo.setAttribute('normal', new THREE.BufferAttribute(mergedNorm, 3));
-    if (mergedUv) mergedGeo.setAttribute('uv', new THREE.BufferAttribute(mergedUv, 2));
-    if (mergedUv1) mergedGeo.setAttribute('uv1', new THREE.BufferAttribute(mergedUv1, 2));
-    if (mergedColor) mergedGeo.setAttribute('aColor', new THREE.BufferAttribute(mergedColor, 3));
-    if (mergedBatchId) mergedGeo.setAttribute('aBatchId', new THREE.BufferAttribute(mergedBatchId, 1));
-    if (mergedRect0) {
-      mergedGeo.setAttribute('aAtlasRect', new THREE.BufferAttribute(mergedRect0, 4));
-      mergedGeo.setAttribute('aAtlasRect1', new THREE.BufferAttribute(mergedRect1!, 4));
-      mergedGeo.setAttribute('aSecUv', new THREE.BufferAttribute(mergedSecUv!, 2));
-    }
-    mergedGeo.setIndex(new THREE.BufferAttribute(mergedIndices, 1));
-    mergedGeo.computeBoundingBox();
-    mergedGeo.computeBoundingSphere();
-
-    const mesh = new THREE.Mesh(mergedGeo, material);
-    mesh.userData.skeletonName = candidates[0].name;
-    mesh.userData.geoRef = candidates[0].geo;
-    mesh.userData.tileRef = tileRef;
-    mesh.userData.primitiveType = 4;
-    mesh.userData.isBatched = true;
-    mesh.userData.batchedCount = candidates.length;
-    if (geoByBatchId.size > 0) {
-      mesh.userData.geoByBatchId = geoByBatchId;
-    }
-
-    return mesh;
+    if (prim.index) geometry.setIndex(new THREE.BufferAttribute(prim.index, 1));
+    else geometry.setDrawRange(0, prim.vertexCount);
+    geometry.boundingBox = new THREE.Box3(
+      new THREE.Vector3(...prim.bounds.boxMin),
+      new THREE.Vector3(...prim.bounds.boxMax)
+    );
+    geometry.boundingSphere = new THREE.Sphere(
+      new THREE.Vector3(...prim.bounds.sphereCenter),
+      prim.bounds.sphereRadius
+    );
+    return geometry;
   };
 
-  const placeObject = (
-    cached: CachedGeometry,
-    name: string,
-    geo: GeoPackageEntry,
-    matrix: THREE.Matrix4 | null
-  ): THREE.Object3D => {
-    const { geometry, pack } = cached;
-    const material = makeMaterial(pack.passNames?.[0], !!geometry.getAttribute('aAtlasRect'));
-    let object: THREE.Mesh | THREE.InstancedMesh;
-
-    const info = skeletonInfo.get(name);
-    const vp = geo.vertexPackage;
+  for (const prim of assembled.primitives) {
+    const geometry = packPrimitive(prim);
+    const geoRef = tile.geoPackage[prim.geoNames[0]] ?? null;
+    const vp = geoRef?.vertexPackage;
+    const material = makeMaterial(prim.passNames[0], !!prim.attributes.aAtlasRect);
+    const matrix =
+      prim.matrix && prim.matrix.length === 16 ? new THREE.Matrix4().fromArray(prim.matrix) : null;
 
     // 棱线包：线段，不是三角面。默认隐藏，等 setEdges(true) 再显示
-    if (isLinePrimitive(pack.primitiveType)) {
+    if (isLinePrimitive(prim.primitiveType)) {
       const lines = new THREE.LineSegments(geometry, edgeLineMaterial);
       lines.visible = options.edges === true;
       lines.renderOrder = 2;
       lines.raycast = () => {};
       lines.userData.isEdgeLines = true;
-      lines.userData.skeletonName = name;
+      lines.userData.skeletonName = prim.skeletonName;
       if (matrix && !matrix.equals(IDENTITY)) {
         matrix.decompose(lines.position, lines.quaternion, lines.scale);
       }
       group.add(lines);
       objects.push(lines);
       group.userData.hasNativeEdges = true;
-      stats.edgeLines++;
-      return lines;
+      continue;
     }
 
     // 点云包：顶点即点，按 THREE.Points 渲染。索引只是点序号，直接走 drawRange。
-    if (isPointPrimitive(pack.primitiveType)) {
+    if (isPointPrimitive(prim.primitiveType)) {
       // PointsMaterial 的顶点色读内置 'color' 槽位，与 aColor 共享同一份 buffer
       if (!geometry.getAttribute('color')) {
         geometry.setAttribute('color', geometry.getAttribute('aColor')!);
@@ -837,47 +398,50 @@ export async function buildTileObjects(
       const points = new THREE.Points(geometry, getPointCloudMaterial());
       // 点云不是 Mesh：viewer 的样式 / 拾取 / 卸载链路都靠这个标记放行
       points.userData.isPointCloud = true;
-      points.userData.skeletonName = name;
-      points.userData.geoRef = geo;
+      points.userData.skeletonName = prim.skeletonName;
+      points.userData.geoRef = geoRef;
       points.userData.tileRef = tile;
-      points.userData.primitiveType = pack.primitiveType;
+      points.userData.primitiveType = prim.primitiveType;
       if (matrix && !matrix.equals(IDENTITY)) {
         matrix.decompose(points.position, points.quaternion, points.scale);
       }
       group.add(points);
       objects.push(points);
       stats.meshes++;
-      return points;
+      continue;
     }
 
-    if (info?.instanced && vp.instanceBuffer && vp.instanceCount > 0) {
+    let object: THREE.Mesh | THREE.InstancedMesh;
+    const instanced =
+      !!vp &&
+      vp.instanceIndex !== -1 &&
+      (vp.instanceMode === 16 || vp.instanceMode === 17) &&
+      !!vp.instanceBuffer &&
+      (vp.instanceCount ?? 0) > 0;
+
+    if (instanced && vp!) {
       // 逐实例的两条属性：
       //   aInstanceBatchId —— 单体控制位，着色器靠它查状态纹理（改色 / 隐藏 / 抬高）
       //   aInstanceIndex   —— 实例序号，拾取时编码进颜色，CPU 侧再映射回 SMID
-      // 逐顶点属性 aBatchId 在这里没用（顶点数 ≠ 实例数），gpu 上按实例取值只能靠 instanced attribute。
       if (!geometry.getAttribute('aInstanceBatchId')) {
-        const ids = vp.instanceBatchIds;
+        const ids = vp!.instanceBatchIds;
         const batchIds =
-          ids && ids.length === vp.instanceCount ? ids.slice() : new Float32Array(vp.instanceCount).fill(-1);
+          ids && ids.length === vp!.instanceCount ? ids.slice() : new Float32Array(vp!.instanceCount).fill(-1);
         geometry.setAttribute('aInstanceBatchId', new THREE.InstancedBufferAttribute(batchIds, 1));
-        const index = new Float32Array(vp.instanceCount);
+        const index = new Float32Array(vp!.instanceCount);
         for (let i = 0; i < index.length; i++) index[i] = i;
         geometry.setAttribute('aInstanceIndex', new THREE.InstancedBufferAttribute(index, 1));
       }
 
-      const instanced = new THREE.InstancedMesh(geometry, material, vp.instanceCount);
-      instanced.instanceMatrix.setUsage(THREE.StaticDrawUsage);
+      const instancedMesh = new THREE.InstancedMesh(geometry, material, vp!.instanceCount);
+      instancedMesh.instanceMatrix.setUsage(THREE.StaticDrawUsage);
       const m4 = new THREE.Matrix4();
       const color = new THREE.Color();
-      const stride = vp.instanceMode;
-      const f32 = new Float32Array(vp.instanceBuffer.buffer, vp.instanceBuffer.byteOffset, vp.instanceCount * stride);
-      for (let i = 0; i < vp.instanceCount; i++) {
+      const stride = vp!.instanceMode;
+      const f32 = new Float32Array(vp!.instanceBuffer!.buffer, vp!.instanceBuffer!.byteOffset, vp!.instanceCount * stride);
+      for (let i = 0; i < vp!.instanceCount; i++) {
         const o = i * stride;
-        // S3M 实例矩阵按 3x4 仿射矩阵（行主序）连续存储 12 个 float：
-        //   Row 0: [r00, r01, r02, tx]
-        //   Row 1: [r10, r11, r12, ty]
-        //   Row 2: [r20, r21, r22, tz]
-        //   Row 3: [0, 0, 0, 1] 隐式补齐
+        // S3M 实例矩阵按 3x4 仿射矩阵（行主序）连续存储 12 个 float（Row3 隐式补齐），
         // 后续紧随 4 个 float 的 RGBA 颜色（stride >= 16）及可选 uint32 的 SMID（stride == 17）。
         // 若用 fromArray 直接按列主序填充 Matrix4，会将平移分量塞进底部的投影行 (w)，
         // 造成严重的透视奇点畸变（所有顶点拉扯成放射状尖锥）。
@@ -887,22 +451,21 @@ export async function buildTileObjects(
           f32[o + 8], f32[o + 9], f32[o + 10], f32[o + 11],
           0, 0, 0, 1
         );
-        instanced.setMatrixAt(i, m4);
+        instancedMesh.setMatrixAt(i, m4);
         if (stride >= 16) {
           const r = f32[o + 12];
           const g = f32[o + 13];
           const b = f32[o + 14];
           if (Number.isFinite(r) && Number.isFinite(g) && Number.isFinite(b)) {
             color.setRGB(r, g, b);
-            instanced.setColorAt(i, color);
+            instancedMesh.setColorAt(i, color);
           }
         }
       }
-      instanced.instanceMatrix.needsUpdate = true;
-      if (instanced.instanceColor) instanced.instanceColor.needsUpdate = true;
-      instanced.frustumCulled = false;
-      stats.instanced++;
-      object = instanced;
+      instancedMesh.instanceMatrix.needsUpdate = true;
+      if (instancedMesh.instanceColor) instancedMesh.instanceColor.needsUpdate = true;
+      instancedMesh.frustumCulled = false;
+      object = instancedMesh;
     } else {
       object = new THREE.Mesh(geometry, material);
     }
@@ -913,120 +476,31 @@ export async function buildTileObjects(
       matrix.decompose(object.position, object.quaternion, object.scale);
     }
 
-    object.userData.skeletonName = name;
-    object.userData.geoRef = geo;
+    object.userData.skeletonName = prim.skeletonName;
+    object.userData.geoRef = geoRef;
     object.userData.tileRef = tile;
-    object.userData.primitiveType = pack.primitiveType;
+    object.userData.primitiveType = prim.primitiveType;
+    if (prim.batchedFrom != null && prim.batchedFrom > 1) {
+      object.userData.isBatched = true;
+      object.userData.batchedCount = prim.batchedFrom;
+      // 合并产物按 batchId 反查 geoRef（拾取用）：原实现在合并时顺手建，这里从 geoNames 重建
+      const geoByBatchId = new Map<number, GeoPackageEntry>();
+      for (const gname of prim.geoNames) {
+        const g = tile.geoPackage[gname];
+        if (!g?.pickInfo) continue;
+        for (const entry of Object.values(g.pickInfo)) {
+          if (typeof entry.batchId === 'number' && entry.batchId >= 0) {
+            geoByBatchId.set(entry.batchId, g);
+          }
+        }
+      }
+      if (geoByBatchId.size > 0) object.userData.geoByBatchId = geoByBatchId;
+    }
     group.add(object);
     objects.push(object);
 
     stats.meshes++;
-    if (pack.primitiveType === 4) stats.triangles += (pack.indexCount || 0) / 3;
-    return object;
-  };
-
-  // 4) 按 Geode 摆放：一个骨架可能被多个 geode 以不同矩阵引用
-  let placed = 0;
-  for (const pageLod of tile.groupNode?.pageLods ?? []) {
-    for (const geode of pageLod.geodes ?? []) {
-      const m = geode.matrix;
-      // S3M 的 matrix4d 是列主序（OpenGL 约定），平移在第 12/13/14 位，
-      // 与 three 的 Matrix4.elements 布局一致 —— 必须用 fromArray 直接搬。
-      // 用 set() 按行主序喂进去等于转置，平移会被塞进投影行，模型直接飞上天。
-      const matrix = m && m.length === 16 ? new THREE.Matrix4().fromArray(m) : null;
-
-      for (const name of geode.skeletonNames ?? []) {
-        const info = skeletonInfo.get(name);
-        if (!info) continue;
-        const geo = tile.geoPackage[name];
-        if (!geo) continue;
-        const vp = geo.vertexPackage;
-        for (let pi = 0; pi < info.indexPackages.length; pi++) {
-          const cached = geoCache.get(`${name}|${pi}`);
-          if (!cached) continue;
-
-          // 棱线包或实例化网格：保持单独摆放
-          if (
-            isLinePrimitive(cached.pack.primitiveType) ||
-            (info.instanced && vp.instanceBuffer && vp.instanceCount > 0)
-          ) {
-            placeObject(cached, name, geo, matrix);
-            placed++;
-            continue;
-          }
-
-          // 普通三角面网格：若开启合批，按材质进行分组收集
-          if (options.batching !== false && cached.pack.primitiveType === 4) {
-            const matKey = cached.pack.passNames?.[0] ?? '__default__';
-            let list = batchGroups.get(matKey);
-            if (!list) {
-              list = [];
-              batchGroups.set(matKey, list);
-            }
-            list.push({ cached, name, geo, matrix });
-            placed++;
-            continue;
-          }
-
-          placeObject(cached, name, geo, matrix);
-          placed++;
-        }
-      }
-    }
-  }
-
-  // 兜底：没有被任何 geode 引用的骨架，按单位矩阵渲染，避免整块消失
-  if (placed === 0) {
-    for (const [name, info] of skeletonInfo) {
-      const geo = tile.geoPackage[name];
-      if (!geo) continue;
-      const vp = geo.vertexPackage;
-      for (let pi = 0; pi < info.indexPackages.length; pi++) {
-        const cached = geoCache.get(`${name}|${pi}`);
-        if (!cached) continue;
-
-        if (
-          isLinePrimitive(cached.pack.primitiveType) ||
-          (info.instanced && vp.instanceBuffer && vp.instanceCount > 0)
-        ) {
-          placeObject(cached, name, geo, null);
-          continue;
-        }
-
-        if (options.batching !== false && cached.pack.primitiveType === 4) {
-          const matKey = cached.pack.passNames?.[0] ?? '__default__';
-          let list = batchGroups.get(matKey);
-          if (!list) {
-            list = [];
-            batchGroups.set(matKey, list);
-          }
-          list.push({ cached, name, geo, matrix: null });
-          continue;
-        }
-
-        placeObject(cached, name, geo, null);
-      }
-    }
-  }
-
-  // 执行同材质几何合批
-  if (batchGroups.size > 0) {
-    for (const [matKey, list] of batchGroups) {
-      stats.originalMeshes = (stats.originalMeshes ?? 0) + list.length;
-      if (list.length === 1) {
-        placeObject(list[0].cached, list[0].name, list[0].geo, list[0].matrix);
-      } else {
-        const hasAtlasRect = !!list[0].cached.geometry.getAttribute('aAtlasRect');
-        const material = makeMaterial(matKey === '__default__' ? undefined : matKey, hasAtlasRect);
-        const batchedMesh = mergeBatchGeometries(list, material, tile);
-        group.add(batchedMesh);
-        objects.push(batchedMesh);
-        stats.meshes++;
-        for (const item of list) {
-          stats.triangles += (item.cached.pack.indexCount || 0) / 3;
-        }
-      }
-    }
+    if (prim.primitiveType === 4) stats.triangles += prim.indexCount / 3;
   }
 
   if (!group.children.length) stats.skipped.push('tile 无可用几何');

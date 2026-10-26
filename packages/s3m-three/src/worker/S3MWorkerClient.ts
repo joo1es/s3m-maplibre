@@ -10,6 +10,7 @@
  */
 import type { ParsedTile, S3MTexture } from '../core/types.js';
 import type { DecodedTextureData } from '../core/TextureDecode.js';
+import type { TileGeometryData } from '../core/TileGeometry.js';
 
 /** Worker 崩溃 / 不可用 —— 与「瓦片数据本身有问题」区分开，调用方据此决定降级还是重试 */
 export class WorkerDeadError extends Error {
@@ -23,6 +24,7 @@ interface ParseOkResponse {
   id: number;
   ok: true;
   tile: ParsedTile;
+  geometry?: TileGeometryData;
 }
 
 interface TexOkResponse {
@@ -73,7 +75,7 @@ export class S3MWorkerClient {
         (err as { permanent?: boolean }).permanent = msg.permanent;
         waiter.reject(err);
       } else if ('tile' in msg) {
-        waiter.resolve(msg.tile);
+        waiter.resolve({ tile: msg.tile, geometry: msg.geometry });
       } else {
         waiter.resolve(msg.data);
       }
@@ -82,23 +84,26 @@ export class S3MWorkerClient {
     worker.onmessageerror = () => this._die('s3m 解析 Worker 消息无法反序列化');
   }
 
-  /** 解析一块瓦片。buffer 会被 structured clone（不 transfer），主线程保留原 buffer 以便崩溃后降级重解 */
-  parseTile(buffer: ArrayBuffer): Promise<ParsedTile> {
+  /**
+   * 解析一块瓦片。buffer 会被 structured clone（不 transfer），主线程保留原 buffer 以便崩溃后降级重解。
+   * assemble = true 时顺带在 Worker 里做纯数据几何组装，返回 { tile, geometry } 一次带回。
+   */
+  parseTile(buffer: ArrayBuffer, assemble = false, batching = true): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
     if (this.dead) return Promise.reject(new WorkerDeadError('s3m 解析 Worker 已终止'));
     const id = ++this._seq;
-    return new Promise<ParsedTile>((resolve, reject) => {
+    return new Promise<{ tile: ParsedTile; geometry?: TileGeometryData }>((resolve, reject) => {
       this._pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      this._worker.postMessage({ type: 'parse', id, buffer });
+      this._worker.postMessage({ type: 'parse', id, buffer, assemble, batching });
     });
   }
 
   /** 解码一张纹理（DXT / CRN / WEBP / RGB 系）。tex.data 走 structured clone，主线程保留原数据 */
-  decodeTexture(tex: S3MTexture): Promise<DecodedTextureData> {
+  decodeTexture(tex: S3MTexture, compressed = false): Promise<DecodedTextureData> {
     if (this.dead) return Promise.reject(new WorkerDeadError('s3m 解析 Worker 已终止'));
     const id = ++this._seq;
     return new Promise<DecodedTextureData>((resolve, reject) => {
       this._pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      this._worker.postMessage({ type: 'tex', id, tex });
+      this._worker.postMessage({ type: 'tex', id, tex, compressed });
     });
   }
 
@@ -138,12 +143,16 @@ export function getSharedS3MWorker(): S3MWorkerClient | null {
  * 纹理解码的「Worker 优先」入口，供 TextureFactory.setTextureOffThreadDecode 装配。
  * 永不 reject：Worker 不可用 / 崩溃 / 单张解码失败都返回 null，调用方主线程兜底
  * （解码失败本身在 decodeTextureData 里也不抛错，走 crn(failed) 之类的标记）。
+ * compressed 由 TextureFactory 按宿主 GL 能力传入，Worker 端据此跳过 DXT 解码。
  */
-export async function decodeTextureWithWorker(tex: S3MTexture): Promise<DecodedTextureData | null> {
+export async function decodeTextureWithWorker(
+  tex: S3MTexture,
+  compressed: boolean
+): Promise<DecodedTextureData | null> {
   const client = getSharedS3MWorker();
   if (!client) return null;
   try {
-    return await client.decodeTexture(tex);
+    return await client.decodeTexture(tex, compressed);
   } catch {
     return null;
   }

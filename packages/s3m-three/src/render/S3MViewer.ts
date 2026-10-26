@@ -23,7 +23,7 @@
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
-import { setMaxAnisotropy, setTextureOffThreadDecode } from './TextureFactory.js';
+import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode } from './TextureFactory.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
@@ -438,8 +438,7 @@ export class S3MViewer {
    * MapLibre 宿主由 S3MLayer 在 onAdd 里调用；纯 three 宿主直接传自己的 canvas / gl。
    */
   /** 创建并配置一个绑定到给定 gl 上下文的 three renderer（mount 与上下文恢复共用） */
-  private _createRenderer(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): THREE.WebGLRenderer {
-    const r = new THREE.WebGLRenderer({
+  private _createRenderer(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): THREE.WebGLRenderer {    const r = new THREE.WebGLRenderer({
       canvas,
       context: gl as WebGLRenderingContext,
       antialias: true,
@@ -452,11 +451,19 @@ export class S3MViewer {
     return r;
   }
 
+  /** 按 GL 能力开/关 DXT 压缩直传：两个 s3tc 扩展都要在（srgb 缺了贴图会发白失配） */
+  private _syncTextureCapabilities(gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+    const s3tc = !!gl.getExtension('WEBGL_compressed_texture_s3tc');
+    const s3tcSrgb = !!gl.getExtension('WEBGL_compressed_texture_s3tc_srgb');
+    setCompressedTexturesSupported(s3tc && s3tcSrgb);
+  }
+
   mount(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
     this.canvas = canvas;
 
     this.renderer = this._createRenderer(canvas, gl);
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
+    this._syncTextureCapabilities(gl);
 
     this.scene = new THREE.Scene();
     this.scene.add(this.groundManager.group);
@@ -498,6 +505,7 @@ export class S3MViewer {
     }
     this.renderer = this._createRenderer(this.canvas, gl);
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
+    this._syncTextureCapabilities(gl);
     this.picker?.dispose();
     this.picker = new Picker(this.renderer);
     // 共享 uniform / 材质引用不变，three 重新编译着色器时会自然接管；

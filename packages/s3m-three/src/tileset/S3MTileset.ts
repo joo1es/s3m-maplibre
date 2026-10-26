@@ -27,6 +27,7 @@ import type {
   TexblockRequestPlan,
 } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
+import type { TileGeometryData } from '../core/TileGeometry.js';
 import type { Group, Texture } from 'three';
 
 function dirOf(url: string): string {
@@ -226,7 +227,12 @@ export interface TileNode {
 /** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
 export type BuildTileFn = (
   tile: ParsedTile,
-  options: { textureCache: Map<string, Texture>; uniforms: StyleUniforms | null }
+  options: {
+    textureCache: Map<string, Texture>;
+    uniforms: StyleUniforms | null;
+    /** Worker 侧已完成的纯数据几何组装（经典 .s3mb 路径），构建器直接包装成 three 对象 */
+    assembled?: TileGeometryData;
+  }
 ) => Promise<{ group: Group; stats: Partial<Stats> }>;
 
 export interface S3MTilesetOptions {
@@ -691,17 +697,18 @@ export class S3MTileset {
   }
 
   /**
-   * 经典 `.s3mb` 瓦片解析：优先走 Worker（把 inflate / Draco / MeshOpt 的 CPU 密集
-   * 解码搬离主线程），Worker 不可用或已崩溃时主线程兜底，两条路径输出完全一致。
+   * 经典 `.s3mb` 瓦片解析：优先走 Worker（inflate / Draco / MeshOpt / 几何组装
+   * 全在 Worker 做，一次往返带回 tile + 纯数据几何），Worker 不可用或已崩溃时
+   * 主线程兜底，两条路径输出完全一致。
    */
-  private async _parseClassicTile(buffer: ArrayBuffer): Promise<ParsedTile> {
+  private async _parseClassicTile(buffer: ArrayBuffer): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
     if (this._useWorker && this._workerClient === undefined) {
       // 与纹理解码共用进程级单例，避免每个数据集各起一个 Worker
       this._workerClient = getSharedS3MWorker();
     }
     if (this._workerClient) {
       try {
-        return await this._workerClient.parseTile(buffer);
+        return await this._workerClient.parseTile(buffer, true);
       } catch (e) {
         if (e instanceof WorkerDeadError) {
           // 脚本加载失败 / 崩溃属于环境问题，永久退回主线程；瓦片本身的问题照常抛
@@ -711,7 +718,7 @@ export class S3MTileset {
         }
       }
     }
-    return parseS3MB(buffer);
+    return { tile: await parseS3MB(buffer) };
   }
 
   /**
@@ -985,6 +992,7 @@ export class S3MTileset {
       const isBlock = /\.s3mblock($|\?)/i.test(baseUrl);
 
       let tile: ParsedTile;
+      let assembled: TileGeometryData | undefined;
       let groupNames: string[] = [];
       const cachedSet = this._groupCache.get(baseUrl);
       if (cachedSet) {
@@ -1007,7 +1015,9 @@ export class S3MTileset {
           groupNames = set.names;
           tile = set.tiles[groupIndex] ?? set.tiles[0]!;
         } else {
-          tile = await this._parseClassicTile(buffer);
+          const parsed = await this._parseClassicTile(buffer);
+          tile = parsed.tile;
+          assembled = parsed.geometry;
         }
       }
       if (isBlock) {
@@ -1017,7 +1027,11 @@ export class S3MTileset {
       }
 
       const build = await this._builder();
-      const buildRes = await build(tile, { textureCache: this.textureCache, uniforms: this._uniforms });
+      const buildRes = await build(tile, {
+        textureCache: this.textureCache,
+        uniforms: this._uniforms,
+        assembled,
+      });
       const { group, stats } = buildRes;
       const texKeys = (buildRes as any).textureKeys ?? (group.userData?.textureKeys as string[] | undefined) ?? Object.keys(tile.textures ?? {});
       this.registerTileTextures(url, texKeys);

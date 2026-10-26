@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs';
 import { inflateSync } from 'node:zlib';
 import { parseS3MB } from '../../packages/s3m-three/src/core/S3MBParser';
 import { decodeTextureData } from '../../packages/s3m-three/src/core/TextureDecode';
+import { assembleTileGeometry } from '../../packages/s3m-three/src/core/TileGeometry';
 import type { S3MTexture } from '../../packages/s3m-three/src/core/types';
 import { collectTransferables } from '../../packages/s3m-three/src/worker/transferables';
 import { S3MWorkerClient, WorkerDeadError } from '../../packages/s3m-three/src/worker/S3MWorkerClient';
@@ -83,7 +84,7 @@ describe('S3MWorkerClient 端到端（Bun Worker 直跑 TS）', () => {
       const file = new URL('../fixtures/draco/pointcloud.s3mb', import.meta.url);
       const bytes = readFileSync(file);
       const main = await parseS3MB(toArrayBuffer(bytes), { inflate: inflateSync });
-      const viaWorker = await client.parseTile(toArrayBuffer(bytes));
+      const { tile: viaWorker } = await client.parseTile(toArrayBuffer(bytes));
       // 关键字段逐项对比：解析在哪个线程跑，产物必须一模一样
       expect(viaWorker.version).toBe(main.version);
       expect(viaWorker.bytesRead).toBe(main.bytesRead);
@@ -139,6 +140,37 @@ describe('S3MWorkerClient 端到端（Bun Worker 直跑 TS）', () => {
     }
   });
 
+  test('Worker 解析+组装一次往返：geometry 与主线程 assembleTileGeometry 一致', async () => {
+    const client = S3MWorkerClient.create();
+    if (!client) return;
+    try {
+      const file = new URL('../fixtures/gaussian-splatting/Tile_0019_262145_524289_0000.s3mb', import.meta.url);
+      const bytes = readFileSync(file);
+      const { tile, geometry } = await client.parseTile(toArrayBuffer(bytes), true);
+      expect(tile).toBeTruthy();
+      expect(geometry).toBeTruthy();
+      const local = assembleTileGeometry(tile!);
+      expect(geometry!.primitives.length).toBe(local.primitives.length);
+      expect(geometry!.stats.vertices).toBe(local.stats.vertices);
+      expect(geometry!.stats.edgeLines).toBe(local.stats.edgeLines);
+      expect(geometry!.stats.instanced).toBe(local.stats.instanced);
+      for (let i = 0; i < local.primitives.length; i++) {
+        const a = geometry!.primitives[i]!;
+        const b = local.primitives[i]!;
+        expect(a.primitiveType).toBe(b.primitiveType);
+        expect(a.vertexCount).toBe(b.vertexCount);
+        expect(a.indexCount).toBe(b.indexCount);
+        expect(a.matrix).toEqual(b.matrix);
+        // 顶点位置逐字节一致（position 是核心产物）
+        expect(new Float32Array(a.attributes.position.array as Float32Array)).toEqual(
+          new Float32Array(b.attributes.position.array as Float32Array)
+        );
+      }
+    } finally {
+      client.dispose();
+    }
+  });
+
   test('decodeTextureData 的 raw 路径：BGR 重排 / alpha 补齐 / flipY', async () => {
     // 2x2 BGR（24 位）小纹理，手工构造
     const px = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18];
@@ -158,6 +190,58 @@ describe('S3MWorkerClient 端到端（Bun Worker 直跑 TS）', () => {
     // 第一像素 BGR(1,2,3) → RGBA(3,2,1,255)
     expect([...out.rgba!.subarray(0, 4)]).toEqual([3, 2, 1, 255]);
     expect(out.hasAlpha).toBe(false);
+  });
+
+  test('压缩直传的块长校验：4×4 对齐块过、尺寸非对齐/块长不符回退解码', async () => {
+    const mk = (width: number, height: number, byteLength: number): S3MTexture =>
+      ({
+        code: 't',
+        level: 0,
+        width,
+        height,
+        compressType: 21, // DXT5 裸块（v3.00 实测组合）
+        pixelFormat: 21,
+        data: new Uint8Array(byteLength),
+        flipY: false,
+      }) as S3MTexture;
+
+    // 4x4 DXT5 = 1 块 × 16B：块长匹配 → 直传
+    const ok = await decodeTextureData(mk(4, 4, 16), { compressed: true });
+    expect(ok.kind).toBe('dxt5(c)');
+    expect(ok.blocks!.byteLength).toBe(16);
+
+    // 6x6：4×4 对齐后期望 2×2×16 = 64B；给 36B（非对齐存储）→ 必须回退解码，
+    // 否则就是 GL_INVALID_VALUE: glCompressedTexSubImage2D <imageSize> mismatch
+    const bad = await decodeTextureData(mk(6, 6, 36), { compressed: true });
+    expect(bad.blocks).toBeUndefined();
+    expect(bad.kind).toBe('dxt5');
+    expect(bad.rgba).not.toBeNull();
+  });
+
+  test('压缩直传模式：dxt1/dxt5 跳过解码原样返回块，flipY 回退解码', async () => {
+    const file = new URL(
+      '../fixtures/gaussian-splatting/Tile_0019_262145_524289_0000.s3mb',
+      import.meta.url
+    );
+    const tile = await parseS3MB(toArrayBuffer(readFileSync(file)), { inflate: inflateSync });
+    const dxt = Object.values(tile.textures ?? {}).find(
+      (t) => t.data && t.width > 0 && !t.flipY && [17, 21, 26, 27, 50000].includes(t.compressType)
+    );
+    if (!dxt) return; // 样例没有 DXT 纹理就跳过
+
+    const compressed = await decodeTextureData(dxt, { compressed: true });
+    expect(compressed.blocks).toBeTruthy(); // 块数据原样透传
+    expect(compressed.rgba).toBeNull();
+    expect(compressed.kind.endsWith('(c)')).toBe(true);
+    expect(['dxt1', 'dxt5']).toContain(compressed.blockFormat);
+    if (compressed.blockFormat === 'dxt1') {
+      expect(compressed.blocks!.length).toBe(compressed.width * compressed.height * 0.5);
+    }
+
+    // flipY（S3MBLOCK 图集）开不了压缩：回退 RGBA 解码路径
+    const flipped = await decodeTextureData({ ...dxt, flipY: true }, { compressed: true });
+    expect(flipped.blocks).toBeUndefined();
+    expect(flipped.rgba).not.toBeNull();
   });
 });
 

@@ -16,15 +16,24 @@
  */
 import { parseS3MB } from '../core/S3MBParser.js';
 import { decodeTextureData } from '../core/TextureDecode.js';
+import { assembleTileGeometry } from '../core/TileGeometry.js';
 import type { ParsedTile, S3MTexture } from '../core/types.js';
+import type { TileGeometryData } from '../core/TileGeometry.js';
 import { collectTransferables } from './transferables.js';
 
-type ParseRequest = { type: 'parse'; id: number; buffer: ArrayBuffer };
-type TexRequest = { type: 'tex'; id: number; tex: S3MTexture };
+type ParseRequest = {
+  type: 'parse';
+  id: number;
+  buffer: ArrayBuffer;
+  /** 解析后顺带做纯数据几何组装（解交错 / 法线 / 合批），一次往返带回 */
+  assemble?: boolean;
+  batching?: boolean;
+};
+type TexRequest = { type: 'tex'; id: number; tex: S3MTexture; compressed?: boolean };
 type Request = ParseRequest | TexRequest;
 
 type ParseResponse =
-  | { id: number; ok: true; tile: ParsedTile }
+  | { id: number; ok: true; tile: ParsedTile; geometry?: TileGeometryData }
   | { id: number; ok: false; message: string; permanent: boolean };
 
 type TexResponse = { id: number; ok: true; data: Awaited<ReturnType<typeof decodeTextureData>> };
@@ -44,10 +53,19 @@ ctx.onmessage = async (e: MessageEvent<Request>) => {
   try {
     if (msg.type === 'parse') {
       const tile = await parseS3MB(msg.buffer);
-      // 响应整体过线（零拷贝）；请求 buffer 是主线程 structured clone 过来的副本，无需回传
-      ctx.postMessage({ id, ok: true, tile } satisfies ParseResponse, collectTransferables(tile));
+      if (msg.assemble) {
+        // 解析 + 组装一起做，避免 tile 回主线程后再整块克隆回来一次
+        const geometry = assembleTileGeometry(tile, { batching: msg.batching });
+        ctx.postMessage(
+          { id, ok: true, tile, geometry } satisfies ParseResponse,
+          [...collectTransferables(tile), ...collectTransferables(geometry)]
+        );
+      } else {
+        // 响应整体过线（零拷贝）；请求 buffer 是主线程 structured clone 过来的副本，无需回传
+        ctx.postMessage({ id, ok: true, tile } satisfies ParseResponse, collectTransferables(tile));
+      }
     } else {
-      const data = await decodeTextureData(msg.tex);
+      const data = await decodeTextureData(msg.tex, { compressed: msg.compressed });
       ctx.postMessage({ id, ok: true, data } satisfies TexResponse, texTransferList(data));
     }
   } catch (err) {

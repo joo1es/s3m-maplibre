@@ -165,6 +165,8 @@ new S3MViewer(options?: S3MViewerOptions)
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
 | `useWorker` | `boolean` | `true` | 用 Web Worker 解析经典 `.s3mb` 瓦片（inflate / Draco / MeshOpt 全在 Worker 跑，主线程只做 fetch 与几何组装）；Worker 不可用或崩溃时自动永久降级主线程。S3MBLOCK 路径仍主线程解析 |
 | （随 `useWorker`）纹理解码 | `boolean` | `true` | DXT / CRN / WEBP 纹理解码与 `.s3mb` 解析共用同一个 Worker（`core/TextureDecode.ts` 三方共用同一份实现，WEBP 走可 transfer 的 ImageBitmap）；失败自动回主线程，产物逐字节一致 |
+| （随 `useWorker`）几何组装 | `boolean` | `true` | 顶点解交错 / 法线计算 / 同材质合批合并（`core/TileGeometry.ts`）随解析在 Worker 完成，主线程只做 three 对象包装；Worker 不可用时主线程跑同一份实现，产物一致 |
+| （随 `useWorker`）DXT 压缩直传 | 自动 | 自动 | 宿主 GL 同时支持 `WEBGL_compressed_texture_s3tc`(+srgb) 时，dxt1/dxt5（含 CRN 转码产物）不解码直接 `CompressedTexture` 上传，显存与上传带宽降为 1/4~1/8；块长与 4×4 对齐公式不符、flipY 图集、移动端无扩展时自动回退 RGBA 解码 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，配了才能 `colorByField()`，见[按业务字段着色](#按业务字段着色) |

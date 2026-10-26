@@ -26,8 +26,23 @@ export interface DecodedTextureData {
   /** WEBP 路径的解码结果（ImageBitmap 可 transfer，主线程直接 new THREE.Texture 包） */
   bitmap: ImageBitmap | null;
   hasAlpha: boolean;
+  /**
+   * 压缩直传模式（decodeTextureData 的 compressed 选项）：不解码，原样返回 DXT 块，
+   * 主线程用 CompressedTexture 硬件解压上传。与 rgba 互斥。
+   */
+  blocks?: Uint8Array;
+  blockFormat?: 'dxt1' | 'dxt5';
   /** CRN 转码失败时的原始错误（渲染层负责打 warn） */
   error?: string;
+}
+
+export interface DecodeOptions {
+  /**
+   * 压缩直传：dxt1/dxt5（含 CRN 转码产物）不解码，原样返回 DXT 块。
+   * 仅在宿主支持 WEBGL_compressed_texture_s3tc(+srgb) 时开启；
+   * flipY 纹理走不了压缩上传（WebGL 对压缩纹理忽略 UNPACK_FLIP_Y），自动回退解码。
+   */
+  compressed?: boolean;
 }
 
 /** 行序翻转（原地）。S3MBLOCK 图集按 GL 方向存储（v=0 在最后一行），解码后要翻一次行 */
@@ -92,8 +107,23 @@ function rawRGBA(tex: S3MTexture): { rgba: Uint8Array; hasAlpha: boolean } {
   return { rgba: out, hasAlpha: hasAlphaChannel(pixelFormat) };
 }
 
+/**
+ * DXT 块数据的期望字节数：4×4 对齐块 × 每块字节（DXT1=8，DXT5=16）。
+ * S3M 纹理宽高不总是 4 的倍数，驱动按声明尺寸算期望大小——对不上就是
+ * GL_INVALID_VALUE: glCompressedTexSubImage2D: The <imageSize> does not match。
+ * 压缩直传前必须用这个函数把关，不匹配就回退 RGBA 解码。
+ */
+export function expectedDxtByteLength(width: number, height: number, format: 'dxt1' | 'dxt5'): number {
+  const bw = (width + 3) >> 2;
+  const bh = (height + 3) >> 2;
+  return bw * bh * (format === 'dxt1' ? 8 : 16);
+}
+
 /** 主线程 / Worker 共用的解码入口。不抛错：失败与不支持都体现在返回值里 */
-export async function decodeTextureData(tex: S3MTexture): Promise<DecodedTextureData> {
+export async function decodeTextureData(
+  tex: S3MTexture,
+  options: DecodeOptions = {}
+): Promise<DecodedTextureData> {
   const empty: DecodedTextureData = {
     kind: 'unsupported(0/0)',
     width: 0,
@@ -106,13 +136,35 @@ export async function decodeTextureData(tex: S3MTexture): Promise<DecodedTexture
 
   const kind = resolveTextureKind(tex.compressType ?? 0, tex.pixelFormat);
 
+  // 压缩直传的公共前提：不是 GL 翻行图集（压缩上传无法 flipY）
+  const canCompress = options.compressed === true && !tex.flipY;
+
+  /** 块数据字节数与 4×4 对齐公式一致才允许直传，否则回退解码 */
+  const compressible = (data: Uint8Array, w: number, h: number, format: 'dxt1' | 'dxt5'): boolean =>
+    data.byteLength === expectedDxtByteLength(w, h, format);
+
   if (kind === 'crn') {
     try {
       const crn = await transcodeCRN(tex.data);
+      const pf = crn.dxtFormat === 1 ? PixelFormat.DXT1 : PixelFormat.DXT5;
+      const fmt = crn.dxtFormat === 1 ? 'dxt1' : 'dxt5';
+      if (canCompress && compressible(crn.data, crn.width, crn.height, fmt)) {
+        // CRN→DXT 的转码免不了（wasm），但后续的 DXT→RGBA 解块省掉，块数据直传 GPU
+        return {
+          kind: `crn->dxt${crn.dxtFormat}(c)`,
+          width: crn.width,
+          height: crn.height,
+          rgba: null,
+          bitmap: null,
+          hasAlpha: pf === PixelFormat.DXT5,
+          blocks: crn.data,
+          blockFormat: fmt,
+        };
+      }
       const decoded = decodeDXT({
         width: crn.width,
         height: crn.height,
-        pixelFormat: crn.dxtFormat === 1 ? PixelFormat.DXT1 : PixelFormat.DXT5,
+        pixelFormat: pf,
         data: crn.data,
       });
       return {
@@ -138,7 +190,21 @@ export async function decodeTextureData(tex: S3MTexture): Promise<DecodedTexture
   }
 
   if (kind === 'dxt1' || kind === 'dxt3' || kind === 'dxt4' || kind === 'dxt5') {
-    const decoded = decodeDXT({ ...tex, pixelFormat: dxtPixelFormatOf(kind) });
+    const pf = dxtPixelFormatOf(kind);
+    // dxt3/dxt4 少见，不进直传白名单；块长与 4×4 对齐公式不符的也回退解码
+    if (canCompress && (kind === 'dxt1' || kind === 'dxt5') && compressible(tex.data, tex.width, tex.height, kind)) {
+      return {
+        kind: `${kind}(c)`,
+        width: tex.width,
+        height: tex.height,
+        rgba: null,
+        bitmap: null,
+        hasAlpha: kind === 'dxt5',
+        blocks: tex.data,
+        blockFormat: kind,
+      };
+    }
+    const decoded = decodeDXT({ ...tex, pixelFormat: pf });
     return { kind, width: tex.width, height: tex.height, rgba: decoded.rgba, bitmap: null, hasAlpha: decoded.hasAlpha };
   }
 
