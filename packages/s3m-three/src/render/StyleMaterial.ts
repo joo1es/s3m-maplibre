@@ -620,13 +620,19 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${FRAG_EMISSIVE}`);
 
     if (atlas) {
-      // map_fragment 里是 `vec4 sampledDiffuseColor = texture2D( map, vMapUv );`
+      // onBeforeCompile 收到的还是未展开的 `#include <map_fragment>`，不是 include 里的
+      // `texture2D( map, vMapUv )`。只替换后者会静默 no-op，最终仍按整张图集普通采样。
+      const atlasMapFragment = /* glsl */ `
+        #ifdef USE_MAP
+          vec4 sampledDiffuseColor = s3mAtlasUnit( vMapUv, vAtlasRect, uAtlasDim, map );
+          diffuseColor *= sampledDiffuseColor;
+        #endif
+      `;
       shader.fragmentShader = shader.fragmentShader.replace(
-        'texture2D( map, vMapUv )',
-        's3mAtlasUnit( vMapUv, vAtlasRect, uAtlasDim, map )'
+        '#include <map_fragment>',
+        `${atlasMapFragment}${secMap ? `\n${FRAG_BAKE}` : ''}`
       );
-    }
-    if (secMap) {
+    } else if (secMap) {
       shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', `#include <map_fragment>\n${FRAG_BAKE}`);
     }
   };

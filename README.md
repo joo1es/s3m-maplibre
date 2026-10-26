@@ -38,6 +38,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 能力 | 状态 | 说明 |
 |---|---|---|
 | S3MB 解析 | ✅ | v2.0 / v3.0 / v3.01，官方样例与线上服务字节级对齐；v1.x（OSGB 缓存）见下方「格式支持边界」 |
+| S3MBLOCK 纹理分包 | ✅ 完整 | 支持单文件 `.s3mblock` 瓦片容器、内嵌图集拼图合批、细级 LOD 外部 `.texblock` 及 pack 批量合并请求（`extratiles`）、多精灵组合画布动态装配与 UV 自动重映射 |
 | MeshOpt 几何压缩 | ✅ | v3 默认压缩方式，浏览器内 wasm 解码，按需加载 |
 | LOD 渐进加载 | ✅ | 支持 `Distance_From_EyePoint` / `Pixel_Size_OnScreen`；线上高斯泼溅与点云用的 `rangeMode = 2`（规范枚举里没有这一档）按屏幕尺寸近似处理，可用 `lodRangeScale` 收放 |
 | 多数据集叠加 | ✅ | 各数据集独立锚点，自动对齐到统一场景原点 |
@@ -101,7 +102,7 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5/dist/maplibre-gl.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.0/dist/browser/s3m-maplibre.iife.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.1/dist/browser/s3m-maplibre.iife.js"></script>
 <script>
   const layer = new S3MMapLibre.S3MLayer({ configUrl: './data/CBD/cbd.scp' });
   map.addLayer(layer);
@@ -120,7 +121,7 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 <script type="module">
   import * as THREE from 'https://esm.sh/three@0.169.0';
   window.THREE = THREE;
-  await import('https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.0/dist/browser/s3m-maplibre.iife.ext-three.js');
+  await import('https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.1/dist/browser/s3m-maplibre.iife.ext-three.js');
 </script>
 ```
 
@@ -135,8 +136,8 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 {
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
-    "s3m-three": "https://cdn.jsdelivr.net/npm/s3m-three@0.3.0/dist/index.js",
-    "s3m-maplibre": "https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.0/dist/index.js"
+    "s3m-three": "https://cdn.jsdelivr.net/npm/s3m-three@0.3.1/dist/index.js",
+    "s3m-maplibre": "https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.1/dist/index.js"
   }
 }
 </script>
@@ -148,7 +149,7 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 
 这条路上 `three` 只有一份（就是你 importmap 里那个），也不需要 `window.THREE`。代价是 dist 是逐文件 ESM（90+ 个文件），首屏请求数比单文件多；在意请求数就用上面的 IIFE。
 
-esm.sh 也能直接吃：`import { S3MLayer } from 'https://esm.sh/s3m-maplibre@0.4.0'`。注意它会为 `three` 生成自己的 URL，你如果同时引 `https://esm.sh/three@0.169.0`，两边不一定是同一个构建——用 `?deps=three@0.169.0` 对齐，或 `?external=three` 配 importmap。
+esm.sh 也能直接吃：`import { S3MLayer } from 'https://esm.sh/s3m-maplibre@0.4.1'`。注意它会为 `three` 生成自己的 URL，你如果同时引 `https://esm.sh/three@0.169.0`，两边不一定是同一个构建——用 `?deps=three@0.169.0` 对齐，或 `?external=three` 配 importmap。
 
 ---
 
@@ -389,7 +390,7 @@ bun run probe:crn -- --crn https://host/iserver/services/svc/rest/realspace/data
 
 | 形态 | config | 瓦片 | 本库支持 |
 |:---|:---|:---|:---|
-| S3M 瓦片缓存（主流） | JSON（`rootTiles` / `position.point3D` / `geoBounds`） | `.s3mb` v2 / v3 / v3.01，或 `.s3mblock` | ✅ 完整 |
+| S3M 瓦片缓存（主流） | JSON（`rootTiles` / `position.point3D` / `geoBounds`） | `.s3mb` v2 / v3 / v3.01，或 `.s3mblock` | ✅ 完整（含 `.s3mblock` 纹理分包与 `.texblock` 细级外部图集完整支持） |
 | SuperMapCache / S3M 1.x | **XML**（`<SuperMapCache>`，`sml:FileType = OSGBFile`） | `.s3m` —— 整棵 LOD 树都是这种容器（子瓦走 `datas/<数据源>/data/path/…/<名>.s3m`） | ✅ 几何 / 纹理 / 细化全通，走 `core/S3M1Parser.ts` |
 | 高斯泼溅 | JSON，`dataType = "3DGaussianSplatting"` | `.s3mb` v3.01 + MeshOpt，**没有索引包**（顶点即点） | ✅ 按点渲染，加载与细化全通 |
 
@@ -514,7 +515,7 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 ## 已知限制
 
 - **Draco 点云**已能解码，但容器结构还没有回归测试钉住（目前只有排查用的探针脚本）。字段顺序与规范描述不一致，改 `core/Draco.ts` 前必须拿真实瓦片复验，见[格式支持边界](#格式支持边界draco--crn--ktx2)。
-- **纹理分包（`s3m:TextureSharing` / S3MBLOCK 单文件）已支持**：这类数据集的 `tiles` 是 `.s3mblock`（例 SuperMap Online 的 `3D-CBD/Xiaopin@CBD`），容器内是 zlib 压缩的 v2 瓦片体 + 内嵌纹理图集；几何顶点区间绑定到图集子区域，解析时把 UV 重映射进图集空间，材质按图集 id 直接绑定。图集数据未内嵌的块会按 `requestNames` 如实报错（当前样本数据全部内嵌）。
+- **纹理分包（`s3m:TextureSharing` / S3MBLOCK 单文件）已完整支持**：这类数据集的 `tiles` 是 `.s3mblock`（如 SuperMap Online 的 `3D-CBD/Xiaopin@CBD` 或复杂精细建筑模型），容器内是 zlib 压缩的 v2 瓦片体 + 内嵌纹理图集；几何顶点区间绑定到图集子区域，解析时把 UV 重映射进图集空间，多图集自动走货架式装箱合并（AtlasPack）。细级 LOD（leaf）子瓦片通过官方 `Uci` 规范的 pack 批量合并请求（`extratiles` 参数与 `kMi` 段解码）拉取外部 `.texblock`，支持将 `Tex_x.texblock#<id>` 多精灵动态解出并装配进高分辨率组合画布，重构纹理与 UV 映射，且具备跨瓦片并发请求去重与图集安全校验。
 - **多块 MeshOpt 骨架已支持**（`blockCount > 1`）：这类骨架是「每块后面紧跟自己的索引包」，索引是块内局部编号。解析时按块合并顶点流、并把各块索引加上顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包。实测 `3D-WorkSpace_pbr1/pbrmodel` 的 `blockCount=2/3` 瓦片已可正常加载。
 - **遮挡取决于「谁写了深度」而不是「开没开地形」**：地形网格与本层共用主 framebuffer 的同一深度缓冲、同一 `depthRangeFor3D`，所以山体能挡建筑；但 S3M 数据通常按海拔 0 建模，开地形时必须用 `setDatasetHeight()` 抬到真实地面高程，否则模型会陷在山体下面（另外地形网格的贴图来自 raster / hillshade 层，没有这两层时地形面是空白的）。不想接 DEM 时，可以用自带物理地表当遮挡源（`ground: { occlude: true }` 或 `setGroundOcclude()`），但它只能表达 `z = 高程` 的一刀切：没有起伏，山体那种「半山腰挡住后面楼」表达不了；两者叠加时，凡是地形已经写了更近深度的像素，平面代理写不进去，山后的建筑仍会露出来。
 - 跨城市量级的数据集叠加会重新引入 float32 精度问题。

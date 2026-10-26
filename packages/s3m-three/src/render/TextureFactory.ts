@@ -140,9 +140,9 @@ function fromRawRGB(tex: S3MTexture): THREE.DataTexture {
 export async function createTexture(tex: S3MTexture | null | undefined): Promise<DecodedTexture> {
   if (!tex || !tex.width || !tex.height) return { texture: null, decoded: 'empty' };
 
-  // 图集纹理（flipY 的原始 DXT 图集 / AtlasPack 拼出来的 RGBA 大图）都必须关 GPU mip，
-  // 层级由 StyleMaterial.s3mAtlasUnit 的内联金字塔自己算。
-  const isAtlas = tex.packed === true || tex.flipY === true;
+  // 图集纹理（flipY 的原始 DXT 图集 / AtlasPack 拼出来的 RGBA 大图 / leaf 组合画布）都必须
+  // 关 GPU mip，层级由 StyleMaterial.s3mAtlasUnit 的内联金字塔自己算。
+  const isAtlas = tex.packed === true || tex.flipY === true || tex.composed === true;
   const asAtlas = <T extends THREE.Texture>(t: T): T => (isAtlas ? configureAtlas(t) : configure(t));
 
   // 判定只能看 compressType：v3.00 的 CRN 纹理 pixelFormat 是 13（ABGR）、

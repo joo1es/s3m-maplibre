@@ -2,7 +2,7 @@
 
 SuperMap S3M 三维模型格式的 **three.js 渲染内核**（宿主无关）。
 
-浏览器内直接解析 `.s3mb` 瓦片，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端：
+浏览器内直接解析 `.s3mb` / `.s3mblock` / `.s3m` 瓦片，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端：
 
 - `core/` 纯解析（无 three 依赖，Node 可跑）
 - `tileset/` 瓦片树 + LOD + 加载调度

@@ -123,18 +123,19 @@
       .btn-danger:hover { background: rgba(239, 68, 68, 0.25); color: #fff; }
 
       .presets { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 4px; }
-      .presets button {
+      .presets button, .preset-btn {
         padding: 3px 8px; font-size: 10.5px; cursor: pointer; border-radius: 5px;
         border: 1px solid rgba(255, 255, 255, 0.09); background: rgba(255, 255, 255, 0.04);
         color: #94a3b8; transition: all 0.15s;
       }
-      .presets button:hover {
-        border-color: rgba(255, 255, 255, 0.2); background: rgba(255, 255, 255, 0.08);
-        color: #f1f5f9;
+      .presets button:hover, .preset-btn:hover {
+        border-color: rgba(56, 189, 248, 0.45); background: rgba(56, 189, 248, 0.12);
+        color: #38bdf8;
       }
-      .presets button.active {
-        border-color: #38bdf8; background: rgba(56, 189, 248, 0.14);
+      .presets button.active, .preset-btn.active {
+        border-color: #38bdf8; background: rgba(56, 189, 248, 0.18);
         color: #38bdf8; font-weight: 600;
+        box-shadow: 0 0 8px rgba(56, 189, 248, 0.2);
       }
 
       /* 数据集复选列表 */
@@ -268,9 +269,37 @@
         .nav-pills { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.06); }
         .nav-pill { color: #64748b; }
         .nav-pill:hover { color: #0f172a; background: rgba(0, 0, 0, 0.04); }
-        .url-box input, .form-select { background: #ffffff; color: #0f172a; border-color: #cbd5e1; }
-        .preset-chip { background: #ffffff; border-color: #e2e8f0; color: #334155; }
-        .preset-chip:hover { border-color: #0284c7; color: #0284c7; }
+        .url-box input, .form-input, .form-select {
+          background: #ffffff;
+          color: #0f172a;
+          border-color: #cbd5e1;
+        }
+        .url-box input:focus, .form-input:focus, .form-select:focus {
+          background: #ffffff;
+          color: #0f172a;
+          border-color: #0284c7;
+          box-shadow: 0 0 0 2px rgba(2, 132, 199, 0.2);
+        }
+        .url-box input::placeholder, .form-input::placeholder {
+          color: #94a3b8;
+        }
+        .presets button, .preset-btn {
+          background: #ffffff;
+          border-color: #cbd5e1;
+          color: #475569;
+        }
+        .presets button:hover, .preset-btn:hover {
+          border-color: #0284c7;
+          background: #f0f9ff;
+          color: #0284c7;
+          box-shadow: 0 1px 4px rgba(2, 132, 199, 0.15);
+        }
+        .presets button.active, .preset-btn.active {
+          border-color: #0284c7;
+          background: #e0f2fe;
+          color: #0284c7;
+          font-weight: 600;
+        }
         .seg { background: rgba(0, 0, 0, 0.05); border-color: rgba(0, 0, 0, 0.08); }
         .seg button { color: #64748b; }
         .seg button:hover { color: #0f172a; }

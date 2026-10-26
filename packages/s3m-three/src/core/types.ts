@@ -157,6 +157,12 @@ export interface S3MTexture {
    */
   packed?: boolean;
   /**
+   * leaf 模式按 `subTexInfos` 把多张精灵贴出来的自上而下 RGBA 画布（可能没进拼图，
+   * 只有一张图集时 packAtlases 返回 null）。与 packed 同等对待：flipY=false、
+   * 不开 GPU mipmap，层级由 StyleMaterial 的内联金字塔自己算。
+   */
+  composed?: boolean;
+  /**
    * 拼图集合签名（`408x192#id1,id2,...`）。拼图是逐块做的，同一个 atlas id 在不同块里
    * 可能落在不同位置，所以跨瓦片共享纹理时 key 必须带上它，否则会复用别的块的排布。
    */

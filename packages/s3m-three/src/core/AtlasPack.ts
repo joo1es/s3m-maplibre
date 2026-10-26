@@ -35,10 +35,28 @@ export interface PackedAtlases {
   offsets: Map<string, { x: number; y: number }>;
 }
 
-/** 解出图集 RGBA（自上而下，不翻转）。非 DXT 或解码失败返回 null。 */
-function decodeAtlasRGBA(tex: AtlasLike): Uint8Array | null {
+/** 解码出的图集图像 + 行序约定 */
+export interface DecodedAtlasImage {
+  rgba: Uint8Array;
+  /**
+   * `true` = 缓冲已是自上而下（v=0 顶行），直接拷；
+   * `false` = 底朝上（DXT 解码输出即是：源第 sy 行写到 height-1-sy），贴进画布要逐行倒序。
+   */
+  topDown: boolean;
+}
+
+/**
+ * 解出图集图像。非 DXT 且非「已经是解好的 RGBA」时返回 null。
+ *
+ * - `compressType=0 + pixelFormat=28`（leaf 组合画布 / 拼图产物）：本来就是自上而下 RGBA，原样返回；
+ * - DXT 族：走 `DXTTextureDecode`，输出按仓库约定是**底朝上**的（见 packAtlases 的行序注释）。
+ */
+export function decodeAtlasImage(tex: AtlasLike): DecodedAtlasImage | null {
   if (!tex.data || !tex.width || !tex.height) return null;
   const ct = tex.compressType;
+  if ((ct === 0 || ct === undefined) && tex.pixelFormat === 28 && tex.data.length === tex.width * tex.height * 4) {
+    return { rgba: tex.data, topDown: true };
+  }
   const isDxt =
     ct === 12 || ct === 13 || ct === 14 || ct === 17 || ct === 19 || ct === 20 || ct === 21 || tex.pixelFormat >= 17;
   if (!isDxt) return null;
@@ -48,7 +66,7 @@ function decodeAtlasRGBA(tex: AtlasLike): Uint8Array | null {
   } catch {
     return null;
   }
-  return out;
+  return { rgba: out, topDown: false };
 }
 
 /**
@@ -58,11 +76,11 @@ export function packAtlases(tp: Record<string, AtlasLike>): PackedAtlases | null
   const entries = Object.entries(tp).filter(([, t]) => t.data && t.width > 0 && t.height > 0);
   if (entries.length < 2) return null;
 
-  const images = new Map<string, { w: number; h: number; rgba: Uint8Array }>();
+  const images = new Map<string, { w: number; h: number; rgba: Uint8Array; topDown: boolean }>();
   for (const [key, tex] of entries) {
-    const rgba = decodeAtlasRGBA(tex);
-    if (!rgba) return null; // 有一张解不出来就整体放弃，保持原样比拼错强
-    images.set(key, { w: tex.width, h: tex.height, rgba });
+    const img = decodeAtlasImage(tex);
+    if (!img) return null; // 有一张解不出来就整体放弃，保持原样比拼错强
+    images.set(key, { w: tex.width, h: tex.height, rgba: img.rgba, topDown: img.topDown });
   }
 
   // 货架式装箱：按宽度累加，超宽换行。图集都是小块，这样做足够紧凑。
@@ -89,7 +107,7 @@ export function packAtlases(tp: Record<string, AtlasLike>): PackedAtlases | null
 
   for (const [id, img] of images) {
     const off = offsets.get(id)!;
-    // ★ 必须逐行**倒序**拷贝。
+    // ★ DXT 解码缓冲必须逐行**倒序**拷贝（topDown=false 时）。
     //
     // DXTTextureDecode 输出的是「源图上下颠倒」的缓冲（源第 sy 行写到 height-1-sy），
     // 而 rect 的 y 是按源图**自上而下**的 offsetY 算的。原样拷贝会让拼图的行序和
@@ -97,8 +115,10 @@ export function packAtlases(tp: Record<string, AtlasLike>): PackedAtlases | null
     // 颠倒量随图集而异，于是「哪些精灵对、哪些精灵错」取决于它属于哪张图集 ——
     // 表现为同一面墙一半正常一半贴到别处。
     // 倒序拷进来之后，拼图行 0 就对应源图顶行，rect.y = (off.y + offsetY) / H 对全部图集统一成立。
+    // 已经是自上而下的缓冲（leaf 组合画布，topDown=true）则原样拷贝，不能再翻一次。
     for (let row = 0; row < img.h; row++) {
-      const src = (img.h - 1 - row) * img.w * 4;
+      const srcRow = img.topDown ? row : img.h - 1 - row;
+      const src = srcRow * img.w * 4;
       data.set(img.rgba.subarray(src, src + img.w * 4), ((off.y + row) * W + off.x) * 4);
     }
   }

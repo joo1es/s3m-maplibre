@@ -71,7 +71,7 @@ import type { InflateFn, ParseOptions } from './S3MBParser.js';
 import type { GeoPackageEntry, GroupNode, PageLOD, ParsedTile, S3MAtlasRects, S3MTexture } from './types.js';
 import { parseGroupNodeEntries, parseSkeletonEntries, parsePickInfoEntries } from './S3MBParser.js';
 import { atlasAlphaMask, shrinkRectToOpaque } from './AtlasAlpha.js';
-import { packAtlases } from './AtlasPack.js';
+import { packAtlases, decodeAtlasImage } from './AtlasPack.js';
 import type { PackedAtlases } from './AtlasPack.js';
 
 /** 图集子区域，以及它绑定的几何顶点区间 */
@@ -116,6 +116,13 @@ export interface S3MBlockTexture {
    * 不换算就会落在一半的位置上，平铺时逐格漂移。
    */
   rectScale?: number;
+  /**
+   * leaf 模式：像素是按 `subTexInfos` 把多张精灵贴出来的**自上而下 RGBA 画布**。
+   * 与 `packed` 独立（可能只有一张图集、没进拼图），但行序/关 mip 的要求相同。
+   */
+  composed?: boolean;
+  /** 组合画布的内容签名（`源#精灵名` 排序拼接）；拼进大图后并入 packKey 区分同 id 不同内容 */
+  leafSig?: string;
 }
 
 export interface S3MBlockPageLod {
@@ -240,7 +247,11 @@ function packTexturePackage(texturePackage: Record<string, S3MBlockTexture>): Pa
   // 落位就不同。纹理缓存却是跨瓦片共享的，只按 id 做 key 会让后一块复用前一块的
   // 拼图（rect 指向旧排布）→ 整块贴错图。所以给每张拼图打一个「集合签名」，
   // 缓存 key 带上它，集合相同才共享。
-  const packKey = `${packed.width}x${packed.height}#${[...packed.offsets.keys()].sort().join(',')}`;
+  // leaf 组合画布再叠一层内容签名（同 id、同落位，但精灵来自不同 Tile_* 文件时内容不同）。
+  const leafSigs = entries.filter((t) => t.leafSig).map((t) => `${t.id}=${t.leafSig}`);
+  const packKey =
+    `${packed.width}x${packed.height}#${[...packed.offsets.keys()].sort().join(',')}` +
+    (leafSigs.length ? `@${[...leafSigs].sort().join(',')}` : '');
   for (const tex of entries) {
     const t = tex as S3MBlockTexture & { origin?: AtlasOrigin };
     // 每次拼都把「当前原始像素」记下来：unpack 要退回到它
@@ -284,7 +295,8 @@ export function unpackBlockTextures(tile: S3MBlockTile): boolean {
     tex.pixelFormat = t.origin.pixelFormat;
     tex.compressType = t.origin.compressType;
     tex.data = t.origin.data;
-    t.flipY = true;
+    // 原始 DXT 图集退回时是底朝上（flipY=true）；leaf 组合画布退回时本来就是自上而下
+    t.flipY = t.composed ? false : true;
     t.packed = false;
     t.rectScale = 1; // 像素退回原始尺寸，rect 参考倍率也要复位
     delete t.packKey;
@@ -321,8 +333,12 @@ function buildTextureTable(texturePackage: Record<string, S3MBlockTexture>): Rec
   for (const tex of Object.values(texturePackage)) {
     if (!tex.data) continue;
     // 拼图输出是自上而下的 RGBA，v=0 就是首行：不能再翻行，也不能让 GPU 生成 mip
-    // （GPU mip 会把相邻子区域混进来，层级必须由 StyleMaterial 的内联金字塔自己算）
+    // （GPU mip 会把相邻子区域混进来，层级必须由 StyleMaterial 的内联金字塔自己算）。
+    // leaf 组合画布（composed）同样自上而下、同样不能开 GPU mip —— 即使它没进拼图
+    // （块里只有一张图集时 packAtlases 返回 null，拼不拼的行序要求是一样的）。
     const isPacked = (tex as { packed?: boolean }).packed === true;
+    const composed = (tex as { composed?: boolean }).composed === true;
+    const topDown = isPacked || composed;
     textures[tex.id] = {
       code: tex.id,
       level: tex.level,
@@ -331,8 +347,9 @@ function buildTextureTable(texturePackage: Record<string, S3MBlockTexture>): Rec
       compressType: tex.compressType,
       pixelFormat: tex.pixelFormat,
       data: tex.data,
-      flipY: !isPacked,
+      flipY: !topDown,
       packed: isPacked,
+      composed,
       packKey: (tex as { packKey?: string }).packKey,
     };
   }
@@ -442,46 +459,45 @@ export interface S3MBlockAtlasImage {
 }
 
 /**
- * 解析独立的 `.texblock` 子图集文件。
+ * 解析独立的 `.texblock` 文件，返回**按段分组**的全部图像记录。
  *
- * S3MBLOCK 的每张根图集（level=0）都挂一个 `childTexNames`，指向同一套排布的**清晰版**：
- * 实测三对样本里，把子图集按归一化 rect 裁回来，与根图集槽位的 alpha 轮廓 IoU 0.85~1.00、
- * 色差也更低（例：48×64 槽位 37.9 vs 像素同位的 88.3），即「换图不换归一化 rect」。
- * 官方 `requestSubTextures` 里那句 `_oriTexture.arrayBufferView = tex.arrayBufferView`
- * 就是整体换图。
+ * 实测三种外层格式（判定顺序即优先级）：
  *
- * 容器（与 .s3mblock 不同，实测字节严丝合缝）：
- * ```
- * uint32 count                     // 组数，实测 1
- * uint32 nameLen; String name      // "911305599.texblock"，即本文件的图集 id
- * uint32 unzipSize; uint32 zipSize
- * byte   zipData[zipSize]          // zlib
- * ```
- * 内层每条记录：
- * ```
- * uint32 compressType              // 14
- * uint32 width; uint32 height
- * uint32 pixelFormat               // 实测 13；像素数按 1 B/px 与 DXT5 吻合
- * uint32 size; byte data[size]
- * ```
+ * 1. **动态 pack（kMi 协议）**：`u32 count | u32 zippedLength[count] | 段[count]`，
+ *    每段 = 普通容器。这是 TextureSharing leaf 模式引擎真正会拉的响应：
+ *    `GET Tex_0_<code>.texblock?extratiles=Tex_0_000;Tex_0_009;…` —— extratiles 是
+ *    **去扩展名**的 quadKey（带 `.texblock` 会被服务端解成别的内容），段顺序与之
+ *    一一对应，官方 `kMi(buffer, quadKeyIndex)` 就是取第 i 段。
+ *    守卫：count ≤ 256（官方 kMi 同限）且头部算术严丝合缝。
+ * 2. **静态 pack**：`u32 count | (offset,length)[count] | 段`，段 = 单条
+ *    `{nameLen|name|unzip|zip|zlib}` 条目（没有段头 count）。`Tex_0.texblock`
+ *    （275 段）是这个格式 —— 但它只是离线索引，引擎并不请求它。
+ * 3. **普通容器**：`u32 count | {nameLen|name|unzip|zip|zlib} × count`。
+ *    `Tile_6_000000.texblock`（16 条记录）、`911305599.texblock`（1 条）属于这类。
+ *
+ * 段语义：pack 的第 i 段对应第 i 个请求名；容器整体算一段。
+ * 记录 `id` = 条目名（如 `117_0.texblock`），leaf 组合时用它对 `subTexInfos.subName`。
+ *
+ * 容器不再只读第一条：旧实现把 `count` 之外的条目全扔了，多记录容器
+ * （`Tile_6_000000` 这类）只能拿到第一张精灵。
  */
-export async function parseS3MBlockTextureFile(
+export async function parseTexblockSegments(
   arrayBuffer: ArrayBuffer,
   options: ParseBlockOptions = {}
-): Promise<S3MBlockAtlasImage[]> {
+): Promise<S3MBlockAtlasImage[][]> {
   const inflate = options.inflate ?? defaultInflate;
-  const r = new BinaryReader(arrayBuffer);
-  const count = r.u32();
-  if (count < 1 || count > 64) throw new Error(`[s3m] .texblock 组数异常：${count}`);
-  const name = r.string();
-  const unzipSize = r.u32();
-  const zipSize = r.u32();
-  if (r.remaining < zipSize) throw new Error(`[s3m] .texblock 声明长度 ${zipSize} 超出文件剩余 ${r.remaining}`);
-  const raw = await inflate(r.bytesCopy(zipSize));
-  if (raw.length !== unzipSize) {
-    throw new Error(`[s3m] .texblock 解压长度不符：声明 ${unzipSize}，实际 ${raw.length}`);
-  }
+  const bytes = new Uint8Array(arrayBuffer);
+  const dyn = await tryDynPack(bytes, inflate);
+  if (dyn) return dyn;
+  const stat = await tryStaticPack(bytes, inflate);
+  if (stat) return stat;
+  const container = await readContainerEntries(bytes, inflate);
+  if (container) return [container];
+  throw new Error('[s3m] .texblock 无法识别的外层格式（动态 pack / 静态 pack / 容器均不成立）');
+}
 
+/** 解压后的裸图像记录区：`ct|w|h|pf|size|data` 可多条连排，尾部允许有无关字节 */
+function readImageRecords(raw: Uint8Array, id: string): S3MBlockAtlasImage[] {
   const t = new BinaryReader(raw.buffer as ArrayBuffer, raw.byteOffset, raw.byteLength);
   const out: S3MBlockAtlasImage[] = [];
   while (t.remaining >= 20) {
@@ -491,10 +507,278 @@ export async function parseS3MBlockTextureFile(
     const pixelFormat = t.u32();
     const size = t.u32();
     if (!width || !height || size > t.remaining) break;
-    out.push({ id: name, width, height, compressType, pixelFormat, data: t.bytesCopy(size) });
+    out.push({ id, width, height, compressType, pixelFormat, data: t.bytesCopy(size) });
   }
-  if (!out.length) throw new Error(`[s3m] .texblock ${name} 内没有可用图集`);
   return out;
+}
+
+/** 读 `count | 条目 × count` 容器（尾部允许有无关字节）。结构不成立返回 null。 */
+async function readContainerEntries(bytes: Uint8Array, inflate: InflateFn): Promise<S3MBlockAtlasImage[] | null> {
+  if (bytes.byteLength < 8) return null;
+  try {
+    const r = new BinaryReader(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+    const count = r.u32();
+    if (count < 1 || count > 4096) return null;
+    const out: S3MBlockAtlasImage[] = [];
+    for (let i = 0; i < count; i++) {
+      const at = r.offset;
+      const nameLen = r.u32();
+      if (nameLen < 1 || nameLen > 4096 || r.remaining < nameLen + 8) return null;
+      r.offset = at; // string() 自带长度前缀，先回退再读，避免把长度吃两遍
+      const name = r.string();
+      const unzipSize = r.u32();
+      const zipSize = r.u32();
+      if (zipSize > r.remaining) return null;
+      const raw = await inflate(r.bytesCopy(zipSize));
+      if (raw.length !== unzipSize) return null;
+      out.push(...readImageRecords(raw, name));
+    }
+    return out.length ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 单条目（无 count 头）：`nameLen|name|unzip|zip|zlib`，必须恰好消费整段。 */
+async function readSingleEntry(bytes: Uint8Array, inflate: InflateFn): Promise<S3MBlockAtlasImage[] | null> {
+  if (bytes.byteLength < 16) return null;
+  try {
+    const r = new BinaryReader(bytes.buffer as ArrayBuffer, bytes.byteOffset, bytes.byteLength);
+    const at = r.offset;
+    const nameLen = r.u32();
+    if (nameLen < 1 || nameLen > 4096 || r.remaining < nameLen + 8) return null;
+    r.offset = at; // string() 自带长度前缀，先回退再读
+    const name = r.string();
+    const unzipSize = r.u32();
+    const zipSize = r.u32();
+    if (zipSize !== r.remaining) return null;
+    const raw = await inflate(r.bytesCopy(zipSize));
+    if (raw.length !== unzipSize) return null;
+    const recs = readImageRecords(raw, name);
+    return recs.length ? recs : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 动态 pack（kMi）：`count | zippedLength[] | 段[]`，段 = 容器。算术必须严丝合缝。 */
+async function tryDynPack(bytes: Uint8Array, inflate: InflateFn): Promise<S3MBlockAtlasImage[][] | null> {
+  if (bytes.byteLength < 8) return null;
+  try {
+    const head = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = head.getUint32(0, true);
+    if (count < 1 || count > 256) return null; // 官方 kMi 同限
+    const header = 4 + 4 * count;
+    if (header > bytes.byteLength) return null;
+    let sum = header;
+    const lens: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const len = head.getUint32(4 + i * 4, true);
+      if (len < 8) return null;
+      lens.push(len);
+      sum += len;
+    }
+    if (sum !== bytes.byteLength) return null;
+    const segments: S3MBlockAtlasImage[][] = [];
+    let off = header;
+    for (const len of lens) {
+      const seg = await readContainerEntries(bytes.subarray(off, off + len), inflate);
+      if (!seg) return null;
+      segments.push(seg);
+      off += len;
+    }
+    return segments;
+  } catch {
+    return null;
+  }
+}
+
+/** 静态 pack：`count | (offset,length)[] | 段`，段 = 单条裸条目（无 count 头）。 */
+async function tryStaticPack(bytes: Uint8Array, inflate: InflateFn): Promise<S3MBlockAtlasImage[][] | null> {
+  if (bytes.byteLength < 12) return null;
+  try {
+    const head = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const count = head.getUint32(0, true);
+    if (count < 1 || count > 4096) return null;
+    const tableEnd = 4 + 8 * count;
+    if (tableEnd > bytes.byteLength) return null;
+    const segments: S3MBlockAtlasImage[][] = [];
+    for (let i = 0; i < count; i++) {
+      const off = head.getUint32(4 + i * 8, true);
+      const len = head.getUint32(8 + i * 8, true);
+      if (off < tableEnd || len < 8 || off > bytes.byteLength - len) return null;
+      const seg = await readSingleEntry(bytes.subarray(off, off + len), inflate);
+      if (!seg) return null;
+      segments.push(seg);
+    }
+    return segments;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 解析独立的 `.texblock` 子图集文件，扁平返回全部记录（`id` = 条目名）。
+ *
+ * 外层格式判定见 `parseTexblockSegments`；单记录文件与旧行为完全一致。
+ */
+export async function parseS3MBlockTextureFile(
+  arrayBuffer: ArrayBuffer,
+  options: ParseBlockOptions = {}
+): Promise<S3MBlockAtlasImage[]> {
+  const segments = await parseTexblockSegments(arrayBuffer, options);
+  return segments.flat();
+}
+
+/* ------------------------------------------------------------------ leaf 模式（多精灵组合） */
+
+/** leaf 请求计划：把 `requestNames` 展开成官方 `_subRequestNames` 那样的子请求名 */
+export interface TexblockRequestPlan {
+  /** pack 基名（`Tex_0`）→ 该组子请求名（`Tex_0_000`…，保持出现顺序、组内去重） */
+  packGroups: Map<string, string[]>;
+  /** 普通文件名（去扩展名，如 `Tile_6_000000`） */
+  plain: string[];
+  /** 全部子请求名（packGroups 展开 + plain，整体去重） */
+  names: string[];
+}
+
+/**
+ * 展开 `requestNames` —— 逐字对应官方 `lM.prototype.createTexture` 里的 `_subRequestNames` 构造：
+ *
+ * - `yke(s)` = 第一个 `.` 之前的部分（`Tex_0.texblock#…` → `Tex_0`，`Tile_6_000000.texblock` → `Tile_6_000000`）；
+ * - stem 首段是 `Tex` → 按 `#` 后的 3 位码展开成 `Tex_0_<code>`（**无 `#` 的 Tex 名不产生子请求**，官方如此）；
+ * - 其它 → 直接用去扩展名的名字。
+ *
+ * 这些名字就是 pack 请求的 quadKey：`extratiles` 用 `;` 连接、**不带扩展名**。
+ */
+export function expandTexblockRequestNames(requestNames: readonly string[] | undefined): TexblockRequestPlan {
+  const yke = (s: string): string => {
+    const dot = s.indexOf('.');
+    return dot >= 0 ? s.slice(0, dot) : s;
+  };
+  const packGroups = new Map<string, string[]>();
+  const plain: string[] = [];
+  for (const rn of requestNames ?? []) {
+    const stem = yke(rn);
+    if (stem.split('_')[0] === 'Tex') {
+      const hash = rn.indexOf('#');
+      if (hash < 0) continue; // 官方：Tex_* 无 #码 → 不产生子请求
+      const base = yke(rn.slice(0, hash));
+      const codes = rn.slice(hash + 1);
+      const group = packGroups.get(base) ?? [];
+      for (let i = 0; i + 3 <= codes.length; i += 3) {
+        const name = `${base}_${codes.slice(i, i + 3)}`;
+        if (!group.includes(name)) group.push(name);
+      }
+      packGroups.set(base, group);
+    } else if (!plain.includes(stem)) {
+      plain.push(stem);
+    }
+  }
+  const names: string[] = [];
+  for (const group of packGroups.values()) for (const n of group) if (!names.includes(n)) names.push(n);
+  for (const n of plain) if (!names.includes(n)) names.push(n);
+  return { packGroups, plain, names };
+}
+
+/** leaf 组合用的精灵：来自哪个子请求 + 记录本身 */
+export interface LeafSprite {
+  /** 子请求名（`Tex_0_000` / `Tile_6_000000`），内容签名用它区分「同名不同文件」 */
+  source: string;
+  image: S3MBlockAtlasImage;
+}
+
+export interface ComposedLeafAtlas {
+  width: number;
+  height: number;
+  /** 自上而下 RGBA（v=0 顶行）；compressType=0 / pixelFormat=28 由调用方写回 */
+  data: Uint8Array;
+  /** 贴上了像素的 subName（按 subTexInfos 顺序） */
+  matched: string[];
+  /** 没拿到精灵的 subName —— 官方同样跳过（`S<0 && isLeaf → continue`），留透明 */
+  missing: string[];
+  /** 精灵尺寸与 rect 不一致的 subName（官方照样贴，记录供排查） */
+  mismatched: string[];
+  /** 内容签名：`源#记录名` 排序拼接，拼图 packKey 用它区分「同 id 不同内容」 */
+  sig: string;
+}
+
+/**
+ * leaf 组合：把多张精灵按 `subTexInfos` 的 offset 贴成整张图集画布。
+ *
+ * 与官方 `requestSubTextures` 的 leaf 分支等价：
+ * - 记录按 `subName` 匹配 `subTexInfos`，没匹配上的精灵忽略、没精灵的 rect 留透明；
+ * - 贴图用**精灵自己的宽高**（官方 `width:D= C.width`），rect 仍按 subTexInfos 的
+ *   sub 宽高（渲染侧照旧），实测两者相等（比例 1.00×1.00）；
+ * - 精灵是「左 2/3 base + 右 1/3 内联 mip 金字塔」的完整小图，原样整张贴入，
+ *   StyleMaterial 的 `s3mAtlasLod` 2/3 采样公式直接适用（见 render/StyleMaterial.ts）；
+ * - DXT 解码缓冲底朝上，逐行倒序贴入（与 `packAtlases` 同一约定），画布行 0 = 源图顶行。
+ *
+ * 返回 null = 没有任何 subName 命中 / 全部解码失败。
+ */
+export function composeLeafAtlas(
+  tex: Pick<S3MBlockTexture, 'width' | 'height' | 'subTexInfos'>,
+  sprites: ReadonlyMap<string, LeafSprite>
+): ComposedLeafAtlas | null {
+  const subs = tex.subTexInfos ?? [];
+  if (!subs.length || !tex.width || !tex.height) return null;
+
+  const placed: { sub: S3MSubTexture; sprite: LeafSprite }[] = [];
+  for (const sub of subs) {
+    const sprite = sprites.get(sub.subName);
+    if (sprite) placed.push({ sub, sprite });
+  }
+  if (!placed.length) return null;
+
+  // 画布至少装下声明尺寸 + 所有精灵（offset + 精灵宽高）
+  let W = tex.width;
+  let H = tex.height;
+  for (const { sub, sprite } of placed) {
+    W = Math.max(W, sub.offsetX + sprite.image.width);
+    H = Math.max(H, sub.offsetY + sprite.image.height);
+  }
+
+  const data = new Uint8Array(W * H * 4);
+  const matched: string[] = [];
+  const missing: string[] = [];
+  const mismatched: string[] = [];
+  const sigs: string[] = [];
+  let painted = 0;
+
+  for (const sub of subs) {
+    const sprite = sprites.get(sub.subName);
+    if (!sprite) {
+      missing.push(sub.subName);
+      continue;
+    }
+    const img = sprite.image;
+    if (img.width !== sub.width || img.height !== sub.height) mismatched.push(sub.subName);
+    const decoded = decodeAtlasImage({
+      id: img.id,
+      width: img.width,
+      height: img.height,
+      compressType: img.compressType,
+      pixelFormat: img.pixelFormat,
+      data: img.data,
+    });
+    if (!decoded) {
+      missing.push(sub.subName); // 像素没贴上（非 DXT 且非已解 RGBA），按缺失处理
+      continue;
+    }
+    for (let row = 0; row < img.height; row++) {
+      const srcRow = decoded.topDown ? row : img.height - 1 - row;
+      const dstY = sub.offsetY + row;
+      if (dstY >= H) break;
+      const src = srcRow * img.width * 4;
+      data.set(decoded.rgba.subarray(src, src + img.width * 4), (dstY * W + sub.offsetX) * 4);
+    }
+    painted++;
+    matched.push(sub.subName);
+    sigs.push(`${sprite.source}#${sub.subName}`);
+  }
+
+  if (!painted) return null;
+  return { width: W, height: H, data, matched, missing, mismatched, sig: sigs.sort().join(',') };
 }
 
 /* ------------------------------------------------------------------ 容器 */

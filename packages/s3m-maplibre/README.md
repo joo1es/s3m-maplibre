@@ -2,7 +2,7 @@
 
 SuperMap S3M 三维模型格式的 **MapLibre / Mapbox 原生渲染图层**。
 
-在 MapLibre GL JS 里直接解析 `.s3mb` 瓦片并渲染，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端。渲染能力来自 [`s3m-three`](https://www.npmjs.com/package/s3m-three)（安装本包会自动带上）。
+在 MapLibre GL JS 里直接解析 `.s3mb` / `.s3mblock` / `.s3m` 瓦片并渲染，不需要预先转成 3D Tiles，也不需要 SuperMap 的 WebGL 客户端。渲染能力来自 [`s3m-three`](https://www.npmjs.com/package/s3m-three)（安装本包会自动带上）。
 
 ## 安装
 

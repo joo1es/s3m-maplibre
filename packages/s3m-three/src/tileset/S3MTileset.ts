@@ -8,16 +8,23 @@
  */
 import { parseS3MB } from '../core/S3MBParser.js';
 import {
-  parseS3MBlock,
+  composeLeafAtlas,
+  expandTexblockRequestNames,
   parseS3MBlockGroups,
-  parseS3MBlockTextureFile,
+  parseTexblockSegments,
   rebuildBlockTextureState,
   unpackBlockTextures,
 } from '../core/S3MBlockParser.js';
 import type { S3MBlockTile } from '../core/S3MBlockParser.js';
 import { evaluateAtlasUpgrade } from '../core/AtlasUpgrade.js';
 import type { AtlasPixels } from '../core/AtlasUpgrade.js';
-import type { S3MBlockAtlasImage, S3MBlockGroupSet, S3MBlockTexture } from '../core/S3MBlockParser.js';
+import type {
+  LeafSprite,
+  S3MBlockAtlasImage,
+  S3MBlockGroupSet,
+  S3MBlockTexture,
+  TexblockRequestPlan,
+} from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { Group, Texture } from 'three';
 
@@ -268,6 +275,13 @@ export class S3MTileset {
   private readonly _groupCache = new Map<string, S3MBlockGroupSet>();
   /** 独立 `.texblock` 图集缓存：id → 图像；null 表示正在请求或确认不可用 */
   readonly externalAtlasCache = new Map<string, S3MBlockAtlasImage | null>();
+  /**
+   * leaf 子请求缓存：去扩展名的子请求名（`Tex_0_000` / `Tile_6_000000`）→ 响应里的记录；
+   * null = 已判定不可用。精灵按全局共享（同名同内容），跨瓦片复用。
+   */
+  readonly leafRequestCache = new Map<string, S3MBlockAtlasImage[] | null>();
+  /** 进行中的 leaf 请求（stem → Promise），跨瓦片并发时同名只发一次 */
+  private readonly _leafPending = new Map<string, Promise<void>>();
   /** 真正被高清版顶替掉的图集 id（判定通过） */
   readonly atlasUpgraded = new Set<string>();
   /** 拿到高清版但判定不通过 → 原因。用于排查「为什么这块还是糊的」 */
@@ -598,25 +612,33 @@ export class S3MTileset {
   }
 
   /**
-   * 把 S3MBLOCK 根图集换成同排布的清晰版（`.texblock` 子图集）。
-   *
-   * 根图集只是 level=0 的低清代理：实测一张 48×64 的槽位在子图集里是 96×128，
-   * 拿它平铺几十次就是一堆棕色马赛克。子图集文件里没有自己的 subTexInfos，
-   * 官方（`requestSubTextures`）的做法就是整体换图、rect 照旧——因为两者是同一套
-   * 排布的等比放大（归一化 rect 直接搬，alpha 轮廓 IoU 0.85~1.00）。
-   *
-   * 只认「更大且字节能完整解析」的子图集；请求失败/尺寸不合法就保留根图集。
-   */
-  /**
-   * 补齐「图集像素不在块文件里」的那一半。
+   * 补齐「图集像素不在块文件里」的那一半 —— 官方 `requestSubTextures` 的等价物。
    *
    * 根瓦片（如 6.s3mblock）的图集是内嵌的（isSaveData=1）；但**子瓦片**（6_00 / 6_01）
-   * 的图集段只有元信息：`data = null` + `requestNames = ['-704919438.texblock']`，
-   * 像素在同目录的独立 `.texblock` 文件里（实测尺寸与声明逐字一致：192×128 / 204×384，
-   * 内容按 1 B/px 的 DXT5 排布）。
-   *
+   * 的图集段只有元信息：`data = null` + `requestNames`，像素在同目录的 `.texblock` 里。
    * 不补这一步的后果不是「糊一点」，而是子瓦片整块无贴图：`tile.textures` 里根本没有
    * 这条纹理，材质拿不到 map，建筑变成纯白几何——精细 LOD 一旦真的加载进来就会显露。
+   *
+   * ★ 只认 requestNames。`childTexNames` 是**下一级 LOD 的图集指针**（官方 `_ancestorTexture`
+   *   用它继承 batchTable 的 rect），它有自己的 subTexInfos：同一个精灵在父级叫 `1460_3`
+   *   96x64、子级叫 `1460_2` 192x128，排布也不一样。拿父级的 rect 去套子级像素必然错位 ——
+   *   上一版就是这么把画面搞坏的。官方从不拿它换像素，那个 LOD 的瓦片自己会加载。
+   *
+   * requestNames 展开（见 `expandTexblockRequestNames`，逐字对应官方 `_subRequestNames`）：
+   *
+   * 1. **整图**（`['-704919438.texblock']`，单条记录 = 整张图集）→ 用 `evaluateAtlasUpgrade`
+   *    验证后整体替换；根块自带缩略图必须验证过才能换，子瓦片（无基准）至少要求长宽比一致。
+   * 2. **leaf 多精灵**（`['Tex_0.texblock#000009…', 'Tile_6_000000.texblock']`，官方 isLeaf）→
+   *    图集本身没有像素，只有 `subTexInfos` 里每块一个精灵 rect。按 subName 把精灵贴回
+   *    各 rect（`composeLeafAtlas`），组合出整张自上而下 RGBA 画布（compressType=0 /
+   *    pixelFormat=28 / flipY=false）。精灵自带「左 2/3 base + 右 1/3 内联 mip 金字塔」，
+   *    与 StyleMaterial 的 `s3mAtlasLod` 2/3 采样公式直接配套，rect 一个像素都不用改。
+   *
+   * 请求方式：pack 组按官方 `Uci` 合并成
+   * `GET Tex_0_<code>.texblock?extratiles=Tex_0_000;Tex_0_009;…`（extratiles **去扩展名**、
+   * 段序 = 请求序，kMi 取第 i 段）；`Tile_*` 是普通多记录容器，整文件解析后按记录名分发。
+   *
+   * 不补/补失败时保持缩略图（或无贴图），由上层照常渲染几何，绝不清空已有纹理表。
    */
   private async _fillExternalAtlases(tile: ParsedTile, url: string): Promise<void> {
     const blockTile = tile as ParsedTile & { texturePackage?: Record<string, S3MBlockTexture> };
@@ -626,28 +648,73 @@ export class S3MTileset {
     // 拼图块：先退回原始图集。拼图是把多张图集重排进一张大图，
     // 换高清图必须在拼图**之前**做，否则 rect 和像素两套排布对不上。
     const wasPacked = unpackBlockTextures(blockTile as S3MBlockTile);
-    const jobs: Promise<void>[] = [];
     /** 只要像素被动过，纹理表 / rect 就必须重算 —— 否则子瓦片会整块白膜 */
     let changed = false;
 
+    // ① 展开 requestNames，跨图集汇总本块还缺哪些子请求（同名只拉一次）
+    const plans = new Map<string, { tex: S3MBlockTexture; plan: TexblockRequestPlan }>();
+    const packMiss = new Map<string, string[]>();
+    const plainMiss: string[] = [];
     for (const [id, tex] of Object.entries(tp)) {
-      // ★ 只认 requestNames。
-      //
-      // `childTexNames` 是**下一级 LOD 的图集指针**（官方 `_ancestorTexture` 用它继承
-      // batchTable 的 rect），它有自己的 subTexInfos：同一个精灵在父级叫 `1460_3` 96x64、
-      // 子级叫 `1460_2` 192x128，排布也不一样。拿父级的 rect 去套子级像素必然错位 ——
-      // 上一版就是这么把画面搞坏的。官方从不拿它换像素，那个 LOD 的瓦片自己会加载。
-      const names: string[] = [];
-      for (const n of tex.requestNames ?? []) {
-        // `Tex_0.texblock#000009015016...` 是「一个文件里装 N 张精灵、按名字取」的容器，
-        // 不是文件名。直接当 URL 请求会带上 # 片段 → 拿到别的文件/404 → 整块白膜。
-        if (n.includes('#')) {
-          this.atlasUpgradeSkipped.set(id, `multi-sprite container (${n.split('#')[0]})`);
-          continue;
-        }
-        names.push(n);
+      const plan = expandTexblockRequestNames(tex.requestNames);
+      if (!plan.names.length) continue; // 只挂了 childTexNames（根瓦片形态）→ 一个请求都不发
+      plans.set(id, { tex, plan });
+      for (const [base, group] of plan.packGroups) {
+        const miss = group.filter((n) => !this.leafRequestCache.has(n));
+        if (!miss.length) continue;
+        const acc = packMiss.get(base) ?? [];
+        for (const n of miss) if (!acc.includes(n)) acc.push(n);
+        packMiss.set(base, acc);
       }
-      if (!names.length) continue;
+      for (const n of plan.plain) {
+        if (!this.leafRequestCache.has(n) && !plainMiss.includes(n)) plainMiss.push(n);
+      }
+    }
+
+    // ② 拉取（先全部 await，再动图集状态；跨瓦片并发时同名请求共享同一个 Promise）
+    const pending: Promise<void>[] = [];
+    for (const [base, names] of packMiss) {
+      let groupFetch: Promise<void> | null = null;
+      const start = () => (groupFetch ??= this._fetchLeafPack(url, base, names));
+      for (const n of names) pending.push(this._ensureLeafFetch(n, start));
+    }
+    for (const n of plainMiss) pending.push(this._ensureLeafFetch(n, () => this._fetchLeafFile(url, n)));
+    if (pending.length) await Promise.all(pending);
+
+    // ③ 逐图集：leaf 组合优先；没匹配上任何精灵就退回「整图替换 + 验证」
+    for (const [id, { tex, plan }] of plans) {
+      const sprites = new Map<string, LeafSprite>();
+      for (const n of plan.names) {
+        const recs = this.leafRequestCache.get(n);
+        if (!recs) continue;
+        for (const r of recs) sprites.set(r.id, { source: n, image: r });
+      }
+
+      const composed = composeLeafAtlas(tex, sprites);
+      if (composed) {
+        const t = tex as S3MBlockTexture & { composed?: boolean; leafSig?: string };
+        t.composed = true;
+        t.leafSig = composed.sig;
+        t.flipY = false; // 画布自上而下（语义见 S3MBlockTexture.flipY 注释）
+        tex.data = composed.data;
+        tex.compressType = 0;
+        tex.pixelFormat = 28; // RGBA
+        tex.width = composed.width;
+        tex.height = composed.height;
+        tex.rectScale = 1; // 画布与 subTexInfos 同一像素空间，rect 原样、不缩放
+        this.atlasUpgraded.add(id);
+        changed = true;
+        if (composed.missing.length || composed.mismatched.length) {
+          // 官方对缺失精灵同样跳过（留透明）；尺寸不一致照样贴。都只告警，不整块拒收。
+          console.warn('[s3m] leaf 图集部分精灵异常：', id, {
+            missing: composed.missing,
+            mismatched: composed.mismatched,
+          });
+        }
+        continue;
+      }
+
+      // —— 整图替换回退（官方 isLeaf=false 的路径）——
       // 子瓦片的图集段只有元信息（data = null），没有可比的基准，只能直接采用；
       // 根块自带缩略图，必须验证过才能换。
       const hasBaseline = !!tex.data;
@@ -676,8 +743,12 @@ export class S3MTileset {
       //   只有 2 张的 child 是「同一套排布的等比放大」（长宽比 0.0%、下采样色差 8.5/11.2），
       //   其余是**重新排版**过的另一张图（长宽比偏差 5.6%~200%，色差 43~86）。
       //   直接套用 subTexInfos 会整张错位，比不换更糟 —— 所以换之前先验一遍。
-      const cached = this.externalAtlasCache.get(id);
       const apply = (img: S3MBlockAtlasImage) => {
+        const t = tex as S3MBlockTexture & { composed?: boolean; leafSig?: string };
+        // 整图是 DXT 原图（底朝上），清掉 leaf 组合状态
+        t.composed = false;
+        t.leafSig = undefined;
+        t.flipY = true;
         // 覆盖解析阶段按内嵌缩略图填好的那份；判定不通过时不会走到这里，原样保留
         tex.data = img.data;
         tex.compressType = img.compressType;
@@ -690,34 +761,26 @@ export class S3MTileset {
         changed = true;
       };
 
-      if (cached === null) continue; // 正在请求 / 确认不可用
-      if (cached) {
-        if (accept(cached)) apply(cached);
-        continue;
-      }
-      this.externalAtlasCache.set(id, null);
-      jobs.push(
-        (async () => {
-          for (const name of names) {
-            const u = resolveUrl(dirOf(url), name);
-            if (!u) continue;
-            try {
-              const res = await fetch(u);
-              if (!res.ok) continue;
-              const imgs = await parseS3MBlockTextureFile(await res.arrayBuffer());
-              const img = imgs[0];
-              if (!img) continue;
-              this.externalAtlasCache.set(id, img);
-              if (accept(img)) apply(img);
-              return;
-            } catch {
-              // 换下一个候选名；全失败就保持缩略图，由上层照常渲染几何
-            }
+      // 候选只可能是普通请求名的第一条记录；Tex pack 段是子精灵，不是整图（与旧实现一致）。
+      let candidate = this.externalAtlasCache.get(id);
+      if (candidate === null) continue; // 已判定不可用
+      if (candidate === undefined) {
+        candidate = null;
+        for (const n of plan.plain) {
+          const recs = this.leafRequestCache.get(n);
+          if (recs?.length) {
+            candidate = recs[0]!;
+            break;
           }
-        })()
-      );
+        }
+        this.externalAtlasCache.set(id, candidate);
+      }
+      if (candidate) {
+        if (accept(candidate)) apply(candidate);
+      } else if (!this.atlasUpgradeSkipped.has(id)) {
+        this.atlasUpgradeSkipped.set(id, 'no usable external image（请求失败或只拿到子精灵）');
+      }
     }
-    if (jobs.length) await Promise.all(jobs);
 
     // 像素定下来了，重新拼图并重算 rect / 纹理表（两者必须一起重算）。
     //
@@ -726,6 +789,55 @@ export class S3MTileset {
     //   像素是刚从 .texblock 拉回来的。只看 wasPacked 的后果是 `tile.textures` 永远是空的
     //   → 近看整片白膜；同时 atlasRects 也没按 rectScale 重算 → 远处马赛克噪点。
     if (wasPacked || changed) rebuildBlockTextureState(blockTile as S3MBlockTile);
+  }
+
+  /** 同名子请求去重：命中缓存立即返回；否则共享进行中的 Promise（跨瓦片并发只发一次） */
+  private _ensureLeafFetch(stem: string, start: () => Promise<void>): Promise<void> {
+    if (this.leafRequestCache.has(stem)) return Promise.resolve();
+    const inflight = this._leafPending.get(stem);
+    if (inflight) return inflight;
+    const p = start().finally(() => this._leafPending.delete(stem));
+    this._leafPending.set(stem, p);
+    return p;
+  }
+
+  /**
+   * pack 组请求 —— 官方 `Uci`：URL = 组内第一个请求的 URL，追加
+   * `extratiles=<全组 quadKey，去扩展名，';' 连接>`；响应是 kMi pack，段序 = extratiles 序。
+   *
+   * 实测服务端两种写法都 200，但带 `.texblock` 的 extratiles 会解出 recs=4 的错内容，
+   * 所以必须用**去扩展名**的 quadKey。
+   */
+  private async _fetchLeafPack(baseUrl: string, base: string, names: string[]): Promise<void> {
+    const u = resolveUrl(dirOf(baseUrl), `${names[0]}.texblock?extratiles=${names.join(';')}`);
+    try {
+      if (!u) throw new Error('无法拼出 URL');
+      const res = await fetch(u);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const segments = await parseTexblockSegments(await res.arrayBuffer());
+      if (segments.length !== names.length) {
+        throw new Error(`pack 段数 ${segments.length} ≠ 请求名 ${names.length}`);
+      }
+      names.forEach((n, i) => this.leafRequestCache.set(n, segments[i]!));
+    } catch (e) {
+      console.warn('[s3m] leaf pack 请求失败：', u, e);
+      for (const n of names) if (!this.leafRequestCache.has(n)) this.leafRequestCache.set(n, null);
+    }
+  }
+
+  /** 普通 `.texblock`（整图或多记录容器）：文件里的全部记录都归这个子请求名 */
+  private async _fetchLeafFile(baseUrl: string, stem: string): Promise<void> {
+    const u = resolveUrl(dirOf(baseUrl), `${stem}.texblock`);
+    try {
+      if (!u) throw new Error('无法拼出 URL');
+      const res = await fetch(u);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const records = (await parseTexblockSegments(await res.arrayBuffer())).flat();
+      this.leafRequestCache.set(stem, records);
+    } catch (e) {
+      console.warn('[s3m] leaf texblock 请求失败：', u, e);
+      if (!this.leafRequestCache.has(stem)) this.leafRequestCache.set(stem, null);
+    }
   }
 
   /**
