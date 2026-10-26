@@ -424,19 +424,25 @@ export class S3MViewer {
    * 绑定宿主画布与 WebGL 上下文，建场景并启动数据集队列。
    * MapLibre 宿主由 S3MLayer 在 onAdd 里调用；纯 three 宿主直接传自己的 canvas / gl。
    */
-  mount(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
-    this.canvas = canvas;
-
-    this.renderer = new THREE.WebGLRenderer({
+  /** 创建并配置一个绑定到给定 gl 上下文的 three renderer（mount 与上下文恢复共用） */
+  private _createRenderer(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): THREE.WebGLRenderer {
+    const r = new THREE.WebGLRenderer({
       canvas,
       context: gl as WebGLRenderingContext,
       antialias: true,
     });
-    this.renderer.autoClear = false;
-    this.renderer.setPixelRatio(1);
+    r.autoClear = false;
+    r.setPixelRatio(1);
     // 白模 albedo 接近 1，不做色调映射会过曝成一片纯白、丢失明暗关系
-    this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.renderer.toneMappingExposure = 1.0;
+    r.toneMapping = THREE.ACESFilmicToneMapping;
+    r.toneMappingExposure = 1.0;
+    return r;
+  }
+
+  mount(canvas: HTMLCanvasElement, gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+    this.canvas = canvas;
+
+    this.renderer = this._createRenderer(canvas, gl);
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
 
     this.scene = new THREE.Scene();
@@ -452,6 +458,38 @@ export class S3MViewer {
     for (const ds of this._datasetQueue) void this.addDataset(ds).catch((e) => this.onError(e));
 
     this._recomputeAnchors();
+  }
+
+  /**
+   * WebGL 上下文恢复后原地换新 renderer，保留已经加载好的场景与瓦片。
+   *
+   * MapLibre 在 `webglcontextlost` 时会销毁 style 并丢弃自定义图层（自定义图层
+   * 无法序列化进 style，所以恢复后不会自动加回）。但自定义图层的 `onRemove` 不会被
+   * 调用，因此我们的 scene / 几何体 / 材质 / 纹理 / 已加载瓦片都还在内存里。
+   *
+   * three 的 GPU 状态是按 renderer 实例缓存的，所以只需把 renderer / picker 换成
+   * 绑在新 gl 上的新实例，下一帧渲染时 three 会自动把现存的几何体、材质、纹理
+   * 重新上传到新上下文 —— 不需要重建场景，也不需要重新拉瓦片。
+   */
+  restoreContext(gl: WebGLRenderingContext | WebGL2RenderingContext): void {
+    if (!this.canvas) {
+      // 理论不会走到：没 mount 过就没有上下文可恢复
+      console.warn('[s3m] restoreContext 调用过早（尚未 mount），按首次挂载处理');
+      return;
+    }
+    try {
+      // 旧上下文已失效，dispose 可能抛错，忽略即可
+      this.renderer?.dispose();
+    } catch {
+      /* noop */
+    }
+    this.renderer = this._createRenderer(this.canvas, gl);
+    setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
+    this.picker?.dispose();
+    this.picker = new Picker(this.renderer);
+    // 共享 uniform / 材质引用不变，three 重新编译着色器时会自然接管；
+    // 这里只确保下一帧尽快驱动一次渲染。
+    this._requestRepaint();
   }
 
   /** 解绑场景并释放全部 GPU 资源。对应 MapLibre 图层的 onRemove()。 */
@@ -2132,6 +2170,9 @@ export class S3MViewer {
     canvasHeight: number;
   }): boolean {
     if (!this.renderer || !this.scene || !this.camera || !this.sceneAnchor || !this.canvas) return false;
+    // 上下文丢失期间（丢失→恢复之间）不要尝试渲染，否则会刷一堆 GL 错误
+    const gl = this.renderer.getContext() as WebGLRenderingContext | null;
+    if (gl && typeof gl.isContextLost === 'function' && gl.isContextLost()) return false;
 
     // 脏标记正常由微任务刷掉；这里再兜一次底，保证「本帧画出来的」一定是最新样式
     this.flushOverrides();

@@ -109,6 +109,53 @@ export class S3MLayer {
     this.viewer.recomputeAnchors();
   };
 
+  /**
+   * WebGL 上下文是否处于丢失状态（丢失→恢复之间为 true）。
+   * 期间 render 会被 S3MViewer 内部短路，避免刷一堆 GL 错误。
+   */
+  private _contextLost = false;
+
+  /** 地图事件监听器是否已挂载，避免上下文恢复重加图层时重复绑定 */
+  private _listenersAttached = false;
+
+  private readonly _onContextLost = (): void => {
+    this._contextLost = true;
+  };
+
+  private readonly _onContextRestored = (): void => {
+    this._contextLost = false;
+    const map = this.map;
+    if (!map) return;
+    // MapLibre 在 webglcontextlost 时销毁 style 并丢弃自定义图层（自定义图层
+    // 无法序列化进 style），恢复后不会自动加回。这里手动重新 addLayer；onAdd 会识别
+    // 「已挂载」并原地换新 renderer，保留已加载的瓦片，不重新拉取。
+    try {
+      const getLayer = map.getLayer;
+      const addLayer = map.addLayer;
+      const has = typeof getLayer === 'function' ? getLayer.call(map, this.id) : undefined;
+      if (!has) {
+        if (typeof addLayer === 'function') addLayer.call(map, this);
+      } else {
+        // 极端情况下图层仍在（理论上不会）：确保 renderer 指向新上下文
+        const gl = this._mapGl();
+        if (gl) this.viewer.restoreContext(gl);
+      }
+    } catch (e) {
+      console.warn('[s3m] WebGL 上下文恢复后重加图层失败，请手动 map.addLayer(layer)', e);
+    }
+    map.triggerRepaint();
+  };
+
+  /** 从画布取回当前的 WebGL 上下文（恢复后已是新上下文） */
+  private _mapGl(): WebGLRenderingContext | WebGL2RenderingContext | null {
+    const canvas = this.map?.getCanvas?.();
+    if (!canvas) return null;
+    return (
+      (canvas.getContext('webgl2') as WebGL2RenderingContext | null) ??
+      (canvas.getContext('webgl') as WebGLRenderingContext | null)
+    );
+  }
+
   constructor(options: S3MLayerOptions = {}) {
     this.id = options.id ?? 's3m';
     this.options = options;
@@ -149,13 +196,24 @@ export class S3MLayer {
     // 老版本回退标准墨卡托）同步进 viewer
     this.map = map;
 
-    this.viewer.mount(map.getCanvas(), gl);
+    if (this.viewer.renderer) {
+      // 上下文恢复路径：onAdd 被再次触发（map.addLayer），原地换新 renderer，
+      // 保留已加载的场景与瓦片，不重建、不重拉。
+      this.viewer.restoreContext(gl);
+    } else {
+      this.viewer.mount(map.getCanvas(), gl);
+    }
 
-    map.on('click', this._onClick);
-    // 事件名必须是全称，写 'projection' 永远不会触发。v4 / v5 / Mapbox 没有这个事件，
-    // 监听一个不存在的事件名是安全的（只是不 fire），初始投影在 onAdd 的 recomputeAnchors 里已覆盖。
-    if (typeof map.on === 'function') {
-      map.on('projectiontransition', this._onProjectionChange);
+    // 监听器只在首次挂载时绑定一次；上下文恢复重加图层时不重复绑定，
+    // 否则 click / projectiontransition 等会被挂多次。
+    if (!this._listenersAttached) {
+      map.on('click', this._onClick);
+      if (typeof map.on === 'function') {
+        map.on('projectiontransition', this._onProjectionChange);
+        map.on('webglcontextlost', this._onContextLost);
+        map.on('webglcontextrestored', this._onContextRestored);
+      }
+      this._listenersAttached = true;
     }
   }
 
@@ -163,7 +221,11 @@ export class S3MLayer {
     this.map?.off('click', this._onClick);
     if (typeof this.map?.off === 'function') {
       this.map.off('projectiontransition', this._onProjectionChange);
+      this.map.off('webglcontextlost', this._onContextLost);
+      this.map.off('webglcontextrestored', this._onContextRestored);
     }
+    this._listenersAttached = false;
+    this._contextLost = false;
     this.viewer.unmount();
     this.viewer.geo = null;
     this.map = null;
@@ -253,6 +315,9 @@ export class S3MLayer {
     const map = this.map;
     const anchor = this.viewer.sceneAnchor;
     if (!map || !anchor) return;
+    // 上下文丢失期间（丢失→恢复之间）不要渲染：renderer 指向失效的 gl，
+    // 真正恢复由 _onContextRestored → restoreContext 接管。
+    if (this._contextLost) return;
 
     const matrix = this._extractMatrix(arg);
     if (!matrix) return;

@@ -40,6 +40,10 @@ export interface MapLike {
     projection?: { worldCoordinateHelper?: unknown };
   };
   getProjection?(): unknown;
+  /** 上下文恢复后用于把自定义图层重新加回地图（MapLibre / Mapbox 都有） */
+  getLayer?(id: string): unknown;
+  addLayer?(layer: unknown): unknown;
+  removeLayer?(id: string): unknown;
 }
 
 export interface MapMouseEventLike {
