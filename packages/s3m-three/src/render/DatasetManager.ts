@@ -31,6 +31,12 @@ export interface S3MDatasetOptions {
   align?: DatasetAlignment;
   /** 垂直高度偏移（米），在 align 对齐基准上的额外偏移，正数抬升，负数下降，默认 0 */
   heightOffset?: number;
+  /**
+   * 是否对该数据集生成几何棱线（CPU 端 EdgesGeometry）。
+   * - 不填：跟随全局 `style.edges`
+   * - true / false：强制开 / 关（例如地形、绿地、道路只显示材质、不描边）
+   */
+  enableEdges?: boolean;
 }
 
 export interface S3MDatasetEntry {

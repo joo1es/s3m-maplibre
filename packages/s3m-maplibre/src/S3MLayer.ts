@@ -505,6 +505,16 @@ export class S3MLayer {
     this.viewer.setEdges(enabled);
   }
 
+  /** 挂载预制棱线缓存（source-creases.f32 这类 Float32 段缓冲），比逐网格现算快得多 */
+  loadCreases(url: string): Promise<void> {
+    return this.viewer.loadCreases(url);
+  }
+
+  /** 移除并释放预制棱线缓存 */
+  clearCreases(): void {
+    this.viewer.clearCreases();
+  }
+
   /* ---------------------------------------------------------------- 单体样式 & 过滤 */
 
   setFeatureStyle(smid: number, style: FeatureStyle): void {

@@ -110,6 +110,8 @@ export interface S3MStyle {
   edgeWidth?: number;
   edgeColor: string;
   edgeOpacity?: number;
+  /** 棱线临界角（度）：相邻面法线夹角超过该值才描边，过滤掉浅坡与曲面细分。默认 55° */
+  edgeThreshold?: number;
   roofThreshold?: number;
   /** 是否与模型原色贴图叠加混合（0 = 纯色覆盖，1 = 叠乘原色贴图） */
   texMix?: number;
@@ -142,6 +144,7 @@ export const DEFAULT_STYLE: S3MStyle = {
   edgeWidth: 1.5,
   edgeColor: '#334155',
   edgeOpacity: 0.6,
+  edgeThreshold: 55,
   roofThreshold: 0.65,
   texMix: 0,
   depthWrite: true,

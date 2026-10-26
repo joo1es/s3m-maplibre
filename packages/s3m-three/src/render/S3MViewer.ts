@@ -21,6 +21,7 @@
  * MapLibre / Mapbox 的胶水层在 s3m-maplibre 包的 S3MLayer.ts。
  */
 import * as THREE from 'three';
+import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import { setMaxAnisotropy } from './TextureFactory.js';
@@ -321,6 +322,8 @@ export class S3MViewer {
   private _selectionEdges: THREE.Mesh | null = null;
   private _selectionEdgeMeshes: THREE.Mesh[] = [];
   private _edgesEnabled = false;
+  /** 预制棱线缓存（Crease Cache）：从外部 source-creases 载入的全局统一 LineSegments，性能最高、视觉最干净 */
+  private _creaseLines: THREE.LineSegments | null = null;
 
   /** 业务属性查询（可选，配了 `attributes` 才有） */
   attributeQuery: AttributeQuery | null = null;
@@ -500,6 +503,7 @@ export class S3MViewer {
   /** 解绑场景并释放全部 GPU 资源。对应 MapLibre 图层的 onRemove()。 */
   unmount(): void {
     for (const id of [...this.datasets.keys()]) this.removeDataset(id);
+    this.clearCreases();
     this.groundManager.dispose();
     this.picker?.dispose();
     this.picker = null;
@@ -1001,7 +1005,11 @@ export class S3MViewer {
       this._indexMeshSmids(mesh);
       this._addMeshHeight(mesh);
       // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义
-      if (this._edgesEnabled && !hasNativeEdges && !isPoints) this._ensureEdges(mesh);
+      // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义。
+      // 自动描边受三道开关控制：全局 style.edges / 数据集 enableEdges / 地形绿地等关键字跳过。
+      if (!hasNativeEdges && !isPoints && this._datasetEdgesEnabled(entry) && !this._shouldSkipAutoEdges(ud, entry.name)) {
+        this._ensureEdges(mesh);
+      }
 
       // 新瓦片要继承当前的不透明度与着色方式
       if (isPoints) {
@@ -1171,8 +1179,12 @@ export class S3MViewer {
     // 点云不走 StyleMaterial 的 uMode，模式切换要单独同步它的材质
     if ('mode' in patch) this._applyPointCloudStyles();
     if ('shading' in patch) this._applyShading();
-    if ('edges' in patch) this.setEdges(!!this.style.edges);
-    else if ('edgeColor' in patch || 'edgeWidth' in patch || 'opacity' in patch || 'edgeOpacity' in patch) {
+    // 临界角变了要重建 CPU 棱线（EdgesGeometry 参数），开/关走 setEdges 整体刷新
+    if ('edgeThreshold' in patch && this._edgesEnabled) {
+      this.setEdges(true);
+    } else if ('edges' in patch) {
+      this.setEdges(!!this.style.edges);
+    } else if ('edgeColor' in patch || 'edgeWidth' in patch || 'opacity' in patch || 'edgeOpacity' in patch) {
       this._refreshEdgeLines();
     }
     if (this._selection) {
@@ -1414,14 +1426,66 @@ export class S3MViewer {
     step();
   }
 
+  /**
+   * 挂载预制棱线缓存（Crease Cache）。
+   *
+   * 直接把 `source-creases.f32` 这类 Float32Array 缓冲载入为一组全局统一的
+   * LineSegments —— 相比逐 Mesh 现算 EdgesGeometry，性能高一个量级，视觉也最干净。
+   * 坐标按「场景本地坐标」（相对场景锚点的米）处理，与瓦片几何同一坐标系。
+   *
+   * @param url  棱线缓存地址（二进制 Float32 序列：x,y,z,x,y,z,… 成对成段）
+   */
+  async loadCreases(url: string): Promise<void> {
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`[s3m] 棱线缓存加载失败: ${resp.status} ${url}`);
+    const buf = await resp.arrayBuffer();
+    const arr = new Float32Array(buf);
+    if (arr.length < 6) return;
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+    const s = this.style;
+    const mat = new THREE.LineBasicMaterial({
+      color: new THREE.Color(s.edgeColor),
+      transparent: true,
+      opacity: Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * Math.min(1, Math.max(0.05, s.opacity ?? 1)),
+      depthWrite: false,
+    });
+    const lines = new THREE.LineSegments(geo, mat);
+    lines.renderOrder = 2;
+    lines.frustumCulled = false;
+    lines.raycast = () => {};
+
+    this.clearCreases();
+    this._creaseLines = lines;
+    this.scene?.add(lines);
+    this._requestRepaint();
+  }
+
+  /** 移除并释放预制棱线缓存 */
+  clearCreases(): void {
+    if (!this._creaseLines) return;
+    this.scene?.remove(this._creaseLines);
+    this._creaseLines.geometry.dispose();
+    (this._creaseLines.material as THREE.Material)?.dispose?.();
+    this._creaseLines = null;
+    this._requestRepaint();
+  }
+
   /** 让全局棱线材质跟上 style.edgeColor / edgeWidth / edgeOpacity */
   private _syncEdgeStyle(): void {
     const s = this.style;
     const u = this.edgeMaterial.uniforms;
     u.uColor.value.set(s.edgeColor);
-    u.uWidth.value = Math.max(0.1, s.edgeWidth ?? 1.2);
+    u.uWidth.value = Math.max(0.1, s.edgeWidth ?? 1.5);
     u.uOpacity.value =
-      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.45)) * Math.min(1, Math.max(0.05, s.opacity ?? 1));
+      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * Math.min(1, Math.max(0.05, s.opacity ?? 1));
+    // 预制棱线缓存（LineBasicMaterial）同步颜色 / 不透明度
+    if (this._creaseLines) {
+      const m = this._creaseLines.material as THREE.LineBasicMaterial;
+      m.color.set(s.edgeColor);
+      m.opacity = Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * Math.min(1, Math.max(0.05, s.opacity ?? 1));
+    }
   }
 
   /** 让数据自带的棱线跟着 style.edgeColor / opacity 走（这些是 LineBasicMaterial，改不了粗细） */
@@ -1429,7 +1493,7 @@ export class S3MViewer {
     const mat = lines.material as THREE.LineBasicMaterial;
     if (!mat || !mat.color) return;
     mat.color.set(this.style.edgeColor);
-    const baseOpacity = this.style.edgeOpacity ?? 0.45;
+    const baseOpacity = this.style.edgeOpacity ?? 0.6;
     mat.opacity = baseOpacity * Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
     mat.transparent = true;
     mat.polygonOffset = true;
@@ -1447,14 +1511,46 @@ export class S3MViewer {
     }
   }
 
+  /** 地形 / 绿地 / 道路 / 地面铺装等不参与自动描边（数据自带棱线包另说） */
+  private static readonly _EDGE_SKIP_KEYWORDS = [
+    'terrain', 'ground', 'vegetation', 'green', 'road', 'dem',
+    '绿地', '道路', '地面', '地形', '植被', '铺装',
+  ];
+
+  /** 数据集级别的棱线开关：enableEdges 优先，否则跟随全局 style.edges */
+  private _datasetEdgesEnabled(entry: S3MDatasetEntry): boolean {
+    const opt = entry.options?.enableEdges;
+    if (opt === true) return true;
+    if (opt === false) return false;
+    return this._edgesEnabled;
+  }
+
+  /** 该 mesh 是否命中「跳过自动描边」的关键字（skeletonName / 数据集名） */
+  private _shouldSkipAutoEdges(ud: MeshUserData, datasetName: string): boolean {
+    const hay = `${ud.skeletonName ?? ''} ${datasetName}`.toLowerCase();
+    return S3MViewer._EDGE_SKIP_KEYWORDS.some((k) => hay.includes(k));
+  }
+
   private _ensureEdges(mesh: THREE.Mesh): void {
     const ud = mesh.userData as MeshUserData;
     if (ud.edges || ud.nativeEdges || !mesh.geometry) return;
-    const indexCount = mesh.geometry.index?.count ?? 0;
+    // 地形 / 绿地 / 道路等不参与自动描边（即使全局开棱线也要跳过）
+    if (this._shouldSkipAutoEdges(ud, '')) return;
+
+    const posAttr = mesh.geometry.getAttribute('position');
+    const indexCount = mesh.geometry.index?.count ?? (posAttr ? posAttr.count : 0);
     // 棱线是 CPU 端建的，超大几何直接跳过，避免拖慢加载
     if (indexCount > 120000) return;
 
-    const source = new THREE.EdgesGeometry(mesh.geometry, 40);
+    // 1. 先做顶点容差焊合，让相邻三角形正确共享边索引。
+    //    S3M 几何常为「每面独立顶点」，不焊合的话 EdgesGeometry 会把每条三角形边都当成边界，棱线爆炸。
+    //    tolerance 取米级模型下的 5mm，足以合并重合顶点又不会误并真实相邻面。
+    const welded = BufferGeometryUtils.mergeVertices(mesh.geometry, 0.005);
+    // 2. 调大临界角（默认 55°，可在 style.edgeThreshold 调），过滤浅坡与曲面细分，只保留真正的棱。
+    const thresholdAngle = this.style.edgeThreshold ?? 55;
+    const source = new THREE.EdgesGeometry(welded, thresholdAngle);
+    welded.dispose();
+
     const attr = source.getAttribute('position') as THREE.BufferAttribute | undefined;
     const segments = attr ? (attr.array as Float32Array) : null;
     source.dispose();
