@@ -413,6 +413,11 @@ export class S3MViewer {
       width: this.style.outlineWidthPx ?? 3,
     });
 
+    // 关键：style.edges 是个开关，但构造函数从没据此启用过棱线，导致
+    // `style: { edges: true }` 形同虚设、_edgesEnabled 永远是 false。
+    // 这里按 style 实际值调一次 setEdges，让开关真正生效（与 setEdges 后来的手工调用一致）。
+    this.setEdges(!!this.style.edges);
+
     this._fps.last = performance.now();
     this._datasetQueue = this._normalizeDatasets(options);
     if (options.attributes) this.attributeQuery = new AttributeQuery(options.attributes);
