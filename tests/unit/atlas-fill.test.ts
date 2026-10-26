@@ -56,9 +56,10 @@ function makeTile(withData: boolean) {
     compressType: 14,
     pixelFormat: 21,
     data: withData ? new Uint8Array(WHITE_DXT5_BLOCK) : null,
-    // 有内嵌缩略图 → 候选走 childTexNames（要验证）；没有 → 走 requestNames（无条件采用）
-    childTexNames: withData ? ['A.texblock'] : [],
-    requestNames: withData ? [] : ['A.texblock'],
+    // 两种情况都走 requestNames（官方只认这个字段）。
+    // `requestNames === [自身 id]` = 整张图集在独立文件里，官方 isLeaf=false → 整张替换。
+    childTexNames: [],
+    requestNames: ['A.texblock'],
     subTexInfos: [
       {
         subName: 's.texblock',
@@ -130,6 +131,36 @@ describe('子瓦片外部图集补齐（data = null + requestNames）', () => {
       );
       const t = tile as unknown as { textures: Record<string, unknown> };
       expect(Object.keys(t.textures)).toHaveLength(0);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test('childTexNames 不得用于替换像素：它是下一级 LOD 的图集指针，不是高清版', async () => {
+    let fetched = 0;
+    globalThis.fetch = (async () => {
+      fetched++;
+      return new Response(makeTexblock('A.texblock', 8, 8), { status: 200 });
+    }) as unknown as typeof fetch;
+    try {
+      const tile = makeTile(true) as never as {
+        texturePackage: Record<string, { childTexNames: string[]; requestNames: string[]; width: number }>;
+        textures: Record<string, { width: number }>;
+      };
+      // 只挂 childTexNames、不给 requestNames —— 这正是根瓦片（6.s3mblock）的形态
+      tile.texturePackage['A.texblock']!.childTexNames = ['A.texblock'];
+      tile.texturePackage['A.texblock']!.requestNames = [];
+      const tileset = newTileset();
+
+      await (tileset as unknown as { _fillExternalAtlases(t: unknown, u: string): Promise<void> })._fillExternalAtlases(
+        tile,
+        'http://localhost/6.s3mblock'
+      );
+
+      // 一个请求都不该发，图集也不该被换（换了下场就是「父级 rect 套子级像素」整张错位）
+      expect(fetched).toBe(0);
+      expect(tileset.atlasUpgraded.size).toBe(0);
+      expect(tile.texturePackage['A.texblock']!.width).toBe(4);
     } finally {
       globalThis.fetch = realFetch;
     }

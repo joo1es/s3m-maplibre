@@ -1,9 +1,9 @@
 /**
  * 高清图集替换门禁（`core/AtlasUpgrade.ts`）的单测。
  *
- * 这一层的存在理由：官方 `requestSubTextures` 是「整体换图、rect 照旧」，
- * 前提是 child 与缩略图**同一套排布、只是分辨率更高**。实测这个前提只对一部分图集成立，
- * 无条件换会整张错位。所以判据必须可测、可回归。
+ * 这一层的存在理由：官方 `requestSubTextures` 里「整张替换」那一支
+ * （`isLeaf = false`）是「换图、rect 照旧」，前提是外部文件与块里那份**同一套排布**。
+ * 实测这个前提只对一部分图集成立，无条件换会整张错位。所以判据必须可测、可回归。
  */
 import { describe, expect, test } from 'bun:test';
 import {
@@ -68,7 +68,7 @@ describe('evaluateAtlasUpgrade：什么时候允许换图', () => {
     expect(v.meanAbsError).toBeLessThan(2);
   });
 
-  test('长宽比不一致 → 拒绝（这是实测里 6/8 张图集的情形）', () => {
+  test('长宽比不一致 → 拒绝（外部文件是另一套排布，rect 一贴就错位）', () => {
     const lo = make(8, 8, checker);
     // 16×24：等比放大不可能长这样
     const hi = make(16, 24, (x, y) => {

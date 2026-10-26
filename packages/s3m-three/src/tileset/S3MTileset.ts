@@ -631,15 +631,38 @@ export class S3MTileset {
     let changed = false;
 
     for (const [id, tex] of Object.entries(tp)) {
-      // 高清子图集：requestNames 是子瓦片「像素在独立文件里」的情形，
-      // childTexNames 才是根图集挂的候选清晰版。
-      const names = [...(tex.requestNames ?? []), ...(tex.childTexNames ?? [])];
+      // ★ 只认 requestNames。
+      //
+      // `childTexNames` 是**下一级 LOD 的图集指针**（官方 `_ancestorTexture` 用它继承
+      // batchTable 的 rect），它有自己的 subTexInfos：同一个精灵在父级叫 `1460_3` 96x64、
+      // 子级叫 `1460_2` 192x128，排布也不一样。拿父级的 rect 去套子级像素必然错位 ——
+      // 上一版就是这么把画面搞坏的。官方从不拿它换像素，那个 LOD 的瓦片自己会加载。
+      const names: string[] = [];
+      for (const n of tex.requestNames ?? []) {
+        // `Tex_0.texblock#000009015016...` 是「一个文件里装 N 张精灵、按名字取」的容器，
+        // 不是文件名。直接当 URL 请求会带上 # 片段 → 拿到别的文件/404 → 整块白膜。
+        if (n.includes('#')) {
+          this.atlasUpgradeSkipped.set(id, `multi-sprite container (${n.split('#')[0]})`);
+          continue;
+        }
+        names.push(n);
+      }
       if (!names.length) continue;
       // 子瓦片的图集段只有元信息（data = null），没有可比的基准，只能直接采用；
       // 根块自带缩略图，必须验证过才能换。
       const hasBaseline = !!tex.data;
       const accept = (img: S3MBlockAtlasImage): boolean => {
-        if (!hasBaseline) return true;
+        if (!hasBaseline) {
+          // 没有缩略图可比，但至少要挡住「根本不是同一张图集」的情况：
+          // 长宽比必须一致，否则 subTexInfos 的 rect 一贴就错位。
+          const loAsp = tex.width / tex.height;
+          const hiAsp = img.width / img.height;
+          if (!(Math.abs(hiAsp / loAsp - 1) <= 0.02)) {
+            this.atlasUpgradeSkipped.set(id, `aspect(no-baseline) ${tex.width}x${tex.height} vs ${img.width}x${img.height}`);
+            return false;
+          }
+          return true;
+        }
         const v = evaluateAtlasUpgrade(tex as unknown as AtlasPixels, img);
         if (v.ok) return true;
         this.atlasUpgradeSkipped.set(

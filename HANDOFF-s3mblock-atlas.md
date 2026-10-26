@@ -6,6 +6,89 @@
 
 ---
 
+## ★ 第十三轮（2026-10-26）：读官方代码，第十二轮的前提整条是错的
+
+第十二轮我假设「`childTexNames` 指向同一张图集的高清版」，还为此造了一个验证门禁。
+**官方包里 `childTexNames` 一次都没出现**（`grep -c childTexNames SuperMap3D.js` = 0）。
+它是我们解析器给「派生图集链」起的名字，官方叫 `_ancestorTexture` / `ancestorMap`。
+
+### 官方原文（`SuperMap3D.js`，`lM.prototype.createTexture`）
+
+```js
+var E = o._textureLod;                      // layer 级开关
+this.isRoot = n && E;
+if (!n || !E) {                             // 非根 或 没开 textureLod
+  this._subRequestNames = [];
+  for (var D = 0; D < h.requestNames.length; D++) {
+    var G = h.requestNames[D], q = yke(G);  // yke = 取 '.' 之前的部分
+    if (q.split('_')[0] === 'Tex') {        // ★ Tex_x.texblock#<三位数字串> → 展开成多个名字
+      var ie = G.split('#'), re = yke(ie[0]);
+      if (ie.length > 1) for (var le = ie[1], he = 0; he < le.length; he += 3) {
+        this._subRequestNames.push(re + '_' + le.substring(he, he + 3));
+      }
+    } else this._subRequestNames.push(q);
+  }
+}
+return this.isLeaf = (!n || !E) && !(h.requestNames.length === 1 && h.requestNames[0] === a);
+```
+
+`requestSubTextures` 里两条分支：
+
+```js
+if (S >= 0) { var W = h[S]; R = W.offsetX; T = W.offsetY; }   // S = 图像名在 _subTextureNames 里的下标
+this.isLeaf
+  ? s.enqueue({ texture: E, subTextureInfo: { xOffset: R, yOffset: T, width: D, height: J, arrayBufferView: ... } })
+  : E.arrayBufferView = C.arrayBufferView;                     // 整张替换
+```
+
+结论：
+
+1. **像素只从 `requestNames` 来**。`childTexNames` 是**下一级 LOD 的图集指针**，
+   官方只用它继承 batchTable 的 rect，从不拿它换像素。
+2. `requestNames === [自身 id]` → `isLeaf = false` → **整张替换**（同一张图集，rect 照旧）。
+3. 否则是 leaf → 拉回来的是**一堆小精灵**，按 `subTexInfos[i].offset` 逐个贴进图集。
+4. `Tex_x.texblock#000009015016...` 不是文件名，是「`Tex_x.texblock` 里按名字取这些图」的清单。
+
+### 数据完全对得上
+
+`subName` 的后缀就是 LOD 级别，父级 `childTexNames` 指向的正是子级那张图集：
+
+| 文件 | 图集 id | 精灵 | 尺寸 |
+|---|---|---|---|
+| `6.s3mblock` | `427494225` | `1460_**3**` | 96×64 |
+| `6_00.s3mblock` | `-704919438` | `1460_**2**` | 192×128 |
+| `6_0000.s3mblock` | `-682963945` | `1460_**1**` | 192×128 |
+| `6_000000.s3mblock` | `-1710530621` | `1460_**0**` | 768×512 |
+
+`427494225` 的 `childTexNames = ['-704919438.texblock']` —— 就是 `6_00` 里那张。
+**它们是同一精灵在不同 LOD 的不同排布**，所以整张替换必然错位。这也解释了第十二轮那张
+「长宽比偏差 5.6%~200%、色差 43~86」的表：我一直在拿**不同 LOD 的图集**互相比。
+
+### 本轮改动
+
+1. `_fillExternalAtlases` **只认 `requestNames`**，`childTexNames` 彻底退出像素路径。
+2. `Tex_*#...` 这类多精灵容器名**不再当 URL 请求**（以前会把 `#` 后面的当片段，
+   请求到别的文件/404 → 整块白膜），先记进 `atlasUpgradeSkipped`。
+3. 没有缩略图可比时（`data = null` 的子瓦片）也要过一道**长宽比**检查，挡住「根本不是同一张」。
+4. 新增回归测试：`childTexNames` 只挂不用时，**一个请求都不该发、图集一个字节都不该变**。
+
+### 还没做的（这就是下一轮的正题）
+
+**leaf 模式没实现**。最细一级（`6_000000`）的图集是 `data = null` +
+`requestNames = ['Tex_0.texblock#...', 'Tile_6_000000.texblock']`，官方会把 `#` 展开成
+`Tex_0_000` / `Tex_0_009` / … 再逐个贴进 1548×1536 的画布。
+要做这一步得先解决两件事：
+
+1. `Tex_0.texblock` 是**多图容器**（实测 275 张），容器布局与单图版不同
+   （没有 name 字符串，`count` 后直接是尺寸表）。我们现在的
+   `parseS3MBlockTextureFile` 只认单图版。
+2. 每张图要能按**名字**取（`Tex_0_000`），而我们的解析器没有读内层记录的名字。
+
+在那之前，最细 LOD 的图集会走 `Tile_6_000000.texblock`（单图版，能解析）——
+如果它也是整张图集，那条路应该能通；否则那一级仍然无贴图。
+
+---
+
 ## ★ 第十二轮（2026-10-26）：高清 `.texblock` 接入 —— 但「换图不换 rect」这个前提是错的
 
 ### 先证伪，再动手
