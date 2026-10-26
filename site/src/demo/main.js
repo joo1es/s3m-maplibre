@@ -953,6 +953,51 @@ $('optOccludeBack').addEventListener('change', (e) => {
   layer.setStyle({ depthWrite: e.target.checked });
 });
 
+/* ---------------------------------------------------------------- 光照调节 */
+
+if ($('optLightMode')) {
+  $('optLightMode').addEventListener('change', (e) => {
+    layer.setLight({ mode: e.target.value });
+  });
+}
+if ($('optLightMain')) {
+  $('optLightMain').addEventListener('input', (e) => {
+    const v = Number(e.target.value) / 100;
+    $('lightMainVal').textContent = v.toFixed(2);
+    layer.setLight({ mainIntensity: v });
+  });
+}
+if ($('optLightAmbient')) {
+  $('optLightAmbient').addEventListener('input', (e) => {
+    const v = Number(e.target.value) / 100;
+    $('lightAmbientVal').textContent = v.toFixed(2);
+    layer.setLight({ ambientIntensity: v });
+  });
+}
+if ($('optLightAltitude')) {
+  $('optLightAltitude').addEventListener('input', (e) => {
+    const deg = Number(e.target.value);
+    $('lightAltitudeVal').textContent = `${deg}°`;
+    layer.setLight({ altitude: (deg * Math.PI) / 180 });
+  });
+}
+if ($('optLightAzimuth')) {
+  $('optLightAzimuth').addEventListener('input', (e) => {
+    const deg = Number(e.target.value);
+    $('lightAzimuthVal').textContent = `${deg}°`;
+    layer.setLight({ azimuth: (deg * Math.PI) / 180 });
+  });
+}
+if ($('optLightMainColor')) {
+  $('optLightMainColor').addEventListener('input', (e) => {
+    layer.setLight({ mainColor: e.target.value });
+  });
+}
+if ($('optLightAmbientColor')) {
+  $('optLightAmbientColor').addEventListener('input', (e) => {
+    layer.setLight({ ambientColor: e.target.value });
+  });
+}
 /* ---------------------------------------------------------------- 过滤与单体定制 */
 
 let hiddenSmids = new Set();

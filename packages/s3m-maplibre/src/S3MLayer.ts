@@ -34,6 +34,7 @@ import type {
   ThematicResult,
   BatchAudit,
   GroundMode,
+  LightOptions,
 } from 's3m-three';
 import type { Ray } from 'three';
 import { Matrix4 } from 'three';
@@ -128,6 +129,8 @@ export class S3MLayer {
       maxConcurrent: options.maxConcurrent,
       lodRangeScale: options.lodRangeScale,
       buildTile: options.buildTile,
+      light: options.light,
+      totalMaxTiles: options.totalMaxTiles,
       attributes: options.attributes,
       // 三个宿主能力全部走回调注入，viewer 不碰任何地图 API
       onRequestRepaint: () => this.map?.triggerRepaint(),
@@ -407,6 +410,16 @@ export class S3MLayer {
   }
 
   /* ---------------------------------------------------------------- 样式 */
+
+  /** 动态设置光照配置（强度、颜色、朝向模式、太阳方位角/仰角等） */
+  setLight(options: Partial<LightOptions>): void {
+    this.viewer.setLight(options);
+  }
+
+  /** 获取当前光照配置快照 */
+  getLight(): LightOptions {
+    return this.viewer.getLight();
+  }
 
   /** 动态设置图层整体透明度 (0.0 ~ 1.0) */
   setOpacity(opacity: number): void {

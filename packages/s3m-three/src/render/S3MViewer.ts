@@ -144,7 +144,42 @@ export interface PickResult extends FeatureAttributes {
   mesh: THREE.Mesh;
 }
 
+export interface LightOptions {
+  /** 环境光强度，默认 0.4 */
+  ambientIntensity?: number;
+  /** 环境光颜色，十六进制或 CSS 颜色字符串，默认 0xffffff */
+  ambientColor?: number | string;
+  /** 半球光天空强度，默认 0.8 */
+  hemisphereIntensity?: number;
+  /** 半球光天空颜色，默认 0xffffff */
+  hemisphereColor?: number | string;
+  /** 半球光地面颜色，默认 0xb6c0cb */
+  hemisphereGroundColor?: number | string;
+  /** 主平行光强度，默认 1.0 */
+  keyLightIntensity?: number;
+  /** 主平行光颜色，默认 0xffffff */
+  keyLightColor?: number | string;
+  /** 补光强度，默认 0.35 */
+  fillLightIntensity?: number;
+  /** 补光颜色，默认 0xffffff */
+  fillLightColor?: number | string;
+  /**
+   * 光照朝向模式：
+   * - 'headlamp': 默认头灯模式（随相机 bearing 旋转，受光面始终面向镜头）
+   * - 'fixed': 固定世界坐标方位角（如太阳光模拟）
+   */
+  mode?: 'headlamp' | 'fixed';
+  /** 方位角（度，0~360），固定模式下以正北为 0 顺时针，头灯模式下为相机相对偏角，默认 150 */
+  azimuth?: number;
+  /** 太阳/光源仰角（度，0~90），默认 50 */
+  altitude?: number;
+}
+
 export interface S3MViewerOptions {
+  /** 光照参数配置（强度、颜色、朝向模式、太阳方位角/仰角等） */
+  light?: LightOptions;
+  /** 全局总驻留瓦片上限（多数据集多图层共享预算），在所有可见数据集之间动态均衡分配，彻底防止爆显存 */
+  totalMaxTiles?: number;
   /** 单数据集简写 */
   configUrl?: string;
   /** 多数据集 */
@@ -294,8 +329,24 @@ export class S3MViewer {
   private _needsRepaint = true;
   private _frame = 0;
   private readonly _fps = { value: 0, last: 0 };
-  private _keyLight: THREE.DirectionalLight | null = null;
-  private _fillLight: THREE.DirectionalLight | null = null;
+  private _ambientLight!: THREE.AmbientLight;
+  private _hemiLight!: THREE.HemisphereLight;
+  private _keyLight!: THREE.DirectionalLight;
+  private _fillLight!: THREE.DirectionalLight;
+  private readonly _lightOptions: Required<LightOptions> = {
+    ambientIntensity: 0.4,
+    ambientColor: 0xffffff,
+    hemisphereIntensity: 0.8,
+    hemisphereColor: 0xffffff,
+    hemisphereGroundColor: 0xb6c0cb,
+    keyLightIntensity: 1.0,
+    keyLightColor: 0xffffff,
+    fillLightIntensity: 0.35,
+    fillLightColor: 0xffffff,
+    mode: 'headlamp',
+    azimuth: 150,
+    altitude: 50,
+  };
 
   private readonly _datasetQueue: S3MDatasetOptions[];
 
@@ -309,10 +360,20 @@ export class S3MViewer {
     this._onRequestRepaint();
   }
 
+  triggerRepaint(): void {
+    this._requestRepaint();
+  }
+
   constructor(options: S3MViewerOptions = {}) {
     this.options = options;
     this.pickable = options.pickable !== false;
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
+    if (options.light) {
+      Object.assign(this._lightOptions, options.light);
+    }
+    if (options.totalMaxTiles) {
+      this._datasetManager.totalMaxTiles = options.totalMaxTiles;
+    }
     this._onRequestRepaint = options.onRequestRepaint ?? (() => {});
     this._getBearing = options.getBearing;
     this.onStats = options.onStats ?? (() => {});
@@ -321,6 +382,11 @@ export class S3MViewer {
     this.onError = options.onError ?? ((e) => console.warn('[s3m]', e));
 
     this.groundManager = new GroundManager(options.ground);
+    if (!this.scene) {
+      this.scene = new THREE.Scene();
+      this.scene.add(this.groundManager.group);
+      this._addLights();
+    }
     this._featureStyleManager = new FeatureStyleManager(
       () => this.style.floorHeight,
       () => this._requestRepaint(),
@@ -412,24 +478,70 @@ export class S3MViewer {
     this.canvas = null;
   }
 
+  private _createLights(): void {
+    this._ambientLight = new THREE.AmbientLight(this._lightOptions.ambientColor as any, this._lightOptions.ambientIntensity);
+    this._hemiLight = new THREE.HemisphereLight(
+      this._lightOptions.hemisphereColor as any,
+      this._lightOptions.hemisphereGroundColor as any,
+      this._lightOptions.hemisphereIntensity
+    );
+    this._keyLight = new THREE.DirectionalLight(this._lightOptions.keyLightColor as any, this._lightOptions.keyLightIntensity);
+    this._fillLight = new THREE.DirectionalLight(this._lightOptions.fillLightColor as any, this._lightOptions.fillLightIntensity);
+    this._updateLights();
+  }
+
   private _addLights(): void {
     if (!this.scene) return;
-    // 环境光与天光打底，保证背光面和折叠处不死黑
-    this.scene.add(new THREE.AmbientLight(0xffffff, 0.4));
-    this.scene.add(new THREE.HemisphereLight(0xffffff, 0xb6c0cb, 0.8));
-    // 主光 / 补光的方向每帧按地图朝向重算（见 _updateLights），
-    // 这样旋转视角时白模始终是亮的，不会转到背光面就一片死灰。
-    this._keyLight = new THREE.DirectionalLight(0xffffff, 1.0);
-    this._fillLight = new THREE.DirectionalLight(0xffffff, 0.35);
-    this.scene.add(this._keyLight, this._fillLight);
+    if (!this._ambientLight) this._createLights();
+    this.scene.add(this._ambientLight, this._hemiLight, this._keyLight, this._fillLight);
+  }
+
+  private _applyLightOptions(): void {
+    if (this._ambientLight) {
+      this._ambientLight.intensity = this._lightOptions.ambientIntensity;
+      this._ambientLight.color.set(this._lightOptions.ambientColor as any);
+    }
+    if (this._hemiLight) {
+      this._hemiLight.intensity = this._lightOptions.hemisphereIntensity;
+      this._hemiLight.color.set(this._lightOptions.hemisphereColor as any);
+      this._hemiLight.groundColor.set(this._lightOptions.hemisphereGroundColor as any);
+    }
+    if (this._keyLight) {
+      this._keyLight.intensity = this._lightOptions.keyLightIntensity;
+      this._keyLight.color.set(this._lightOptions.keyLightColor as any);
+    }
+    if (this._fillLight) {
+      this._fillLight.intensity = this._lightOptions.fillLightIntensity;
+      this._fillLight.color.set(this._lightOptions.fillLightColor as any);
+    }
   }
 
   /**
-   * 让光照跟着地图朝向走：主光在镜头后上方偏左，补光在后上方偏右。
-   * 相当于一盏头灯，看到的立面永远是受光面。
+   * 动态设置光照配置
+   */
+  setLight(options: Partial<LightOptions>): void {
+    Object.assign(this._lightOptions, options);
+    this._applyLightOptions();
+    this._updateLights();
+    this._needsRepaint = true;
+    this.triggerRepaint();
+  }
+
+  /**
+   * 获取当前光照配置快照
+   */
+  getLight(): LightOptions {
+    return { ...this._lightOptions };
+  }
+
+  /**
+   * 更新光照位置与方向：
+   * - 'headlamp': 随地图方位角 bearing 旋转，主光始终在镜头上方，受光面面向镜头；
+   * - 'fixed': 固定世界方位角（如模拟恒定日光）。
    */
   private _updateLights(): void {
-    const bearing = ((this._getBearing?.() ?? 0) * Math.PI) / 180;
+    if (!this._keyLight || !this._fillLight) return;
+    const bearing = this._lightOptions.mode === 'fixed' ? 0 : (((this._getBearing?.() ?? 0) * Math.PI) / 180);
     const place = (light: THREE.DirectionalLight | null, azOffsetDeg: number, elevDeg: number): void => {
       if (!light) return;
       const az = bearing + (azOffsetDeg * Math.PI) / 180;
@@ -437,8 +549,8 @@ export class S3MViewer {
       const c = Math.cos(el);
       light.position.set(Math.sin(az) * c, Math.cos(az) * c, Math.sin(el)).multiplyScalar(1000);
     };
-    place(this._keyLight, 150, 50);
-    place(this._fillLight, 215, 30);
+    place(this._keyLight, this._lightOptions.azimuth, this._lightOptions.altitude);
+    place(this._fillLight, this._lightOptions.azimuth + 65, Math.max(10, this._lightOptions.altitude - 20));
   }
 
   /* ---------------------------------------------------------------- 数据集 */
@@ -877,6 +989,27 @@ export class S3MViewer {
    * 而 LOD 细化、瓦片重载、淘汰回补都会换掉 mesh —— 不重放的话，用户点中的那栋楼
    * 一细化就失去高亮（状态还在 _selection.smid 里，只是没人往新 mesh 上刷）。
    */
+  /**
+   * 判断一块无 SMID 单体化信息的网格（如倾斜摄影或白模整块）是否空间覆盖当前选中命中点
+   */
+  private _isMeshCoveringSelection(mesh: THREE.Mesh, sel: PickResult): boolean {
+    if (!sel.point) return false;
+    const geom = mesh.geometry;
+    if (!geom) return false;
+    if (!geom.boundingBox) geom.computeBoundingBox();
+    if (!geom.boundingBox) return false;
+
+    // 将选中的三维场景点转入网格局部坐标系进行包围盒检测
+    const pt = new THREE.Vector3(sel.point[0], sel.point[1], sel.point[2]);
+    mesh.updateWorldMatrix(true, false);
+    const inv = mesh.matrixWorld.clone().invert();
+    const localPt = pt.applyMatrix4(inv);
+
+    // 留出 0.5 米容差，避免刚好处于三角网格边缘缝隙时漏判
+    const box = geom.boundingBox.clone().expandByScalar(0.5);
+    return box.containsPoint(localPt);
+  }
+
   private _replaySelectionOnto(mesh: THREE.Mesh): void {
     const sel = this._selection;
     if (!sel) return;
@@ -893,7 +1026,13 @@ export class S3MViewer {
     // 拾取命中的那块 mesh 用原始 batchId；同一 smid 散在别的几何里时按各自的区间算
     if (mesh === sel.mesh) batchId = sel.batchId;
     // 这块几何里根本没有这个单体 → 不动它（否则会把无关瓦片一起点亮）
-    if (batchId < 0 && mesh !== sel.mesh) return;
+    if (batchId < 0 && mesh !== sel.mesh) {
+      if (sel.smid == null && ud.datasetId === sel.datasetId && this._isMeshCoveringSelection(mesh, sel)) {
+        batchId = -1;
+      } else {
+        return;
+      }
+    }
 
     mat.userData.uSelBatch.value = batchId;
     mat.userData.uSelWhole.value = batchId < 0 ? 1 : 0;
@@ -903,44 +1042,56 @@ export class S3MViewer {
     this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
   }
 
-  /** 瓦片被淘汰：从拾取表和场景里摘掉，并释放它自己的 GPU 资源 */
+  /** 瓦片被淘汰：从拾取表和场景里摘掉，并深度彻底释放所有几何体与材质显存 */
   private _unregisterTile(node: TileNode, entry: S3MDatasetEntry): void {
-    for (const child of [...node.group.children]) {
-      const mesh = child as THREE.Mesh;
-      if (!mesh.isMesh) continue;
-      const ud = mesh.userData as MeshUserData;
-      // 「这块 mesh 没了」≠「用户不再选中」：LOD 细化 / 淘汰回补都会换掉 mesh。
-      // 以前这里一律 select(null)，于是点中的那栋楼一拉近，选中状态就整个被清掉。
-      const wasSelected = this._selectedMeshes.includes(mesh);
-      if (wasSelected) {
-        this._selectedMeshes = this._selectedMeshes.filter((m) => m !== mesh);
+    node.group.traverse((child) => {
+      const obj = child as any;
+      if (obj.userData?.pickId != null) {
+        this._pickables.delete(obj.userData.pickId);
+        this._releasePickId(obj.userData.pickId);
+        obj.userData.pickId = undefined;
       }
-      if (this._selection?.mesh === mesh) {
-        const smid = this._selection.smid;
-        const carrier =
-          smid != null ? [...(this._smidMeshes.get(smid) ?? [])].find((m) => m !== mesh && m.parent) : undefined;
-        if (carrier) {
-          // 选中身份交给承载同一 smid 的另一块 mesh（通常是接替显示的子瓦）
-          this._selection = { ...this._selection, mesh: carrier };
-          this._replaySelectionOnto(carrier);
+      if (obj.isMesh) {
+        const wasSelected = this._selectedMeshes.includes(obj);
+        if (wasSelected) {
+          this._selectedMeshes = this._selectedMeshes.filter((m) => m !== obj);
+        }
+        const currentSel = this._selection;
+        if (currentSel && currentSel.mesh === obj) {
+          const smid = currentSel.smid;
+          const carrier = (
+            smid != null
+              ? [...(this._smidMeshes.get(smid) ?? [])].find((m) => m !== obj && m.parent)
+              : this._selectedMeshes.find((m) => m !== obj && m.parent && (m.parent as any).visible) ??
+                this._selectedMeshes.find((m) => m !== obj && m.parent)
+          ) as THREE.Mesh | undefined;
+          if (carrier) {
+            // 选中身份交给承载同一 smid 的另一块 mesh（通常是接替显示的子瓦）
+            this._selection = { ...currentSel, mesh: carrier };
+            this._replaySelectionOnto(carrier);
+          } else {
+            this.select(null);
+          }
+        }
+        this._unindexMeshSmids(obj);
+        this._removeMeshHeight(obj);
+        this._featureStyleManager.disposeMesh(obj);
+        const styled = styledMaterialOf(obj);
+        styled?.dispose?.();
+      }
+      // 深度释放材质（点云、普通材质、材质数组）
+      if (isOwnedPointCloudMaterial(obj.material)) {
+        (obj.material as THREE.Material).dispose();
+      } else if (obj.material) {
+        if (Array.isArray(obj.material)) {
+          obj.material.forEach((m: any) => m?.dispose?.());
         } else {
-          this.select(null);
+          obj.material.dispose?.();
         }
       }
-      if (ud.pickId != null) {
-        this._pickables.delete(ud.pickId);
-        this._releasePickId(ud.pickId);
-        ud.pickId = undefined;
-      }
-      this._unindexMeshSmids(mesh);
-      this._removeMeshHeight(mesh);
-      this._featureStyleManager.disposeMesh(mesh);
-      const styled = styledMaterialOf(mesh);
-      styled?.dispose?.();
-      // 点云材质是本模块按模式建的，不走 styled 那条链
-      if (isOwnedPointCloudMaterial(mesh.material)) (mesh.material as THREE.Material).dispose();
-      mesh.geometry?.dispose?.();
-    }
+      // 释放几何体显存缓冲
+      obj.geometry?.dispose?.();
+    });
     entry.root.remove(node.group);
   }
 

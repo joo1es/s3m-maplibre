@@ -59,6 +59,50 @@ export default function StyleSection() {
       </section>
 
       <section>
+        <h2>光照调节 (Lighting)</h2>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+          <span style="color:#94a3b8; font-size:11.5px;">光照模式</span>
+          <select id="optLightMode" class="form-select">
+            <option value="headlamp" selected>头灯跟随 (Headlamp)</option>
+            <option value="fixed">太阳方位固定 (Fixed)</option>
+          </select>
+        </div>
+        <label class="rng">
+          <span>主光强度</span>
+          <input type="range" id="optLightMain" min="0" max="250" step="5" value="90" />
+          <b id="lightMainVal">0.9</b>
+        </label>
+        <label class="rng">
+          <span>环境光强度</span>
+          <input type="range" id="optLightAmbient" min="0" max="200" step="5" value="80" />
+          <b id="lightAmbientVal">0.8</b>
+        </label>
+        <label class="rng">
+          <span>高度角 (仰角)</span>
+          <input type="range" id="optLightAltitude" min="10" max="90" step="2" value="46" />
+          <b id="lightAltitudeVal">46°</b>
+        </label>
+        <label class="rng">
+          <span>方位角 (方向)</span>
+          <input type="range" id="optLightAzimuth" min="0" max="360" step="5" value="29" />
+          <b id="lightAzimuthVal">29°</b>
+        </label>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-top: 6px;">
+          <span style="color:#94a3b8; font-size:11.5px;">光照颜色</span>
+          <div style="display: flex; gap: 10px; align-items: center;">
+            <label style="display: flex; align-items: center; gap: 4px; font-size: 11px; color: #94a3b8; cursor: pointer;">
+              主光
+              <input type="color" id="optLightMainColor" value="#ffffff" style="width:20px; height:20px; padding:0; border:none; border-radius:4px; cursor:pointer;" />
+            </label>
+            <label style="display: flex; align-items: center; gap: 4px; font-size: 11px; color: #94a3b8; cursor: pointer;">
+              环境
+              <input type="color" id="optLightAmbientColor" value="#ffffff" style="width:20px; height:20px; padding:0; border:none; border-radius:4px; cursor:pointer;" />
+            </label>
+          </div>
+        </div>
+      </section>
+
+      <section>
         <h2>地形 (MapLibre Terrain)</h2>
         <label class="chk">
           <input type="checkbox" id="optTerrain" /> 开启真实地形（AWS Terrarium DEM）

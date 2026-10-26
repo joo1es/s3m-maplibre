@@ -64,6 +64,68 @@ export interface DatasetManagerCallbacks {
 export class DatasetManager {
   readonly datasets = new Map<string, S3MDatasetEntry>();
   sceneAnchor: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null = null;
+  totalMaxTiles: number = 0;
+
+  get(id: string): S3MDatasetEntry | undefined {
+    return this.datasets.get(id);
+  }
+
+  values(): IterableIterator<S3MDatasetEntry> {
+    return this.datasets.values();
+  }
+
+  /**
+   * 同步预注册数据集（用于提前建立条目与预算平衡）
+   */
+  registerDataset(options: S3MDatasetOptions): S3MDatasetEntry {
+    const existing = this.datasets.get(options.id);
+    if (existing) return existing;
+    const root = new THREE.Group();
+    root.name = `s3m-dataset:${options.id}`;
+    root.visible = options.visible !== false;
+    const entry: S3MDatasetEntry = {
+      id: options.id,
+      name: options.name ?? options.id,
+      options,
+      root,
+      tileset: null,
+      anchor: null,
+      baseAlignOffset: 0,
+      userOffset: options.heightOffset ?? 0,
+      heightOffset: options.heightOffset ?? 0,
+      offset: [0, 0, 0],
+      visible: options.visible !== false,
+      error: null,
+    };
+    this.datasets.set(options.id, entry);
+    this.rebalanceBudgets();
+    return entry;
+  }
+
+  /**
+   * 全局多数据集预算再平衡：在所有可见数据集之间均衡分配 maxTiles
+   */
+  rebalanceBudgets(totalMaxTiles?: number): void {
+    const budget = totalMaxTiles ?? this.totalMaxTiles;
+    if (!budget || budget <= 0) return;
+    this.totalMaxTiles = budget;
+
+    const visibleEntries = Array.from(this.datasets.values()).filter((d) => d.visible && d.tileset);
+    const count = Math.max(1, visibleEntries.length);
+    const perDataset = Math.max(8, Math.floor(budget / count));
+
+    for (const entry of this.datasets.values()) {
+      if (!entry.tileset) continue;
+      if (entry.visible) {
+        entry.tileset.maxTiles = perDataset;
+        entry.tileset.hardCap = perDataset + Math.max(4, Math.ceil(perDataset * 0.5));
+      } else {
+        // 隐藏数据集仅保留极低配额（防止占着显存）
+        entry.tileset.maxTiles = Math.min(4, entry.tileset.maxTiles);
+        entry.tileset.hardCap = Math.min(6, entry.tileset.hardCap);
+      }
+    }
+  }
 
   /** 根据语义对齐方式（'top' | 'bottom' | 'center'）和数据源高度范围计算基准高度偏移 */
   computeAlignOffset(tileset: S3MTileset | null, align?: DatasetAlignment): number {
@@ -144,6 +206,7 @@ export class DatasetManager {
       },
     });
     entry.tileset = tileset;
+    this.rebalanceBudgets();
 
     try {
       await tileset.init();
@@ -179,6 +242,7 @@ export class DatasetManager {
     entry.tileset?.dispose();
     scene.remove(entry.root);
     this.datasets.delete(id);
+    this.rebalanceBudgets();
 
     if (this.datasets.size > 0) {
       this.recomputeAnchors(geo);
@@ -277,6 +341,7 @@ export class DatasetManager {
     if (!entry) return;
     entry.visible = visible;
     entry.root.visible = visible;
+    this.rebalanceBudgets();
   }
 
   /**

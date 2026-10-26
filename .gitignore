@@ -7,3 +7,4 @@ package-lock.json
 site/dist-ssr/
 site/dist-demo/
 site/dist-demo-ssr/
+demo/assets/

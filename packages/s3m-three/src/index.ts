@@ -95,6 +95,7 @@ export type {
   S3MFilter,
   GroundMode,
   GroundOptions,
+  LightOptions,
 } from './render/S3MViewer.js';
 
 export { buildTileObjects } from './render/GeometryBuilder.js';

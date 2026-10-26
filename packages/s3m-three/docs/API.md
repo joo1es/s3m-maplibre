@@ -160,6 +160,8 @@ new S3MViewer(options?: S3MViewerOptions)
 | `ground` | `GroundOptions` | — | 3D 物理地表面 / 基坑开挖配置 |
 | `pickable` | `boolean` | `true` | 是否响应拾取 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
+| `totalMaxTiles` | `number` | — | 多数据集全局驻留瓦片总预算；开启后在可见数据集间动态均衡分配，防止叠加爆显存 |
+| `light` | `LightOptions` | — | 场景光照配置，可配环境光与主平行光的颜色、强度、模式与方位角/高度角 |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
@@ -243,6 +245,38 @@ setEdges(enabled: boolean): void
 棱线优先用**数据自带的棱线包**（`primitiveType === 13` 的索引包）：解析时就建好 `LineSegments`，开关只是切 `visible`，成本为零。数据里没有时才用 `EdgesGeometry` 在 CPU 端现算（8ms 一帧切片，超过 12 万索引直接跳过）。棱线画成**屏幕空间等宽线**（`packages/s3m-three/src/render/EdgeLines.ts`）：WebGL 的 `lineWidth` 恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。
 
 > 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺。
+
+### 光照控制 (Adjustable Lighting)
+
+```ts
+setLight(patch: Partial<LightOptions>): void
+getLight(): LightOptions
+```
+
+```ts
+interface LightOptions {
+  /** 环境光颜色，默认 0xffffff */
+  ambientColor?: number | string;
+  /** 环境光强度，默认 0.8 */
+  ambientIntensity?: number;
+  /** 主平行光颜色，默认 0xffffff */
+  mainColor?: number | string;
+  /** 主平行光强度，默认 0.9 */
+  mainIntensity?: number;
+  /**
+   * 光照模式：
+   * - 'headlamp': 头灯模式（默认）。平行光方向随相机视线/地图航向角 (bearing) 旋转，始终保持从观察者斜上方照射。
+   * - 'fixed': 固定世界坐标方位。模拟真实太阳光照射，方位角与高度角在世界空间保持固定。
+   */
+  mode?: 'headlamp' | 'fixed';
+  /** 方位角（弧度，默认 0.5）。headlamp 模式为相对视线夹角；fixed 模式 0 为正北 */
+  azimuth?: number;
+  /** 高度角/仰角（弧度，默认 0.8，约 46°） */
+  altitude?: number;
+}
+```
+
+调用 `setLight` 会即时更新场景光源并自动触发重新绘制（`triggerRepaint()`）。
 
 ### 单体样式与状态
 
@@ -787,11 +821,15 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 
 ---
 
-## 性能调优
+## 性能调优与显存管理
 
 | 手段 | 说明 |
 |---|---|
-| `maxTiles` | 每个数据集驻留瓦片上限，默认 64。叠加 5 个数据集时建议 40~48 |
+| `totalMaxTiles` | 多数据集全局瓦片总预算（如 `96` 或 `128`），自动在可见数据集间均衡分配配额，隐藏数据集时自动回收预算，防止多图层叠加爆显存 |
+| `maxTiles` | 单数据集瓦片驻留上限，默认 64。叠加多个数据集时建议配合 `totalMaxTiles` 或下调至 32~48 |
+| `maxImageCache` | 原始图集与 leaf 段图像记录的 LRU 缓存容量上限（默认 128），超限自动淘汰旧缓存，防止漫游时内存不断累积 |
+| 纹理引用计数 | 瓦片淘汰时按引用计数释放未被其他瓦片复用的 `Texture` 并调用 `dispose()`，真正归还 GPU 显存 |
+| 几何/材质深度释放 | 瓦片注销时深度遍历对象树，彻底释放 `Mesh`、`Points`（点云/高斯泼溅）以及 `LineSegments`（棱线包）的 `BufferGeometry` 与材质 |
 | `maxConcurrent` | 每数据集并发，默认 4。公开服务建议 2~3 |
 | 关闭 `edges` | 棱线是 CPU 端构建的等宽线几何（每段线段 4 个顶点），内存和 drawcall 都随网格数增长，大场景慎用 |
 | `shading: 'flat'` | 与 `'smooth'` 性能相当，但视觉更干净 |

@@ -58,6 +58,8 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | LOD 细化倍率 | ✅ | `lodRangeScale` 运行时动态调节粗细模判定阈值 |
 | 实例化几何 | ✅ | `instanceMode` 16 / 17 |
 | 正交投影 | ✅ | 可选开关（`projection: 'orthographic'`），默认透视；需 MapLibre ≥ 5，正交时底图 / 地形 / marker 需 App 退出，见[正交投影](#正交投影) |
+| 可调光照 | ✅ | `setLight()` / `getLight()` 支持动态调整环境光与主平行光的颜色、强度、方位角与高度角，支持 `headlamp`（跟随视角）与 `fixed`（太阳固定世界方位）模式 |
+| 显存与多图层优化 | ✅ | 全局瓦片预算 `totalMaxTiles` 动态分配、纹理引用计数淘汰自动释放 GPU 显存、递归深度释放几何/材质/点云/线框，防止长时间漫游或多图层堆叠爆显存 |
 | 瓦片同材质合批 | ✅ | 倾斜摄影大瓦片自动合批，大幅降低 DrawCall |
 | 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
 | DXT / WebP 纹理 | ✅ | |
@@ -102,7 +104,7 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 
 ```html
 <script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5/dist/maplibre-gl.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.1/dist/browser/s3m-maplibre.iife.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.2/dist/browser/s3m-maplibre.iife.js"></script>
 <script>
   const layer = new S3MMapLibre.S3MLayer({ configUrl: './data/CBD/cbd.scp' });
   map.addLayer(layer);
@@ -121,7 +123,7 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 <script type="module">
   import * as THREE from 'https://esm.sh/three@0.169.0';
   window.THREE = THREE;
-  await import('https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.1/dist/browser/s3m-maplibre.iife.ext-three.js');
+  await import('https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.2/dist/browser/s3m-maplibre.iife.ext-three.js');
 </script>
 ```
 
@@ -136,8 +138,8 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 {
   "imports": {
     "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
-    "s3m-three": "https://cdn.jsdelivr.net/npm/s3m-three@0.3.1/dist/index.js",
-    "s3m-maplibre": "https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.1/dist/index.js"
+    "s3m-three": "https://cdn.jsdelivr.net/npm/s3m-three@0.3.2/dist/index.js",
+    "s3m-maplibre": "https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.2/dist/index.js"
   }
 }
 </script>
@@ -149,7 +151,7 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 
 这条路上 `three` 只有一份（就是你 importmap 里那个），也不需要 `window.THREE`。代价是 dist 是逐文件 ESM（90+ 个文件），首屏请求数比单文件多；在意请求数就用上面的 IIFE。
 
-esm.sh 也能直接吃：`import { S3MLayer } from 'https://esm.sh/s3m-maplibre@0.4.1'`。注意它会为 `three` 生成自己的 URL，你如果同时引 `https://esm.sh/three@0.169.0`，两边不一定是同一个构建——用 `?deps=three@0.169.0` 对齐，或 `?external=three` 配 importmap。
+esm.sh 也能直接吃：`import { S3MLayer } from 'https://esm.sh/s3m-maplibre@0.4.2'`。注意它会为 `three` 生成自己的 URL，你如果同时引 `https://esm.sh/three@0.169.0`，两边不一定是同一个构建——用 `?deps=three@0.169.0` 对齐，或 `?external=three` 配 importmap。
 
 ---
 

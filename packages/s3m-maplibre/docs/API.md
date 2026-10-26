@@ -117,6 +117,8 @@ new S3MLayer(options?: S3MLayerOptions)
 | `ground` | `GroundOptions` | — | 3D 物理地表面 / 基坑开挖配置 |
 | `pickable` | `boolean` | `true` | 是否响应点击 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
+| `totalMaxTiles` | `number` | — | 多数据集全局瓦片总预算，在可见数据集间动态均衡分配配额，防止多图层叠合爆显存 |
+| `light` | `LightOptions` | — | 场景光照配置（环境光、主光、方位角、高度角及 headlamp/fixed 模式） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 字段着色章节](../s3m-three/docs/API.md#按业务字段着色) |
@@ -183,6 +185,15 @@ setEdges(enabled: boolean): void
 - 数据自带的棱线包是原始线段，仍是 1px，只受颜色 / 透明度控制。
 
 > 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺，整片模型变成放射状三角面。
+
+### 光照控制
+
+```ts
+setLight(patch: Partial<LightOptions>): void
+getLight(): LightOptions
+```
+
+委托内部 `viewer.setLight` / `viewer.getLight`，支持动态调整环境光与主平行光的颜色、强度、方位角、高度角以及 `headlamp`（跟随地图航向视角）与 `fixed`（固定世界太阳方位）模式，并自动触发地图重绘。参数定义见 [s3m-three 光照章节](../s3m-three/docs/API.md#光照控制-adjustable-lighting)。
 
 ### 拾取与空间查询
 

@@ -216,6 +216,10 @@ export interface TileNode {
   parentUrl?: string;
   /** 当前帧是否满足细化条件 */
   needRefine?: boolean;
+  /** 该瓦片引用的纹理 key 清单，用于引用计数与显存释放 */
+  textureKeys?: string[];
+  /** 瓦片构建产生的统计信息，用于淘汰时准确扣减 stats */
+  stats?: { meshes: number; vertices: number; triangles: number };
 }
 
 /** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
@@ -228,6 +232,8 @@ export interface S3MTilesetOptions {
   configUrl: string;
   maxTiles?: number;
   maxConcurrent?: number;
+  /** 原始图像/子图集缓存上限（LRU），默认 128 */
+  maxImageCache?: number;
   buildTile?: BuildTileFn | null;
   uniforms?: StyleUniforms | null;
   onTile?: (node: TileNode) => void;
@@ -266,6 +272,9 @@ export class S3MTileset {
   readonly nodes = new Map<string, TileNode>();
   readonly failed = new Set<string>();
   readonly textureCache = new Map<string, Texture>();
+  maxImageCache: number;
+  private readonly _textureRefs = new Map<string, number>();
+  private readonly _tileTextureKeys = new Map<string, string[]>();
   readonly pending = new Set<string>();
   /** 是否请求 `.texblock` 子图集，默认关，见 S3MTilesetOptions.atlasLod */
   atlasLod: boolean;
@@ -316,7 +325,7 @@ export class S3MTileset {
   /** 格式类永久错误只向上报一次，避免整棵瓦片树刷同样的日志 */
   private _permanentReported = false;
   /** 请求量的硬上限（软上限 maxTiles 的超额余量），见构造函数注释 */
-  private hardCap = 96;
+  hardCap = 96;
   /** 本数据集是 S3M 1.x（SuperMapCache，.s3m）：子瓦地址规则与 3.x 不同 */
   private isS3MV1 = false;
   private _buildTile: BuildTileFn | null;
@@ -341,6 +350,7 @@ export class S3MTileset {
     // 并发与总量限制：iServer 公开服务上别把人家打爆
     this.maxConcurrent = options.maxConcurrent ?? 4;
     this.maxTiles = options.maxTiles ?? 64;
+    this.maxImageCache = options.maxImageCache ?? 128;
     // 硬上限 = 软上限 + 余量。淘汰只在「新瓦片已经落地并接管显示」之后做（make-before-break），
     // 所以中间态允许临时超出 maxTiles；硬上限只用来挡住失控的请求量，不用于挤掉正在显示的内容。
     this.hardCap = this.maxTiles + Math.max(8, Math.ceil(this.maxTiles * 0.5));
@@ -419,19 +429,91 @@ export class S3MTileset {
    * 两轮都按「最久没进有效范围」排，同帧再比距离。
    * 淘汰最细一级时，如果上一级也不在内存里，顺手把上一级排回队列补洞。
    */
+  /** 记录瓦片引用的纹理 key，并递增其引用计数 */
+  registerTileTextures(url: string, textureKeys: string[]): void {
+    this._tileTextureKeys.set(url, textureKeys);
+    const node = this.nodes.get(url);
+    if (node) {
+      node.textureKeys = textureKeys;
+    }
+    for (const key of textureKeys) {
+      this._textureRefs.set(key, (this._textureRefs.get(key) ?? 0) + 1);
+    }
+  }
+
+  /** 淘汰单块瓦片节点并释放专属纹理 */
+  _evictTileNode(victim: TileNode): void {
+    this.nodes.delete(victim.url);
+    victim.group?.parent?.remove(victim.group);
+    this._onTileRemoved(victim);
+    this._parentOf.delete(victim.url);
+
+    this.stats.tiles = Math.max(0, this.stats.tiles - 1);
+    if (victim.stats) {
+      this.stats.meshes = Math.max(0, this.stats.meshes - (victim.stats.meshes ?? 0));
+      this.stats.vertices = Math.max(0, this.stats.vertices - (victim.stats.vertices ?? 0));
+      this.stats.triangles = Math.max(0, this.stats.triangles - (victim.stats.triangles ?? 0));
+    }
+
+    // 释放此瓦片引用的纹理计数；引用归零时从 GPU / 缓存彻底 dispose
+    const keys = victim.textureKeys ?? this._tileTextureKeys.get(victim.url) ?? (victim.group?.userData?.textureKeys as string[] | undefined);
+    this._tileTextureKeys.delete(victim.url);
+    if (keys?.length) {
+      for (const key of keys) {
+        const ref = (this._textureRefs.get(key) ?? 1) - 1;
+        if (ref <= 0) {
+          this._textureRefs.delete(key);
+          const tex = this.textureCache.get(key);
+          if (tex) {
+            tex.dispose?.();
+            this.textureCache.delete(key);
+          }
+        } else {
+          this._textureRefs.set(key, ref);
+        }
+      }
+    }
+  }
+
+  /** 存入外部图集（带 LRU 容量上限） */
+  putExternalAtlas(id: string, img: S3MBlockAtlasImage | null): void {
+    if (this.externalAtlasCache.size >= this.maxImageCache && !this.externalAtlasCache.has(id)) {
+      const oldestKey = this.externalAtlasCache.keys().next().value;
+      if (oldestKey !== undefined) this.externalAtlasCache.delete(oldestKey);
+    }
+    Map.prototype.set.call(this.externalAtlasCache, id, img);
+  }
+
+  /** 读取外部图集 */
+  getExternalAtlas(id: string): S3MBlockAtlasImage | null | undefined {
+    return this.externalAtlasCache.get(id);
+  }
+
+  /** 存入 leaf 记录段（带 LRU 容量上限） */
+  putLeafRecords(name: string, recs: S3MBlockAtlasImage[] | null): void {
+    if (this.leafRequestCache.size >= this.maxImageCache && !this.leafRequestCache.has(name)) {
+      const oldestKey = this.leafRequestCache.keys().next().value;
+      if (oldestKey !== undefined) this.leafRequestCache.delete(oldestKey);
+    }
+    Map.prototype.set.call(this.leafRequestCache, name, recs);
+  }
+
+  /** 读取 leaf 记录段 */
+  getLeafRecords(name: string): S3MBlockAtlasImage[] | null | undefined {
+    return this.leafRequestCache.get(name);
+  }
+
   private _evictOne(allowUncovered = false): boolean {
+
     // 只挑安全候选：叶子 → 已被子瓦接手的父瓦。allowUncovered 仅在超出硬上限时开启（内存兜底）
-    const victim = this._pickVictim(false, allowUncovered) ?? this._pickVictim(true, allowUncovered);
+    const victim = this._pickVictim(true, allowUncovered) ?? this._pickVictim(false, allowUncovered);
     if (!victim) return false;
 
     const parentUrl = victim.parentUrl ?? this._parentOf.get(victim.url);
     const childUrls = victim.childUrls ?? (victim.childUrl ? [victim.childUrl] : []);
     const isLeaf = !childUrls.some((u) => u !== victim.url && this.nodes.has(u));
 
-    this.nodes.delete(victim.url);
-    victim.group.parent?.remove(victim.group);
-    this._onTileRemoved(victim);
-    this._parentOf.delete(victim.url);
+    this._evictTileNode(victim);
 
     // 淘汰的是中间层时，把已加载的子孙改挂到它的父级上：
     // 不然它们瞬间"无父"，父级那边还留着指向 victim 的 childUrls，
@@ -459,8 +541,8 @@ export class S3MTileset {
     }
 
     // 删的是最细一级、而上一级又不在内存里 → 把上一级排回去，别让那块地空着
-    if (isLeaf && parentUrl && !this.nodes.has(parentUrl) && !this.pending.has(parentUrl)) {
-      this._enqueue(parentUrl);
+    if (false as boolean && isLeaf && parentUrl && !this.nodes.has(parentUrl) && !this.pending.has(parentUrl)) {
+      // 淘汰阶段不再重新入队父瓦，防止预算满载时引发父子死循环震荡（thrashing loop）
     }
     return true;
   }
@@ -773,7 +855,7 @@ export class S3MTileset {
             break;
           }
         }
-        this.externalAtlasCache.set(id, candidate);
+        this.putExternalAtlas(id, candidate);
       }
       if (candidate) {
         if (accept(candidate)) apply(candidate);
@@ -818,10 +900,10 @@ export class S3MTileset {
       if (segments.length !== names.length) {
         throw new Error(`pack 段数 ${segments.length} ≠ 请求名 ${names.length}`);
       }
-      names.forEach((n, i) => this.leafRequestCache.set(n, segments[i]!));
+      names.forEach((n, i) => this.putLeafRecords(n, segments[i]!));
     } catch (e) {
       console.warn('[s3m] leaf pack 请求失败：', u, e);
-      for (const n of names) if (!this.leafRequestCache.has(n)) this.leafRequestCache.set(n, null);
+      for (const n of names) if (!this.leafRequestCache.has(n)) this.putLeafRecords(n, null);
     }
   }
 
@@ -833,10 +915,10 @@ export class S3MTileset {
       const res = await fetch(u);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const records = (await parseTexblockSegments(await res.arrayBuffer())).flat();
-      this.leafRequestCache.set(stem, records);
+      this.putLeafRecords(stem, records);
     } catch (e) {
       console.warn('[s3m] leaf texblock 请求失败：', u, e);
-      if (!this.leafRequestCache.has(stem)) this.leafRequestCache.set(stem, null);
+      if (!this.leafRequestCache.has(stem)) this.putLeafRecords(stem, null);
     }
   }
 
@@ -898,7 +980,10 @@ export class S3MTileset {
       }
 
       const build = await this._builder();
-      const { group, stats } = await build(tile, { textureCache: this.textureCache, uniforms: this._uniforms });
+      const buildRes = await build(tile, { textureCache: this.textureCache, uniforms: this._uniforms });
+      const { group, stats } = buildRes;
+      const texKeys = (buildRes as any).textureKeys ?? (group.userData?.textureKeys as string[] | undefined) ?? Object.keys(tile.textures ?? {});
+      this.registerTileTextures(url, texKeys);
       const lod = this._pickLod(tile);
 
       const childUrls: string[] = [];
@@ -932,6 +1017,11 @@ export class S3MTileset {
         childUrls,
         parentUrl: this._parentOf.get(url),
         state: 'ready',
+        stats: {
+          meshes: stats.meshes ?? 0,
+          vertices: stats.vertices ?? 0,
+          triangles: stats.triangles ?? 0,
+        },
       };
 
       this.nodes.set(url, node);

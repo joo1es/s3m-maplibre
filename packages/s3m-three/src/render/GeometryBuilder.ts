@@ -288,6 +288,7 @@ export interface BuildTileResult {
   group: THREE.Group;
   stats: TileBuildStats;
   objects: THREE.Object3D[];
+  textureKeys?: string[];
 }
 
 interface CachedGeometry {
@@ -308,6 +309,7 @@ export async function buildTileObjects(
   const textureByCode = options.textureCache ?? new Map<string, THREE.Texture>();
   const group = new THREE.Group();
   const objects: THREE.Object3D[] = [];
+  const usedTextureKeys: string[] = [];
   const stats: TileBuildStats = {
     meshes: 0,
     vertices: 0,
@@ -352,6 +354,7 @@ export async function buildTileObjects(
     const { texture, decoded } = await createTexture(tex);
     if (texture) {
       textureByCode.set(key, texture);
+      usedTextureKeys.push(key);
       stats.textures++;
     } else {
       stats.skipped.push(`texture ${code} → ${decoded}`);
@@ -1028,5 +1031,6 @@ export async function buildTileObjects(
 
   if (!group.children.length) stats.skipped.push('tile 无可用几何');
 
-  return { group, stats, objects };
+  group.userData.textureKeys = usedTextureKeys;
+  return { group, stats, objects, textureKeys: usedTextureKeys };
 }
