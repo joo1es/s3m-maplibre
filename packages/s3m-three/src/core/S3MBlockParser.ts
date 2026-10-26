@@ -72,6 +72,7 @@ import type { GeoPackageEntry, GroupNode, PageLOD, ParsedTile, S3MAtlasRects, S3
 import { parseGroupNodeEntries, parseSkeletonEntries, parsePickInfoEntries } from './S3MBParser.js';
 import { atlasAlphaMask, shrinkRectToOpaque } from './AtlasAlpha.js';
 import { packAtlases } from './AtlasPack.js';
+import type { PackedAtlases } from './AtlasPack.js';
 
 /** 图集子区域，以及它绑定的几何顶点区间 */
 export interface S3MSubTextureBinding {
@@ -103,6 +104,18 @@ export interface S3MBlockTexture {
   childTexNames: string[];
   requestNames: string[];
   subTexInfos: S3MSubTexture[];
+  /** 拼图后为 false（数据自上而下），原始 DXT 图集为 true */
+  flipY?: boolean;
+  /** 已被 packAtlases 合并进一张大图 */
+  packed?: boolean;
+  /** 拼图集合签名，纹理缓存 key 用 */
+  packKey?: string;
+  /**
+   * `subTexInfos` 的像素坐标相对于**当前**像素的倍数（默认 1）。
+   * 换成整数倍高清图后置为倍数：rect 是归一化的，但 offset/width 是像素，
+   * 不换算就会落在一半的位置上，平铺时逐格漂移。
+   */
+  rectScale?: number;
 }
 
 export interface S3MBlockPageLod {
@@ -198,9 +211,138 @@ function parseBlockTextures(r: BinaryReader): Record<string, S3MBlockTexture> {
  * （不参与合成）。**不能**默认成 (0,0,1,1)：那等于拿整张图集当贴图，配上世界尺度的
  * 野 UV 就是一屏重复的微缩照片。
  */
+/** 拼图前的原始图集元信息（重拼时要能退回去） */
+interface AtlasOrigin {
+  width: number;
+  height: number;
+  pixelFormat: number;
+  compressType: number;
+  dataLength: number;
+  /** 原始像素。**必须留**：换高清图之后要重拼，没有它就退不回原始图集 */
+  data?: Uint8Array;
+}
+
+/**
+ * 把一个块里的多张图集拼成一张（原地改写 `texturePackage`）。
+ *
+ * 单独抽出来是因为它必须能**重跑**：`_fillExternalAtlases` 会把块内嵌的缩略图换成
+ * `childTexNames` 指向的高清 `.texblock`，像素变了就得重新拼、重新算 rect。
+ * 所以拼图前要把原始像素存进 `origin.data`。
+ *
+ * 已经拼过就直接返回（重复拼会把 RGBA 当 DXT 解，整张废掉）。
+ */
+function packTexturePackage(texturePackage: Record<string, S3MBlockTexture>): PackedAtlases | null {
+  const entries = Object.values(texturePackage);
+  if (entries.some((t) => (t as { packed?: boolean }).packed)) return null;
+  const packed = packAtlases(texturePackage);
+  if (!packed) return null;
+  // 拼图是**逐块**做的：同一个 atlas id 在 LOD 兄弟块里参与的拼图集合可能不同，
+  // 落位就不同。纹理缓存却是跨瓦片共享的，只按 id 做 key 会让后一块复用前一块的
+  // 拼图（rect 指向旧排布）→ 整块贴错图。所以给每张拼图打一个「集合签名」，
+  // 缓存 key 带上它，集合相同才共享。
+  const packKey = `${packed.width}x${packed.height}#${[...packed.offsets.keys()].sort().join(',')}`;
+  for (const tex of entries) {
+    const t = tex as S3MBlockTexture & { origin?: AtlasOrigin };
+    // 每次拼都把「当前原始像素」记下来：unpack 要退回到它
+    t.origin = {
+      width: tex.width,
+      height: tex.height,
+      pixelFormat: tex.pixelFormat,
+      compressType: tex.compressType,
+      dataLength: tex.data?.length ?? 0,
+      data: tex.data ?? undefined,
+    };
+    tex.width = packed.width;
+    tex.height = packed.height;
+    tex.data = packed.data;
+    tex.compressType = 0;
+    tex.pixelFormat = 28; // RGBA
+    t.flipY = false; // 拼图按自上而下存，v=0 就是顶行
+    t.packed = true;
+    t.packKey = packKey;
+  }
+  return packed;
+}
+
+/**
+ * 把拼图退回原始图集（`_fillExternalAtlases` 换高清图之前调用）。
+ *
+ * ★ 调用后 `tile.textures` / `tile.atlasRects` 会被清空 —— 它们描述的是**拼图**坐标系，
+ *   而此刻像素已经退回单张图集，两者不再自洽。必须紧接着调用
+ *   `rebuildBlockTextureState` 才能拿去渲染。清空而不是留着旧值，是为了让「忘了重拼」
+ *   立刻表现为无贴图，而不是画面上莫名其妙的错位。
+ */
+export function unpackBlockTextures(tile: S3MBlockTile): boolean {
+  const tp = tile.texturePackage;
+  if (!tp) return false;
+  let any = false;
+  for (const tex of Object.values(tp)) {
+    const t = tex as S3MBlockTexture & { origin?: AtlasOrigin };
+    if (!t.packed || !t.origin?.data) continue;
+    tex.width = t.origin.width;
+    tex.height = t.origin.height;
+    tex.pixelFormat = t.origin.pixelFormat;
+    tex.compressType = t.origin.compressType;
+    tex.data = t.origin.data;
+    t.flipY = true;
+    t.packed = false;
+    t.rectScale = 1; // 像素退回原始尺寸，rect 参考倍率也要复位
+    delete t.packKey;
+    any = true;
+  }
+  if (any) {
+    tile.textures = {};
+    tile.atlasRects = {};
+  }
+  return any;
+}
+
+/**
+ * 重算「纹理表 + 逐顶点矩形」。
+ *
+ * 调用时机：拼图状态刚变化过（首次解析、或换完高清图重拼）。两者必须一起重算 ——
+ * `atlasRects` 是拼图坐标系，`textures` 是喂给渲染侧的 map，**不同步就是满屏雪花**
+ * （见第十一轮事故）。
+ */
+export function rebuildBlockTextureState(tile: S3MBlockTile): void {
+  const packed = packTexturePackage(tile.texturePackage ?? {});
+  tile.atlasRects = buildAtlasRects(tile.geoPackage, tile.texturePackage ?? {}, packed);
+  tile.textures = buildTextureTable(tile.texturePackage ?? {});
+}
+
+/**
+ * 图集 → 渲染用的纹理表。
+ *
+ * ★ 必须在拼图**之后**建：拼图会原地改写 `width/height/data`，先建就会拿到拼图前的
+ *   块内嵌缩略图，而 `atlasRects` 是拼图坐标系的 —— 两者差 4 倍，表现为满屏彩色雪花。
+ */
+function buildTextureTable(texturePackage: Record<string, S3MBlockTexture>): Record<string, S3MTexture> {
+  const textures: Record<string, S3MTexture> = {};
+  for (const tex of Object.values(texturePackage)) {
+    if (!tex.data) continue;
+    // 拼图输出是自上而下的 RGBA，v=0 就是首行：不能再翻行，也不能让 GPU 生成 mip
+    // （GPU mip 会把相邻子区域混进来，层级必须由 StyleMaterial 的内联金字塔自己算）
+    const isPacked = (tex as { packed?: boolean }).packed === true;
+    textures[tex.id] = {
+      code: tex.id,
+      level: tex.level,
+      width: tex.width,
+      height: tex.height,
+      compressType: tex.compressType,
+      pixelFormat: tex.pixelFormat,
+      data: tex.data,
+      flipY: !isPacked,
+      packed: isPacked,
+      packKey: (tex as { packKey?: string }).packKey,
+    };
+  }
+  return textures;
+}
+
 function buildAtlasRects(
   geoPackage: Record<string, GeoPackageEntry>,
-  texturePackage: Record<string, S3MBlockTexture>
+  texturePackage: Record<string, S3MBlockTexture>,
+  packed: PackedAtlases | null
 ): Record<string, S3MAtlasRects> {
   const rects: Record<string, S3MAtlasRects> = {};
   const rectOf = (name: string, key: 'uv' | 'uv2'): Float32Array => {
@@ -218,54 +360,20 @@ function buildAtlasRects(
   // 一个 geo 的顶点可能分散绑定在多张图集上（官方用纹理数组按 batch 取）。
   // 这里先把它们拼成一张大图，rect 全部换算到拼图坐标系，单张 map 就能覆盖全部顶点。
   //
-  // 顺序很重要：**先在各自图集里做 alpha 收缩，再拼**。
-  // 收缩要读的是「这张图集自己的 alpha 掩码」，拼成大图之后坐标与掩码都对不上了。
+  // ★ rect **不做任何裁切**，原样保留 (offsetX, offsetY, width, height)。
+  //   width 里包含了子区域右 1/3 的内联 mip 金字塔（见 StyleMaterial.s3mAtlasLod），
+  //   按 alpha 收缩到不透明包围盒会同时破坏两件事：mip0 的 2/3 比例、以及 mip 列的偏移量，
+  //   结果就是每格采到邻格内容。透明区域交给 alphaTest 处理，不动 rect。
   const localRects = new Map<string, { x: number; y: number; w: number; h: number }[]>();
   for (const [key, tex] of Object.entries(texturePackage)) {
     if (!tex.width || !tex.height) continue;
-    const mask = atlasAlphaMask(tex);
-    const W = tex.width;
-    const H = tex.height;
+    // subTexInfos 是「缩略图像素坐标」；换成整数倍高清图后要按 rectScale 换算，
+    // 才能和 packed.offsets（也是像素）落在同一空间。
+    const rs = tex.rectScale ?? 1;
     localRects.set(
       key,
-      tex.subTexInfos.map((sub) => {
-        let lx = sub.offsetX;
-        let ly = sub.offsetY;
-        let lw = sub.width;
-        let lh = sub.height;
-        if (mask) {
-          // 图集里的精灵是「立面 + 上方天空」的整块照片，天空 alpha=0。
-          // 裁到不透明包围盒后，一个 uv 周期只重复立面本体，不再每格带一段天空。
-          const nf = shrinkRectToOpaque({ x: lx / W, y: ly / H, w: lw / W, h: lh / H }, mask, W, H);
-          lx = nf.x * W;
-          ly = nf.y * H;
-          lw = nf.w * W;
-          lh = nf.h * H;
-        }
-        return { x: lx, y: ly, w: lw, h: lh };
-      })
+      tex.subTexInfos.map((sub) => ({ x: sub.offsetX * rs, y: sub.offsetY * rs, w: sub.width * rs, h: sub.height * rs }))
     );
-  }
-
-  const packed = packAtlases(texturePackage);
-  if (packed) {
-    for (const tex of Object.values(texturePackage)) {
-      // 拼合会覆盖 width/height/data，把解析出来的原始元信息留一份，便于排查与测试
-      (tex as { origin?: unknown }).origin = {
-        width: tex.width,
-        height: tex.height,
-        pixelFormat: tex.pixelFormat,
-        compressType: tex.compressType,
-        dataLength: tex.data?.length ?? 0,
-      };
-      tex.width = packed.width;
-      tex.height = packed.height;
-      tex.data = packed.data;
-      tex.compressType = 0;
-      tex.pixelFormat = 28; // RGBA
-      (tex as { flipY?: boolean }).flipY = false; // 拼图按自上而下存，v=0 就是顶行
-      (tex as { packed?: boolean }).packed = true;
-    }
   }
 
   let groupId = 0;
@@ -512,21 +620,17 @@ export async function parseS3MBlockGroups(
     }
 
     // ---- 图集 → 纹理表 ----
-    const textures: Record<string, S3MTexture> = {};
-    for (const tex of Object.values(texturePackage)) {
-      if (!tex.data) continue;
-      textures[tex.id] = {
-        code: tex.id,
-        level: tex.level,
-        width: tex.width,
-        height: tex.height,
-        compressType: tex.compressType,
-        pixelFormat: tex.pixelFormat,
-        data: tex.data,
-        flipY: true,
-      };
-    }
-    const atlasRects = buildAtlasRects(geoPackage, texturePackage);
+    //
+    // ★ 顺序有讲究：先拼图 → 再算 rect → 最后建纹理表。
+    //   拼图会原地改写 texturePackage 的 width/height/data，所以三者的坐标系必须一起定。
+    //   以前 textures 建在拼图之前，于是 atlasRects 按拼图尺寸（408×192）归一化、
+    //   textures 却是拼图前的块内嵌缩略图（108×192 DXT5），渲染侧 uAtlasDim 取 map 的尺寸，
+    //   texSize 只有真实值的 1/4：maxMip 从 log2(64)=6 掉到 log2(16.9)=4、
+    //   dFdx(uv*texSize) 同比变小 → mip 几乎恒为 0 → 每像素采到随机纹素。
+    //   表现就是满屏彩色雪花，而且越远越糟（正是「不同视距观感不一致」）。
+    const packed = packTexturePackage(texturePackage);
+    const atlasRects = buildAtlasRects(geoPackage, texturePackage, packed);
+    const textures = buildTextureTable(texturePackage);
 
     // pageLOD：容器提供的 LOD/子瓦片信息是权威；geodes 在内层 groupNode 里
     const innerLods = groupNode.pageLods;

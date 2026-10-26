@@ -304,54 +304,63 @@ const FRAG_PARS = /* glsl */ `
       varying vec4 vSecRect;
     #endif
     /**
-     * S3MBLOCK 图集采样 —— 照抄官方 iClient3D 12.1.1 的片元实现
-     * （着色器原文截获自 gl.shaderSource，存 _tmp/og/full.txt）。
-     *
-     * 官方 sampleLod 永远传 LOD 0，层级靠「把子区域 rect 平移 + 内缩」选出来；
-     * 因此图集必须关掉 GPU mip（见 TextureFactory.configureAtlas），否则自动层级
-     * 会把相邻子区域混进来。
-     * 注：官方 width *= 2/3 只是算 maxMip 的收缩系数 —— 实测子区域右侧邻着的是
-     * 另一张子纹理（1094_3 旁边是 1130_3），不是它的内联 mip，别照字面理解成 mip 链。
+     * 官方 CalculateMipLevel（vec2 版），逐字照抄 iClient3D 12.1.1。
+     * 用**未 fract** 的 uv 求屏幕空间导数 —— 先 fract 再求导会在平铺接缝处炸出
+     * 一个巨大导数，GPU 直接把整块砖采成最糊的 mip，表现为每块砖边缘一条暗线。
      */
-    vec2 s3mBatchUV( vec2 uv, vec2 translate, vec2 scale, vec2 dim, float mip ) {
+    void s3mMipLevel( vec2 uv, vec2 texSize, float maxMip, out float mip ) {
+      vec2 dx = dFdx( uv * texSize.x );
+      vec2 dy = dFdy( uv * texSize.y );
+      float dotX = dot( dx, dx );
+      float dotY = dot( dy, dy );
+      float dMax = max( dotX, dotY );
+      float dMin = min( dotX, dotY );
+      float off = clamp( ( dMax - dMin ) / max( dMax + dMin, 1e-8 ), 0.0, 1.0 );
+      float d = dMax * ( 1.0 - off ) + dMin * off;
+      mip = clamp( 0.5 * log2( max( d, 1e-8 ) ), 0.0, maxMip - 1.62 );
+    }
+
+    /**
+     * 按指定 mip 档采样子区域（官方 czm_getTexColorForS3M 的内层循环体）。
+     *
+     * ★ 子区域 rect 的**右 1/3 不是贴图内容，是内联 mip 金字塔**：
+     *   mip0 只占左 2/3，右 1/3 从上往下依次堆 1/2、1/4、1/8 缩略图，总高恰好 = rect 高。
+     *   官方那句 width *= 2.0/3.0 就是为这个，不是「经验收缩系数」。
+     *   数值实证：14 个块 691 条子纹理里 96.7% 满足「右侧 1/3 ≈ 左 2/3 的 1/2 下采样」
+     *   （平均误差 6.8 vs 27.3）。
+     *   所以 mip > 0 时采样点必须右移到 x + 2/3·w，并下移到 (2^(m-1)-1)/2^(m-1)。
+     */
+    vec4 s3mAtlasLod( vec2 uv, vec2 translate, vec2 scale, vec2 texSize, sampler2D tex, float mip ) {
       vec2 t = translate;
       if ( mip > 0.0 ) {
         t.x = translate.x + scale.x;
         float temp = pow( 2.0, mip - 1.0 );
         t.y = translate.y + scale.y * ( temp - 1.0 ) / temp;
       }
-      float texScale = 1.0 / pow( 2.0, mip );
+      float inv = 1.0 / pow( 2.0, mip );
       vec2 o = fract( uv );
-      vec2 off = vec2( pow( 2.0, mip ) / dim.x, pow( 2.0, mip ) / dim.y );
-      o = clamp( o, off, vec2( 1.0 ) - off );
-      return o * texScale * scale + t;
+      // 半纹素内缩，避免双线性把邻格内容混进来
+      vec2 guard = vec2( pow( 2.0, mip ) / texSize.x, pow( 2.0, mip ) / texSize.y );
+      o = clamp( o, guard, vec2( 1.0 ) - guard );
+      return texture2D( tex, o * inv * scale + t );
     }
+
     /**
-     * 图集采样（S3MBLOCK 共享纹理）。
-     *
-     * 公式照抄官方 SDK 的着色器（s3m-spec 仓库
-     * S3M_SDK/S3M_JS/S3M_module/S3MTiles/Shaders/S3MTilesFS.js 里的
-     * getTextureAtlasColor / calculateMipLevel）：fract 取平铺周期内的位置，
-     * 再按子区域 rect 平移缩放进去。
-     *
-     * 与官方唯一的差异：官方把 width 乘 2.0 / 3.0，因为它的图集在精灵右侧
-     * 三分之一内联了一整条 mip 链，采样 mip > 0 时会平移到那块区域。我们解出来的
-     * 图集里没有这条内联链（放大单个槽位看不到逐级缩小的副本），一旦按官方
-     * 公式采样 mip > 0，就会采到邻居槽位 —— 整面墙碎成拼贴。
-     * 所以这里：精灵按 rect 的满宽取，mip 固定 0。
+     * 图集采样入口：层级由 ceil/floor 两档各采一次再平均（官方同样做法），
+     * 因为内联金字塔只有 2 的整数次幂，中间档必须靠混合。
      */
     vec4 s3mAtlasUnit( vec2 uv, vec4 rect, vec2 atlasDim, sampler2D tex ) {
       // 退化矩形 = 官方 batchId < 0：该纹理单元不参与合成
       if ( rect.z <= 0.0 || rect.w <= 0.0 ) return vec4( 1.0 );
-      vec2 dim = vec2( rect.z * atlasDim.x, rect.w * atlasDim.y );
-      // 官方 getTexAtlasParameter 里的 width *= 2/3 是为了避开精灵右侧那条内联 mip 链。
-      // 我们自己的图集是解析阶段重新装箱拼出来的（core/AtlasPack.ts），每格只有本体、
-      // 没有内联链，所以按 rect 满宽采样；再乘 2/3 会把每个精灵裁掉三分之一。
-      vec2 scale = dim / atlasDim;
-      vec2 translate = rect.xy;
-      // 官方 calculateTexCoord 就是 fract(uv) —— uv 是几何自带的 set0 世界尺度坐标，
-      // 一个周期正好铺一张精灵。不再做任何额外缩放。
-      return texture2D( tex, s3mBatchUV( uv, translate, scale, dim, 0.0 ) );
+      vec2 dimPx = vec2( rect.z * atlasDim.x, rect.w * atlasDim.y );
+      vec2 texSize = vec2( dimPx.x * ( 2.0 / 3.0 ), dimPx.y );
+      float maxMip = log2( max( min( texSize.x, texSize.y ), 1.0 ) );
+      vec2 scale = texSize / atlasDim;
+      float mip = 0.0;
+      s3mMipLevel( uv, texSize, maxMip, mip );
+      vec4 hi = s3mAtlasLod( uv, rect.xy, scale, texSize, tex, ceil( mip ) );
+      vec4 lo = s3mAtlasLod( uv, rect.xy, scale, texSize, tex, floor( mip ) );
+      return hi * 0.5 + lo * 0.5;
     }
   #endif
   uniform int uMode;
@@ -546,8 +555,6 @@ export interface StyledMaterialOptions {
   atlas?: boolean;
   /** 图集材质的第二套纹理（官方 BakeTex，光照烘焙），与 base 相乘 */
   secMap?: THREE.Texture | null;
-  /** 几何已按绑定组生成 0..1 逐面 UV（不再按精灵像素尺寸换算） */
-  atlasUvNormalized?: boolean;
 }
 
 /**
@@ -586,7 +593,6 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   const secMap = atlas ? (opts.secMap ?? null) : null;
   if (atlas) mat.defines = { ...(mat.defines as Record<string, string>), S3M_ATLAS: '' };
   if (secMap) mat.defines = { ...mat.defines, S3M_ATLAS_SEC: '' };
-  if (atlas && opts.atlasUvNormalized) mat.defines = { ...mat.defines, S3M_ATLAS_UV_NORM: '' };
   // 官方 uTextureDim = (base宽, base高, bake宽, bake高)，取实际绑定纹理的像素尺寸
   const uAtlasDim = { value: new THREE.Vector2(opts.map?.image?.width || 1, opts.map?.image?.height || 1) };
   const uAtlasDim1 = { value: new THREE.Vector2(secMap?.image?.width || 1, secMap?.image?.height || 1) };
@@ -628,7 +634,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   // 不同材质共用同一段注入代码，必须让 three 认为它们的 program 可复用；
   // 但图集 / 烘焙两套宏会改注入结果，必须进 cacheKey，否则会复用错 program。
   mat.customProgramCacheKey = () =>
-    `s3m-styled${atlas ? '-atlas' : ''}${secMap ? '-bake' : ''}${atlas && opts.atlasUvNormalized ? '-uvn' : ''}`;
+    `s3m-styled${atlas ? '-atlas' : ''}${secMap ? '-bake' : ''}`;
 
   mat.userData.uSelBatch = uSelBatch;
   mat.userData.uSelWhole = uSelWhole;

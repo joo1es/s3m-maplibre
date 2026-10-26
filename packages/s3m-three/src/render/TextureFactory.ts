@@ -140,6 +140,11 @@ function fromRawRGB(tex: S3MTexture): THREE.DataTexture {
 export async function createTexture(tex: S3MTexture | null | undefined): Promise<DecodedTexture> {
   if (!tex || !tex.width || !tex.height) return { texture: null, decoded: 'empty' };
 
+  // 图集纹理（flipY 的原始 DXT 图集 / AtlasPack 拼出来的 RGBA 大图）都必须关 GPU mip，
+  // 层级由 StyleMaterial.s3mAtlasUnit 的内联金字塔自己算。
+  const isAtlas = tex.packed === true || tex.flipY === true;
+  const asAtlas = <T extends THREE.Texture>(t: T): T => (isAtlas ? configureAtlas(t) : configure(t));
+
   // 判定只能看 compressType：v3.00 的 CRN 纹理 pixelFormat 是 13（ABGR）、
   // 行标的 CRN 是 32856（GL_RGBA8），都不是 26 / 27（见 core/TextureFormat.ts）
   const kind = resolveTextureKind(tex.compressType ?? 0, tex.pixelFormat);
@@ -153,7 +158,7 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
         pixelFormat: crn.dxtFormat === 1 ? 17 : 21,
         data: crn.data,
       });
-      return { texture: configure(decoded), decoded: `crn->dxt${crn.dxtFormat}` };
+      return { texture: asAtlas(decoded), decoded: `crn->dxt${crn.dxtFormat}` };
     } catch (e) {
       // 一张纹理坏了不该带崩整个瓦片，如实上报并降级成无贴图
       console.warn('[s3m] CRN 转码失败：', e);
@@ -164,10 +169,7 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
   if (kind === 'dxt1' || kind === 'dxt3' || kind === 'dxt4' || kind === 'dxt5') {
     const decoded = decodeDXT({ ...tex, pixelFormat: dxtPixelFormatOf(kind) });
     // flipY 为真即 S3MBLOCK 图集（见 core/types.ts），必须无 mip
-    return {
-      texture: tex.flipY ? configureAtlas(decoded) : configure(decoded),
-      decoded: kind,
-    };
+    return { texture: asAtlas(decoded), decoded: kind };
   }
 
   if (kind === 'webp') {
@@ -175,12 +177,12 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
     const bmp = await createImageBitmap(blob);
     const t = new THREE.Texture(bmp);
     t.needsUpdate = true;
-    return { texture: configure(t), decoded: 'webp' };
+    return { texture: asAtlas(t), decoded: 'webp' };
   }
 
   if (kind === 'raw') {
     const decoded = fromRawRGB(tex);
-    return { texture: tex.flipY ? configureAtlas(decoded) : configure(decoded), decoded: 'raw' };
+    return { texture: asAtlas(decoded), decoded: 'raw' };
   }
 
   // KTX2 / ETC 需要额外解码器，先如实上报而不是静默出错

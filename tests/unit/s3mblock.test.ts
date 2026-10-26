@@ -131,6 +131,29 @@ describe('S3MBLOCK 容器与内嵌瓦片', () => {
     inAtlas([rects.uv2![0]!, rects.uv2![1]!, rects.uv2![2]!, rects.uv2![3]!]);
   });
 
+  test('rect 宽度必须包含子区域右 1/3 的内联 mip 列', async () => {
+    // 子区域右 1/3 不是贴图内容，是 mip 金字塔（mip1 在 (x+2w/3, y)，mip2 在它下方…）。
+    // 所以 rect 必须原样保留 width，不能按 alpha 收缩到不透明包围盒 ——
+    // 一旦收缩，着色器里 `texSize = rect.zw * 2/3` 算出来的就不是 mip0 的尺寸，
+    // mip>0 时平移量也会落空，整面墙碎成拼贴。
+    const tile = await parse('0.s3mblock');
+    let checked = 0;
+    for (const tex of Object.values(tile.texturePackage)) {
+      for (const sub of tex.subTexInfos) {
+        for (const b of sub.bindings) {
+          if (b.texUnitIndex !== 0) continue;
+          const r = tile.atlasRects?.[b.geoName]?.uv;
+          if (!r) continue;
+          const v = b.vertexOffset;
+          expect(r[v * 4 + 2]! * tex.width).toBeCloseTo(sub.width, 5);
+          expect(r[v * 4 + 3]! * tex.height).toBeCloseTo(sub.height, 5);
+          checked++;
+        }
+      }
+    }
+    expect(checked).toBeGreaterThan(0);
+  });
+
   test('1.s3mblock / 2.s3mblock：全覆盖子区域，矩形退化为整张图集', async () => {
     for (const name of ['1.s3mblock', '2.s3mblock']) {
       const tile = await parse(name);
@@ -160,6 +183,182 @@ describe('S3MBLOCK 容器与内嵌瓦片', () => {
         expect(y + h).toBeLessThanOrEqual(1 + 1e-6);
         expect(Number.isFinite(f[v * 2]!)).toBe(true);
       }
+    }
+  });
+});
+
+describe('S3MBLOCK 纹理表必须与 rect 同坐标系', () => {
+  /**
+   * 这是一条**曾经真错**的不变量：`textures` 原来在 `buildAtlasRects`（内部会把多张图集
+   * 拼成一张）**之前**就建好了，于是渲染侧拿到的是拼图前的块内嵌缩略图（如 120×128 DXT5），
+   * 而 aAtlasRect 是拼图坐标系（按 240×128 归一化）。
+   *
+   * 后果不是「糊一点」，而是 texSize 只有真实值的 1/2：
+   *   maxMip = log2(min(w*2/3, h)) 掉一档、dFdx(uv*texSize) 也跟着变小 → mip 几乎恒为 0
+   *   → 每像素采到随机纹素 → 满屏彩色雪花，越远越糟。
+   */
+  test('拼图块：textures 的尺寸/像素必须就是拼图那张，且不许翻行、不许开 GPU mip', async () => {
+    const tile = await parse('0.s3mblock');
+    let packedCount = 0;
+    for (const [id, tp] of Object.entries(tile.texturePackage)) {
+      const tex = tile.textures[id];
+      expect(tex).toBeDefined();
+      expect(tex!.width).toBe(tp.width);
+      expect(tex!.height).toBe(tp.height);
+      // 像素必须是同一份，不能是拼图前那份
+      expect(tex!.data).toBe(tp.data as Uint8Array);
+      if ((tp as { packed?: boolean }).packed) {
+        packedCount++;
+        expect(tex!.packed).toBe(true);
+        // 拼图输出自上而下，v=0 就是首行：再翻行整张图会上下颠倒
+        expect(tex!.flipY).toBe(false);
+        expect(tex!.compressType).toBe(0);
+        expect(tex!.pixelFormat).toBe(28);
+      }
+    }
+    expect(packedCount).toBeGreaterThan(0);
+  });
+
+  test('未拼图的块仍走「原始 DXT 图集 + 翻行」那条路', async () => {
+    const tile = await parse('1.s3mblock');
+    const id = Object.keys(tile.texturePackage)[0]!;
+    const tex = tile.textures[id]!;
+    expect(tex.packed).toBeFalsy();
+    expect(tex.flipY).toBe(true);
+    expect(tex.data).toBe(tile.texturePackage[id]!.data as Uint8Array);
+  });
+});
+
+describe('S3MBLOCK 高清图集重拼（解拼图 → 换图 → 重拼）', () => {
+  /** 把「渲染侧真正会用到的东西」抓一份快照，用来比较重拼前后是否完全一致 */
+  function snapshot(tile: ReturnType<typeof parse> extends Promise<infer T> ? T : never) {
+    const rects: Record<string, number[]> = {};
+    for (const [geo, r] of Object.entries(tile.atlasRects ?? {})) {
+      rects[geo] = Array.from(r.uv ?? []);
+      rects[`${geo}#group`] = Array.from(r.group ?? []);
+    }
+    const textures: Record<string, unknown> = {};
+    for (const [id, t] of Object.entries(tile.textures ?? {})) {
+      textures[id] = { w: t.width, h: t.height, packed: t.packed, flipY: t.flipY, packKey: t.packKey };
+    }
+    return { rects, textures };
+  }
+
+  test('解拼图后状态必须显式失效（不能留着拼图坐标系的旧值）', async () => {
+    const { unpackBlockTextures } = await import('../../packages/s3m-three/src/core/S3MBlockParser');
+    const tile = await parse('0.s3mblock');
+    expect(Object.keys(tile.textures).length).toBeGreaterThan(0);
+
+    const unpacked = unpackBlockTextures(tile);
+    expect(unpacked).toBe(true);
+
+    for (const tp of Object.values(tile.texturePackage)) {
+      const t = tp as unknown as { packed?: boolean; flipY?: boolean; origin?: { width: number } };
+      expect(t.packed).toBeFalsy();
+      // 退回原始 DXT 图集 → 又要翻行了
+      expect(t.flipY).toBe(true);
+      expect(tp.width).toBe(t.origin!.width);
+    }
+    // 失效而不是留旧值：忘了重拼要立刻表现为「没贴图」，而不是画面错位
+    expect(tile.textures).toEqual({});
+    expect(tile.atlasRects).toEqual({});
+  });
+
+  test('重拼必须逐位还原：rect / 纹理表 / 拼图签名都不能漂', async () => {
+    const { unpackBlockTextures, rebuildBlockTextureState } = await import('../../packages/s3m-three/src/core/S3MBlockParser');
+    const tile = await parse('0.s3mblock');
+    const before = snapshot(tile);
+
+    expect(unpackBlockTextures(tile)).toBe(true);
+    rebuildBlockTextureState(tile);
+
+    expect(snapshot(tile)).toEqual(before);
+    // 纹理表里的像素必须就是 texturePackage 里那张（第十一轮事故的核心不变量）
+    for (const [id, tp] of Object.entries(tile.texturePackage)) {
+      expect(tile.textures[id]!.data).toBe(tp.data as Uint8Array);
+    }
+  });
+
+  test('换成整数倍高清图后，归一化 rect 必须完全不变（rectScale 的作用）', async () => {
+    const { rebuildBlockTextureState } = await import('../../packages/s3m-three/src/core/S3MBlockParser');
+
+    // 造一个最小可用的块：单图集（不触发拼图）+ 一个 4 顶点几何
+    const mkTile = (w: number, h: number, rectScale?: number) => {
+      const tp = {
+        A: {
+          id: 'A',
+          level: 0,
+          width: w,
+          height: h,
+          compressType: 0,
+          pixelFormat: 28,
+          data: new Uint8Array(w * h * 4),
+          childTexNames: [],
+          requestNames: [],
+          rectScale,
+          subTexInfos: [
+            {
+              subName: 's.texblock',
+              offsetX: 2,
+              offsetY: 1,
+              width: 8,
+              height: 6,
+              bindings: [{ geoName: 'G', texUnitIndex: 0, vertexOffset: 0, vertexCount: 4 }],
+            },
+          ],
+        },
+      };
+      return {
+        geoPackage: { G: { vertexPackage: { verticesCount: 4 } } },
+        texturePackage: tp,
+        textures: {},
+        atlasRects: {},
+      } as unknown as Parameters<typeof rebuildBlockTextureState>[0];
+    };
+
+    // 基准：rect 参考尺寸 = 纹理尺寸
+    const base = mkTile(32, 32);
+    rebuildBlockTextureState(base);
+    const r0 = Array.from(base.atlasRects!['G']!.uv!);
+
+    // 换成 2 倍高清图：尺寸翻倍 + rectScale=2 → 归一化 rect 必须一模一样
+    const hi = mkTile(64, 64, 2);
+    rebuildBlockTextureState(hi);
+    const r1 = Array.from(hi.atlasRects!['G']!.uv!);
+
+    expect(r1).toEqual(r0);
+    // 反证：如果忘了 rectScale，rect 会缩到一半
+    const forgot = mkTile(64, 64);
+    rebuildBlockTextureState(forgot);
+    const r2 = Array.from(forgot.atlasRects!['G']!.uv!);
+    expect(r2[2]).toBeCloseTo(r0[2]! / 2, 6);
+  });
+
+  test('换过像素再重拼，rect 跟着拼图重算而不是沿用旧值', async () => {
+    const { unpackBlockTextures, rebuildBlockTextureState } = await import('../../packages/s3m-three/src/core/S3MBlockParser');
+    const tile = await parse('0.s3mblock');
+    const ids = Object.keys(tile.texturePackage);
+    expect(ids.length).toBeGreaterThan(1);
+
+    // 模拟「第一张图集换成了更大的高清版」（内容随便，只看重拼是否把它算进去）
+    expect(unpackBlockTextures(tile)).toBe(true);
+    const first = tile.texturePackage[ids[0]!]!;
+    const big = new Uint8Array(first.width * 2 * first.height * 2 * 4).fill(200);
+    first.data = big;
+    first.width *= 2;
+    first.height *= 2;
+
+    rebuildBlockTextureState(tile);
+
+    // 拼图整体变宽了，归一化 rect 必须随之改变（第二张图集的 x 会被推到更右边）
+    const packedW = tile.texturePackage[ids[0]!]!.width;
+    expect(packedW).toBeGreaterThan(0);
+    const geo = Object.keys(tile.atlasRects)[0]!;
+    const r = tile.atlasRects[geo]!.uv!;
+    expect(r.length).toBeGreaterThan(0);
+    for (let i = 0; i < r.length; i += 4) {
+      expect(r[i + 2]!).toBeGreaterThan(0);
+      expect(r[i]! + r[i + 2]!).toBeLessThanOrEqual(1 + 1e-6);
     }
   });
 });

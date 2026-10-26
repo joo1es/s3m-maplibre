@@ -89,8 +89,16 @@ export function packAtlases(tp: Record<string, AtlasLike>): PackedAtlases | null
 
   for (const [id, img] of images) {
     const off = offsets.get(id)!;
+    // ★ 必须逐行**倒序**拷贝。
+    //
+    // DXTTextureDecode 输出的是「源图上下颠倒」的缓冲（源第 sy 行写到 height-1-sy），
+    // 而 rect 的 y 是按源图**自上而下**的 offsetY 算的。原样拷贝会让拼图的行序和
+    // rect 的约定相反；更糟的是同一块里各图集高度不同（192 / 184 / 64 / 128），
+    // 颠倒量随图集而异，于是「哪些精灵对、哪些精灵错」取决于它属于哪张图集 ——
+    // 表现为同一面墙一半正常一半贴到别处。
+    // 倒序拷进来之后，拼图行 0 就对应源图顶行，rect.y = (off.y + offsetY) / H 对全部图集统一成立。
     for (let row = 0; row < img.h; row++) {
-      const src = row * img.w * 4;
+      const src = (img.h - 1 - row) * img.w * 4;
       data.set(img.rgba.subarray(src, src + img.w * 4), ((off.y + row) * W + off.x) * 4);
     }
   }

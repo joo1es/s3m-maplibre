@@ -7,7 +7,16 @@
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
-import { parseS3MBlock, parseS3MBlockGroups, parseS3MBlockTextureFile } from '../core/S3MBlockParser.js';
+import {
+  parseS3MBlock,
+  parseS3MBlockGroups,
+  parseS3MBlockTextureFile,
+  rebuildBlockTextureState,
+  unpackBlockTextures,
+} from '../core/S3MBlockParser.js';
+import type { S3MBlockTile } from '../core/S3MBlockParser.js';
+import { evaluateAtlasUpgrade } from '../core/AtlasUpgrade.js';
+import type { AtlasPixels } from '../core/AtlasUpgrade.js';
 import type { S3MBlockAtlasImage, S3MBlockGroupSet, S3MBlockTexture } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { Group, Texture } from 'three';
@@ -259,6 +268,10 @@ export class S3MTileset {
   private readonly _groupCache = new Map<string, S3MBlockGroupSet>();
   /** 独立 `.texblock` 图集缓存：id → 图像；null 表示正在请求或确认不可用 */
   readonly externalAtlasCache = new Map<string, S3MBlockAtlasImage | null>();
+  /** 真正被高清版顶替掉的图集 id（判定通过） */
+  readonly atlasUpgraded = new Set<string>();
+  /** 拿到高清版但判定不通过 → 原因。用于排查「为什么这块还是糊的」 */
+  readonly atlasUpgradeSkipped = new Map<string, string>();
   readonly stats: Stats = { tiles: 0, loading: 0, failed: 0, meshes: 0, vertices: 0, triangles: 0, datasets: 1 };
 
   maxConcurrent: number;
@@ -609,43 +622,54 @@ export class S3MTileset {
     const blockTile = tile as ParsedTile & { texturePackage?: Record<string, S3MBlockTexture> };
     const tp = blockTile.texturePackage;
     if (!tp) return;
+
+    // 拼图块：先退回原始图集。拼图是把多张图集重排进一张大图，
+    // 换高清图必须在拼图**之前**做，否则 rect 和像素两套排布对不上。
+    const wasPacked = unpackBlockTextures(blockTile as S3MBlockTile);
     const jobs: Promise<void>[] = [];
+    /** 只要像素被动过，纹理表 / rect 就必须重算 —— 否则子瓦片会整块白膜 */
+    let changed = false;
 
     for (const [id, tex] of Object.entries(tp)) {
-      // 已经拼合成一张大图的块：像素是我们自己重新排过的，再拿单张高清图覆盖会整张错位
-      if ((tex as { packed?: boolean }).packed) continue;
       // 高清子图集：requestNames 是子瓦片「像素在独立文件里」的情形，
-      // childTexNames 才是根图集挂的「同一套排布的清晰版」。
-      // 根块常常自带一份内嵌 data，但它是低分辨率缩略图（实测 120x184 对高清 300x304）——
-      // 一张 120x184 的图集装 26 个槽位，每个槽位只能画一整栋楼的缩略图，
-      // 贴到墙上就是「满墙小楼照片」。官方一律用 childTexNames 指向的清晰版。
+      // childTexNames 才是根图集挂的候选清晰版。
       const names = [...(tex.requestNames ?? []), ...(tex.childTexNames ?? [])];
       if (!names.length) continue;
+      // 子瓦片的图集段只有元信息（data = null），没有可比的基准，只能直接采用；
+      // 根块自带缩略图，必须验证过才能换。
+      const hasBaseline = !!tex.data;
+      const accept = (img: S3MBlockAtlasImage): boolean => {
+        if (!hasBaseline) return true;
+        const v = evaluateAtlasUpgrade(tex as unknown as AtlasPixels, img);
+        if (v.ok) return true;
+        this.atlasUpgradeSkipped.set(
+          id,
+          `${v.reason} aspectΔ=${(v.aspectDelta * 100).toFixed(1)}% scale=${v.scale} err=${Number.isNaN(v.meanAbsError) ? 'n/a' : v.meanAbsError.toFixed(1)}`
+        );
+        return false;
+      };
 
+      // ★ 不能无条件换图。实测 3D-OlympicGreen/Building 两块共 8 张图集里，
+      //   只有 2 张的 child 是「同一套排布的等比放大」（长宽比 0.0%、下采样色差 8.5/11.2），
+      //   其余是**重新排版**过的另一张图（长宽比偏差 5.6%~200%，色差 43~86）。
+      //   直接套用 subTexInfos 会整张错位，比不换更糟 —— 所以换之前先验一遍。
       const cached = this.externalAtlasCache.get(id);
       const apply = (img: S3MBlockAtlasImage) => {
-        // 覆盖解析阶段按内嵌缩略图填好的那份；请求失败时不会走到这里，原样保留
+        // 覆盖解析阶段按内嵌缩略图填好的那份；判定不通过时不会走到这里，原样保留
         tex.data = img.data;
         tex.compressType = img.compressType;
         tex.pixelFormat = img.pixelFormat;
-        tile.textures[id] = {
-          code: id,
-          level: tex.level,
-          // 必须用清晰版自己的尺寸：块里声明的 120x184 只是缩略图大小，
-          // 拿它去解码 300x304 的像素会整张错位。subTexInfos 的 rect 是归一化的，
-          // 换图不换归一化坐标，所以不受影响。
-          width: img.width || tex.width,
-          height: img.height || tex.height,
-          compressType: img.compressType,
-          pixelFormat: img.pixelFormat,
-          data: img.data,
-          flipY: true,
-        };
+        // rect 是归一化的，但 subTexInfos 的 offset/width 是像素，必须按倍数换算
+        tex.rectScale = tex.width > 0 ? img.width / tex.width : 1;
+        tex.width = img.width || tex.width;
+        tex.height = img.height || tex.height;
+        this.atlasUpgraded.add(id);
+        changed = true;
       };
 
       if (cached === null) continue; // 正在请求 / 确认不可用
       if (cached) {
-        apply(cached);
+        if (accept(cached)) apply(cached);
         continue;
       }
       this.externalAtlasCache.set(id, null);
@@ -661,69 +685,35 @@ export class S3MTileset {
               const img = imgs[0];
               if (!img) continue;
               this.externalAtlasCache.set(id, img);
-              apply(img);
+              if (accept(img)) apply(img);
               return;
             } catch {
-              // 换下一个候选名；全失败就保持无贴图，由上层照常渲染几何
+              // 换下一个候选名；全失败就保持缩略图，由上层照常渲染几何
             }
           }
         })()
       );
     }
     if (jobs.length) await Promise.all(jobs);
+
+    // 像素定下来了，重新拼图并重算 rect / 纹理表（两者必须一起重算）。
+    //
+    // ★ 这里必须用 `wasPacked || changed`，不能只看 wasPacked：
+    //   **子瓦片**的图集是 `data = null` + `requestNames`，根本没参与拼图（wasPacked=false），
+    //   像素是刚从 .texblock 拉回来的。只看 wasPacked 的后果是 `tile.textures` 永远是空的
+    //   → 近看整片白膜；同时 atlasRects 也没按 rectScale 重算 → 远处马赛克噪点。
+    if (wasPacked || changed) rebuildBlockTextureState(blockTile as S3MBlockTile);
   }
 
-  private async _upgradeAtlasLod(tile: ParsedTile, url: string): Promise<void> {
-    if (!this.atlasLod) return; // 默认关，见 S3MTilesetOptions.atlasLod
-    const blockTile = tile as ParsedTile & { texturePackage?: Record<string, { childTexNames?: string[]; width: number; height: number }> };
-    const tp = blockTile.texturePackage;
-    if (!tp) return;
-    const jobs: Promise<void>[] = [];
-
-    for (const [id, tex] of Object.entries(tp)) {
-      if ((tex as { packed?: boolean }).packed) continue;
-      const childName = (tex.childTexNames ?? [])[0];
-      const apply = (best: S3MBlockAtlasImage) => {
-        const t = tile.textures[id];
-        if (!t) return;
-        t.width = best.width;
-        t.height = best.height;
-        t.compressType = best.compressType;
-        t.pixelFormat = best.pixelFormat;
-        t.data = best.data;
-        // 换了像素就得重解码：缓存里那份是按旧尺寸解的
-        this.textureCache.delete(id);
-      };
-
-      // 同一张图集会被很多瓦片引用：拉过就复用，没拉过才发请求
-      const cached = this.atlasLodCache.get(id);
-      if (cached === null) continue; // 正在请求 / 已确认没有清晰版
-      if (cached) {
-        if (cached.width * cached.height > tex.width * tex.height) apply(cached);
-        continue;
-      }
-      if (!childName) continue;
-      this.atlasLodCache.set(id, null);
-      const childUrl = resolveUrl(url, childName);
-      if (!childUrl) continue;
-      jobs.push(
-        (async () => {
-          try {
-            const res = await fetch(childUrl);
-            if (!res.ok) return;
-            const imgs = await parseS3MBlockTextureFile(await res.arrayBuffer());
-            const best = imgs.reduce((a, b) => (b.width * b.height > a.width * a.height ? b : a), imgs[0]!);
-            // 只接受清晰版：像素数必须严格大于根图集，否则宁可保留原图
-            if (best.width * best.height <= tex.width * tex.height) return;
-            this.atlasLodCache.set(id, best);
-            apply(best);
-          } catch {
-            // 子图集是增强项，拿不到就用根图集，不该拖垮整块瓦片
-          }
-        })()
-      );
-    }
-    if (jobs.length) await Promise.all(jobs);
+  /**
+   * @deprecated 已由 `_fillExternalAtlases` 覆盖，保留仅为兼容 `atlasLod` 选项。
+   *
+   * 旧实现「像素数更大就整体换图」，正是被证伪的那个前提：实测 8 张图集里只有 2 张的
+   * child 是等比放大，其余是重新排版过的另一张图，硬换会整张错位。
+   * 现在换图统一走 `_fillExternalAtlases` + `evaluateAtlasUpgrade` 的验证流程。
+   */
+  private async _upgradeAtlasLod(_tile: ParsedTile, _url: string): Promise<void> {
+    return;
   }
 
   private async _load(url: string): Promise<void> {

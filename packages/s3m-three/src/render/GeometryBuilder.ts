@@ -47,406 +47,26 @@ function isPointPrimitive(primitiveType: number): boolean {
   return primitiveType === POINT_PRIMITIVE;
 }
 
-/**
- * 按「binding 的原始 uv 跨度 ÷ 精灵像素尺寸」重算图集 UV（顶点已按三角形展开）。
- *
- * 关键事实（`_tmp/atlas/calib.mts` 实测 53 条 binding 得出）：同一个骨架里混着两类 binding ——
- *
- * | binding | uv 跨度 | 精灵像素 | 含义 |
- * |---|---|---|---|
- * | `108_3` | 1.0 × 1.0 | 96×32 | uv 已经是 0..1，一面墙一整张精灵 |
- * | `103_3` | 279 × 31 | 12×8 | uv 是世界尺度，一张精灵只占很小一段，必须平铺 |
- *
- * 所以「一律 0..1」会把第二类拉成一整张照片，「一律平铺」又会把第一类切成碎片。
- * 统一公式：把 uv 归一化到该组的跨度，再按 `跨度 / 精灵像素` 取整重复 ——
- * 这样两类都退化成正确结果，而且**保留了 uv 的空间连续性**（相邻墙不会贴到图集别处）。
- *
- * 之所以必须展开顶点：转角顶点同时属于两堵墙，共享一份 UV 会把另一面墙拽歪。
- */
-export function buildScaledUVs(
-  expandedUv: THREE.BufferAttribute,
-  expandedDim: Float32Array,
-  index: ArrayLike<number>,
-  groups: Float32Array
-): Float32Array | null {
-  const triCount = (index.length / 3) | 0;
-  if (triCount < 1) return null;
-
-  const uv = expandedUv.array as ArrayLike<number>;
-  const stride = expandedUv.itemSize;
-  const giCount = triCount * 3;
-
-  // 先把展开后的顶点按「原顶点」映射回 group / dim
-  const gidOf = new Int32Array(giCount);
-  const dimW = new Float32Array(giCount);
-  const dimH = new Float32Array(giCount);
-  const wide = new Uint8Array(giCount);
-  for (let g = 0; g < giCount; g++) {
-    const src = index[g]!;
-    gidOf[g] = groups[src] ?? -1;
-    dimW[g] = expandedDim[src * 3] ?? 1;
-    dimH[g] = expandedDim[src * 3 + 1] ?? 1;
-    wide[g] = expandedDim[src * 3 + 2] ? 1 : 0;
-  }
-
-  // 整块网格的 uv 包围盒：给「精灵 = 整张图集」那类顶点用
-  let mu0 = Infinity, mu1 = -Infinity, mv0 = Infinity, mv1 = -Infinity;
-  for (let g = 0; g < giCount; g++) {
-    const u = uv[g * stride]!;
-    const v = uv[g * stride + 1]!;
-    if (u < mu0) mu0 = u;
-    if (u > mu1) mu1 = u;
-    if (v < mv0) mv0 = v;
-    if (v > mv1) mv1 = v;
-  }
-  const groupWide = new Uint8Array(giCount);
-  for (let g = 0; g < giCount; g++) if (wide[g]) groupWide[gidOf[g]! >= 0 ? gidOf[g]! : 0] = 1;
-
-  // 逐组统计 uv 包围盒
-  const box = new Map<number, { u0: number; u1: number; v0: number; v1: number; w: number; h: number }>();
-  for (let g = 0; g < giCount; g++) {
-    const gid = gidOf[g]!;
-    if (gid < 0) continue;
-    const u = uv[g * stride]!;
-    const v = uv[g * stride + 1]!;
-    let b = box.get(gid);
-    if (!b) {
-      b = { u0: u, u1: u, v0: v, v1: v, w: dimW[g]!, h: dimH[g]! };
-      box.set(gid, b);
-    } else {
-      if (u < b.u0) b.u0 = u;
-      if (u > b.u1) b.u1 = u;
-      if (v < b.v0) b.v0 = v;
-      if (v > b.v1) b.v1 = v;
-    }
-  }
-
-  // 预计算每组 (起点, 跨度, 重复次数)
-  const calc = new Map<number, { u0: number; v0: number; su: number; sv: number; ru: number; rv: number }>();
-  const meshSu = mu1 - mu0;
-  const meshSv = mv1 - mv0;
-  for (const [gid, b] of box) {
-    // 精灵几乎等于整张图集 = 这是「整块街区的一张照片」：每面墙都归一化到 0..1
-    // 就等于每栋楼都贴同一张照片（实测所有楼都出现同一个招牌）。
-    // 这类必须按**整个网格**的 uv 包围盒来归一化，每面墙只取自己那一块。
-    if (groupWide[gid] && meshSu > 1e-6 && meshSv > 1e-6) {
-      calc.set(gid, { u0: mu0, v0: mv0, su: meshSu, sv: meshSv, ru: 1, rv: 1 });
-      continue;
-    }
-    const su = b.u1 - b.u0;
-    const sv = b.v1 - b.v0;
-    // 水平：精灵左右接缝实测差为 0（完全连续），所以可以平铺。
-    // 一个周期 = 精灵宽（像素）个 uv 单位；至少 1 次，四舍五入到整数保持接缝对齐。
-    const ru = su > 1e-6 ? Math.max(1, Math.round(su / Math.max(b.w, 1))) : 1;
-    // 垂直：精灵上下接缝差 150+，而相邻行只差 10 上下 —— 它**不可平铺**。
-    // 竖直方向永远只铺一次，把整张立面拉伸到墙高；按比例取整会得到一条条横向错位。
-    const rv = 1;
-    calc.set(gid, { u0: b.u0, v0: b.v0, su, sv, ru, rv });
-  }
-
-  const out = new Float32Array(giCount * 2);
-  for (let g = 0; g < giCount; g++) {
-    const gid = gidOf[g]!;
-    const c = gid >= 0 ? calc.get(gid) : undefined;
-    if (!c) continue;
-    const u = uv[g * stride]!;
-    const v = uv[g * stride + 1]!;
-    // 跨度为 0 的方向（垂直于墙的那一维）取精灵中线，避免除零
-    out[g * 2] = c.su > 1e-6 ? ((u - c.u0) / c.su) * c.ru : 0.5 * c.ru;
-    out[g * 2 + 1] = c.sv > 1e-6 ? ((v - c.v0) / c.sv) * c.rv : 0.5 * c.rv;
-  }
-  return out;
-}
+/* ------------------------------------------------------------------ 图集 UV */
 
 /**
- * 按「绑定组」生成逐面 0..1 的图集 UV（顶点已按三角形展开，返回长度 = 三角形数 * 6）。
+ * S3MBLOCK 图集的 UV 一律用几何自带的 uv0 原值，这里不再做任何重算。
  *
- * 依据来自数据本身：块文件的 subTexInfos 里，每条 binding 明确写了「哪段顶点用哪张子纹理」
- * （geoName + vertexOffset + vertexCount）。这就是官方的 batch 表语义 —— 官方片元里
- * `fract(uv) * scale + translate` 用的 uv 正是这套划分下的局部坐标。
+ * 走过三轮弯路才定下来（每一条都不要再试）：
+ *   1. 「按世界尺度 fract」—— uv0 是建模工具留下的逐岛坐标，不是世界投影，
+ *      全局跨度 279 只是所有岛拼起来的包围盒，拿它除以瓦片尺寸算出的
+ *      「1 个 uv 周期 = 1.65 m」是错的；
+ *   2. 「按 binding 分组、逐面 0..1」—— 等于把作者排好的映射丢掉，
+ *      一面墙强行铺一整张精灵，长墙被横向拉糊；
+ *   3. 「按 uv 跨度 ÷ 精灵像素取整重复」—— 同上，而且依赖精灵像素尺寸这个
+ *      与几何无关的量。
  *
- * 所以这里直接按 binding 分组：一组顶点（= 一面墙 / 一个建筑单体的一个立面）用整张精灵，
- * 水平竖直都归一化到 0..1，不做平铺。之前的两种做法都不对：
- *   - 用世界尺度 uv 直接 fract：一个周期只有 1.65 m，整段立面被压进两米重复几百遍；
- *   - 按几何连通性自己分 patch：整片街区被并成一块，每面墙显示的都是整个街区。
+ * 官方引擎的做法（iClient3D 12.1.1，VS 里 getUVMatrixForBatch / FS 里
+ * czm_getTexColorForS3M）就是：fract(uv0) 直接乘子区域尺寸再平移到子区域，
+ * 一个 uv 周期 = 一张精灵，作者在 uv0 里已经把重复次数写死了。
+ * 唯一需要额外处理的是子区域右 1/3 那条内联 mip 链，见 StyleMaterial.s3mAtlasSample。
  */
-export function buildGroupUVs(
-  expandedPosition: THREE.BufferAttribute,
-  index: ArrayLike<number>,
-  groups: Float32Array
-): Float32Array | null {
-  const triCount = (index.length / 3) | 0;
-  if (triCount < 1) return null;
 
-  const pos = expandedPosition.array as ArrayLike<number>;
-  const stride = expandedPosition.itemSize;
-  const px = (k: number) => pos[k * stride]!;
-  const py = (k: number) => pos[k * stride + 1]!;
-  const pz = (k: number) => pos[k * stride + 2]!;
-
-  const axisOf = (x: number, y: number, z: number) => {
-    const ax = Math.abs(x), ay = Math.abs(y), az = Math.abs(z);
-    if (ay >= ax && ay >= az) return 1; // 顶面 → xz
-    if (ax >= az) return 0; // 法线朝 x → zy
-    return 2; // 法线朝 z → xy
-  };
-  const uvAxes = (axis: number): [number, number] => {
-    if (axis === 1) return [0, 2];
-    if (axis === 0) return [2, 1];
-    return [0, 1];
-  };
-  const comp = (k: number, axis: number) => (axis === 0 ? px(k) : axis === 1 ? py(k) : pz(k));
-
-  // key = groupId * 4 + axis，保证同一组里不同朝向的墙各算各的包围盒
-  const keyOf = new Int32Array(triCount).fill(-1);
-  const minU: number[] = [];
-  const maxU: number[] = [];
-  const minV: number[] = [];
-  const maxV: number[] = [];
-  const axisOfPatch: number[] = [];
-  const keyToPatch = new Map<number, number>();
-
-  for (let t = 0; t < triCount; t++) {
-    const o = t * 3;
-    const gid = groups[index[o]!] ?? -1;
-    if (gid < 0) continue;
-    const ux = px(o + 1) - px(o), uy = py(o + 1) - py(o), uz = pz(o + 1) - pz(o);
-    const vx = px(o + 2) - px(o), vy = py(o + 2) - py(o), vz = pz(o + 2) - pz(o);
-    const mx = uy * vz - uz * vy;
-    const my = uz * vx - ux * vz;
-    const mz = ux * vy - uy * vx;
-    if (!(Math.hypot(mx, my, mz) > 1e-9)) continue; // 退化三角形
-    const axis = axisOf(mx, my, mz);
-    const key = gid * 4 + axis;
-    let pid = keyToPatch.get(key);
-    if (pid === undefined) {
-      pid = axisOfPatch.length;
-      keyToPatch.set(key, pid);
-      axisOfPatch.push(axis);
-      minU.push(Infinity);
-      maxU.push(-Infinity);
-      minV.push(Infinity);
-      maxV.push(-Infinity);
-    }
-    keyOf[t] = pid;
-    const [ui, vi] = uvAxes(axis);
-    for (let k = 0; k < 3; k++) {
-      const u = comp(o + k, ui);
-      const v = comp(o + k, vi);
-      if (u < minU[pid]!) minU[pid] = u;
-      if (u > maxU[pid]!) maxU[pid] = u;
-      if (v < minV[pid]!) minV[pid] = v;
-      if (v > maxV[pid]!) maxV[pid] = v;
-    }
-  }
-
-  const out = new Float32Array(triCount * 6);
-  for (let t = 0; t < triCount; t++) {
-    const pid = keyOf[t]!;
-    if (pid < 0) continue;
-    const axis = axisOfPatch[pid]!;
-    const [ui, vi] = uvAxes(axis);
-    const w = maxU[pid]! - minU[pid]!;
-    const h = maxV[pid]! - minV[pid]!;
-    // 长墙按「宽高比」取整数重复：一面 4:1 的墙横向放 4 张，纵向始终 1 张 ——
-    // 竖直方向必须只铺一次，否则立面照会被切成一条条。
-    // 一张精灵 = 这面墙的整张立面照片（含所有楼层），所以横向也只铺一次。
-    // 之前按宽高比取重复，一栋 200x72 的板楼横向铺 3 张，窗格被横着拉大三倍。
-    const repeat = 1;
-    for (let k = 0; k < 3; k++) {
-      const gi = t * 3 + k;
-      const u = comp(gi, ui);
-      const v = comp(gi, vi);
-      out[gi * 2] = w > 1e-6 ? ((u - minU[pid]!) / w) * repeat : 0;
-      out[gi * 2 + 1] = h > 1e-6 ? (v - minV[pid]!) / h : 0;
-    }
-  }
-  return out;
-}
-
-/**
- * 由三角网生成「逐面 0..1」的图集 UV（顶点按三角形展开，返回长度 = 三角形数 * 6）。
- *
- * 背景：S3MBLOCK 的原始 UV 是世界尺度投影坐标（实测 ±139），而图集里每个精灵是
- * **一整段建筑立面**。拿世界 UV 去 fract 等于把整段立面压进两米重复几百遍。
- *
- * 三条踩过的坑：
- *   1. patch 必须「共面」—— 只按法线主轴分组会把整片街区并成一整块，bbox 一归一化，
- *      每面墙显示的就是整个街区；
- *   2. 不能按顶点索引判相邻 —— 这类模型的三角形基本不共享顶点（实测 79% 的 patch
- *      退化成一个三角形），必须按**空间坐标**量化后再判相邻；
- *   3. 顶点必须按三角形展开 —— 转角顶点同时属于两堵墙，共享 UV 会把另一面墙拽歪。
- */
-export function buildFaceUVs(
-  expandedPosition: THREE.BufferAttribute,
-  index: ArrayLike<number>,
-  _vertexCount?: number
-): Float32Array | null {
-  const triCount = (index.length / 3) | 0;
-  if (triCount < 1) return null;
-
-  const pos = expandedPosition.array as ArrayLike<number>;
-  const stride = expandedPosition.itemSize;
-  const px = (k: number) => pos[k * stride]!;
-  const py = (k: number) => pos[k * stride + 1]!;
-  const pz = (k: number) => pos[k * stride + 2]!;
-
-  const giCount = triCount * 3;
-  const Q = 20; // 5 cm 量化，抹掉浮点误差
-
-  // ---- 位置量化 → 位置顶点 id（重复顶点合并）----
-  const posId = new Int32Array(giCount);
-  const idMap = new Map<string, number>();
-  let posCount = 0;
-  for (let g = 0; g < giCount; g++) {
-    const key = `${Math.round(px(g) * Q)}_${Math.round(py(g) * Q)}_${Math.round(pz(g) * Q)}`;
-    let id = idMap.get(key);
-    if (id === undefined) {
-      id = posCount++;
-      idMap.set(key, id);
-    }
-    posId[g] = id;
-  }
-  idMap.clear();
-
-  // ---- 逐三角形：法线 + 平面偏移 ----
-  const nx = new Float32Array(triCount);
-  const ny = new Float32Array(triCount);
-  const nz = new Float32Array(triCount);
-  const plane = new Float32Array(triCount);
-  const ok = new Uint8Array(triCount);
-
-  for (let t = 0; t < triCount; t++) {
-    const o = t * 3;
-    const ux = px(o + 1) - px(o), uy = py(o + 1) - py(o), uz = pz(o + 1) - pz(o);
-    const vx = px(o + 2) - px(o), vy = py(o + 2) - py(o), vz = pz(o + 2) - pz(o);
-    const mx = uy * vz - uz * vy;
-    const my = uz * vx - ux * vz;
-    const mz = ux * vy - uy * vx;
-    const len = Math.hypot(mx, my, mz);
-    if (!(len > 1e-9)) continue; // 退化三角形
-    nx[t] = mx / len;
-    ny[t] = my / len;
-    nz[t] = mz / len;
-    const cx = (px(o) + px(o + 1) + px(o + 2)) / 3;
-    const cy = (py(o) + py(o + 1) + py(o + 2)) / 3;
-    const cz = (pz(o) + pz(o + 1) + pz(o + 2)) / 3;
-    plane[t] = nx[t]! * cx + ny[t]! * cy + nz[t]! * cz;
-    ok[t] = 1;
-  }
-
-  // ---- 并查集（域 = 三角形；位置 id 只用来判共边）----
-  const parent = new Int32Array(triCount);
-  for (let i = 0; i < triCount; i++) parent[i] = i;
-  const find = (x: number): number => {
-    let r = x;
-    while (parent[r] !== r) r = parent[r]!;
-    while (parent[x] !== r) {
-      const n = parent[x]!;
-      parent[x] = r;
-      x = n;
-    }
-    return r;
-  };
-  const union = (a: number, b: number) => {
-    const ra = find(a);
-    const rb = find(b);
-    if (ra !== rb) parent[rb] = ra;
-  };
-
-  const edgeMap = new Map<number, number>();
-  const DOT_MIN = 0.985; // 约 10°
-  const PLANE_EPS = 0.6; // 米
-
-  for (let t = 0; t < triCount; t++) {
-    if (!ok[t]) continue;
-    const o = t * 3;
-    for (let k = 0; k < 3; k++) {
-      const a = posId[o + k]!;
-      const b = posId[o + ((k + 1) % 3)]!;
-      if (a === b) continue;
-      const lo = a < b ? a : b;
-      const hi = a < b ? b : a;
-      const key = lo * posCount + hi;
-      const other = edgeMap.get(key);
-      if (other === undefined) {
-        edgeMap.set(key, t);
-        continue;
-      }
-      if (!ok[other]) continue;
-      const dot = nx[t]! * nx[other]! + ny[t]! * ny[other]! + nz[t]! * nz[other]!;
-      if (Math.abs(dot) < DOT_MIN) continue;
-      if (Math.abs(plane[t]! - plane[other]!) > PLANE_EPS) continue;
-      union(t, other);
-    }
-  }
-
-  // ---- patch 包围盒 ----
-  const patchOf = new Int32Array(triCount).fill(-1);
-  const patchAxis: number[] = [];
-  const patchMin: number[][] = [];
-  const patchMax: number[][] = [];
-  const rootToPatch = new Map<number, number>();
-
-  const axisOf = (x: number, y: number, z: number) => {
-    const ax = Math.abs(x), ay = Math.abs(y), az = Math.abs(z);
-    if (ay >= ax && ay >= az) return 1; // 顶面 / 底面 → xz
-    if (ax >= az) return 0; // 法线朝 x → zy
-    return 2; // 法线朝 z → xy
-  };
-  const uvAxes = (axis: number): [number, number] => {
-    if (axis === 1) return [0, 2]; // 顶面：u=x v=z
-    if (axis === 0) return [2, 1]; // 法线朝 x：u=z v=y
-    return [0, 1]; // 法线朝 z：u=x v=y
-  };
-  const comp = (k: number, axis: number) => (axis === 0 ? px(k) : axis === 1 ? py(k) : pz(k));
-
-  for (let t = 0; t < triCount; t++) {
-    if (!ok[t]) continue;
-    const root = find(t);
-    let pid = rootToPatch.get(root);
-    if (pid === undefined) {
-      pid = patchAxis.length;
-      rootToPatch.set(root, pid);
-      patchAxis.push(axisOf(nx[t]!, ny[t]!, nz[t]!));
-      patchMin.push([Infinity, Infinity]);
-      patchMax.push([-Infinity, -Infinity]);
-    }
-    patchOf[t] = pid;
-    const [ui, vi] = uvAxes(patchAxis[pid]!);
-    const mn = patchMin[pid]!;
-    const mx = patchMax[pid]!;
-    for (let k = 0; k < 3; k++) {
-      const u = comp(t * 3 + k, ui);
-      const v = comp(t * 3 + k, vi);
-      if (u < mn[0]!) mn[0] = u;
-      if (u > mx[0]!) mx[0] = u;
-      if (v < mn[1]!) mn[1] = v;
-      if (v > mx[1]!) mx[1] = v;
-    }
-  }
-
-  const out = new Float32Array(triCount * 6);
-  for (let t = 0; t < triCount; t++) {
-    const pid = patchOf[t]!;
-    if (pid < 0) continue;
-    const axis = patchAxis[pid]!;
-    const [ui, vi] = uvAxes(axis);
-    const mn = patchMin[pid]!, mx = patchMax[pid]!;
-    const w = mx[0]! - mn[0]!;
-    const h = mx[1]! - mn[1]!;
-    // 一面墙一张精灵：先不做横向重复，避免同一面墙被拼成好几栋楼
-    const repeat = 1;
-    for (let k = 0; k < 3; k++) {
-      const gi = t * 3 + k;
-      const u = comp(gi, ui);
-      const v = comp(gi, vi);
-      out[gi * 2] = w > 1e-6 ? ((u - mn[0]!) / w) * repeat : 0;
-      out[gi * 2 + 1] = h > 1e-6 ? (v - mn[1]!) / h : 0;
-    }
-  }
-  return out;
-}
 
 /**
  * 点云共享材质：顶点色直接上屏，不受光照影响。
@@ -650,22 +270,10 @@ export interface TileBuildStats {
   skipped: string[];
 }
 
-/**
- * S3MBLOCK 图集的 base UV 取法。
- *
- * - `raw`：直接用数据里的世界尺度 UV（跨度可达 ±139），`fract` 之后一个周期约 1.65 m，
- *   一张整栋楼缩略图会被压到两米宽重复几百遍 —— 满屏 confetti。
- * - `face`：按三角网连通面重新生成「一面墙一套 0..1」的 UV，等价于官方引擎自己算出来的
- *   那套 texcoord（实测 set2 成对出现 0/1、上界是整数重复次数）。
- */
-export type AtlasUvMode = 'raw' | 'face';
-
 export interface BuildTileOptions {
   /** 全局共享 uniform；不传则本次构建自建一份（不推荐，样式将无法全局联动） */
   uniforms?: StyleUniforms;
   textureCache?: Map<string, THREE.Texture>;
-  /** S3MBLOCK 图集 base UV 的取法，默认 'face'（与官方观感一致） */
-  atlasUv?: AtlasUvMode;
   /** 是否显示数据自带的棱线包 */
   edges?: boolean;
   edgeColor?: THREE.ColorRepresentation;
@@ -697,9 +305,6 @@ export async function buildTileObjects(
   options: BuildTileOptions = {}
 ): Promise<BuildTileResult> {
   const uniforms = options.uniforms ?? createSharedUniforms();
-  const atlasUvMode: AtlasUvMode = options.atlasUv ?? 'face';
-  /** 本轮几何是否用了「按绑定组归一化」的 UV：决定片元要不要再按精灵像素尺寸换算 */
-  let atlasUvNormalized = false;
   const textureByCode = options.textureCache ?? new Map<string, THREE.Texture>();
   const group = new THREE.Group();
   const objects: THREE.Object3D[] = [];
@@ -723,20 +328,30 @@ export async function buildTileObjects(
   group.userData.hasNativeEdges = false;
 
   // 1) 纹理
+  //
+  // 缓存 key 不能只用 atlas id：拼图（AtlasPack）是**逐块**做的，同一个 id 在 LOD 兄弟块里
+  // 参与的拼图集合可能不同、落位也不同。只按 id 复用会把别块的排布拿过来，
+  // 而 aAtlasRect 是本块的 —— 整块贴错图。带 packKey 的按「id#集合签名」隔离。
+  const texKeyOf = (code: string): string => {
+    const t = (tile.textures as Record<string, { packKey?: string }> | undefined)?.[code];
+    return t?.packKey ? `${code}#${t.packKey}` : code;
+  };
+
   for (const [code, tex] of Object.entries(tile.textures ?? {})) {
     // 同一个图集 id 会被很多瓦片共用：先到的那块可能只拿到内嵌缩略图（120x184），
     // 后面的块换成了高清版（240x304）。只按 id 判「缓存已有」会让高清永远进不来，
     // 满屏都是马赛克。所以尺寸变大时必须重解码并覆盖。
-    const prev = textureByCode.get(code);
+    const key = texKeyOf(code);
+    const prev = textureByCode.get(key);
     if (prev) {
       const img = prev.image as { width?: number; height?: number } | undefined;
       const prevPixels = (img?.width ?? 0) * (img?.height ?? 0);
       if (prevPixels >= (tex.width ?? 0) * (tex.height ?? 0)) continue;
-      textureByCode.delete(code);
+      textureByCode.delete(key);
     }
     const { texture, decoded } = await createTexture(tex);
     if (texture) {
-      textureByCode.set(code, texture);
+      textureByCode.set(key, texture);
       stats.textures++;
     } else {
       stats.skipped.push(`texture ${code} → ${decoded}`);
@@ -756,13 +371,13 @@ export async function buildTileObjects(
     const m = unwrapMaterial(entry);
     const units = materialUnits(m);
     const unit0 = units[0];
-    let map = unit0 ? (textureByCode.get(materialName(unit0) ?? unit0.id ?? '') ?? null) : null;
+    let map = unit0 ? (textureByCode.get(texKeyOf(materialName(unit0) ?? unit0.id ?? '')) ?? null) : null;
     // S3MBLOCK 的烘焙图（unit1 / BakeTex）是光照烘焙，官方与 base 相乘；缺它建筑就是一片平白
     const unit1 = units[1];
     const noBake = (globalThis as { __S3M_NO_BAKE?: boolean }).__S3M_NO_BAKE === true;
     const secMap =
       hasAtlasRect && unit1 && !noBake
-        ? (textureByCode.get(materialName(unit1) ?? unit1.id ?? '') ?? null)
+        ? (textureByCode.get(texKeyOf(materialName(unit1) ?? unit1.id ?? '')) ?? null)
         : null;
 
     // 检查并应用 texmodmatrix 纹理变换矩阵
@@ -809,7 +424,7 @@ export async function buildTileObjects(
 
     // 镂空图集（S3MBLOCK）：建筑照片是异形 alpha 抠图，轮廓顶点会采到 alpha=0 的像素，
     // 不丢弃的话就是成片的黑面。cutoff 取材质自带的 alphaCutoff（实测 0.01）。
-    // rect 已经在解析阶段按图集 alpha 收缩到立面本体（见 core/AtlasAlpha.ts），
+    // rect 是图集里的原始子区域（含右 1/3 的内联 mip 列），不做任何裁切，
     // 这里保留 alphaTest 只为挡掉轮廓外的零星像素，不会再出现整面墙被抠空。
     const alphaTest = (map as THREE.Texture | null)?.userData?.s3mHasAlpha
       ? Math.max((m?.alphaCutoff as number) ?? 0, 0.01)
@@ -825,7 +440,6 @@ export async function buildTileObjects(
       roughness: isWater && !map ? 0.12 : roughness,
       alphaTest,
       atlas: hasAtlasRect && !!map,
-      atlasUvNormalized,
       secMap,
     });
     return mat;
@@ -909,53 +523,7 @@ export async function buildTileObjects(
       if (idx) geometry.setIndex(idx);
       else geometry.setDrawRange(0, vertexCount);
 
-      // 图集 UV 要按三角形拆顶点：转角顶点同时属于两堵墙，共享 UV 会把其中一面墙拽歪
-      let expandedPosition = attributes.position as THREE.BufferAttribute;
-      if (
-        atlasUvMode === 'face' &&
-        attributes.aAtlasRect &&
-        idx &&
-        !isLinePrimitive(pack.primitiveType) &&
-        !isPointPrimitive(pack.primitiveType)
-      ) {
-        const expanded = geometry.toNonIndexed();
-        expandedPosition = expanded.getAttribute('position') as THREE.BufferAttribute;
-        geometry.dispose();
-        geometry = expanded;
-      }
 
-      // S3MBLOCK 图集：原始 UV 是世界尺度投影坐标（±139），一张立面精灵只摊到 1.65 m，
-      // fract 之后就是满屏重复的微缩照片。这里换成「一面墙一套 0..1」，
-      // 等价于官方引擎自己在 GPU 侧生成的那套 texcoord。
-      if (
-        atlasUvMode === 'face' &&
-        attributes.aAtlasRect &&
-        idx &&
-        !isLinePrimitive(pack.primitiveType) &&
-        !isPointPrimitive(pack.primitiveType)
-      ) {
-        const groups = tile.atlasRects?.[name]?.group;
-        const dims = tile.atlasRects?.[name]?.groupDim;
-        const expUv = geometry.getAttribute('uv') as THREE.BufferAttribute | undefined;
-        let faceUv: Float32Array | null = null;
-        if (groups && dims && expUv) {
-          // groupDim 是「原顶点」维度的，按 index 展开一份给 UV 重算用
-          const idxArr = idx.array as ArrayLike<number>;
-          const expDim = new Float32Array(idxArr.length * 3);
-          for (let i = 0; i < idxArr.length; i++) {
-            expDim[i * 3] = dims[idxArr[i]! * 3] ?? 1;
-            expDim[i * 3 + 1] = dims[idxArr[i]! * 3 + 1] ?? 1;
-            expDim[i * 3 + 2] = dims[idxArr[i]! * 3 + 2] ?? 0;
-          }
-          faceUv = buildScaledUVs(expUv, expDim, idxArr, groups);
-        }
-        if (!faceUv) {
-          faceUv = buildFaceUVs(expandedPosition, idx.array as ArrayLike<number>, vertexCount);
-        } else {
-          atlasUvNormalized = true;
-        }
-        if (faceUv) geometry.setAttribute('uv', new THREE.BufferAttribute(faceUv, 2));
-      }
 
       // 如果数据本身没有法线且是三角网格，必须在绑定了 index 之后计算法线
       // 绝不能在未索引的 attributes.position 上算，否则非连续顶点会导致法线朝向错乱甚至越界 NaN 导致死黑面

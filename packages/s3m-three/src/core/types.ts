@@ -150,6 +150,17 @@ export interface S3MTexture {
    * 解码成 RGBA 后要翻一次行再上传，rect 坐标（offsetY 从 v=0 起）才对得上。
    */
   flipY?: boolean;
+  /**
+   * 由 AtlasPack 拼合出来的 RGBA 大图（不是文件里的原始 DXT 块）。
+   * 这类纹理：① 已是自上而下，flipY 必须为 false；② 不能开 GPU mipmap，
+   * 层级由 StyleMaterial 的内联金字塔自己算；③ rect 是拼图坐标系。
+   */
+  packed?: boolean;
+  /**
+   * 拼图集合签名（`408x192#id1,id2,...`）。拼图是逐块做的，同一个 atlas id 在不同块里
+   * 可能落在不同位置，所以跨瓦片共享纹理时 key 必须带上它，否则会复用别的块的排布。
+   */
+  packKey?: string;
 }
 
 /* ------------------------------------------------------------------ 瓦片 */

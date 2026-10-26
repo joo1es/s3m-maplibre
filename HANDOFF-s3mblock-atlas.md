@@ -6,6 +6,356 @@
 
 ---
 
+## ★ 第十二轮（2026-10-26）：高清 `.texblock` 接入 —— 但「换图不换 rect」这个前提是错的
+
+### 先证伪，再动手
+
+原计划是把 `childTexNames` 指向的高清 `.texblock` 直接顶替块内嵌缩略图。动手前先用数据验了
+那句注释里的前提（"同一套排布、只是分辨率更高"），结果**只有 2/8 张图集成立**：
+
+| 缩略图 | 高清 | 长宽比偏差 | 下采样后色差 | 结论 |
+|---|---|---|---|---|
+| 96×64 | 192×128 | 0.0% | **8.5** | 真·高清版（2 倍整数等比） |
+| 96×64 | 192×128 | 0.0% | **11.2** | 同上 |
+| 108×192 | 204×384 | −5.6% | 43.3 | 重新排版过的另一张图 |
+| 120×184 | 300×304 | +51.3% | 83.3 | 同上 |
+| 84×128 | 180×240 | +14.3% | 60.2 | 同上 |
+| 132×192 | 120×144 | +21.2% | 86.4 | 同上 |
+| 96×96 | 192×248 | −22.6% | 83.4 | 同上 |
+| 96×192 | 192×128 | +200% | 63.4 | 根本不是同一张 |
+
+补充证据：
+- `subTexInfos` 的 `offset+size` 覆盖范围**正好等于缩略图尺寸**（108×192 / 120×184 / 96×64 / 84×128），
+  说明这些 offset 是**缩略图坐标系**，不是高清坐标系。
+- `.texblock` 解压后**没有**尾部排布表（`剩余=0`），里面只有一条图像记录。
+- 试过第三假设「高清 = 缩略图按整数 s 倍放大后被裁剪」，误差仍是 37~58，不成立。
+
+所以**无条件换图会整张错位，比不换更糟**。这也解释了为什么 `_fillExternalAtlases` 当初会写
+`if (packed) continue` —— 那是绕开问题，不是解决。
+
+### 本轮改动
+
+1. **新增 `core/AtlasUpgrade.ts`** —— 可判定的替换门禁：
+   - 长宽比偏差 ≤ 2%（`DEFAULT_MAX_ASPECT_DELTA`）
+   - 两轴必须是**同一个整数倍**（`scale === scaleY && Number.isInteger(scale)`）——
+     否则 `subTexInfos` 的像素 offset 没法精确换算
+   - 把高清图面积平均缩到缩略图尺寸后，不透明区域 RGB 平均绝对误差 ≤ 24（`DEFAULT_MAX_MEAN_ERROR`）
+   - 缩略图全透明 / 解不出来 → 一律不换（宁可不换，不能换错）
+2. **`core/S3MBlockParser.ts`** 拆出三个可复用步骤，并支持「换图后重拼」：
+   - `packTexturePackage` / `buildTextureTable` / `buildAtlasRects(…, packed)` 三段分离
+   - `unpackBlockTextures(tile)` —— 退回原始图集；**同时清空** `textures` / `atlasRects`
+     （它们描述拼图坐标系，此刻已不自洽。忘了重拼要立刻表现为无贴图，而不是画面错位）
+   - `rebuildBlockTextureState(tile)` —— 拼图 + 重算 rect + 重建纹理表，三者必须一起
+   - `origin.data` 现在会保留原始像素（没有它就退不回去）
+3. **新增 `S3MBlockTexture.rectScale`** —— `subTexInfos` 的像素坐标相对当前像素的倍数。
+   换 2 倍高清图后置 2，`buildAtlasRects` 里乘上去，**归一化 rect 保持不变**。
+   （rect 是归一化的所以天然不变，但 offset/width 是像素，不换算会落在一半的位置上，
+   平铺时逐格漂移。）
+4. **`tileset/S3MTileset.ts`**：
+   - `_fillExternalAtlases` 改为「先 `unpack` → 逐张 fetch + 验证 → 采用/保留 → `rebuild`」
+   - `data === null` 的子瓦片（`requestNames` 那条路）没有基准可比，仍无条件采用
+   - 新增 `atlasUpgraded` / `atlasUpgradeSkipped`（带原因）便于排查「这块为什么还是糊的」
+   - `_upgradeAtlasLod` 标为 `@deprecated` 并清空实现：它「像素数更大就换」的判据正是被证伪的那条
+
+### 单元测试（都做过变异验证）
+
+`tests/unit/atlas-upgrade.test.ts`（10 条）：
+- `boxDownsample` 必须是**面积平均**（2×2 黑白棋盘 → 中灰 127，不能取某一边）
+- 等比 2 倍 → 通过且误差 < 2
+- 长宽比不一致 → `aspect`
+- 长宽比一致但内容错位 → `content`（**注意**：基准图不能用棋盘格，它是周期的，
+  平移偶数像素会「看起来一样」，第一版测试就栽在这）
+- 高清并不更大 / 全透明 / 噪声 / 解不出来的格式 → 全部拒绝且不崩
+- 透明区域不参与比较
+
+`tests/unit/s3mblock.test.ts` 新增 4 条：
+- 拼图块：`textures[id]` 必须就是 `texturePackage[id]` 那张（第十一轮事故的核心不变量）
+- 解拼图后 `textures` / `atlasRects` 必须被清空
+- 解拼图 → 重拼必须**逐位还原**（rect / 纹理表 / packKey 都不漂）
+- 换成整数倍高清图后归一化 rect 完全不变（并反证：忽略 `rectScale` 会缩到一半）
+
+变异验证：unpack 不清状态 / 门禁恒通过 / 忽略 `rectScale` → 三条各自对应的测试都会红。
+
+### 端到端离线验证
+
+`render.mts` 加了 `HIRES=1`，走**和 App 完全相同**的路径（解拼图 → 验证 → 采用 → 重拼）：
+
+```bash
+HIRES=1 HI_DIR=_tmp/algo/hr   bun run _tmp/algo/render.mts _tmp/algo/6.s3mblock out.png 900 35 18
+HIRES=1 HI_DIR=_tmp/algo/hr41 bun run _tmp/algo/render.mts _tmp/algo/b41.s3mblock out.png 620 40 18
+```
+
+结果：6.s3mblock 拼图从 408×192 变 504×192（1 张被采用），画面 1.48% 像素变化、无破坏；
+b41 从 408×192 变 516×192（1 张被采用），但那张绑在 `texUnitIndex=1`（烘焙图），
+离线渲染器只画 base，所以像素差 0 —— **不是 bug**。
+
+### 诚实的结论
+
+这轮把「高清图」这条路**做对了，但没有把画面变清晰多少**：这块数据里 8 张图集只有 2 张的
+child 是真正的等比高清版，其余是重新排版的另一张图，硬换必错。
+真正能让画面更清晰的是**换数据集/换服务端 LOD**，不是继续在图集上做文章。
+
+### 本轮踩的坑（一定要记住）
+
+改完第一版就出事了：**远看马赛克噪点、近看白膜**。
+
+原因是我把 `apply()` 里「顺手写 `tile.textures[id]`」那句删了，改成「只有拼图块（`wasPacked`）
+才 `rebuildBlockTextureState`」。但**子瓦片的图集是 `data = null` + `requestNames`，压根没参与拼图**
+（`wasPacked = false`），像素是刚拉回来的 —— 于是：
+
+- `tile.textures` 永远是空的 → 材质拿不到 map → **近看整片白膜**
+- `atlasRects` 也没按 `rectScale` 重算 → 远处**马赛克噪点**
+
+修法只有一行，但条件是关键：
+
+```ts
+if (wasPacked || changed) rebuildBlockTextureState(tile);   // changed = 任何一次 apply
+```
+
+`tests/unit/atlas-fill.test.ts` 专门锁这条（3 条，直接构造 `.texblock` 字节流 + stub `fetch`
+跑真实的 `_fillExternalAtlases`，不是测一个复制的条件）。把 `|| changed` 去掉，前两条立刻红。
+
+教训：**「像素变了」和「拼图变了」是两件事，但都要求重算纹理表 + rect**。
+只认拼图状态会漏掉所有 `data = null` 的子瓦片，而它们正是近距离看到的那些。
+
+### 还没做的
+
+1. 实机复验（仍然没有浏览器截图）。这轮改动全部有单测 + 离线端到端，但「与官方同机位并排一致」
+   仍未确认。
+2. 高清版的**烘焙图**（`texUnitIndex=1`）路径：`render.mts` 只画 base，离线验证覆盖不到。
+   实机若发现烘焙图变花，先看 `atlasUpgradeSkipped` 里有没有对应 id。
+3. `groupDim`（`darr`）用的是未缩放的 `sub.width/height`；目前着色器不读它，留着仅作排查。
+
+---
+
+## ★ 第十一轮（2026-10-26）：第十轮算法是对的，但**喂给它的纹理不是同一张**
+
+**先读这一节。** 第十轮把 UV 算法对齐了官方，实机却是满屏彩色雪花 —— 不是算法错，
+是 `aAtlasRect` 和 `map` 来自两个不同的坐标系。
+
+### 真凶：`textures` 在拼图**之前**就建好了
+
+`parseS3MBlockGroups` 里原来的顺序是：
+
+```ts
+const textures = {...};                 // ← 从 texturePackage 抄一份
+const atlasRects = buildAtlasRects(...); // ← 拼图发生在这里面（packAtlases）
+```
+
+`buildAtlasRects` 会把一个块里的多张图集用 `packAtlases` 拼成一张大图，并把
+`texturePackage` 的 `width/height/data` **原地改写成拼图结果**。而 `textures` 是抄在
+拼图之前的，于是：
+
+| | 尺寸 | 内容 | 坐标系 |
+|---|---|---|---|
+| `atlasRects`（喂 `aAtlasRect`） | 408×192 | — | 拼图坐标系 |
+| `textures`（喂 `map` / `uAtlasDim`） | 108×192 | 块内嵌缩略图 DXT5 | 单张图集坐标系 |
+
+渲染侧 `uAtlasDim` 取的是 `map.image.width`，所以 `texSize = rect.zw × 108 × 2/3`
+只有真实值的 1/4：
+
+- `maxMip = log2(min(w·2/3, h))` 从 `log2(64)=6` 掉到 `log2(16.9)=4`
+- `dFdx(uv · texSize)` 同比变小 → `mip` 几乎恒为 0 → 内联金字塔**根本没被用上**
+- 每像素落到随机纹素 → 彩色雪花；越远越糟（正是「不同视距观感不一致」）
+
+同时 `translate = rect.xy` 是拼图坐标，采的却是单张图集 —— 连贴图内容都是错的
+（离线复现：整面墙变成橙红黄的别的楼）。这解释了为什么第十轮「算法改对了、画面没变」。
+
+### 复现方式（不需要浏览器）
+
+`render.mts` 加了 `MODE=app`：用 `tile.textures[id]` 走 `decodeDXT + flipRows + flipY=false`
+那条路（即 App 真实拿到的纹理），`atlasDim` 用它自己的尺寸。跑出来就是实机那个样子。
+
+```bash
+MODE=app bun run _tmp/algo/render.mts _tmp/algo/6.s3mblock out.png 900 35 18   # 修复前
+       bun run _tmp/algo/render.mts _tmp/algo/6.s3mblock out.png 900 35 18   # 修复后
+```
+
+### 本轮改动
+
+1. `core/S3MBlockParser.ts`
+   - `buildAtlasRects` 调到建 `textures` **之前**，`textures` 抄的是拼图后的结果。
+   - 拼图块写 `packed: true` / `flipY: false`（拼图自上而下，v=0 就是首行，不能再翻）。
+   - 给每张拼图打 `packKey = "408x192#id1,id2,…"`（见下）。
+2. `core/types.ts` — `S3MTexture` 增加 `packed?` / `packKey?`。
+3. `render/TextureFactory.ts` — 新增 `isAtlas = packed || flipY`，统一走
+   `configureAtlas`（`generateMipmaps=false` + `LinearFilter` + `ClampToEdge`）。
+   以前这个判断只看 `flipY`，拼图纹理（flipY=false）会被当成普通纹理开 GPU mip。
+4. `render/GeometryBuilder.ts` — 纹理缓存 key 从 `atlasId` 改成 `atlasId#packKey`。
+   拼图是**逐块**做的，同一个 atlas id 在 LOD 兄弟块里落位可能不同；
+   `options.textureCache` 是跨瓦片共享的，只按 id 复用会把别块的排布拿过来 → 整块贴错图。
+5. `tests/unit/s3mblock.test.ts` — 新增两条不变量（已做变异验证：把顺序改回去必须红）：
+   - 拼图块：`textures[id]` 的尺寸/像素必须就是 `texturePackage[id]` 那张，且 `packed=true`、`flipY=false`
+   - 未拼图的块仍走「原始 DXT 图集 + 翻行」
+
+### 关于「不同视距观感要一致」
+
+修完之后剩下的差距分两层，别混在一起：
+
+- **已消除**：`texSize` 差 4 倍导致的 mip 恒 0。这一层是**距离越远越糟**的元凶。
+- **仍存在（可接受）**：精灵本身很小（12×8），`maxMip - 1.62` 的官方钳位让它最多只能
+  缩小 2.6 倍；一像素跨十几格 uv 时仍会有轻微噪点。这是官方公式的固有上限
+  （内联金字塔最深层只有 `w/3 × h/8`，压不到 1×1），**不是 bug，不要为此改钳位**。
+  离线扫过 900/540/360/240 px：540 以上（≈ 你的截图那个比例）干净，240 才开始有噪点。
+
+### 已知未做（下一步优先级从高到低）
+
+1. **高清 `.texblock` 仍然没进拼图块**。`_fillExternalAtlases` 第一行就是
+   `if (packed) continue`，所以拼图块一直用块内嵌缩略图（108×192），
+   官方用的是 `childTexNames` 指向的清晰版（300×304 量级）。
+   要做对必须**先拉高清、再拼图**：把 `packAtlas` 从 `buildAtlasRects` 里拆出来，
+   在 `_fillExternalAtlases` 之后重跑一遍（`origin` 里要留 raw data 才能重拼）。
+   **风险**：高清版与缩略图的长宽比不一致（120×184 vs 300×304），
+   「换图不换归一化 rect」这个假设没验过，动之前先用 `sheet.mts` 对一遍 alpha 轮廓。
+2. 实机复验。本轮改动全部有离线对照与单测，但「与官方同机位并排一致」仍未截图确认。
+
+---
+
+## ★ 第十轮（2026-10-26）：找到真凶 —— 子区域右 1/3 是内联 mip 金字塔，§4 的撤回是错的
+
+**先读这一节，它推翻了 §4 里的一条关键结论。**
+
+### 证据（全部离线，不需要浏览器）
+
+把官方 `SuperMap3D.js` 里的 768 段内嵌着色器解密（`_sd()` 是 base64 + XOR "S3M"）后，
+`getTextureParameter` 里那句 `width *= 2.0/3.0` 和 `czm_getTexColorForS3M` 的 mip 平移量
+合起来**精确对应一种图集布局**：
+
+```
+mip0 只占左 2/3（宽 = rect.w × 2/3，高 = rect.h）
+右 1/3 是从上往下堆的内联 mip 金字塔：
+  mip1 在 (x + 2w/3, y)         尺寸 w/3   × h/2
+  mip2 在 (x + 2w/3, y + h/2)   尺寸 w/6   × h/4
+  mip3 在 (x + 2w/3, y + 3h/4)  尺寸 w/12  × h/8 …
+  整列总高恰好 = h
+```
+`translate.y = y + scale.y·(2^(m-1)-1)/2^(m-1)` 的 m=1/2/3 分别落在 `y / y+h/2 / y+3h/4`，
+与上面完全吻合。
+
+数值实证（14 个块、691 条子纹理）：
+
+```
+「右侧 1/3 ≈ 左 2/3 的 1/2 下采样」成立 668 条（96.7%）
+平均误差：down2(base) vs 右侧1/3 = 6.8 ；base vs 右侧1/3 = 27.3
+```
+
+`92_3`（24×16）放大 12 倍可以直接看到：左边 4 个蓝窗格，右边 1/3 是同样 4 个窗格的缩小版。
+按 mip 0/1/2/3 各采一遍，得到的是同一幅窗格的 1/1、1/2、1/4、1/8 —— 逐级变糊，不会串到邻格。
+
+### §4 那条撤回为什么错了
+
+§4 写「图集子区域自带内联 mip 链（base 占 2/3 宽）」→ **无依据**，理由是
+「(48,0,24,16) 右边紧挨的是另一张子纹理 1130_3」。
+
+真相：**缩略图本身就是同一幅图案的缩小版，肉眼看就是「图案的延续」**。
+把它和「左 2/3 做 1/2 下采样」做数值比对就能分开（误差 6.8 vs 27.3），肉眼分不开。
+
+去掉 2/3 的后果：每个平铺周期采到的是「立面 + 它自己的缩略版 + 一条透明边」，
+重复几十遍就是 §7 一直描述的「整栋微缩楼照片重复」——**confetti 的机制就是这个**。
+
+### 顺带解掉三个悬案
+
+1. **第三套 texcoord 不是 UV，是 `aTextureBatchId`**。GLSL 里
+   `#ifdef MULTI_TEX attribute vec2 aTextureBatchId;`，`getTextureBatchId0=att.x`（base 批号）、
+   `getTextureBatchId1=att.y`（bake 批号）。观测到的 `(0,1)(0,1)…` + `range[0,25]` 完全对得上：
+   该图集 26 条子纹理，而 `v0+123` 正好绑给列表第 0 条。
+   → **第三轮「set2 是引擎生成的逐面 UV」是幻影，不用生成，我们本来就有。**
+2. **「uv 周期 1.65 m」算错了**：那是拿全局 uv 跨度 279 除以瓦片 460 m。逐 binding 实测
+   跨度从 `1.0×1.0` 到 `279×55` 都有，没有单一周期。uv0 是建模工具留下的逐岛坐标。
+3. **AtlasPack 行序 bug**（新发现）：拼图时原样拷解码器输出（上下颠倒），而 rect 的 y 按源图
+   自上而下算。同一块里各图集高度不同（192/184/64/128），颠倒量随图集而异 ——
+   于是「哪些精灵对」取决于它属于哪张图集。修前实测同一块里覆盖率 0% / 50% / 100% 混着，
+   修后全部 ~100%。这条很可能是「同一面墙一半正常一半贴到别处」的真因。
+
+### 本轮改动
+
+| 文件 | 改动 |
+|---|---|
+| `core/AtlasPack.ts` | 逐行**倒序**拷贝，拼图行 0 = 源图顶行 |
+| `core/S3MBlockParser.ts` | 删掉 rect 的 alpha 裁切（裁了会破坏 2/3 比例与 mip 列偏移）；rect 原样保留 |
+| `render/GeometryBuilder.ts` | **删掉** `buildScaledUVs` / `buildGroupUVs` / `buildFaceUVs` 与 `atlasUv` 选项，UV 一律用原始 uv0 |
+| `render/StyleMaterial.ts` | `s3mAtlasUnit` 换成官方 `czm_getTexColorForS3M`：`texSize = rect.zw × (2/3, 1)`、`dFdx` 算 mip、ceil/floor 两档平均；删掉 `S3M_ATLAS_UV_NORM` |
+| `tests/unit/atlas-pack.test.ts` | 新增：合成 DXT5 三段色带，钉住拼图行序（注入 bug 会红） |
+| `tests/unit/s3mblock.test.ts` | 新增：rect 宽度必须等于子区域原宽（含 mip 列） |
+
+`bun run typecheck` 0 错误；`bun test ./tests/unit` 123 pass / 0 fail。
+`bun run build:three && bun run build:maplibre` 已重跑（`build:demo` 最后一步被环境
+safe-delete 拦住，与本任务无关）。
+
+### 离线验证器（本轮最大资产，替掉「截图—猜—再截图」）
+
+`_tmp/algo/` 下：
+
+- `atlas.mts` —— 独立抽 `.s3mblock` 的原始图集（跳过 groupNode/skeleton 段）
+- `agg.mts` —— 全量统计「右侧 1/3 是不是 1/2 下采样」
+- `tile.mts` —— 按 rect 平铺对比（整宽 vs 左 2/3）
+- `mipdemo.mts` —— 同一精灵 mip 0/1/2/3 阶梯图
+- `verify.mts` —— **按片元着色器公式把 binding 摊成图**，三列并排：
+  `A 旧逐面 / B 整宽rect / C 修复后`
+
+跑法：`bun run _tmp/algo/verify.mts _tmp/algo/6.s3mblock 400 out.png "92"`
+（`6.s3mblock` 用 `curl` 从
+`https://www.supermapol.com/realspace/services/3D-OlympicGreen-2/rest/realspace/datas/Building@OlympicGreen/6.s3mblock` 拉）。
+
+结论：C 列是干净均匀的窗格网格，B 列每格带一条缩略副本与透明边，A 列是整张精灵被拉满墙。
+
+### 整瓦片软件光栅化（本轮补完，离「截图」最近的东西）
+
+`verify.mts` 只能证明「一个 binding 的 uv 空间映射」，证明不了「整栋楼看起来对不对」。
+所以又补了两个工具，都不需要浏览器：
+
+- `wall.mts` —— 把**一个 binding 的真实三角形**按法线主轴摊平成一面墙，逐像素 fract 后取样。
+  出三列：`A 逐面归一化 / B 整宽 rect / C 修复后`。
+- `render.mts` —— **整瓦片软件渲染**：正交相机 + z-buffer + alphaTest + 逐片元 fract，
+  同一相机同一几何出三列。这才是真正能替代截图的东西。
+- `sheet.mts` —— 精灵体检表：同一子纹理「整宽 rect」与「左 2/3」各平铺 3×2 放大并排。
+- `dbg.mts` —— 打印某块的 atlasRects / texturePackage / bindings 全貌（PICK 不中时先跑它）。
+- `audit.mts` —— 审计 rect 在三角形内是否恒定、有没有零矩形、顶点被几个 binding 覆盖。
+- `uvdim.mts` —— 量 uv0 的量纲与「一个 uv 周期跨几个屏幕像素」。
+- `lods.mts` —— 打印块的 groupNode / pageLOD / 包围球 / 原始 textures 表。
+
+跑法：
+
+```bash
+bun run _tmp/algo/render.mts _tmp/algo/6.s3mblock _tmp/algo/render_6.png 900 35 18
+bun run _tmp/algo/wall.mts   _tmp/algo/b41.s3mblock "1008,1706" 8 _tmp/algo/wall_b41.png
+bun run _tmp/algo/sheet.mts  _tmp/algo/b41.s3mblock "1008,1706" 8
+```
+
+结果（两个块互证，`6.s3mblock` 单图集 / `b41.s3mblock` 4 图集 74 条子纹理）：
+
+| 列 | 整瓦片渲染表现 |
+|---|---|
+| A 逐面归一化 | 一面墙 = 一整张精灵，窗格被拉成大色块，全糊 |
+| B 整宽 rect | 每格右边带一块半透明**缩微立面**，远处看就是满屏雪花 / 破洞 |
+| C 左 2/3 + 内联 mip | 均匀窗格，无缩略副本、无透明边 |
+
+`sheet.mts` 是机理最直观的一张图：整宽 rect 平铺时，每个周期右侧那块棋盘格里
+能直接看见**缩小版的同一栋楼**——那就是 mip1 缩略图，不是「图案的延续」。
+
+**两个坐标系的坑（写工具必踩）**：
+
+1. `subTexInfos` 里的 `offsetX/offsetY/width/height` 是**像素**，不是归一化值。
+   解析器才把它们归一化（`buildAtlasRects`）。
+2. 运行时用的 rect 在**拼图坐标系**里 = `packed.offsets.get(atlasKey)` + 局部 offset。
+   只拿 `sub.offsetX` 去取样会整体偏移（b41 上偏 96px），采到隔壁精灵，
+   表现为「明明是灰墙却渲染出红砖」。**取样一律用 `tile.atlasRects[geoName].uv` 里的值。**
+
+### 还没做的
+
+1. **没在浏览器里跑过**。改动全部经离线烘焙与单测验证，但「与官方同机位并排一致」这个验收
+   基准仍未复验 —— 需要 `?all=1` 那个 URL 的实机截图。
+2. alphaTest 现在直接作用在原 rect 上（不再靠裁切 rect 规避天空）。若实机仍有镂空，
+   该调的是 `alphaTest` 阈值 / `alphaMode`，**不要再回去裁 rect**。
+3. `fract(uv)` + GPU mipmap 的接缝问题：本轮 mip 完全走内联金字塔（图集关 GPU mip，
+   `TextureFactory.configureAtlas` 已确认 `generateMipmaps=false` + `LinearFilter` +
+   `ClampToEdge`），所以不存在接缝；若将来改成「裁出 mip0 + 开 GPU mip」，必须用
+   `textureGrad` 传未 fract 的导数，否则每块砖边缘一条暗线。
+4. 极小化（一像素跨多格 uv）时 `mip` 会顶到 `maxMip - 1.62`，`guard` 把 `o` 夹成常数，
+   出彩色条带。这是官方公式本身的行为（同样会夹），不是本次改动的缺陷，不要当 bug 修。
+
+---
+
 ## 〇、第二轮结论（2026-10-25 晚，重要，先读这里）
 
 在 §7 卡住的地方，用**官方侧实测**把「纹理解码 / rect 约定 / UV 解析 / 着色器公式」这四个假设
@@ -419,7 +769,7 @@ textureunitstates = ["103.water"]
 |---|---|
 | "官方不翻行，所以我们也该不翻" | **等价**。官方 `_supportCompressType = 1` 走 `compressedTexImage2D`（不翻）；只有当 DXT 被 CPU 解码成 RGBA 时才 `flipY = true`（Cesium 那版对手动翻 arrayBufferView）。我们恒走 CPU 解码 + 翻行，两边下标都落在 `H-1-offsetY-f·h` |
 | "官方采样用的是祖先图集的 rect" | **错**。运行时实测 `ancestor` / `ancestorBake` = `null`，batch 表存的就是本级 `_subTexInfos` 的像素 rect |
-| "图集子区域自带内联 mip 链（base 占 2/3 宽）" | **无依据**。`(48,0,24,16)` 右边紧挨的是 `(48,16,24,8)`，subName 是另一张子纹理 `1130_3`，不是它的 mip。`width *= 2/3` 只是算 `maxMip` 的经验收缩系数 |
+| "图集子区域自带内联 mip 链（base 占 2/3 宽）" | ~~**无依据**。`(48,0,24,16)` 右边紧挨的是 `(48,16,24,8)`，subName 是另一张子纹理 `1130_3`，不是它的 mip。`width *= 2/3` 只是算 `maxMip` 的经验收缩系数~~ → **这条撤回本身是错的，见 §十**：右侧 1/3 确实是 1/2 下采样的内联 mip 列（691 条子纹理 96.7% 成立），缩略图看起来像「图案的延续」只是因为图案自相似。 |
 | "换子图集 + 保留归一化 rect 能提清晰度" | **实测更糟**（碎成满屏空洞）。三对样本比例不固定：`1.941×2.000`、`2.000×2.000`、`2.000×1.579` |
 | "我的着色器改写让渲染变差了" | **错**。OlympicGreen 在改写前就已经是 confetti，我当时拿 Building@CBD 的观感当成了"已验证的好基准" |
 
