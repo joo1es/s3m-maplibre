@@ -8,6 +8,7 @@
 import { describe, expect, test } from 'bun:test';
 import * as THREE from 'three';
 import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
+import { mergeVerticesByPosition } from '../../packages/s3m-three/src/render/MergeVertices';
 
 function makeBoxMesh(): THREE.Mesh {
   const geo = new THREE.BoxGeometry(1, 1, 1);
@@ -128,5 +129,28 @@ describe('_ensureEdges：顶点焊合 + 临界角 + 过滤', () => {
       { id: 'd2', name: 'building', options: { enableEdges: true }, root: new THREE.Group() }
     );
     expect((m2.userData as any).edges).toBeTruthy();
+  });
+
+  test('7. mergeVerticesByPosition：每面独立顶点（各自 UV）也能按位置焊合', () => {
+    // 两个三角形共享 AB 边，但 6 个顶点各自独立（S3M 典型形态：每面独立顶点 + 各自 UV）
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      'position',
+      new THREE.BufferAttribute(
+        new Float32Array([
+          0, 0, 0, 1, 0, 0, 0.5, 0, 0.5, // T1: A B C
+          1, 0, 0, 0, 0, 0, 0.5, -0.707, -0.707, // T2: B A D（反向遍历共享边）
+        ]),
+        3
+      )
+    );
+    const welded = mergeVerticesByPosition(geo, 0.005);
+    // 6 个原始顶点 → 4 个唯一位置（A、B 各出现两次被合并）
+    expect(welded.getAttribute('position').count).toBe(4);
+    expect(welded.getIndex()!.count).toBe(6);
+
+    // 焊合后 EdgesGeometry 能识别共享边：阈值 1° → 5 条棱（含共享棱）
+    const e = new THREE.EdgesGeometry(welded, 1);
+    expect((e.getAttribute('position').array as Float32Array).length / 6).toBe(5);
   });
 });

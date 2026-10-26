@@ -21,7 +21,6 @@
  * MapLibre / Mapbox 的胶水层在 s3m-maplibre 包的 S3MLayer.ts。
  */
 import * as THREE from 'three';
-import * as BufferGeometryUtils from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import { setMaxAnisotropy } from './TextureFactory.js';
@@ -43,6 +42,7 @@ import {
   createThickLineMaterial,
 } from './EdgeLines.js';
 import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
+import { mergeVerticesByPosition } from './MergeVertices.js';
 import {
   resolveFeature,
   measureSegments,
@@ -1544,8 +1544,10 @@ export class S3MViewer {
 
     // 1. 先做顶点容差焊合，让相邻三角形正确共享边索引。
     //    S3M 几何常为「每面独立顶点」，不焊合的话 EdgesGeometry 会把每条三角形边都当成边界，棱线爆炸。
+    //    注意用本地实现而不是 three/examples/jsm —— jsm 子路径导入会在宿主里
+    //    制造第二份 three 实例（"Multiple instances of Three.js" 警告的元凶）。
     //    tolerance 取米级模型下的 5mm，足以合并重合顶点又不会误并真实相邻面。
-    const welded = BufferGeometryUtils.mergeVertices(mesh.geometry, 0.005);
+    const welded = mergeVerticesByPosition(mesh.geometry, 0.005);
     // 2. 调大临界角（默认 55°，可在 style.edgeThreshold 调），过滤浅坡与曲面细分，只保留真正的棱。
     const thresholdAngle = this.style.edgeThreshold ?? 55;
     const source = new THREE.EdgesGeometry(welded, thresholdAngle);
