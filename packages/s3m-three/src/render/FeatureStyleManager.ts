@@ -6,7 +6,9 @@
  * 2. 专题图分析（按业务字段分段着色、连续插值着色、字段过滤、高度拉伸）
  * 3. 2 行状态纹理（uBatchTex）的烘焙与 GPU 上传：
  *    - Row 0: [R, G, B, elevation / hidden]
- *    - Row 1: [translationX, translationY, translationZ, reserved]
+ *    - Row 1: [translationX, translationY, translationZ, opacity]
+ *      约定：alpha 0 = 无单体透明覆盖（shader 不乘），(0,1) 开区间为实际透明度，
+ *      opacity <= 0 等价 hidden（走 Row 0 的 -1 隐藏位）
  * 4. 批次冲突审计（auditBatches）
  */
 import * as THREE from 'three';
@@ -26,7 +28,7 @@ export interface FeatureStyle {
   elevation?: number;
   /** 自定义单体三维平移偏移量 [dx, dy, dz]（米） */
   translation?: [number, number, number];
-  /** 自定义单体透明度（0~1） */
+  /** 自定义单体透明度（0~1，batch 粒度；<= 0 等价 hidden，1 / 不传 = 不覆盖） */
   opacity?: number;
   /** 是否隐藏该单体 */
   hidden?: boolean;
@@ -562,6 +564,8 @@ export class FeatureStyleManager {
       if (mat.userData.uBatchTexActive) {
         mat.userData.uBatchTexActive.value = 0;
       }
+      // 单体淡化清除后，把材质 transparent 还原成全局透明度语义
+      if (mat.transparent && mat.opacity >= 0.999) mat.transparent = false;
       return;
     }
 
@@ -569,6 +573,7 @@ export class FeatureStyleManager {
       if (mat.userData.uBatchTexActive) {
         mat.userData.uBatchTexActive.value = 0;
       }
+      if (mat.transparent && mat.opacity >= 0.999) mat.transparent = false;
       return;
     }
 
@@ -611,6 +616,7 @@ export class FeatureStyleManager {
     const colorOfBatch = new Map<number, string>();
     const elevOfBatch = new Map<number, number>();
     const translationOfBatch = new Map<number, [number, number, number]>();
+    const opacityOfBatch = new Map<number, number>();
     const ownersOfBatch = new Map<number, number>();
 
     for (const [smidStr, entry] of Object.entries(pickInfo)) {
@@ -661,6 +667,16 @@ export class FeatureStyleManager {
         continue;
       }
 
+      // 单体独立透明度：<= 0 等价 hidden；(0,1) 写入状态纹理第 2 行 alpha；>= 1 不覆盖
+      const fade = st?.opacity;
+      if (fade != null) {
+        if (fade <= 0) {
+          hiddenBatches.add(bId);
+          continue;
+        }
+        if (fade < 1 && !opacityOfBatch.has(bId)) opacityOfBatch.set(bId, fade);
+      }
+
       const col = st?.color ?? this.thematicColors.get(smid);
       if (col && !colorOfBatch.has(bId)) colorOfBatch.set(bId, col);
 
@@ -703,6 +719,19 @@ export class FeatureStyleManager {
       data[r1 + 2] = trans[2] + (elevOfBatch.get(bId) ?? 0);
       hasActive = true;
     }
+
+    // 单体独立透明度写在第 2 行 alpha：shader 里 0 = 无覆盖，不会误伤未设置的单体
+    let hasFade = false;
+    for (const [bId, fade] of opacityOfBatch) {
+      if (hiddenBatches.has(bId)) continue;
+      data[(w + bId) * 4 + 3] = fade;
+      hasActive = true;
+      hasFade = true;
+    }
+
+    // 有淡化单体时整块材质要开混合才有透明效果；清除后还原为全局透明度语义
+    if (hasFade && !mat.transparent) mat.transparent = true;
+    else if (!hasFade && mat.transparent && mat.opacity >= 0.999) mat.transparent = false;
 
     let conflicts = 0;
     for (const [bId, owners] of ownersOfBatch) {

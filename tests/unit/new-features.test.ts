@@ -74,6 +74,60 @@ describe('2. 单体 xy/z 平移（状态纹理第 2 行）', () => {
   });
 });
 
+describe('2.5 单体独立透明度（状态纹理第 2 行 alpha）', () => {
+  const mkStyledMesh = (layer: S3MLayer, smid: number) => {
+    const geom = new THREE.BoxGeometry(10, 10, 10);
+    geom.setAttribute('aBatchId', new THREE.BufferAttribute(new Float32Array(geom.attributes.position.count), 1));
+    const mesh = new THREE.Mesh(geom, createStyledMaterial(layer.uniforms));
+    mesh.userData = { pickId: 0, geoRef: { pickInfo: { [smid]: { batchId: 0 } } } };
+    return mesh;
+  };
+
+  test('写入第 2 行 alpha，材质开 transparent；清除后还原', () => {
+    const layer = mkLayer({ configUrl: 'http://example.com/config.json' });
+    const mesh = mkStyledMesh(layer, 101);
+
+    layer.setFeatureStyle(101, { opacity: 0.4 });
+    layer.viewer._applyOverridesToMesh(mesh);
+
+    const mat = mesh.material as unknown as {
+      transparent: boolean;
+      opacity: number;
+      userData: {
+        uBatchTex: { value: { image: { data: Float32Array; width: number } } };
+        uBatchTexActive: { value: number };
+      };
+    };
+    const tex = mat.userData.uBatchTex.value;
+    const w = tex.image.width;
+    // Row 1 alpha = 0.4（(0,1) 开区间），Row 0 不受影响（不隐藏）
+    expect(tex.image.data[w * 4 + 3]).toBeCloseTo(0.4, 5);
+    expect(tex.image.data[3]).toBe(0);
+    expect(mat.transparent).toBe(true);
+
+    // 清除后：uBatchTexActive 归零（渲染不再采样状态纹理）、transparent 还原（全局 opacity=1）
+    layer.removeFeatureStyle(101);
+    layer.viewer._applyOverridesToMesh(mesh);
+    expect(mat.userData.uBatchTexActive.value).toBe(0);
+    expect(mat.transparent).toBe(false);
+  });
+
+  test('opacity <= 0 等价 hidden，走 Row 0 隐藏位', () => {
+    const layer = mkLayer({ configUrl: 'http://example.com/config.json' });
+    const mesh = mkStyledMesh(layer, 102);
+
+    layer.setFeatureStyle(102, { opacity: 0 });
+    layer.viewer._applyOverridesToMesh(mesh);
+
+    const mat = mesh.material as unknown as {
+      userData: { uBatchTex: { value: { image: { data: Float32Array; width: number } } } };
+    };
+    const tex = mat.userData.uBatchTex.value;
+    expect(tex.image.data[3]).toBe(-1); // Row 0 hidden
+    expect(tex.image.data[tex.image.width * 4 + 3]).toBe(0);
+  });
+});
+
 describe('3. getFeatureBounds & flyToFeature', () => {
   test('单体范围计算与飞向宿主 map.fitBounds', () => {
     const layer = mkLayer({ configUrl: 'http://example.com/config.json' });

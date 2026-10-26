@@ -499,6 +499,12 @@ const FRAG_COLOR = /* glsl */ `
       diffuseColor.rgb = bState.rgb;
       hasCustomColor = true;
     }
+    // 单体独立透明度（状态纹理第 2 行 alpha，0 = 无覆盖）。
+    // 与全局 uOpacity（diffuseColor.a 初值）和图集贴图自带 alpha 逐级叠乘
+    vec4 bOffset = texture2D( uBatchTex, vec2( ( s3mBid + 0.5 ) / uBatchTexWidth, 0.75 ) );
+    if ( bOffset.a > 0.0 ) {
+      diffuseColor.a *= bOffset.a;
+    }
   }
 
   // 3. 选中单体高亮 + 其余压暗
