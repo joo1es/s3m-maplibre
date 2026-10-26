@@ -163,6 +163,8 @@ new S3MViewer(options?: S3MViewerOptions)
 | `totalMaxTiles` | `number` | — | 多数据集全局驻留瓦片总预算；开启后在可见数据集间动态均衡分配，防止叠加爆显存 |
 | `light` | `LightOptions` | — | 场景光照配置，可配环境光与主平行光的颜色、强度、模式与方位角/高度角 |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
+| `useWorker` | `boolean` | `true` | 用 Web Worker 解析经典 `.s3mb` 瓦片（inflate / Draco / MeshOpt 全在 Worker 跑，主线程只做 fetch 与几何组装）；Worker 不可用或崩溃时自动永久降级主线程。S3MBLOCK 路径仍主线程解析 |
+| （随 `useWorker`）纹理解码 | `boolean` | `true` | DXT / CRN / WEBP 纹理解码与 `.s3mb` 解析共用同一个 Worker（`core/TextureDecode.ts` 三方共用同一份实现，WEBP 走可 transfer 的 ImageBitmap）；失败自动回主线程，产物逐字节一致 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，配了才能 `colorByField()`，见[按业务字段着色](#按业务字段着色) |
@@ -290,6 +292,8 @@ clearFeatureStyles(): void
 flushOverrides(): void          // 手动刷脏标记（紧接着读纹理 / 截图 / 导出前用）
 getAllMeshes(): THREE.Mesh[]    // 当前驻留的全部网格
 ```
+
+`FeatureStyle.opacity` 支持单体独立透明度（batch 粒度）：写入状态纹理第 2 行 alpha，片元里与全局透明度、贴图 alpha 叠乘。约定 `0 < opacity < 1` 生效，`opacity <= 0` 等价 `hidden`，`1` / 不传 = 不覆盖；有淡化单体时该块材质自动开混合，清除后还原为全局透明度语义。与 LOD / 拾取 / 描边兼容（淡化只是改像素 alpha，不参与深度剔除）。
 
 ### 字段着色 / 过滤 / 抬高
 

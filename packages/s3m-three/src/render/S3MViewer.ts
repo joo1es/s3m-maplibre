@@ -23,7 +23,8 @@
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
-import { setMaxAnisotropy } from './TextureFactory.js';
+import { setMaxAnisotropy, setTextureOffThreadDecode } from './TextureFactory.js';
+import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
   STYLE_LABELS,
@@ -193,6 +194,8 @@ export interface S3MViewerOptions {
   maxTiles?: number;
   /** 每个数据集并发请求数 */
   maxConcurrent?: number;
+  /** 是否用 Web Worker 解析经典 .s3mb 瓦片（默认开，崩溃自动降级主线程），见 S3MTilesetOptions.useWorker */
+  useWorker?: boolean;
   /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
   lodRangeScale?: number;
   /** 自定义瓦片构建器（测试 / 服务端渲染时注入） */
@@ -401,6 +404,8 @@ export class S3MViewer {
     );
 
     this.uniforms = createSharedUniforms();
+    // 纹理解码优先派给共享解析 Worker（崩溃自动回主线程，见 decodeTextureWithWorker）
+    setTextureOffThreadDecode(decodeTextureWithWorker);
     this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
     this.outlineMaterial = createOutlineMaterial(this.uniforms);
 
@@ -604,7 +609,8 @@ export class S3MViewer {
 
   private _normalizeDatasets(options: S3MViewerOptions): S3MDatasetOptions[] {
     if (Array.isArray(options.datasets)) return options.datasets.filter((d) => !!d?.configUrl);
-    if (options.configUrl) return [{ id: 'default', name: '默认数据集', configUrl: options.configUrl }];
+    if (options.configUrl)
+      return [{ id: 'default', name: '默认数据集', configUrl: options.configUrl, useWorker: options.useWorker }];
     return [];
   }
 

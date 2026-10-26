@@ -18,8 +18,29 @@
  * 真实服务里的 CRN 纹理会被当成未知格式整包丢掉（模型变成无贴图的灰模）。
  */
 
-/** S3M 3.01（行标）compressType 取值 */
-export const TextureCompress = {
+/**
+ * S3M 像素 / 块格式枚举（iClient3D S3MPixelFormat）。
+ *
+ * 原本住在 render/TextureFactory，纹理解码下沉到 core（Worker 复用）后搬到这里；
+ * TextureFactory 保留同名 re-export，对外 API 不变。
+ */
+export const PixelFormat = {
+  RGB: 10,
+  BGR: 11,
+  ARGB: 12,
+  ABGR: 13,
+  BGRA: 14,
+  RGBA: 28,
+  WEBP: 25,
+  DXT1: 17,
+  DXT3: 19,
+  DXT4: 20,
+  DXT5: 21,
+  CRN_DXT5: 26,
+  STANDARD_CRN: 27,
+} as const;
+
+/** S3M 3.01（行标）compressType 取值 */export const TextureCompress = {
   NONE: 0,
   DXT1_RGB: 33776,
   DXT1_RGBA: 33777,

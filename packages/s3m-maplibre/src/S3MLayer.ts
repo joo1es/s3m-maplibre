@@ -174,6 +174,7 @@ export class S3MLayer {
       pickable: options.pickable,
       maxTiles: options.maxTiles,
       maxConcurrent: options.maxConcurrent,
+      useWorker: options.useWorker,
       lodRangeScale: options.lodRangeScale,
       buildTile: options.buildTile,
       light: options.light,

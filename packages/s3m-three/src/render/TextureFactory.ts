@@ -1,32 +1,18 @@
 /**
  * S3M 纹理 → three.js Texture
  *
- * S3M 的纹理是「裸块」：没有容器头，只有 width/height/compressType/dataSize/pixelFormat + 原始字节。
- * 该走哪条解码路径由 compressType 决定（见 core/TextureFormat.ts）：DXT 族直接解块，
- * CRN（26 / 27 / 38001 / 50000）先用 crunch wasm 转码回 DXT，WEBP 交给浏览器，
- * RGB 系逐像素拷贝。
+ * 解码本体已下沉到 core/TextureDecode.ts（three 无关，主线程 / Worker 共用），
+ * 本文件只负责两件事：
+ *   1. 优先把解码派给 Worker（setTextureOffThreadDecode 注入，S3MViewer 装配），
+ *      Worker 不可用时用同一份 decodeTextureData 在主线程兜底；
+ *   2. 把纯数据解码产物包成 three Texture 并按 atlas / 普通 分别配置采样参数。
  */
 import * as THREE from 'three';
-import DXTTextureDecode from '../core/DXTTextureDecode.js';
-import { transcodeCRN } from '../core/CRNDecode.js';
-import { dxtPixelFormatOf, resolveTextureKind } from '../core/TextureFormat.js';
 import type { S3MTexture } from '../core/types.js';
+import { decodeTextureData } from '../core/TextureDecode.js';
+import type { DecodedTextureData } from '../core/TextureDecode.js';
 
-export const PixelFormat = {
-  RGB: 10,
-  BGR: 11,
-  ARGB: 12,
-  ABGR: 13,
-  BGRA: 14,
-  RGBA: 28,
-  WEBP: 25,
-  DXT1: 17,
-  DXT3: 19,
-  DXT4: 20,
-  DXT5: 21,
-  CRN_DXT5: 26,
-  STANDARD_CRN: 27,
-} as const;
+export { PixelFormat } from '../core/TextureFormat.js';
 
 /** 由 S3MLayer 在拿到 GL 上下文后注入，用于斜视角下保持纹理清晰 */
 let maxAnisotropy = 1;
@@ -39,6 +25,26 @@ export interface DecodedTexture {
   texture: THREE.Texture | null;
   /** 实际走的解码路径，`unsupported(26)` 这类值会进 stats.skipped */
   decoded: string;
+}
+
+/**
+ * 注入「离线解码」实现（S3MViewer 装配：走共享解析 Worker）。
+ * 返回 null = Worker 不可用 / 崩溃，createTexture 自动退回主线程 decodeTextureData。
+ */
+let offThreadDecode: ((tex: S3MTexture) => Promise<DecodedTextureData | null>) | null = null;
+
+export function setTextureOffThreadDecode(
+  fn: ((tex: S3MTexture) => Promise<DecodedTextureData | null>) | null
+): void {
+  offThreadDecode = fn;
+}
+
+async function decodeTexture(tex: S3MTexture): Promise<DecodedTextureData> {
+  if (offThreadDecode) {
+    const viaWorker = await offThreadDecode(tex);
+    if (viaWorker) return viaWorker;
+  }
+  return decodeTextureData(tex);
 }
 
 function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
@@ -74,117 +80,32 @@ function configureAtlas<T extends THREE.Texture>(tex: T): T {
   return tex;
 }
 
-/** 行序翻转（原地）。S3MBLOCK 图集按 GL 方向存储（v=0 在最后一行），解码后要翻一次行 */
-function flipRows(rgba: Uint8Array, width: number, height: number): void {
-  const row = width * 4;
-  const tmp = new Uint8Array(row);
-  for (let y = 0; y < height >> 1; y++) {
-    const a = y * row;
-    const b = (height - 1 - y) * row;
-    tmp.set(rgba.subarray(a, a + row));
-    rgba.copyWithin(a, b, b + row);
-    rgba.set(tmp, b);
-  }
-}
-
-/** 该像素格式自带 alpha 通道（DXT1 的 1bit alpha 不算，历史上没开过 alphaTest） */
-function hasAlphaChannel(pixelFormat: number): boolean {
-  return (
-    pixelFormat === PixelFormat.DXT3 ||
-    pixelFormat === PixelFormat.DXT4 ||
-    pixelFormat === PixelFormat.DXT5 ||
-    pixelFormat === PixelFormat.ARGB ||
-    pixelFormat === PixelFormat.ABGR ||
-    pixelFormat === PixelFormat.BGRA ||
-    pixelFormat === PixelFormat.RGBA
-  );
-}
-
-/** 解 DXT 到 RGBA8。DXT5 是 1 字节/像素，DXT1 是 0.5 字节/像素。 */
-/** DXT 解码只需要尺寸 / 格式 / 字节，CRN 转码出来的结果也走这条路 */
-function decodeDXT(tex: Pick<S3MTexture, 'width' | 'height' | 'pixelFormat' | 'data' | 'flipY'>): THREE.DataTexture {
-  const { width, height, pixelFormat, data } = tex;
-  const out = new Uint8Array(width * height * 4);
-  DXTTextureDecode.decode(out, width, height, data, pixelFormat);
-  if (tex.flipY) flipRows(out, width, height);
-  const dt = new THREE.DataTexture(out, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
-  if (hasAlphaChannel(pixelFormat)) dt.userData.s3mHasAlpha = true;
-  return dt;
-}
-
-function fromRawRGB(tex: S3MTexture): THREE.DataTexture {
-  const { width, height, pixelFormat, data } = tex;
-  const out = new Uint8Array(width * height * 4);
-  // RGBA / BGRA / ARGB / ABGR 都是 4 字节，前两个是「尾字节是 alpha」，后两个是「首字节是 alpha」
-  const hasAlpha =
-    pixelFormat === PixelFormat.RGBA ||
-    pixelFormat === PixelFormat.BGRA ||
-    pixelFormat === PixelFormat.ARGB ||
-    pixelFormat === PixelFormat.ABGR;
-  const swapRB = pixelFormat === PixelFormat.BGR || pixelFormat === PixelFormat.BGRA;
-  const alphaFirst = pixelFormat === PixelFormat.ARGB || pixelFormat === PixelFormat.ABGR;
-  const src = hasAlpha ? 4 : 3;
-  for (let i = 0, s = 0, d = 0; i < width * height; i++, s += src, d += 4) {
-    const p = alphaFirst ? s + 1 : s;
-    out[d] = swapRB ? data[p + 2] : data[p];
-    out[d + 1] = data[p + 1];
-    out[d + 2] = swapRB ? data[p] : data[p + 2];
-    out[d + 3] = hasAlpha ? data[alphaFirst ? s : s + 3] : 255;
-  }
-  if (tex.flipY) flipRows(out, width, height);
-  const dt = new THREE.DataTexture(out, width, height, THREE.RGBAFormat, THREE.UnsignedByteType);
-  if (hasAlphaChannel(pixelFormat)) dt.userData.s3mHasAlpha = true;
-  return dt;
-}
-
 export async function createTexture(tex: S3MTexture | null | undefined): Promise<DecodedTexture> {
   if (!tex || !tex.width || !tex.height) return { texture: null, decoded: 'empty' };
 
   // 图集纹理（flipY 的原始 DXT 图集 / AtlasPack 拼出来的 RGBA 大图 / leaf 组合画布）都必须
   // 关 GPU mip，层级由 StyleMaterial.s3mAtlasUnit 的内联金字塔自己算。
   const isAtlas = tex.packed === true || tex.flipY === true || tex.composed === true;
-  const asAtlas = <T extends THREE.Texture>(t: T): T => (isAtlas ? configureAtlas(t) : configure(t));
 
-  // 判定只能看 compressType：v3.00 的 CRN 纹理 pixelFormat 是 13（ABGR）、
-  // 行标的 CRN 是 32856（GL_RGBA8），都不是 26 / 27（见 core/TextureFormat.ts）
-  const kind = resolveTextureKind(tex.compressType ?? 0, tex.pixelFormat);
+  const data = await decodeTexture(tex);
 
-  if (kind === 'crn') {
-    try {
-      const crn = await transcodeCRN(tex.data);
-      const decoded = decodeDXT({
-        width: crn.width,
-        height: crn.height,
-        pixelFormat: crn.dxtFormat === 1 ? 17 : 21,
-        data: crn.data,
-      });
-      return { texture: asAtlas(decoded), decoded: `crn->dxt${crn.dxtFormat}` };
-    } catch (e) {
+  if (!data.rgba && !data.bitmap) {
+    if (data.error) {
       // 一张纹理坏了不该带崩整个瓦片，如实上报并降级成无贴图
-      console.warn('[s3m] CRN 转码失败：', e);
-      return { texture: null, decoded: 'crn(failed)' };
+      console.warn('[s3m] CRN 转码失败：', data.error);
     }
+    return { texture: null, decoded: data.kind };
   }
 
-  if (kind === 'dxt1' || kind === 'dxt3' || kind === 'dxt4' || kind === 'dxt5') {
-    const decoded = decodeDXT({ ...tex, pixelFormat: dxtPixelFormatOf(kind) });
-    // flipY 为真即 S3MBLOCK 图集（见 core/types.ts），必须无 mip
-    return { texture: asAtlas(decoded), decoded: kind };
+  let texture: THREE.Texture;
+  if (data.bitmap) {
+    texture = new THREE.Texture(data.bitmap);
+  } else {
+    const dt = new THREE.DataTexture(data.rgba!, data.width, data.height, THREE.RGBAFormat, THREE.UnsignedByteType);
+    if (data.hasAlpha) dt.userData.s3mHasAlpha = true;
+    texture = dt;
   }
-
-  if (kind === 'webp') {
-    const blob = new Blob([tex.data as BlobPart], { type: 'image/webp' });
-    const bmp = await createImageBitmap(blob);
-    const t = new THREE.Texture(bmp);
-    t.needsUpdate = true;
-    return { texture: asAtlas(t), decoded: 'webp' };
-  }
-
-  if (kind === 'raw') {
-    const decoded = fromRawRGB(tex);
-    return { texture: asAtlas(decoded), decoded: 'raw' };
-  }
-
-  // KTX2 / ETC 需要额外解码器，先如实上报而不是静默出错
-  return { texture: null, decoded: `unsupported(${tex.compressType}/${tex.pixelFormat})` };
+  texture.needsUpdate = true;
+  // flipY 为真即 S3MBLOCK 图集（见 core/types.ts），必须无 mip
+  return { texture: isAtlas ? configureAtlas(texture) : configure(texture), decoded: data.kind };
 }

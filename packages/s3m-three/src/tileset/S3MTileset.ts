@@ -7,6 +7,7 @@
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
+import { getSharedS3MWorker, S3MWorkerClient, WorkerDeadError } from '../worker/S3MWorkerClient.js';
 import {
   composeLeafAtlas,
   expandTexblockRequestNames,
@@ -235,6 +236,15 @@ export interface S3MTilesetOptions {
   /** 原始图像/子图集缓存上限（LRU），默认 128 */
   maxImageCache?: number;
   buildTile?: BuildTileFn | null;
+  /**
+   * 是否用 Web Worker 解析经典 `.s3mb` 瓦片（默认开）。
+   *
+   * Worker 里跑 parseS3MB 全链路（inflate / Draco / MeshOpt 内联 wasm 解码），
+   * 主线程只做 fetch 与几何组装，消除加载阶段的解析卡顿。
+   * Worker 创建失败或崩溃时自动**永久**降级回主线程解析，行为与关闭时完全一致。
+   * S3MBLOCK 路径（图集补齐与主线程缓存强耦合）暂不进 Worker，仍主线程解析。
+   */
+  useWorker?: boolean;
   uniforms?: StyleUniforms | null;
   onTile?: (node: TileNode) => void;
   /** 超过 maxTiles 被淘汰时回调，调用方要自己把场景里的对象和拾取表清掉 */
@@ -330,6 +340,8 @@ export class S3MTileset {
   private isS3MV1 = false;
   private _buildTile: BuildTileFn | null;
   private readonly _uniforms: StyleUniforms | null;
+  /** 经典 .s3mb 的 Worker 解析客户端；undefined = 尚未尝试创建，null = 不可用/已降级 */
+  private _workerClient: S3MWorkerClient | null | undefined;  private readonly _useWorker: boolean;
   private _queue: string[] = [];
   private _active = 0;
 
@@ -346,6 +358,7 @@ export class S3MTileset {
     this._buildTile = options.buildTile ?? null;
     // 着色器共享 uniform，由 S3MLayer 持有并传进来
     this._uniforms = options.uniforms ?? null;
+    this._useWorker = options.useWorker !== false;
 
     // 并发与总量限制：iServer 公开服务上别把人家打爆
     this.maxConcurrent = options.maxConcurrent ?? 4;
@@ -678,6 +691,30 @@ export class S3MTileset {
   }
 
   /**
+   * 经典 `.s3mb` 瓦片解析：优先走 Worker（把 inflate / Draco / MeshOpt 的 CPU 密集
+   * 解码搬离主线程），Worker 不可用或已崩溃时主线程兜底，两条路径输出完全一致。
+   */
+  private async _parseClassicTile(buffer: ArrayBuffer): Promise<ParsedTile> {
+    if (this._useWorker && this._workerClient === undefined) {
+      // 与纹理解码共用进程级单例，避免每个数据集各起一个 Worker
+      this._workerClient = getSharedS3MWorker();
+    }
+    if (this._workerClient) {
+      try {
+        return await this._workerClient.parseTile(buffer);
+      } catch (e) {
+        if (e instanceof WorkerDeadError) {
+          // 脚本加载失败 / 崩溃属于环境问题，永久退回主线程；瓦片本身的问题照常抛
+          this._workerClient = null;
+        } else {
+          throw e;
+        }
+      }
+    }
+    return parseS3MB(buffer);
+  }
+
+  /**
    * 记住一个块文件里解析出来的全部 LOD 组。
    *
    * 一棵 LOD 子树的几层几何加图集动辄好几 MB，全数据集都留着会把内存吃光，
@@ -970,7 +1007,7 @@ export class S3MTileset {
           groupNames = set.names;
           tile = set.tiles[groupIndex] ?? set.tiles[0]!;
         } else {
-          tile = await parseS3MB(buffer);
+          tile = await this._parseClassicTile(buffer);
         }
       }
       if (isBlock) {
@@ -1269,6 +1306,7 @@ export class S3MTileset {
   }
 
   dispose(): void {
+    this._workerClient?.dispose();
     for (const node of this.nodes.values()) {
       node.group.traverse((o) => {
         const mesh = o as {

@@ -31,6 +31,8 @@ export interface S3MDatasetOptions {
   align?: DatasetAlignment;
   /** 垂直高度偏移（米），在 align 对齐基准上的额外偏移，正数抬升，负数下降，默认 0 */
   heightOffset?: number;
+  /** 是否用 Web Worker 解析经典 .s3mb 瓦片（默认开，崩溃自动降级主线程），见 S3MTilesetOptions.useWorker */
+  useWorker?: boolean;
   /**
    * 是否对该数据集生成几何棱线（CPU 端 EdgesGeometry）。
    * - 不填：跟随全局 `style.edges`
@@ -194,6 +196,7 @@ export class DatasetManager {
       maxConcurrent: maxConcurrent,
       lodRangeScale: ds.lodRangeScale ?? defaultLodRangeScale,
       buildTile: buildTile ?? null,
+      useWorker: ds.useWorker,
       uniforms: uniforms,
       onTile: (node) => {
         callbacks.onTile(node, entry);

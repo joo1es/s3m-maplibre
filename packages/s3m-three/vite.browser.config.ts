@@ -24,6 +24,10 @@ export default defineConfig(({ mode }) => {
       // ext-three 是第二轮构建，别把第一轮的产物清掉
       emptyOutDir: !externalThree,
       target: 'es2020',
+      // 解析 Worker（new Worker(new URL(...), { type: 'module' })）按 ESM 打成独立资产
+      worker: {
+        format: 'es',
+      },
       // 这个文件是给人 <script> 直接引的，不打 map
       sourcemap: false,
       lib: {
