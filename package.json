@@ -25,6 +25,8 @@
     "test:e2e": "bun test ./tests/e2e",
     "test:meshopt": "bun run build:three && node tools/meshopt-check.mjs --preset shenyin",
     "test:oracle": "node tools/official-oracle.mjs",
+    "release": "node tools/release.mjs",
+    "release:check": "node tools/release.mjs --check",
     "probe:parse": "bun run build:three && node tools/parse-sample.mjs",
     "probe:crn": "bun run build:three && node tools/crn-probe.mjs",
     "probe:lod": "bun run build:three && node tools/lod-probe.mjs",
