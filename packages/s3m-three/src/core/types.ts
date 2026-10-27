@@ -283,6 +283,8 @@ export interface StyleUniforms {
   uTexMix?: { value: number };
   /** 基础漫反射底色增益 / 直通自发光微调（0~1，默认 0.0） */
   uAmbientGain?: { value: number };
+  /** 双纹理交叉淡化插值因子（0~1，0 = 状态 A，1 = 状态 B） */
+  uBatchMix?: { value: number };
   /** 图层整体透明度（共享 uniform，透明度动画靠它做到 O(1)） */
   uOpacity?: { value: number };
   /** 棱线淡入淡出乘子（setEdges 过渡期间 0→1） */

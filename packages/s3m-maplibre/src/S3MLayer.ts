@@ -43,6 +43,7 @@ import type { Ray, ToneMapping } from 'three';
 import { Matrix4 } from 'three';
 import {
   buildOrthoMVP,
+  buildBlendedMVP,
   extractFovRadians,
   extractNearFar,
   extractProjectionMatrix,
@@ -104,6 +105,22 @@ export class S3MLayer {
   /** 正交不可用只告警一次 */
   private _orthoWarned = false;
   private _projection: ProjectionMode = 'perspective';
+  /** 正交插值参数：0 = 纯透视，1 = 纯正交，过渡期间由 animator 平滑推进 */
+  private _projectionT = 0;
+
+  private _ensureProjectionChannel(): void {
+    if (this.viewer.animator.has('projection.t')) return;
+    this.viewer.animator.register('projection.t', {
+      dim: 1,
+      read: (out) => {
+        out[0] = this._projectionT;
+      },
+      write: (v) => {
+        this._projectionT = v[0];
+        this.map?.triggerRepaint();
+      },
+    });
+  }
 
   private readonly _onProjectionChange = (): void => {
     // MapLibre v6 起 setProjection() 会 fire 'projectiontransition'。
@@ -164,6 +181,7 @@ export class S3MLayer {
     this.options = options;
     this.pickable = options.pickable !== false;
     this._projection = options.projection === 'orthographic' ? 'orthographic' : 'perspective';
+    this._projectionT = this._projection === 'orthographic' ? 1 : 0;
     this.onStats = options.onStats ?? (() => {});
     this.onReady = options.onReady ?? (() => {});
     this.onPick = options.onPick ?? (() => {});
@@ -251,23 +269,25 @@ export class S3MLayer {
   }
 
   /**
-   * 正交模式：把透视 MVP 换成同视角正交 MVP。
+   * 正交模式：把透视 MVP 换成同视角正交 MVP（支持 t 混合）。
    * 返回 null = 本帧保持透视（拿不到独立投影矩阵 / 矩阵不同源），只告警一次。
    */
-  private _applyOrtho(arg: unknown, mvp: Matrix4): Matrix4 | null {
+  private _applyOrtho(arg: unknown, mvp: Matrix4, t = 1): Matrix4 | null {
+    if (t <= 0) return mvp;
     const { nearZ, farZ } = extractNearFar(arg);
     const projectionMatrix = extractProjectionMatrix(arg);
     if (!projectionMatrix) {
       this._warnOrtho('render() 输入里没有独立的投影矩阵（需要 MapLibre ≥ 5）');
       return null;
     }
-    const built = buildOrthoMVP(
+    const built = buildBlendedMVP(
       { projectionMatrix, mvp: mvp.elements, nearZ, farZ },
       {
         distance: this.map?.transform?.cameraToCenterDistance ?? 0,
         fov: this._frameFov(arg),
         aspect: this._canvasAspect(),
-      }
+      },
+      t
     );
     if (!built) {
       this._warnOrtho('拿到的投影矩阵与 MVP 不同源（反推结果不是仿射变换）');
@@ -298,23 +318,49 @@ export class S3MLayer {
   }
 
   /**
-   * 切换投影模式，下一帧生效。
+   * 切换投影模式，可带平滑过渡。
    *
    * 正交只影响本层：底图瓦片、地形、DOM Marker / 弹窗仍走 MapLibre 的透视
    * 投影，和正交层差 ≈ 楼高 / 相机距（城市尺度几十到上百像素），App 需要
    * 自行把这些层退出。拾取、选中描边、按单体着色/隐藏/抬高不受影响。
    */
-  setProjection(mode: ProjectionMode): void {
+  setProjection(mode: ProjectionMode, transition?: TransitionOptions): void {
     const next = mode === 'orthographic' ? 'orthographic' : 'perspective';
-    if (this._projection === next) return;
+    const targetT = next === 'orthographic' ? 1 : 0;
+    const duration = transition?.duration ?? 0;
+    const wantAnim = duration > 0 || !!transition?.spring;
+
     this._projection = next;
     this._orthoWarned = false;
+
+    if (!wantAnim) {
+      if (this.viewer.animator.has('projection.t')) this.viewer.animator.cancel('projection.t');
+      this._projectionT = targetT;
+      this.map?.triggerRepaint();
+      return;
+    }
+
+    this._ensureProjectionChannel();
+    this.viewer.animator.to('projection.t', targetT, {
+      ...transition,
+      duration,
+      easing: transition?.easing ?? 'easeInOutCubic',
+      onComplete: () => {
+        this._projectionT = targetT;
+        this.map?.triggerRepaint();
+      },
+    });
     this.map?.triggerRepaint();
   }
 
   /** 当前投影模式 */
   get projection(): ProjectionMode {
     return this._projection;
+  }
+
+  /** 当前正交插值比例（0 = 纯透视，1 = 纯正交） */
+  get projectionT(): number {
+    return this._projectionT;
   }
 
   render(gl: WebGLRenderingContext | WebGL2RenderingContext, arg: unknown): void {
@@ -329,10 +375,10 @@ export class S3MLayer {
     if (!matrix) return;
 
     // 正交模式：视图矩阵从 MapLibre 输入反推（P⁻¹×MVP），不是自建相机，
-    // 所以不会和宿主的 pan/zoom/pitch 错位。
+    // 支持按 _projectionT 在透视与正交之间平滑插值过渡。
     let mvpMat = new Matrix4().fromArray(matrix as number[]);
-    if (this._projection === 'orthographic') {
-      mvpMat = this._applyOrtho(arg, mvpMat) ?? mvpMat;
+    if (this._projectionT > 0.0001) {
+      mvpMat = this._applyOrtho(arg, mvpMat, this._projectionT) ?? mvpMat;
     }
 
     const canvas = map.getCanvas();
@@ -557,6 +603,47 @@ export class S3MLayer {
     transition?: TransitionOptions
   ): void {
     this.viewer.moveFeatureBy(smid, delta, transition);
+  }
+
+  /**
+   * 让单体进行刚体姿态旋转（在 GPU 顶点着色器中以 pivot 轴心进行 3x3 矩阵旋转变换）。
+   *
+   * @param smid 单体 SMID
+   * @param rotation 旋转弧度或姿态：数字（绕 Z 轴 yaw 弧度）| [rx, ry, rz] 欧拉角 | [x,y,z,w] 四元数 | Euler/Quaternion/Matrix
+   * @param pivot 旋转中心轴心点 [px, py, pz]（局部坐标，默认 [0, 0, 0]）
+   * @param transition 动画过渡参数
+   */
+  rotateFeature(
+    smid: number,
+    rotation: NonNullable<FeatureStyle['rotation']>,
+    pivot?: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    this.viewer.rotateFeature(smid, rotation, pivot, transition);
+  }
+
+  /** 让单体增量旋转（相对当前旋转角度） */
+  rotateFeatureBy(
+    smid: number,
+    deltaRotation: number | [number, number, number],
+    pivot?: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    this.viewer.rotateFeatureBy(smid, deltaRotation, pivot, transition);
+  }
+
+  /**
+   * 双纹理 GPU 交叉淡化（跨状态 / 专题图平滑过渡）。
+   *
+   * 采用双纹理 (uBatchTex + uBatchTex2 + uBatchMix) 硬件混合，
+   * 即使几千上万栋建筑全量切换配色/高度/显隐/姿态，也无需在 CPU 逐单体创建通道，
+   * 由 GPU 顶点与片元着色器以 60FPS 零成本硬件插值完成过渡。
+   */
+  crossFadeStyles(
+    targetStyles: Map<number, FeatureStyle> | Record<string | number, FeatureStyle>,
+    transition?: TransitionOptions
+  ): void {
+    this.viewer.crossFadeStyles(targetStyles, transition);
   }
 
   /** 单体样式过渡：颜色 / 抬高 / 透明度 / 平移可任意组合 */

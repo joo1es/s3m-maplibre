@@ -38,6 +38,8 @@ export interface ThickLineStyleUniforms {
 /** 等宽线的「单体状态」uniform：直接复用主材质 userData 里那几个对象，自动跟随 */
 export interface ThickLineBatchUniforms {
   uBatchTex: { value: THREE.Texture };
+  uBatchTex2?: { value: THREE.Texture };
+  uBatchMix?: { value: number };
   uBatchTexWidth: { value: number };
   uBatchTexActive: { value: number };
 }
@@ -69,29 +71,53 @@ const VERT = /* glsl */ `
   uniform float uElevation;
   uniform vec3 uTranslation;
   uniform sampler2D uBatchTex;
+  uniform sampler2D uBatchTex2;
+  uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
 
+  vec4 s3mSampleBatch( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
+    vec4 vA = texture2D( texA, uv );
+    if ( mixVal <= 0.0001 ) return vA;
+    vec4 vB = texture2D( texB, uv );
+    return mix( vA, vB, mixVal );
+  }
+
   void main() {
-    // 单体平移 / 拔高 / 隐藏：与主着色器同一份状态纹理、同一套口径。
-    // 不采样的话，单体一动棱线就留在原地——这正是「棱线跟随」要解决的。
+    // 单体平移 / 旋转 / 拔高 / 隐藏：与主着色器同一份 5 行状态纹理、同一套变换口径。
+    // 不采样的话，单体一动或一转棱线就留在原地——这正是「棱线跟随」要解决的。
     vec3 s3mA = position;
     vec3 s3mB = aOther;
+    vec3 s3mCustomOffset = vec3( 0.0 );
+    mat3 s3mRot = mat3( 1.0 );
+    vec3 s3mPivot = vec3( 0.0 );
+
     if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
-      vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.25 ) );
+      float s3mU = ( aBatchId + 0.5 ) / uBatchTexWidth;
+      vec4 bState = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
       if ( bState.a < -0.5 ) {
         // 该单体被隐藏：顶点着色器不能 discard，扔到裁剪空间外
         gl_Position = vec4( 2.0, 2.0, 2.0, 1.0 );
         return;
       }
-      vec4 bOffset = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.75 ) );
-      vec3 s3mOffset = bOffset.xyz;
-      if ( s3mOffset.z == 0.0 && bState.a > 0.0 ) {
-        s3mOffset.z = bState.a;
+      vec4 bOffset = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
+      s3mCustomOffset = bOffset.xyz;
+      if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
+        s3mCustomOffset.z = bState.a;
       }
-      s3mA += s3mOffset;
-      s3mB += s3mOffset;
+      vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.5 ), uBatchMix );
+      vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.7 ), uBatchMix );
+      vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.9 ), uBatchMix );
+      s3mRot = mat3(
+        vec3( r2.x, r3.x, r4.x ),
+        vec3( r2.y, r3.y, r4.y ),
+        vec3( r2.z, r3.z, r4.z )
+      );
+      s3mPivot = vec3( r2.w, r3.w, r4.w );
     }
+
+    s3mA = s3mRot * ( s3mA - s3mPivot ) + s3mPivot + s3mCustomOffset;
+    s3mB = s3mRot * ( s3mB - s3mPivot ) + s3mPivot + s3mCustomOffset;
 
     // 选中单体平移/拔高：与着色器里 transformed += uTranslation 保持同一口径（物体空间）
     vec3 offset = uTranslation + vec3( 0.0, 0.0, uElevation );
@@ -158,10 +184,12 @@ export function createThickLineMaterial(
   if (opts.opacity !== undefined && styleUniforms) style.uOpacity.value = opts.opacity;
   if (opts.width !== undefined && styleUniforms) style.uWidth.value = opts.width;
 
-  const batch: Required<ThickLineBatchUniforms> = batchUniforms ?? {
-    uBatchTex: { value: DUMMY_BATCH_TEX },
-    uBatchTexWidth: { value: 1 },
-    uBatchTexActive: { value: 0 },
+  const batch: Required<ThickLineBatchUniforms> = {
+    uBatchTex: batchUniforms?.uBatchTex ?? { value: DUMMY_BATCH_TEX },
+    uBatchTex2: batchUniforms?.uBatchTex2 ?? { value: DUMMY_BATCH_TEX },
+    uBatchMix: batchUniforms?.uBatchMix ?? { value: 0 },
+    uBatchTexWidth: batchUniforms?.uBatchTexWidth ?? { value: 1 },
+    uBatchTexActive: batchUniforms?.uBatchTexActive ?? { value: 0 },
   };
 
   const mat = new THREE.ShaderMaterial({
@@ -174,6 +202,8 @@ export function createThickLineMaterial(
       uElevation: style.uElevation ?? { value: opts.elevation ?? 0 },
       uTranslation: { value: new THREE.Vector3(0, 0, 0) },
       uBatchTex: batch.uBatchTex,
+      uBatchTex2: batch.uBatchTex2,
+      uBatchMix: batch.uBatchMix,
       uBatchTexWidth: batch.uBatchTexWidth,
       uBatchTexActive: batch.uBatchTexActive,
     },

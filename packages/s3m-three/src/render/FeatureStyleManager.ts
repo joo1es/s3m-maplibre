@@ -32,6 +32,159 @@ export interface FeatureStyle {
   opacity?: number;
   /** 是否隐藏该单体 */
   hidden?: boolean;
+  /**
+   * 单体姿态旋转。
+   * 支持：
+   * 1. 纯数字：绕 Z 轴（朝天方向）旋转弧度（最常用的建筑朝向）
+   * 2. 数组 [rx, ry, rz]：欧拉角（弧度）
+   * 3. 数组 [x, y, z, w]：四元数
+   * 4. THREE.Euler | THREE.Quaternion | THREE.Matrix3 | THREE.Matrix4
+   */
+  rotation?:
+    | number
+    | [number, number, number]
+    | [number, number, number, number]
+    | THREE.Euler
+    | THREE.Quaternion
+    | THREE.Matrix3
+    | THREE.Matrix4;
+  /** 旋转中心轴心点 [px, py, pz]（局部坐标，默认 [0, 0, 0]） */
+  pivot?: [number, number, number];
+}
+
+export type RotationMatrix9 = [
+  number, number, number, // Row 0: R00, R01, R02
+  number, number, number, // Row 1: R10, R11, R12
+  number, number, number  // Row 2: R20, R21, R22
+];
+
+/**
+ * 将各类旋转表示统一解析为 3x3 行优先矩阵数组
+ */
+export function resolveRotationMatrix(
+  rot?:
+    | number
+    | [number, number, number]
+    | [number, number, number, number]
+    | THREE.Euler
+    | THREE.Quaternion
+    | THREE.Matrix3
+    | THREE.Matrix4
+    | null
+): RotationMatrix9 | null {
+  if (rot == null) return null;
+  if (typeof rot === 'number') {
+    const c = Math.cos(rot);
+    const s = Math.sin(rot);
+    return [
+      c, -s, 0,
+      s,  c, 0,
+      0,  0, 1,
+    ];
+  }
+  if (Array.isArray(rot)) {
+    if (rot.length === 3) {
+      const euler = new THREE.Euler(rot[0], rot[1], rot[2]);
+      const m = new THREE.Matrix4().makeRotationFromEuler(euler);
+      const e = m.elements;
+      return [
+        e[0], e[4], e[8],
+        e[1], e[5], e[9],
+        e[2], e[6], e[10],
+      ];
+    }
+    if (rot.length === 4) {
+      const q = new THREE.Quaternion(rot[0], rot[1], rot[2], rot[3]);
+      const m = new THREE.Matrix4().makeRotationFromQuaternion(q);
+      const e = m.elements;
+      return [
+        e[0], e[4], e[8],
+        e[1], e[5], e[9],
+        e[2], e[6], e[10],
+      ];
+    }
+  }
+  if (rot instanceof THREE.Euler) {
+    const m = new THREE.Matrix4().makeRotationFromEuler(rot);
+    const e = m.elements;
+    return [
+      e[0], e[4], e[8],
+      e[1], e[5], e[9],
+      e[2], e[6], e[10],
+    ];
+  }
+  if (rot instanceof THREE.Quaternion) {
+    const m = new THREE.Matrix4().makeRotationFromQuaternion(rot);
+    const e = m.elements;
+    return [
+      e[0], e[4], e[8],
+      e[1], e[5], e[9],
+      e[2], e[6], e[10],
+    ];
+  }
+  if (rot instanceof THREE.Matrix3) {
+    const e = rot.elements;
+    return [
+      e[0], e[3], e[6],
+      e[1], e[4], e[7],
+      e[2], e[5], e[8],
+    ];
+  }
+  if (rot instanceof THREE.Matrix4) {
+    const e = rot.elements;
+    return [
+      e[0], e[4], e[8],
+      e[1], e[5], e[9],
+      e[2], e[6], e[10],
+    ];
+  }
+  return null;
+}
+
+/**
+ * 提取欧拉角 [rx, ry, rz]（弧度）用于动画插值
+ */
+export function extractEulerAngles(
+  rot?:
+    | number
+    | [number, number, number]
+    | [number, number, number, number]
+    | THREE.Euler
+    | THREE.Quaternion
+    | THREE.Matrix3
+    | THREE.Matrix4
+    | null
+): [number, number, number] {
+  if (rot == null) return [0, 0, 0];
+  if (typeof rot === 'number') return [0, 0, rot];
+  if (Array.isArray(rot)) {
+    if (rot.length === 3) return [rot[0], rot[1], rot[2]];
+    if (rot.length === 4) {
+      const q = new THREE.Quaternion(rot[0], rot[1], rot[2], rot[3]);
+      const e = new THREE.Euler().setFromQuaternion(q);
+      return [e.x, e.y, e.z];
+    }
+  }
+  if (rot instanceof THREE.Euler) return [rot.x, rot.y, rot.z];
+  if (rot instanceof THREE.Quaternion) {
+    const e = new THREE.Euler().setFromQuaternion(rot);
+    return [e.x, e.y, e.z];
+  }
+  if (rot instanceof THREE.Matrix3) {
+    const m = new THREE.Matrix4().set(
+      rot.elements[0], rot.elements[3], rot.elements[6], 0,
+      rot.elements[1], rot.elements[4], rot.elements[7], 0,
+      rot.elements[2], rot.elements[5], rot.elements[8], 0,
+      0, 0, 0, 1
+    );
+    const e = new THREE.Euler().setFromRotationMatrix(m);
+    return [e.x, e.y, e.z];
+  }
+  if (rot instanceof THREE.Matrix4) {
+    const e = new THREE.Euler().setFromRotationMatrix(rot);
+    return [e.x, e.y, e.z];
+  }
+  return [0, 0, 0];
 }
 
 export interface ColorByFieldOptions {
@@ -173,7 +326,13 @@ export class FeatureStyleManager {
 
   private readonly _meshBatchTextures = new WeakMap<
     THREE.Mesh,
-    { texture: THREE.DataTexture; data: Float32Array; width: number }
+    {
+      texture: THREE.DataTexture;
+      data: Float32Array;
+      texture2?: THREE.DataTexture;
+      data2?: Float32Array;
+      width: number;
+    }
   >();
   private readonly _markedMeshes = new Set<THREE.Mesh>();
   private _dirtyAll = false;
@@ -216,11 +375,21 @@ export class FeatureStyleManager {
     return this.featureStyles.get(smid) ?? null;
   }
 
-  getFeatureEffectiveOffset(smid: number | null): { translation?: [number, number, number]; elevation?: number } {
+  getFeatureEffectiveOffset(smid: number | null): {
+    translation?: [number, number, number];
+    elevation?: number;
+    rotation?: FeatureStyle['rotation'];
+    pivot?: [number, number, number];
+  } {
     if (smid == null) return {};
     const st = this.featureStyles.get(smid);
     const elev = st?.elevation ?? this.thematicElevation.get(smid);
-    return { translation: st?.translation, elevation: elev };
+    return {
+      translation: st?.translation,
+      elevation: elev,
+      rotation: st?.rotation,
+      pivot: st?.pivot,
+    };
   }
 
   getFeatureStyles(): Map<number, FeatureStyle> {
@@ -551,72 +720,48 @@ export class FeatureStyleManager {
     return { smids: 0, batches, conflicts, conflictingSmids: involved.size };
   }
 
-  applyOverridesToMesh(mesh: THREE.Mesh): void {
-    const mat = styledMaterialOf(mesh);
-    if (!mat) return;
-
-    const ud = mesh.userData as any;
-    const pickInfo = ud.geoRef?.pickInfo;
-
-    const hasStyles =
-      this.featureStyles.size > 0 || this.thematicColors.size > 0 || this.thematicElevation.size > 0;
-    const filter = this.filter;
-    const hasFilter =
-      this.fieldFilter != null ||
-      (filter != null &&
-        ((filter.include?.length ?? 0) > 0 ||
-          (filter.exclude?.length ?? 0) > 0 ||
-          filter.predicate != null));
-
-    if (!hasStyles && !hasFilter) {
-      if (mat.userData.uBatchTexActive) {
-        mat.userData.uBatchTexActive.value = 0;
-      }
-      // 单体淡化清除后，把材质 transparent 还原成全局透明度语义
-      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
-      return;
-    }
-
-    if (!pickInfo || Object.keys(pickInfo).length === 0) {
-      if (mat.userData.uBatchTexActive) {
-        mat.userData.uBatchTexActive.value = 0;
-      }
-      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
-      return;
-    }
-
-    let maxBatch = 0;
-    for (const p of Object.values(pickInfo)) {
-      const id = pickEntryId(p as any);
-      if (id > maxBatch) maxBatch = id;
-    }
-    const width = Math.max(maxBatch + 1, 1);
-
-    let record = this._meshBatchTextures.get(mesh);
-    if (!record || record.width < width) {
-      const data = new Float32Array(width * 2 * 4);
-      const texture = new THREE.DataTexture(data, width, 2, THREE.RGBAFormat, THREE.FloatType);
-      texture.minFilter = THREE.NearestFilter;
-      texture.magFilter = THREE.NearestFilter;
-      record = { texture, data, width };
-      this._meshBatchTextures.set(mesh, record);
-      mat.userData.uBatchTex.value = texture;
-      mat.userData.uBatchTexWidth.value = width;
-    }
-
-    const { data, texture } = record;
-    const w = record.width;
+  private _bakeStylesIntoBuffer(
+    data: Float32Array,
+    width: number,
+    pickInfo: Record<string, unknown>,
+    mesh: THREE.Mesh,
+    styleMap: Map<number, FeatureStyle>
+  ): { hasActive: boolean; hasFade: boolean; conflicts: number } {
+    const w = width;
     for (let i = 0; i < w; i++) {
+      // Row 0: [R, G, B, elevation/hidden]
       data[i * 4 + 0] = -1;
       data[i * 4 + 1] = -1;
       data[i * 4 + 2] = -1;
       data[i * 4 + 3] = 0;
 
+      // Row 1: [translationX, translationY, translationZ, opacity]
       const r1 = (w + i) * 4;
       data[r1 + 0] = 0;
       data[r1 + 1] = 0;
       data[r1 + 2] = 0;
       data[r1 + 3] = 0;
+
+      // Row 2: [R00, R01, R02, pivot.x] (单位矩阵默认值)
+      const r2 = (w * 2 + i) * 4;
+      data[r2 + 0] = 1;
+      data[r2 + 1] = 0;
+      data[r2 + 2] = 0;
+      data[r2 + 3] = 0;
+
+      // Row 3: [R10, R11, R12, pivot.y]
+      const r3 = (w * 3 + i) * 4;
+      data[r3 + 0] = 0;
+      data[r3 + 1] = 1;
+      data[r3 + 2] = 0;
+      data[r3 + 3] = 0;
+
+      // Row 4: [R20, R21, R22, pivot.z]
+      const r4 = (w * 4 + i) * 4;
+      data[r4 + 0] = 0;
+      data[r4 + 1] = 0;
+      data[r4 + 2] = 1;
+      data[r4 + 3] = 0;
     }
 
     let hasActive = false;
@@ -624,13 +769,17 @@ export class FeatureStyleManager {
     const colorOfBatch = new Map<number, string>();
     const elevOfBatch = new Map<number, number>();
     const translationOfBatch = new Map<number, [number, number, number]>();
+    const rotationOfBatch = new Map<number, RotationMatrix9>();
+    const pivotOfBatch = new Map<number, [number, number, number]>();
     const opacityOfBatch = new Map<number, number>();
     const ownersOfBatch = new Map<number, number>();
+    const filter = this.filter;
+    const ud = mesh.userData as any;
 
     for (const [smidStr, entry] of Object.entries(pickInfo)) {
       const smid = Number(smidStr);
       const bId = pickEntryId(entry as any);
-      if (bId < 0 || bId >= record.width) continue;
+      if (bId < 0 || bId >= w) continue;
       ownersOfBatch.set(bId, (ownersOfBatch.get(bId) ?? 0) + 1);
 
       let hidden = false;
@@ -669,7 +818,7 @@ export class FeatureStyleManager {
         }
       }
 
-      const st = this.featureStyles.get(smid);
+      const st = styleMap.get(smid);
       if (st?.hidden) {
         hiddenBatches.add(bId);
         continue;
@@ -693,6 +842,14 @@ export class FeatureStyleManager {
 
       if (st?.translation && !translationOfBatch.has(bId)) {
         translationOfBatch.set(bId, st.translation);
+      }
+
+      const rotMat = resolveRotationMatrix(st?.rotation);
+      if (rotMat && !rotationOfBatch.has(bId)) {
+        rotationOfBatch.set(bId, rotMat);
+      }
+      if (st?.pivot && !pivotOfBatch.has(bId)) {
+        pivotOfBatch.set(bId, st.pivot);
       }
     }
 
@@ -737,16 +894,112 @@ export class FeatureStyleManager {
       hasFade = true;
     }
 
-    // 有淡化单体时整块材质要开混合才有透明效果；清除后还原为全局透明度语义
-    if (hasFade && !mat.transparent) mat.transparent = true;
-    else if (!hasFade && mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
+    for (const [bId, rot] of rotationOfBatch) {
+      if (hiddenBatches.has(bId)) continue;
+      const piv = pivotOfBatch.get(bId) ?? [0, 0, 0];
+      const r2 = (w * 2 + bId) * 4;
+      data[r2 + 0] = rot[0];
+      data[r2 + 1] = rot[1];
+      data[r2 + 2] = rot[2];
+      data[r2 + 3] = piv[0];
+
+      const r3 = (w * 3 + bId) * 4;
+      data[r3 + 0] = rot[3];
+      data[r3 + 1] = rot[4];
+      data[r3 + 2] = rot[5];
+      data[r3 + 3] = piv[1];
+
+      const r4 = (w * 4 + bId) * 4;
+      data[r4 + 0] = rot[6];
+      data[r4 + 1] = rot[7];
+      data[r4 + 2] = rot[8];
+      data[r4 + 3] = piv[2];
+      hasActive = true;
+    }
+
+    for (const [bId, piv] of pivotOfBatch) {
+      if (rotationOfBatch.has(bId) || hiddenBatches.has(bId)) continue;
+      data[(w * 2 + bId) * 4 + 3] = piv[0];
+      data[(w * 3 + bId) * 4 + 3] = piv[1];
+      data[(w * 4 + bId) * 4 + 3] = piv[2];
+      hasActive = true;
+    }
 
     let conflicts = 0;
     for (const [bId, owners] of ownersOfBatch) {
       if (owners < 2) continue;
-      if (!hiddenBatches.has(bId) && !colorOfBatch.has(bId) && !elevOfBatch.has(bId)) continue;
+      if (!hiddenBatches.has(bId) && !colorOfBatch.has(bId) && !elevOfBatch.has(bId) && !rotationOfBatch.has(bId)) continue;
       conflicts++;
     }
+
+    return { hasActive, hasFade, conflicts };
+  }
+
+  applyOverridesToMesh(mesh: THREE.Mesh): void {
+    const mat = styledMaterialOf(mesh);
+    if (!mat) return;
+
+    const ud = mesh.userData as any;
+    const pickInfo = ud.geoRef?.pickInfo;
+
+    const hasStyles =
+      this.featureStyles.size > 0 || this.thematicColors.size > 0 || this.thematicElevation.size > 0;
+    const filter = this.filter;
+    const hasFilter =
+      this.fieldFilter != null ||
+      (filter != null &&
+        ((filter.include?.length ?? 0) > 0 ||
+          (filter.exclude?.length ?? 0) > 0 ||
+          filter.predicate != null));
+
+    if (!hasStyles && !hasFilter) {
+      if (mat.userData.uBatchTexActive) {
+        mat.userData.uBatchTexActive.value = 0;
+      }
+      // 单体淡化清除后，把材质 transparent 还原成全局透明度语义
+      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
+      return;
+    }
+
+    if (!pickInfo || Object.keys(pickInfo).length === 0) {
+      if (mat.userData.uBatchTexActive) {
+        mat.userData.uBatchTexActive.value = 0;
+      }
+      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
+      return;
+    }
+
+    let maxBatch = 0;
+    for (const p of Object.values(pickInfo)) {
+      const id = pickEntryId(p as any);
+      if (id > maxBatch) maxBatch = id;
+    }
+    const width = Math.max(maxBatch + 1, 1);
+
+    let record = this._meshBatchTextures.get(mesh);
+    if (!record || record.width < width) {
+      const data = new Float32Array(width * 5 * 4);
+      const texture = new THREE.DataTexture(data, width, 5, THREE.RGBAFormat, THREE.FloatType);
+      texture.minFilter = THREE.NearestFilter;
+      texture.magFilter = THREE.NearestFilter;
+      record = { texture, data, width };
+      this._meshBatchTextures.set(mesh, record);
+      mat.userData.uBatchTex.value = texture;
+      mat.userData.uBatchTexWidth.value = width;
+    }
+
+    const { data, texture } = record;
+    const { hasActive, hasFade, conflicts } = this._bakeStylesIntoBuffer(
+      data,
+      record.width,
+      pickInfo,
+      mesh,
+      this.featureStyles
+    );
+
+    // 有淡化单体时整块材质要开混合才有透明效果；清除后还原为全局透明度语义
+    if (hasFade && !mat.transparent) mat.transparent = true;
+    else if (!hasFade && mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
 
     if (conflicts > 0 && !this._batchConflictWarned) {
       this._batchConflictWarned = true;
@@ -762,6 +1015,93 @@ export class FeatureStyleManager {
     if (mat.userData.uBatchTexActive) {
       mat.userData.uBatchTexActive.value = hasActive ? 1 : 0;
     }
+  }
+
+  /**
+   * 准备双纹理交叉淡化：烘焙目标样式到第二纹理 (uBatchTex2)
+   */
+  prepareCrossFade(targetStyles: Map<number, FeatureStyle>, meshes: Iterable<THREE.Mesh>): void {
+    for (const mesh of meshes) {
+      const mat = styledMaterialOf(mesh);
+      if (!mat) continue;
+      const ud = mesh.userData as any;
+      const pickInfo = ud.geoRef?.pickInfo;
+      if (!pickInfo || Object.keys(pickInfo).length === 0) continue;
+
+      let maxBatch = 0;
+      for (const p of Object.values(pickInfo)) {
+        const id = pickEntryId(p as any);
+        if (id > maxBatch) maxBatch = id;
+      }
+      const width = Math.max(maxBatch + 1, 1);
+
+      let record = this._meshBatchTextures.get(mesh);
+      if (!record || record.width < width) {
+        const data = new Float32Array(width * 5 * 4);
+        const texture = new THREE.DataTexture(data, width, 5, THREE.RGBAFormat, THREE.FloatType);
+        texture.minFilter = THREE.NearestFilter;
+        texture.magFilter = THREE.NearestFilter;
+        record = { texture, data, width };
+        this._meshBatchTextures.set(mesh, record);
+        mat.userData.uBatchTex.value = texture;
+        mat.userData.uBatchTexWidth.value = width;
+      }
+
+      if (!record.texture2 || !record.data2 || record.data2.length < record.width * 5 * 4) {
+        const data2 = new Float32Array(record.width * 5 * 4);
+        const texture2 = new THREE.DataTexture(data2, record.width, 5, THREE.RGBAFormat, THREE.FloatType);
+        texture2.minFilter = THREE.NearestFilter;
+        texture2.magFilter = THREE.NearestFilter;
+        record.data2 = data2;
+        record.texture2 = texture2;
+      }
+
+      // 确保当前纹理包含当前状态
+      this._bakeStylesIntoBuffer(record.data, record.width, pickInfo, mesh, this.featureStyles);
+      record.texture.needsUpdate = true;
+
+      // 烘焙目标状态到 data2
+      const res2 = this._bakeStylesIntoBuffer(record.data2, record.width, pickInfo, mesh, targetStyles);
+      record.texture2.needsUpdate = true;
+
+      mat.userData.uBatchTex2.value = record.texture2;
+      mat.userData.uBatchTexActive.value = 1;
+      if (res2.hasFade && !mat.transparent) mat.transparent = true;
+    }
+  }
+
+  /**
+   * 提交双纹理交叉淡化：将 targetStyles 回写到主状态，并将 data2 复制到 data
+   */
+  commitCrossFade(targetStyles: Map<number, FeatureStyle>, meshes: Iterable<THREE.Mesh>): void {
+    this.featureStyles.clear();
+    for (const [k, v] of targetStyles) {
+      this.featureStyles.set(k, v);
+    }
+    for (const mesh of meshes) {
+      const mat = styledMaterialOf(mesh);
+      if (!mat) continue;
+      const record = this._meshBatchTextures.get(mesh);
+      if (!record || !record.data2 || !record.texture2) continue;
+
+      record.data.set(record.data2);
+      record.texture.needsUpdate = true;
+      mat.userData.uBatchTex2.value = mat.userData.uBatchTex.value;
+    }
+    this._onStyleChanged();
+    this._triggerRepaint();
+  }
+
+  /**
+   * 取消交叉淡化并恢复单一纹理
+   */
+  cancelCrossFade(meshes: Iterable<THREE.Mesh>): void {
+    for (const mesh of meshes) {
+      const mat = styledMaterialOf(mesh);
+      if (!mat) continue;
+      mat.userData.uBatchTex2.value = mat.userData.uBatchTex.value;
+    }
+    this._triggerRepaint();
   }
 
   markOverridesDirty(subset?: Iterable<THREE.Mesh>, allMeshes?: Iterable<THREE.Mesh>): void {
@@ -783,6 +1123,7 @@ export class FeatureStyleManager {
     const record = this._meshBatchTextures.get(mesh);
     if (record) {
       record.texture.dispose();
+      record.texture2?.dispose();
       this._meshBatchTextures.delete(mesh);
     }
   }

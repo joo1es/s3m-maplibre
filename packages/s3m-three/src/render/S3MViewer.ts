@@ -94,6 +94,8 @@ import {
   type FieldElevationOptions,
   type FieldElevationResult,
   type S3MFilter,
+  resolveRotationMatrix,
+  extractEulerAngles,
 } from './FeatureStyleManager.js';
 
 import {
@@ -304,7 +306,7 @@ const STYLE_SCALAR_KEYS = [
 const STYLE_COLOR_KEYS = ['colorA', 'colorB', 'colorC', 'selectColor', 'edgeColor'] as const;
 
 /** 可动画的单体属性 */
-const FEATURE_PROPS = ['translation', 'elevation', 'opacity', 'color'] as const;
+const FEATURE_PROPS = ['translation', 'elevation', 'opacity', 'color', 'rotation'] as const;
 type FeatureProp = (typeof FEATURE_PROPS)[number];
 
 /** 单体沿折线运动的参数 */
@@ -949,6 +951,111 @@ export class S3MViewer {
   }
 
   /**
+   * 让单体进行刚体姿态旋转（在 GPU 顶点着色器中以 pivot 轴心进行 3x3 矩阵旋转变换）。
+   *
+   * @param smid 单体 SMID
+   * @param rotation 旋转弧度或姿态：数字（绕 Z 轴 yaw 弧度）| [rx, ry, rz] 欧拉角 | [x,y,z,w] 四元数 | Euler/Quaternion/Matrix
+   * @param pivot 旋转中心轴心点 [px, py, pz]（局部坐标，默认 [0, 0, 0]）
+   * @param transition 动画过渡参数
+   */
+  rotateFeature(
+    smid: number,
+    rotation:
+      | number
+      | [number, number, number]
+      | [number, number, number, number]
+      | THREE.Euler
+      | THREE.Quaternion
+      | THREE.Matrix3
+      | THREE.Matrix4,
+    pivot?: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    const cur = this._featureStyleManager.getFeatureStyle(smid) ?? {};
+    if (pivot) {
+      this._featureStyleManager.setFeatureStyle(smid, { ...cur, pivot }, this._meshesOf([smid]));
+    }
+    const targetEuler = extractEulerAngles(rotation);
+    const key = this._ensureFeatureChannel(smid, 'rotation');
+    this.animator.to(key, targetEuler, transition);
+  }
+
+  /** 让单体增量旋转的便捷写法 */
+  rotateFeatureBy(
+    smid: number,
+    deltaRotation: number | [number, number, number],
+    pivot?: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    const curEuler = extractEulerAngles(this._featureStyleManager.getFeatureStyle(smid)?.rotation);
+    const d = typeof deltaRotation === 'number' ? [0, 0, deltaRotation] : deltaRotation;
+    this.rotateFeature(
+      smid,
+      [curEuler[0] + d[0], curEuler[1] + d[1], curEuler[2] + d[2]],
+      pivot,
+      transition
+    );
+  }
+
+  /**
+   * 双纹理 GPU 交叉淡化（跨状态 / 专题图平滑过渡）。
+   *
+   * 采用双纹理 (uBatchTex + uBatchTex2 + uBatchMix) 硬件混合，
+   * 即使几千上万栋建筑全量切换配色/高度/显隐/姿态，也无需在 CPU 逐单体创建通道，
+   * 由 GPU 顶点与片元着色器以 60FPS 零成本硬件插值完成过渡。
+   */
+  crossFadeStyles(
+    targetStyles: Map<number, FeatureStyle> | Record<string | number, FeatureStyle>,
+    transition?: TransitionOptions
+  ): void {
+    const targetMap =
+      targetStyles instanceof Map
+        ? targetStyles
+        : new Map(Object.entries(targetStyles).map(([k, v]) => [Number(k), v]));
+
+    const meshes = this.getAllMeshes();
+    this._featureStyleManager.prepareCrossFade(targetMap, meshes);
+
+    const key = 'batch.mix';
+    if (!this.animator.has(key)) {
+      this.animator.register(key, {
+        dim: 1,
+        read: (out) => {
+          out[0] = this.uniforms.uBatchMix?.value ?? 0;
+        },
+        write: (v) => {
+          if (this.uniforms.uBatchMix) {
+            this.uniforms.uBatchMix.value = v[0];
+          }
+          this.triggerRepaint();
+        },
+      });
+    }
+
+    const duration = transition?.duration ?? 0;
+    const wantAnim = duration > 0 || !!transition?.spring;
+    if (!wantAnim) {
+      if (this.animator.has(key)) this.animator.cancel(key);
+      if (this.uniforms.uBatchMix) this.uniforms.uBatchMix.value = 0;
+      this._featureStyleManager.commitCrossFade(targetMap, meshes);
+      this.triggerRepaint();
+      transition?.onComplete?.();
+      return;
+    }
+
+    if (this.uniforms.uBatchMix) this.uniforms.uBatchMix.value = 0;
+    this.animator.to(key, 1, {
+      ...transition,
+      onComplete: () => {
+        if (this.uniforms.uBatchMix) this.uniforms.uBatchMix.value = 0;
+        this._featureStyleManager.commitCrossFade(targetMap, meshes);
+        this.triggerRepaint();
+        transition?.onComplete?.();
+      },
+    });
+  }
+
+  /**
    * 让单体沿折线运动。
    *
    * 路径先做**弧长参数化**（见 anim/Path.ts）：缓动作用在「已走距离」上，而不是
@@ -1034,6 +1141,7 @@ export class S3MViewer {
    */
   animateFeature(smid: number, style: Partial<FeatureStyle>, transition?: TransitionOptions): void {
     if (style.translation) this.moveFeature(smid, style.translation, transition);
+    if (style.rotation != null) this.rotateFeature(smid, style.rotation, style.pivot, transition);
     if (style.elevation != null) {
       this.animator.to(this._ensureFeatureChannel(smid, 'elevation'), style.elevation, transition);
     }
@@ -1127,7 +1235,7 @@ export class S3MViewer {
     const key = `feature.${smid}.${prop}`;
     if (this.animator.has(key)) return key;
 
-    const channel: Channel = prop === 'translation' || prop === 'color'
+    const channel: Channel = prop === 'translation' || prop === 'color' || prop === 'rotation'
       ? {
           dim: 3,
           read: (out) => {
@@ -1136,6 +1244,12 @@ export class S3MViewer {
               out[0] = t?.[0] ?? 0;
               out[1] = t?.[1] ?? 0;
               out[2] = t?.[2] ?? 0;
+            } else if (prop === 'rotation') {
+              const r = this._featureStyleManager.getFeatureStyle(smid)?.rotation;
+              const euler = extractEulerAngles(r);
+              out[0] = euler[0];
+              out[1] = euler[1];
+              out[2] = euler[2];
             } else {
               // 没有自定义色时以图层主色为起点，插值才连续
               const hex = this._featureStyleManager.getFeatureStyle(smid)?.color ?? this.style.colorA;
@@ -1154,9 +1268,21 @@ export class S3MViewer {
                 { ...cur, translation: [v[0], v[1], v[2]] },
                 meshes
               );
-              // 有位移就关掉视锥剔除，否则移出原始包围球后整块瓦片会凭空消失
-              const moving = Math.abs(v[0]) > 1e-6 || Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6;
-              for (const mesh of meshes) mesh.frustumCulled = !moving;
+              // 有位移或旋转就关掉视锥剔除，否则移出原始包围球后整块瓦片会凭空消失
+              const transMoving = Math.abs(v[0]) > 1e-6 || Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6;
+              const rotEuler = extractEulerAngles(cur.rotation);
+              const rotMoving = Math.abs(rotEuler[0]) > 1e-6 || Math.abs(rotEuler[1]) > 1e-6 || Math.abs(rotEuler[2]) > 1e-6;
+              for (const mesh of meshes) mesh.frustumCulled = !(transMoving || rotMoving);
+            } else if (prop === 'rotation') {
+              this._featureStyleManager.setFeatureStyle(
+                smid,
+                { ...cur, rotation: [v[0], v[1], v[2]] },
+                meshes
+              );
+              const rotMoving = Math.abs(v[0]) > 1e-6 || Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6;
+              const t = cur.translation ?? [0, 0, 0];
+              const transMoving = Math.abs(t[0]) > 1e-6 || Math.abs(t[1]) > 1e-6 || Math.abs(t[2]) > 1e-6;
+              for (const mesh of meshes) mesh.frustumCulled = !(rotMoving || transMoving);
             } else {
               const c = this._colorScratch.setRGB(v[0], v[1], v[2]);
               this._featureStyleManager.setFeatureStyle(
@@ -2322,6 +2448,8 @@ export class S3MViewer {
     const batch = styled?.userData?.uBatchTex
       ? {
           uBatchTex: styled.userData.uBatchTex,
+          uBatchTex2: styled.userData.uBatchTex2,
+          uBatchMix: this.uniforms.uBatchMix,
           uBatchTexWidth: styled.userData.uBatchTexWidth,
           uBatchTexActive: styled.userData.uBatchTexActive,
         }
@@ -2335,6 +2463,8 @@ export class S3MViewer {
     const batch = styled?.userData?.uBatchTex
       ? {
           uBatchTex: styled.userData.uBatchTex,
+          uBatchTex2: styled.userData.uBatchTex2,
+          uBatchMix: this.uniforms.uBatchMix,
           uBatchTexWidth: styled.userData.uBatchTexWidth,
           uBatchTexActive: styled.userData.uBatchTexActive,
         }
@@ -2501,6 +2631,20 @@ export class S3MViewer {
       const trans = off.translation;
       const elev = off.elevation;
       const finalPos = hitPoint.clone();
+
+      if (off.rotation) {
+        const rotMat = resolveRotationMatrix(off.rotation);
+        if (rotMat) {
+          const m3 = new THREE.Matrix3().set(
+            rotMat[0], rotMat[1], rotMat[2],
+            rotMat[3], rotMat[4], rotMat[5],
+            rotMat[6], rotMat[7], rotMat[8]
+          );
+          const piv = off.pivot ? new THREE.Vector3(off.pivot[0], off.pivot[1], off.pivot[2]) : new THREE.Vector3(0, 0, 0);
+          finalPos.sub(piv).applyMatrix3(m3).add(piv);
+        }
+      }
+
       if (trans) finalPos.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
       else if (elev) finalPos.z += elev;
 
@@ -2731,7 +2875,20 @@ export class S3MViewer {
         const trans = off.translation;
         const elev = off.elevation;
 
+        const rotMat = off.rotation ? resolveRotationMatrix(off.rotation) : null;
+        let rotM3: THREE.Matrix3 | null = null;
+        let rotPiv: THREE.Vector3 | null = null;
+        if (rotMat) {
+          rotM3 = new THREE.Matrix3().set(
+            rotMat[0], rotMat[1], rotMat[2],
+            rotMat[3], rotMat[4], rotMat[5],
+            rotMat[6], rotMat[7], rotMat[8]
+          );
+          rotPiv = off.pivot ? new THREE.Vector3(off.pivot[0], off.pivot[1], off.pivot[2]) : new THREE.Vector3(0, 0, 0);
+        }
+
         for (const c of corners) {
+          if (rotM3 && rotPiv) c.sub(rotPiv).applyMatrix3(rotM3).add(rotPiv);
           if (trans) c.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
           else if (elev) c.z += elev;
 

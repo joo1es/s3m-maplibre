@@ -78,6 +78,11 @@ export {
   DatasetManager,
   FeatureStyleManager,
 } from './render/S3MViewer.js';
+export {
+  resolveRotationMatrix,
+  extractEulerAngles,
+} from './render/FeatureStyleManager.js';
+export type { RotationMatrix9 } from './render/FeatureStyleManager.js';
 export type {
   DatasetAlignment,
   S3MDatasetOptions,
@@ -129,6 +134,7 @@ export type {
 
 export {
   buildOrthoMVP,
+  buildBlendedMVP,
   extractProjectionMatrix,
   extractNearFar,
   extractFovRadians,

@@ -14,6 +14,7 @@ import { describe, expect, test } from 'bun:test';
 import * as THREE from 'three';
 import {
   buildOrthoMVP,
+  buildBlendedMVP,
   extractFovRadians,
   extractProjectionMatrix,
   extractNearFar,
@@ -352,5 +353,46 @@ describe('8. 接线：真实类上的行为', () => {
     // 不可用时只告警一次，不要每帧刷屏
     expect(warnings.length).toBe(1);
     expect(warnings[0]).toMatch(/没有独立的投影矩阵/);
+  });
+
+  test('正交/透视平滑过渡：buildBlendedMVP 与 setProjection(mode, transition)', () => {
+    const eye = new THREE.Vector3(0, -DISTANCE, 500);
+    const target = new THREE.Vector3(0, 0, 0);
+    const { P, mvp } = makePerspectiveFrame(eye, target);
+
+    const input = {
+      projectionMatrix: P.elements,
+      mvp: mvp.elements,
+      nearZ: NEAR,
+      farZ: FAR,
+    };
+    const params = { distance: DISTANCE, fov: FOV, aspect: ASPECT };
+
+    // t = 0 时等价透视
+    const t0 = buildBlendedMVP(input, params, 0);
+    expect(t0).toBeTruthy();
+    expect(matrixDiff(t0!.matrix, mvp)).toBeLessThan(1e-6);
+
+    // t = 1 时等价正交
+    const t1 = buildBlendedMVP(input, params, 1);
+    const pureOrtho = buildOrthoMVP(input, params);
+    expect(t1).toBeTruthy();
+    expect(matrixDiff(t1!.matrix, pureOrtho!.matrix)).toBeLessThan(1e-6);
+
+    // 0 < t < 1 时平滑连续插值
+    const tMid = buildBlendedMVP(input, params, 0.5);
+    expect(tMid).toBeTruthy();
+    expect(matrixDiff(tMid!.matrix, mvp)).toBeGreaterThan(0.01);
+    expect(matrixDiff(tMid!.matrix, pureOrtho!.matrix)).toBeGreaterThan(0.01);
+
+    // S3MLayer setProjection 支持动画过渡参数
+    const layer = new S3MLayer({ id: 'layer-ortho-anim' });
+    expect(layer.projection).toBe('perspective');
+    expect(layer.projectionT).toBe(0);
+
+    layer.setProjection('orthographic', { duration: 100 });
+    expect(layer.projection).toBe('orthographic');
+    // 开始动画后已注册 projection.t 通道
+    expect(layer.viewer.animator.has('projection.t')).toBe(true);
   });
 });

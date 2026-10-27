@@ -172,6 +172,7 @@ export interface StyledMaterial extends THREE.MeshStandardMaterial {
     uSelBatch: { value: number };
     uSelWhole: { value: number };
     uBatchTex: { value: THREE.Texture };
+    uBatchTex2: { value: THREE.Texture };
     uBatchTexWidth: { value: number };
     uBatchTexActive: { value: number };
     /** 单块瓦片的淡入系数（1 = 完全显示） */
@@ -181,8 +182,14 @@ export interface StyledMaterial extends THREE.MeshStandardMaterial {
   };
 }
 
-const DUMMY_DATA = new Float32Array([-1, -1, -1, 0, 0, 0, 0, 0]);
-export const DUMMY_BATCH_TEX = new THREE.DataTexture(DUMMY_DATA, 1, 2, THREE.RGBAFormat, THREE.FloatType);
+const DUMMY_DATA = new Float32Array([
+  -1, -1, -1, 0, // Row 0: color rgb, elevation/hidden
+  0, 0, 0, 0,    // Row 1: translation xyz, opacity
+  1, 0, 0, 0,    // Row 2: rot row 0, pivot.x
+  0, 1, 0, 0,    // Row 3: rot row 1, pivot.y
+  0, 0, 1, 0,    // Row 4: rot row 2, pivot.z
+]);
+export const DUMMY_BATCH_TEX = new THREE.DataTexture(DUMMY_DATA, 1, 5, THREE.RGBAFormat, THREE.FloatType);
 DUMMY_BATCH_TEX.minFilter = THREE.NearestFilter;
 DUMMY_BATCH_TEX.magFilter = THREE.NearestFilter;
 DUMMY_BATCH_TEX.needsUpdate = true;
@@ -226,6 +233,8 @@ export function createSharedUniforms(): StyleUniforms {
     uTexMix: { value: 0 },
     /** 基础底色增益 / 暗部补偿（0~1，默认 0.0） */
     uAmbientGain: { value: 0 },
+    /** 双纹理交叉淡化插值系数（0 = 纯 uBatchTex, 1 = 纯 uBatchTex2） */
+    uBatchMix: { value: 0 },
     /**
      * 图层整体透明度：在片元里乘进 diffuseColor.a。
      *
@@ -264,6 +273,8 @@ const VERT_PARS = /* glsl */ `
   uniform float uSelWhole;
   uniform float uSelElevation;
   uniform sampler2D uBatchTex;
+  uniform sampler2D uBatchTex2;
+  uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
   varying float vBatchId;
@@ -271,6 +282,11 @@ const VERT_PARS = /* glsl */ `
   varying float vWorldZ;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
+
+  // 跨 chunk 共享的顶点姿态变量（在 beginnormal_vertex 建立，begin_vertex / worldpos 使用）
+  vec3 s3mCustomOffset;
+  mat3 s3mRot;
+  vec3 s3mPivot;
 
   /** 当前图元所属单体的控制位：实例化取实例属性，其余取逐顶点属性 */
   float s3mBatchRaw() {
@@ -280,27 +296,85 @@ const VERT_PARS = /* glsl */ `
       return aBatchId;
     #endif
   }
+
+  vec4 s3mSampleBatch( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
+    vec4 vA = texture2D( texA, uv );
+    if ( mixVal <= 0.0001 ) return vA;
+    vec4 vB = texture2D( texB, uv );
+    return mix( vA, vB, mixVal );
+  }
+
+  vec4 s3mSampleBatchRow0( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
+    vec4 vA = texture2D( texA, uv );
+    if ( mixVal <= 0.0001 ) return vA;
+    vec4 vB = texture2D( texB, uv );
+    vec4 res = mix( vA, vB, mixVal );
+    if ( vA.r < 0.0 && vB.r >= 0.0 ) {
+      res.rgb = vB.rgb;
+    } else if ( vA.r >= 0.0 && vB.r < 0.0 ) {
+      res.rgb = vA.rgb;
+    }
+    if ( vA.a < -0.5 || vB.a < -0.5 ) {
+      res.a = ( mixVal >= 0.5 ) ? vB.a : vA.a;
+    }
+    return res;
+  }
+
+  vec4 s3mSampleBatchRow1( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
+    vec4 vA = texture2D( texA, uv );
+    if ( mixVal <= 0.0001 ) return vA;
+    vec4 vB = texture2D( texB, uv );
+    vec4 res = mix( vA, vB, mixVal );
+    if ( vA.a == 0.0 && vB.a > 0.0 ) {
+      res.a = mix( 1.0, vB.a, mixVal );
+    } else if ( vA.a > 0.0 && vB.a == 0.0 ) {
+      res.a = mix( vA.a, 1.0, mixVal );
+    }
+    return res;
+  }
 `;
 
-const VERT_ELEVATION = /* glsl */ `
-  float s3mBatch = s3mBatchRaw();
-  vec3 s3mCustomOffset = vec3( 0.0 );
-  if ( uBatchTexActive > 0 && s3mBatch >= 0.0 ) {
-    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.25 ) );
-    if ( bState.a < -0.5 ) {
-      transformed = vec3( 0.0 );
-    } else {
-      vec4 bOffset = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.75 ) );
+const VERT_SETUP = /* glsl */ `
+  s3mCustomOffset = vec3( 0.0 );
+  s3mRot = mat3( 1.0 );
+  s3mPivot = vec3( 0.0 );
+  float s3mBatchSetup = s3mBatchRaw();
+  if ( uBatchTexActive > 0 && s3mBatchSetup >= 0.0 ) {
+    float s3mU = ( s3mBatchSetup + 0.5 ) / uBatchTexWidth;
+    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
+    if ( bState.a >= -0.5 ) {
+      vec4 bOffset = s3mSampleBatchRow1( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
       s3mCustomOffset = bOffset.xyz;
       if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
         s3mCustomOffset.z = bState.a;
       }
+      vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.5 ), uBatchMix );
+      vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.7 ), uBatchMix );
+      vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.9 ), uBatchMix );
+      s3mRot = mat3(
+        vec3( r2.x, r3.x, r4.x ),
+        vec3( r2.y, r3.y, r4.y ),
+        vec3( r2.z, r3.z, r4.z )
+      );
+      s3mPivot = vec3( r2.w, r3.w, r4.w );
+    }
+  }
+  objectNormal = normalize( s3mRot * objectNormal );
+`;
+
+const VERT_ELEVATION = /* glsl */ `
+  float s3mBatchElev = s3mBatchRaw();
+  if ( uBatchTexActive > 0 && s3mBatchElev >= 0.0 ) {
+    float s3mU = ( s3mBatchElev + 0.5 ) / uBatchTexWidth;
+    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
+    if ( bState.a < -0.5 ) {
+      transformed = vec3( 0.0 );
     }
   }
 
-  float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( s3mBatch - uSelBatch ), 0.5 ), uSelWhole );
-  // 实例化时这是局部坐标，实例矩阵只含平移 + 绕 z 旋转（白模摆位），所以偏移仍沿局部轴生效
-  transformed += s3mCustomOffset;
+  float s3mSelElev = max( step( 0.0, uSelBatch ) * step( abs( s3mBatchElev - uSelBatch ), 0.5 ), uSelWhole );
+  // 刚体旋转以 s3mPivot 为中心，再叠加自定义平移与选中拔高
+  transformed = s3mRot * ( transformed - s3mPivot ) + s3mPivot + s3mCustomOffset;
   transformed.z += s3mSelElev * uSelElevation;
 `;
 
@@ -328,7 +402,7 @@ const VERT_WORLD = /* glsl */ `
   #else
     mat3 s3mNormMat = mat3( modelMatrix );
   #endif
-  vWorldNormal = normalize( s3mNormMat * normal );
+  vWorldNormal = normalize( s3mNormMat * ( s3mRot * normal ) );
 `;
 
 const FRAG_PARS = /* glsl */ `
@@ -411,6 +485,8 @@ const FRAG_PARS = /* glsl */ `
   uniform float uSelEmissive;
   uniform float uDimFactor;
   uniform sampler2D uBatchTex;
+  uniform sampler2D uBatchTex2;
+  uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
   uniform float uFilterMinZ;
@@ -435,6 +511,35 @@ const FRAG_PARS = /* glsl */ `
   varying float vWorldZ;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
+
+  vec4 s3mSampleBatchRow0( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
+    vec4 vA = texture2D( texA, uv );
+    if ( mixVal <= 0.0001 ) return vA;
+    vec4 vB = texture2D( texB, uv );
+    vec4 res = mix( vA, vB, mixVal );
+    if ( vA.r < 0.0 && vB.r >= 0.0 ) {
+      res.rgb = vB.rgb;
+    } else if ( vA.r >= 0.0 && vB.r < 0.0 ) {
+      res.rgb = vA.rgb;
+    }
+    if ( vA.a < -0.5 || vB.a < -0.5 ) {
+      res.a = ( mixVal >= 0.5 ) ? vB.a : vA.a;
+    }
+    return res;
+  }
+
+  vec4 s3mSampleBatchRow1( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
+    vec4 vA = texture2D( texA, uv );
+    if ( mixVal <= 0.0001 ) return vA;
+    vec4 vB = texture2D( texB, uv );
+    vec4 res = mix( vA, vB, mixVal );
+    if ( vA.a == 0.0 && vB.a > 0.0 ) {
+      res.a = mix( 1.0, vB.a, mixVal );
+    } else if ( vA.a > 0.0 && vB.a == 0.0 ) {
+      res.a = mix( vA.a, 1.0, mixVal );
+    }
+    return res;
+  }
 
   float s3mHash( float p ) {
     p = fract( p * 0.1031 );
@@ -531,7 +636,8 @@ const FRAG_COLOR = /* glsl */ `
   bool hasCustomColor = false;
   if ( uBatchTexActive > 0 && s3mBid >= 0.0 ) {
     // 用取整后的 id 采样：否则逐像素的插值误差会让纹素在边界上来回跳，同样出彩色噪点
-    vec4 bState = texture2D( uBatchTex, vec2( ( s3mBid + 0.5 ) / uBatchTexWidth, 0.25 ) );
+    float s3mU = ( s3mBid + 0.5 ) / uBatchTexWidth;
+    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
     if ( bState.a < -0.5 ) {
       discard; // 属于被过滤隐藏的单体
     }
@@ -542,7 +648,7 @@ const FRAG_COLOR = /* glsl */ `
     }
     // 单体独立透明度（状态纹理第 2 行 alpha，0 = 无覆盖）。
     // 与全局 uOpacity（diffuseColor.a 初值）和图集贴图自带 alpha 逐级叠乘
-    vec4 bOffset = texture2D( uBatchTex, vec2( ( s3mBid + 0.5 ) / uBatchTexWidth, 0.75 ) );
+    vec4 bOffset = s3mSampleBatchRow1( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
     if ( bOffset.a > 0.0 ) {
       diffuseColor.a *= bOffset.a;
     }
@@ -643,6 +749,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   // 没有单体化信息的几何（batchId = -1）只能整块选中
   const uSelWhole = { value: 0 };
   const uBatchTex = { value: DUMMY_BATCH_TEX };
+  const uBatchTex2 = { value: DUMMY_BATCH_TEX };
   const uBatchTexWidth = { value: 1.0 };
   const uBatchTexActive = { value: 0 };
   /** 单块瓦片的淡入系数：逐材质独享（每块网格一份材质），默认 1 = 完全显示 */
@@ -662,6 +769,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       uSelBatch,
       uSelWhole,
       uBatchTex,
+      uBatchTex2,
       uBatchTexWidth,
       uBatchTexActive,
       uTileFade,
@@ -672,6 +780,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
 
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>\n${VERT_PARS}`)
+      .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>\n${VERT_SETUP}`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>\n${VERT_ELEVATION}`)
       .replace('#include <worldpos_vertex>', VERT_WORLD);
 
@@ -706,6 +815,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   mat.userData.uSelBatch = uSelBatch;
   mat.userData.uSelWhole = uSelWhole;
   mat.userData.uBatchTex = uBatchTex;
+  mat.userData.uBatchTex2 = uBatchTex2;
   mat.userData.uBatchTexWidth = uBatchTexWidth;
   mat.userData.uBatchTexActive = uBatchTexActive;
   mat.userData.uTileFade = uTileFade;
@@ -722,26 +832,48 @@ const OUTLINE_VERT = /* glsl */ `
   uniform float uWidth;
   uniform float uElevation;
   uniform sampler2D uBatchTex;
+  uniform sampler2D uBatchTex2;
+  uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
   varying float vSel;
+
+  vec4 s3mSampleBatch( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
+    vec4 vA = texture2D( texA, uv );
+    if ( mixVal <= 0.0001 ) return vA;
+    vec4 vB = texture2D( texB, uv );
+    return mix( vA, vB, mixVal );
+  }
+
   void main() {
     vSel = max( step( 0.0, uSelBatch ) * step( abs( aBatchId - uSelBatch ), 0.5 ), uSelWhole );
     vec3 s3mCustomOffset = vec3( 0.0 );
+    mat3 s3mRot = mat3( 1.0 );
+    vec3 s3mPivot = vec3( 0.0 );
     if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
-      vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.25 ) );
+      float s3mU = ( aBatchId + 0.5 ) / uBatchTexWidth;
+      vec4 bState = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
       if ( bState.a < -0.5 ) {
         vSel = 0.0; // 过滤隐藏的单体不显示描边
       } else {
-        vec4 bOffset = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.75 ) );
+        vec4 bOffset = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
         s3mCustomOffset = bOffset.xyz;
         if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
           s3mCustomOffset.z = bState.a;
         }
+        vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.5 ), uBatchMix );
+        vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.7 ), uBatchMix );
+        vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.9 ), uBatchMix );
+        s3mRot = mat3(
+          vec3( r2.x, r3.x, r4.x ),
+          vec3( r2.y, r3.y, r4.y ),
+          vec3( r2.z, r3.z, r4.z )
+        );
+        s3mPivot = vec3( r2.w, r3.w, r4.w );
       }
     }
-    vec3 p = position + normal * uWidth * vSel;
-    p += s3mCustomOffset;
+    vec3 p = position + ( s3mRot * normal ) * uWidth * vSel;
+    p = s3mRot * ( p - s3mPivot ) + s3mPivot + s3mCustomOffset;
     p.z += vSel * uElevation;
     gl_Position = projectionMatrix * modelViewMatrix * vec4( p, 1.0 );
   }
@@ -763,6 +895,8 @@ export interface OutlineMaterial extends THREE.ShaderMaterial {
     uWidth: { value: number };
     uElevation: { value: number };
     uBatchTex: { value: THREE.Texture };
+    uBatchTex2: { value: THREE.Texture };
+    uBatchMix: { value: number };
     uBatchTexWidth: { value: number };
     uBatchTexActive: { value: number };
     uColor: { value: THREE.Color };
@@ -778,6 +912,8 @@ export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9)
       uWidth: { value: initialWidth },
       uElevation: { value: 0 },
       uBatchTex: { value: DUMMY_BATCH_TEX },
+      uBatchTex2: { value: DUMMY_BATCH_TEX },
+      uBatchMix: shared.uBatchMix ?? { value: 0 },
       uBatchTexWidth: { value: 1.0 },
       uBatchTexActive: { value: 0 },
       uColor: { value: shared.uSelColor.value.clone() },

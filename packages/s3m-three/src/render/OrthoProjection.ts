@@ -187,3 +187,55 @@ export function buildOrthoMVP(input: OrthoInput, params: OrthoParams): OrthoMVP 
   ortho.updateProjectionMatrix();
   return { matrix: ortho.projectionMatrix.clone().multiply(view), view };
 }
+
+/**
+ * 平滑过渡正交与透视 MVP：
+ * t = 0 时纯透视，t = 1 时纯正交，0 < t < 1 时在投影矩阵元素级平滑线性插值。
+ * 因为半高以目标焦平面距离为基准，目标平面上的几何在过渡期间零位移零跳变。
+ */
+export function buildBlendedMVP(input: OrthoInput, params: OrthoParams, t: number): OrthoMVP | null {
+  const p = input.projectionMatrix;
+  if (!p || p.length < 16) return null;
+
+  const pMat = new THREE.Matrix4().fromArray(Array.from(p));
+  const mvp = new THREE.Matrix4().fromArray(Array.from(input.mvp));
+  if (pMat.determinant() === 0) return null;
+  if (!matchesFov(pMat, params.fov)) return null;
+
+  const view = pMat.clone().invert().multiply(mvp);
+  if (!closeTo(pMat.clone().multiply(view), Array.from(input.mvp))) return null;
+  if (!isAffine(view)) return null;
+
+  const clampedT = Math.max(0, Math.min(1, t));
+  if (clampedT <= 0) {
+    return { matrix: mvp, view };
+  }
+
+  const { distance, fov, aspect } = params;
+  if (!(distance > 0) || !(fov > 0) || !(aspect > 0)) return null;
+
+  const halfH = distance * Math.tan(fov / 2);
+  const halfW = halfH * aspect;
+
+  let near = input.nearZ != null && input.nearZ > 0 ? input.nearZ : 1;
+  let far = input.farZ != null && input.farZ > near ? input.farZ : distance * 4 + 1000;
+  if (!(far > near)) far = near + 1000;
+
+  const ortho = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, near, far);
+  ortho.updateProjectionMatrix();
+
+  if (clampedT >= 1) {
+    return { matrix: ortho.projectionMatrix.clone().multiply(view), view };
+  }
+
+  // 广义齐次投影矩阵元素插值：P(t) = (1 - t) * P_persp + t * P_ortho
+  const pBlend = new THREE.Matrix4();
+  const ePersp = pMat.elements;
+  const eOrtho = ortho.projectionMatrix.elements;
+  const eBlend = pBlend.elements;
+  for (let i = 0; i < 16; i++) {
+    eBlend[i] = (1 - clampedT) * ePersp[i] + clampedT * eOrtho[i];
+  }
+
+  return { matrix: pBlend.multiply(view), view };
+}
