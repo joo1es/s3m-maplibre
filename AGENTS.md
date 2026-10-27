@@ -151,7 +151,7 @@ NODE_OPTIONS= bun run release patch        # 或 minor / major / --align
 # ② 打 tag（脚本结尾会把这两行原样打出来）
 git tag s3m-three@0.4.15
 git tag s3m-maplibre@0.4.15
-# ③ push tag（GitHub 走代理，见下）
+# ③ push tag（GitHub 走代理，见下）：两个连着推，不要等 npm 出现新版本
 ```
 
 tag → 包的映射：
@@ -167,6 +167,12 @@ CI 里的硬性校验（触发失败会直接中止，不会发出半个包）�
 1. **标签版本必须等于 `package.json` 的 version**，防止改完代码忘了改版本号。
 2. 发 `s3m-maplibre` 时，会用 `npm view` 确认它依赖的 `s3m-three@^x.y.z` **已经存在于 npm**。所以顺序永远是 **先 `s3m-three`，后 `s3m-maplibre`**。
 3. 构建 + typecheck 必须过。
+
+**不要等 npm 出现新版本再推第二个 tag。** 两个 tag 连续推完就行：
+
+- npm registry 的元数据缓存大约 **10 分钟**才刷新，这期间 `npm view` / `curl registry.npmjs.org/<pkg>/<ver>` 可能一直是 404。拿它当「发完了没有」的判断依据，只会白等十几分钟，还容易误判成没发出去。
+- 所以 `s3m-maplibre` 那个 job 的依赖校验**可能因为缓存滞后而失败**（`npm 上不存在 s3m-three@^0.4.15`）。这时的处理不是重发，而是去 Actions 上**重跑（Re-run failed jobs）**那个 job —— 缓存已经暖了就会通过。
+- 判断发没发成功，只看 Actions 里 `Publish to npm` 的 job 状态，不要看 registry。
 
 发布完成后自动创建 GitHub Release（`generate_release_notes`）。
 
@@ -235,8 +241,8 @@ node tools/release.mjs minor           # 两包一起 0.5.0
 - [ ] `bun run release patch`（或 `minor` / `major`；脚本会同步 `bun.lock`）—— 不要手改版本
 - [ ] `bun run release:check` 通过（x/y 已同步）
 - [ ] commit + push `main`
-- [ ] 打 tag（`s3m-three@x.y.z` 必须**先**推），再推 `s3m-maplibre@x.y.z`
-- [ ] 去 Actions 看 `Publish to npm` 两个 job 都绿
+- [ ] 打 tag（`s3m-three@x.y.z` 必须**先**推），再推 `s3m-maplibre@x.y.z` —— 两个连着推，**不要等 npm 出现新版本**
+- [ ] 去 Actions 看 `Publish to npm` 两个 job 都绿（依赖校验因缓存滞后失败就 Re-run 该 job）
 
 发布后再改代码 = 要么另发一个补丁版本，要么 `git tag -f` 重推（npm 一旦发出去就不能覆盖，`-f` 只对**还没发成功**的 tag 有意义）。所以 tag 尽量等代码稳定、文档补齐后再打。
 
@@ -276,5 +282,5 @@ node tools/release.mjs minor           # 两包一起 0.5.0
 | `bun` / `pnpm` 毫无输出地失败 | 本机 `NODE_OPTIONS` 注入，加 `NODE_OPTIONS=` 前缀 |
 | push 超时 / 要用户名密码 | 没走 `127.0.0.1:10809` 代理，或用了 PortableGit 的 GCM |
 | 发布 CI 报「标签与版本不一致」 | tag 版本 ≠ `package.json` version |
-| 发布 CI 报「npm 上不存在 s3m-three@x」 | 先发内核，再发图层 |
+| 发布 CI 报「npm 上不存在 s3m-three@x」 | 用 `npm view` / registry 轮询判断发没发是徒劳的：npm 缓存约 10 分钟才刷新。去 Actions **Re-run failed jobs**，不要重发 |
 | CI 报「两个包的 x/y 不同步」 | 手改了版本或漏了 `bun install`：跑 `node tools/release.mjs --align` 或 `patch --align` |

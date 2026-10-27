@@ -158,7 +158,8 @@ function nextSteps(next) {
   console.log(`     ${C.yellow('publish.yml 只跑 build + typecheck，不跑测试 —— 这一步不能省')}`);
   console.log(`  3. git add -A && git commit -m "chore: release ${next.three} / ${next.maplibre}"`);
   console.log(`  4. git tag ${tagThree} && git tag ${tagMaplibre}`);
-  console.log(`  5. 先推内核，再推图层（publish.yml 会校验依赖已在 npm 上）：`);
+  console.log(`  5. 先推内核，再推图层；两个连着推，${C.yellow('不要等 npm 出现新版本')}`);
+  console.log(`     ${C.dim('npm 缓存约 10 分钟才刷新，轮询 registry 只会白等；依赖校验失败就 Re-run 该 job')}`);
   console.log(C.dim(`     ${proxy} main`));
   console.log(C.dim(`     ${proxy} ${tagThree}`));
   console.log(C.dim(`     ${proxy} ${tagMaplibre}`));
