@@ -142,8 +142,27 @@ export default function StyleSection() {
         <label class="chk">
           <input type="checkbox" id="optHideBasemap" /> 隐藏地图底图
         </label>
-        <label class="chk">
-          <input type="checkbox" id="optOrtho" /> 正交投影（工程俯视/轴测）
+        <label
+          class="chk"
+          title="叠加矢量瓦片并把 building 层画成 fill-extrusion，用来看 3D 建筑与 S3M 精模同屏的效果"
+        >
+          <input type="checkbox" id="optVector" /> 矢量底图 + 3D 建筑（MVT）
+        </label>
+        <input
+          type="text"
+          id="optVectorUrl"
+          placeholder="TileJSON 或 {z}/{x}/{y} 模板，留空用 OpenFreeMap"
+          title="矢量瓦片源。免费全球源都在境外，慢的话可以填 MapTiler / 自建 PMTiles / iServer 的地址"
+          style="width:100%;margin:-2px 0 6px;font-size:11px"
+        />
+        <label class="chk" title="只把 S3M 层换成正交：底图仍走 MapLibre 的透视投影，两者差 ≈ 楼高/相机距，所以会把底图退出">
+          <input type="checkbox" id="optOrtho" /> 正交 · 仅模型
+        </label>
+        <label
+          class="chk"
+          title="接管 MapLibre 的投影矩阵，底图 / 地形 / 标记与模型共用同一个正交相机，底图不必退出。beta，视角不自然，适合俯视"
+        >
+          <input type="checkbox" id="optOrthoGlobal" /> 正交 · 全局（beta）
         </label>
       </section>
     </>

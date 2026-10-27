@@ -1,6 +1,6 @@
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat } from 's3m-maplibre';
+import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat, enableMapLibreOrtho } from 's3m-maplibre';
 import pkg from 's3m-maplibre/package.json';
 
 
@@ -693,8 +693,15 @@ $('optTerrainSnap')?.addEventListener('change', (e) => {
 
 /* ---------------------------------------------------------------- 底图与正交投影 */
 
+// 三个开关的状态提前声明：updateBasemapVisibility 会读它们，而它可能在任何时机被调
+let orthoMode = 'none'; // 'none' | 'local' | 'global'
+let orthoPatch = null;
+let vectorOn = false;
+
 function updateBasemapVisibility() {
-  const hide = !!$('optHideBasemap')?.checked || !!$('optOrtho')?.checked;
+  // 「仅模型」正交时，底图仍是透视，和正交的模型差一个楼高/相机距，只能退掉；
+  // 「全局」正交下 MapLibre 自己也是正交，底图照常显示。
+  const hide = !!$('optHideBasemap')?.checked || orthoMode === 'local';
   const isUnderground = !!$('optUnderground')?.checked;
 
   for (const id of ['bg', 'osm']) {
@@ -713,7 +720,9 @@ function updateBasemapVisibility() {
   }
 
   if (!hide) {
-    const opacity = isUnderground ? 0.22 : 0.82;
+    // 矢量底图叠在栅格之上：栅格压暗当底衬，既不会因为 MVT 没下完而白屏，
+    // 又能看清 fill-extrusion 的建筑体量。
+    const opacity = vectorOn ? 0.3 : isUnderground ? 0.22 : 0.82;
     if (map.getLayer('osm')) {
       map.setPaintProperty('osm', 'raster-opacity', opacity);
     }
@@ -751,17 +760,187 @@ $('optGroundOcclude')?.addEventListener('change', (e) => {
   setStatus(on ? '地表遮挡已开启：地面以下被切掉（地表钉在 z=0，高程滑杆控制埋深）' : '地表遮挡已关闭：地下几何恢复显示');
 });
 
+/* ---------------------------------------------------------------- 矢量底图（MVT）
+
+   用 OpenFreeMap 的全球矢量瓦片（OpenMapTiles 规范，免 key），把 building 层画成
+   fill-extrusion —— 这样能直接看「3D 矢量建筑 + S3M 精模」同屏：
+   · 透视正常时，MVT 建筑会近大远小，S3M 精模也是；
+   · 切到「正交 · 全局」后两者会一起变成无灭点的平行投影，说明它们确实共用一个相机。
+
+   注意：瓦片源在境外，网络不通时会提示失败，不影响其它功能。*/
+
+const DEFAULT_MVT = 'https://tiles.openfreemap.org/planet';
+/** 当前用的源签名：源一变就得把图层和 source 拆了重建 */
+let vectorSourceSig = '';
+
+/** 支持两种写法：TileJSON 地址，或者直接的 `{z}/{x}/{y}` 瓦片模板 */
+function currentMvtSource() {
+  const raw = ($('optVectorUrl')?.value || '').trim() || DEFAULT_MVT;
+  if (raw.includes('{z}') || raw.includes('{x}')) {
+    return { type: 'vector', tiles: [raw], minzoom: 0, maxzoom: 14 };
+  }
+  return { type: 'vector', url: raw };
+}
+
+function dropVectorLayers() {
+  for (const id of ['ofm-bldg', 'ofm-road', 'ofm-water']) {
+    if (map.getLayer(id)) map.removeLayer(id);
+  }
+  if (map.getSource('ofm')) map.removeSource('ofm');
+  vectorSourceSig = '';
+}
+
+function hideVectorLayers(hide) {
+  for (const id of ['ofm-water', 'ofm-road', 'ofm-bldg']) {
+    if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', hide ? 'none' : 'visible');
+  }
+}
+
+function setVectorBasemap(on) {
+  vectorOn = on;
+  if (!on) {
+    // 只隐藏不销毁：再打开时不用重新下载瓦片
+    hideVectorLayers(true);
+    updateBasemapVisibility();
+    setStatus('已关闭矢量底图');
+    return;
+  }
+  try {
+    const src = currentMvtSource();
+    const sig = JSON.stringify(src);
+    if (map.getSource('ofm') && vectorSourceSig !== sig) dropVectorLayers();
+    if (!map.getSource('ofm')) {
+      map.addSource('ofm', src);
+      vectorSourceSig = sig;
+    }
+    // 插在 S3M 自定义层之前：矢量底图在下，模型在上
+    const s3mLayerId = map.getStyle().layers.find((l) => l.type === 'custom')?.id;
+
+    if (!map.getLayer('ofm-water')) {
+      map.addLayer(
+        {
+          id: 'ofm-water',
+          type: 'fill',
+          source: 'ofm',
+          'source-layer': 'water',
+          paint: { 'fill-color': '#9ec5e8', 'fill-opacity': 0.95 },
+        },
+        s3mLayerId
+      );
+      map.addLayer(
+        {
+          id: 'ofm-road',
+          type: 'line',
+          source: 'ofm',
+          'source-layer': 'transportation',
+          paint: {
+            'line-color': '#ffffff',
+            'line-opacity': 0.9,
+            'line-width': ['interpolate', ['linear'], ['zoom'], 10, 0.5, 14, 1.5, 18, 7],
+          },
+        },
+        s3mLayerId
+      );
+      // 3D 建筑：OpenMapTiles 的 building 层带 render_height / render_min_height
+      map.addLayer(
+        {
+          id: 'ofm-bldg',
+          type: 'fill-extrusion',
+          source: 'ofm',
+          'source-layer': 'building',
+          paint: {
+            'fill-extrusion-color': [
+              'interpolate',
+              ['linear'],
+              ['coalesce', ['get', 'render_height'], ['get', 'height'], 12],
+              0,
+              '#cfd6e2',
+              60,
+              '#b0b9c9',
+              200,
+              '#8d97a9',
+            ],
+            // 没有高度字段时给 12m 兜底，否则整个 building 层会退化成平面
+            'fill-extrusion-height': [
+              'coalesce',
+              ['get', 'render_height'],
+              ['get', 'height'],
+              12,
+            ],
+            'fill-extrusion-base': ['coalesce', ['get', 'render_min_height'], 0],
+            'fill-extrusion-opacity': 0.92,
+          },
+        },
+        s3mLayerId
+      );
+    } else {
+      hideVectorLayers(false);
+    }
+    updateBasemapVisibility();
+    setStatus('矢量底图已加载：building 画成 fill-extrusion，可和 S3M 精模对比');
+
+
+  } catch (err) {
+    vectorOn = false;
+    if ($('optVector')) $('optVector').checked = false;
+    updateBasemapVisibility();
+    setStatus(`矢量底图加载失败：${err && err.message ? err.message : err}`);
+  }
+}
+
+$('optVector')?.addEventListener('change', (e) => setVectorBasemap(e.target.checked));
+
 $('optHideBasemap').addEventListener('change', (e) => {
   updateBasemapVisibility();
   setStatus(e.target.checked ? '已隐藏地图底图' : '已恢复地图底图');
 });
 
-$('optOrtho').addEventListener('change', (e) => {
-  const on = e.target.checked;
-  layer.setProjection(on ? 'orthographic' : 'perspective');
-  // 正交只覆盖 S3M 层：底图走 MapLibre 自己的透视投影，会与本层对不齐，整体退出。
+/* 正交有两种，互斥：
+
+   1) 仅模型（local）—— layer.setProjection('orthographic')。只换 S3M 层的 MVP，
+      底图仍走 MapLibre 的透视投影，两者差 ≈ 楼高/相机距，所以要把底图退掉。
+      好处是完全不碰 MapLibre，最稳。
+
+   2) 全局（global）—— enableMapLibreOrtho(map)。接管 MapLibre 的投影矩阵，
+      底图 / 地形 / 标记与模型共用同一个正交相机，底图不用退，也不会错位。
+      beta：依赖 maplibre-gl@5 的内部字段，视角本身也不自然（没有灭点）。 */
+
+function applyOrthoMode(mode) {
+  orthoMode = mode;
+  if ($('optOrtho')) $('optOrtho').checked = mode === 'local';
+  if ($('optOrthoGlobal')) $('optOrthoGlobal').checked = mode === 'global';
+
+  orthoPatch ??= enableMapLibreOrtho(map, { enabled: false });
+  orthoPatch.setEnabled(mode === 'global');
+  layer.setProjection(mode === 'local' ? 'orthographic' : 'perspective');
   updateBasemapVisibility();
-  setStatus(on ? '正交投影已开启：底图退出' : '已切回透视投影');
+
+  setStatus(
+    mode === 'local'
+      ? '正交（仅模型）：底图退出，S3M 层单独正交'
+      : mode === 'global'
+        ? '正交（全局）：底图与模型共用同一正交相机'
+        : '已切回透视投影'
+  );
+
+  // ?orthoDebug=1：核对接管是否真的生效。正交的标志是 viewProj 的 w 行 = (0,0,0,1)，
+  // 仍是透视则是 (0,0,-1,0)。结果同时写到 data-ortho-w 与控制台。
+  if (new URLSearchParams(window.location.search).get('orthoDebug') === '1') {
+    const w = map.transform?._viewProjMatrix;
+    if (w) {
+      const row = [w[3], w[7], w[11], w[15]].map((v) => Number(v).toFixed(3)).join(',');
+      document.body.dataset.orthoW = row;
+      console.info('[s3m] viewProj w 行 =', row, '（正交应为 0,0,0,1）');
+    }
+  }
+}
+
+$('optOrtho')?.addEventListener('change', (e) => {
+  applyOrthoMode(e.target.checked ? 'local' : 'none');
+});
+
+$('optOrthoGlobal')?.addEventListener('change', (e) => {
+  applyOrthoMode(e.target.checked ? 'global' : 'none');
 });
 
 /* ---------------------------------------------------------------- 着色 UI */
@@ -1596,18 +1775,28 @@ layer.onPick = (f) => renderFeature(f);
 /* ---------------------------------------------------------------- 地图加载入口 */
 
 map.on('load', async () => {
-  map.addLayer(layer);
+  // ?nos3m=1：只留 MapLibre 底图，用来隔离「正交接管」与「S3M 层」各自的问题
+  const nos3m = new URLSearchParams(window.location.search).get('nos3m') === '1';
+  if (!nos3m) map.addLayer(layer);
   initSourceControls();
 
-  // ?ortho=1 直接以正交模式打开（勾选框同步，底图自动退出）
-  if (new URLSearchParams(window.location.search).get('ortho') === '1') {
-    $('optOrtho').checked = true;
-    $('optOrtho').dispatchEvent(new Event('change'));
+  // ?ortho=local 只把模型换正交；?ortho=global 接管整个 MapLibre（=1 等同 local）
+  const orthoParam = new URLSearchParams(window.location.search).get('ortho');
+  if (orthoParam) applyOrthoMode(orthoParam === 'global' ? 'global' : 'local');
+
+  // ?mvt=<TileJSON|模板> 指定矢量源
+  const mvtParam = new URLSearchParams(window.location.search).get('mvt');
+  if (mvtParam && $('optVectorUrl')) $('optVectorUrl').value = mvtParam;
+
+  // ?vector=1 直接叠加矢量底图（MVT）+ 3D 建筑
+  if (new URLSearchParams(window.location.search).get('vector') === '1') {
+    if ($('optVector')) $('optVector').checked = true;
+    setVectorBasemap(true);
   }
 
   // 从 URL query ?url= 获取，若无则使用默认的 CCTV CBD 模型
   const initialUrl = getQueryUrl() || DEFAULT_URL;
-  await loadSource(initialUrl);
+  if (!nos3m) await loadSource(initialUrl);
 });
 
 /* ---------------------------------------------------------------- 状态轮询 */
