@@ -23,5 +23,13 @@ export type {
   WorldCoordinateHelperLike,
 } from './MapLibreGeoAdapter.js';
 
+/**
+ * 实验性：把 MapLibre 全局换成正交投影（默认不启用）。
+ * 开启后底图 / 地形 / 标记与 S3M 共用一个正交相机，不再需要本层的
+ * `setProjection('orthographic')`（那样只有模型变正交，底图仍是透视）。
+ */
+export { enableMapLibreOrtho, applyOrthoMatrices } from './maplibreOrtho.js';
+export type { MapLibreOrthoOptions } from './maplibreOrtho.js';
+
 /** 渲染内核（s3m-three）全量再导出，保持与 0.2.x 单包版的导入兼容 */
 export * from 's3m-three';

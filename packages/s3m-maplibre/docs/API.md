@@ -12,6 +12,8 @@
 - [`S3MLayer`](#s3mlayer)
 - [动画与过渡](#动画与过渡)
 - [投影](#投影)
+  - [全局正交（beta，选配）](#全局正交beta选配)
+  - [近裁剪面（贴脸看时不消失）](#近裁剪面贴脸看时不消失)
 - [宿主兼容与已知限制](#宿主兼容与已知限制)
 - [数据与许可](#数据与许可)
 
@@ -532,6 +534,50 @@ V = P⁻¹ × MVP
 - 解出的视图矩阵会做刚体校验（3×3 正交、底行 `[0,0,0,1]`）；校验不过说明两个输入矩阵不同源，同样退回透视并告警。
 
 底层数学在 `packages/s3m-three/src/render/OrthoProjection.ts`（从 `s3m-three` 入口导出），`npm test` 里的 `tools/test-ortho.mjs` 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。
+
+### 全局正交（beta，选配）
+
+上面那条 `setProjection('orthographic')` 只把 **S3M 层**换成正交，底图仍是透视，两者差 ≈ 楼高 / 相机距，所以一直建议把底图退掉。如果你要的是「整个场景都是正交」——底图、地形、标记与模型共用同一个相机，那需要直接接管 MapLibre 的投影矩阵：
+
+```ts
+import { enableMapLibreOrtho } from 's3m-maplibre';
+
+const ortho = enableMapLibreOrtho(map);   // 安装，默认立即生效
+ortho.setEnabled(false);                  // 运行时开关
+ortho.reinstall();                        // map.setProjection() 重建 transform 后补装
+ortho.dispose();                          // 卸载，恢复原生透视
+```
+
+开启后**不要再调** `layer.setProjection('orthographic')`——本层继续用透视模式即可，它拿到的 MVP 本身就是正交的。
+
+**原理**：MapLibre v5 的 `_setProjectionInternal` 是写死的 switch（只有 mercator / globe / vertical-perspective），没有注册入口。但它的矩阵计算是分层的：
+
+```
+Transform.calcMatrices()                 ← 基类壳，只算像素常量
+  └─ this._callbacks.calcMatrices()      ← 固定为 () => this._calcMatrices()
+       └─ MercatorTransform._calcMatrices()   ← 真正的投影矩阵链
+```
+
+`_callbacks` 走的是 `this._calcMatrices()`（动态查表），所以覆盖实例上的 `_calcMatrices`，在原始计算之后把整条链按正交重算一遍即可。原实现仍照常执行，`_nearZ / _farZ / _pixelPerMeter / cameraToCenterDistance` 这些中间量直接复用。
+
+矩阵链里唯一需要换的是第一步：
+
+```js
+n = perspective(fov, aspect, near, far)   // 原文
+n = ortho(-w/2, w/2, -h/2, h/2, …)        // 改成这个
+```
+
+因为 `cameraToCenterDistance = 0.5 / tan(fov/2) × height`，这一改动让**中心平面上的投影与透视逐点相同**，只是去掉了近大远小。`viewProj / mercatorMatrix / pixelMatrix / pixelMatrix3D / alignedProjMatrix` 全部按同一条链重算，拾取用的 `pixelMatrix` 也在内。
+
+验证方式（`tests/unit/maplibre-ortho.test.ts`，6 条，纯矩阵）：中心点落在屏幕正中、地面点正交与透视差 < 1e-9、1 world 单位 = 1 像素、高处点不再外扩、`pixelMatrix` 与 `viewProj` 同源、缺 helper 时返回 false 保持透视。
+
+**beta 边界，务必先看**：
+
+- **只验证过 maplibre-gl 5.24**。它依赖 `_calcMatrices`、`_helper._nearZ`、`_viewProjMatrix` 等内部字段，MapLibre 大版本升级**一定会**需要重新核对，属于「升级即回归风险」的耦合。这也是它默认不启用、且放在独立函数而不是 `S3MLayer` 选项里的原因。
+- **正交视角本来就不自然**。没有灭点，pitch 一大画面就没有纵深感，斜视下看着"扁"。实践里它适合 `pitch = 0` 的俯视量测、规划图、工程图；不适合当常规漫游视图（这也是 deck.gl 把 `OrthographicView` 归到非地理视图的原因）。
+- **标签避让、地形高程、fog 仍按透视语义推导**。符号层用的是另一套 `labelPlaneMatrix` 系，正交下会有位置/避让偏差；地形（`terrain`）没有验证，建议正交时关掉。`queryRenderedFeatures` 的拾取已经一起重算，基本可用。
+- `map.setProjection()`（含 `vertical-perspective` / `globe`）会重建 transform 实例，patch 会丢，需要 `reinstall()`。监听 `projectiontransition` 事件后补装即可。
+- 切换开关时不会自动触发重算（MapLibre 的矩阵是惰性的），`setEnabled()` 内部已经主动调了一次 `_calcMatrices`，你不需要再手动 `triggerRepaint`。
 
 ### 近裁剪面（贴脸看时不消失）
 
