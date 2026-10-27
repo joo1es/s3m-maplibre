@@ -10,8 +10,8 @@ import {
   createSharedUniforms,
   createThickLineMaterial,
   createLineSharedUniforms,
-} from 's3m-three';
-import { S3MLayer } from 's3m-maplibre';
+} from '../../packages/s3m-three/src/index.js';
+import { S3MLayer } from '../../packages/s3m-maplibre/src/S3MLayer.js';
 
 describe('GPU 路径动画 (GPU Path Animation)', () => {
   describe('1. GPUPathManager 基础能力与数据纹理烘焙', () => {
