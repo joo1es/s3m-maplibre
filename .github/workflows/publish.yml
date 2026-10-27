@@ -82,6 +82,10 @@ jobs:
           fi
           echo "版本一致：$PKG@$PKGVER"
 
+      # 两个包的 x/y 必须同步（只有 patch 各自独立），见 AGENTS.md#版本
+      - name: Verify cross-package version sync
+        run: node tools/release.mjs --check
+
       - name: Build and typecheck
         run: |
           npm run build

@@ -31,6 +31,10 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      # 两个包的 x/y 必须同步（只有 patch 各自独立），见 AGENTS.md#版本
+      - name: Verify version sync
+        run: node tools/release.mjs --check
+
       - name: Typecheck
         run: bun run typecheck
 
