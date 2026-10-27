@@ -173,6 +173,8 @@ new S3MViewer(options?: S3MViewerOptions)
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 **DPR 上限**（不截断）。默认按 `canvasHeight` 物理像素算，与官方 `calcPixFromCam` 同口径；3x DPR 手机上由此会多细化、多拉瓦片，传 `2` 即按「CSS 高度 × 2」截断 |
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = 取 GPU 最大值，通常 16）。移动端封到 4 / 8 肉眼通常无差，采样成本明显下降。只影响之后创建的纹理 |
 | `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。非图集的 RGBA / WebP 产物按 2× 盒式滤波减半到上限内；DXT 压缩直传与图集不受影响 |
+| `maxImageCache` | `number` | `128` | 纹理缓存条数上限。一条 = 一张已解码的瓦片纹理，1024² RGBA 约 4MB，128 条即约 512MB 显存；低端设备 32~48。LRU，降下来下次淘汰时释放 |
+| `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型。`lambert` 用 `MeshLambertMaterial` 替换 PBR，去掉 GGX 与环境球谐，片元约省一半；白模 / 纯色 / 按高度着色几乎无差。模块级全局，只影响之后创建的材质 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，配了才能 `colorByField()`，见[按业务字段着色](#按业务字段着色) |
 | `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
@@ -378,6 +380,7 @@ setAnisotropyCap(cap: number): void           // Infinity = 取 GPU 最大值（
 readonly anisotropyCap: number
 setMaxTextureSize(n: number): void            // Infinity = 不限制（默认）
 readonly maxTextureSize: number
+readonly maxImageCache: number
 readonly stats: Stats
 readonly fps: number
 getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
@@ -1207,6 +1210,8 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 | `lodPixelRatioCap` | LOD 判定用屏幕高度的 DPR 上限，默认不截断。见下方「移动端 / 差设备」 |
 | `anisotropyCap` | 各向异性过滤上限，默认取 GPU 最大值。移动端 4 / 8 通常肉眼无差 |
 | `maxTextureSize` | 纹理长边像素上限，默认不限制。手机上 1024 即可，显存降到 1/4 |
+| `maxImageCache` | 纹理缓存条数，默认 128。低端机 32~48，和 `maxTextureSize` 一起管显存 |
+| `materialQuality: 'lambert'` | 换成 Lambert 光照，片元约省一半。白模 / 按高度配色看不出差别，贴图模式会略平 |
 | `maxImageCache` | 原始图集与 leaf 段图像记录的 LRU 缓存容量上限（默认 128），超限自动淘汰旧缓存，防止漫游时内存不断累积 |
 | 纹理引用计数 | 瓦片淘汰时按引用计数释放未被其他瓦片复用的 `Texture` 并调用 `dispose()`，真正归还 GPU 显存 |
 | 几何/材质深度释放 | 瓦片注销时深度遍历对象树，彻底释放 `Mesh`、`Points`（点云/高斯泼溅）以及 `LineSegments`（棱线包）的 `BufferGeometry` 与材质 |

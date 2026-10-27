@@ -120,7 +120,8 @@ export {
   createStyledMaterial,
   createOutlineMaterial,
 } from './render/StyleMaterial.js';
-export type { StyleMode, SelectMode, StyledMaterial, StyledMaterialOptions, OutlineMaterial } from './render/StyleMaterial.js';
+export type { StyleMode, SelectMode, StyledMaterial, StyledMaterialOptions, OutlineMaterial, MaterialQuality } from './render/StyleMaterial.js';
+export { setMaterialQuality, getMaterialQuality } from './render/StyleMaterial.js';
 
 export { Picker } from './render/Picker.js';
 export type { PickHit } from './render/Picker.js';

@@ -24,6 +24,7 @@ import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
+import { setMaterialQuality } from './StyleMaterial.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
@@ -236,6 +237,12 @@ export interface S3MViewerOptions {
    */
   maxTriangles?: number;
   /**
+   * 纹理缓存条数上限（默认 128）。一条对应一张已解码的瓦片纹理，
+   * 1024² 的 RGBA 一张约 4MB，128 条就是 512MB 显存 —— 低端设备建议 32~48。
+   * 与 `maxTextureSize` 配合使用：后者降单张尺寸，这条降张数。
+   */
+  maxImageCache?: number;
+  /**
    * 各向异性过滤上限（默认不封顶，取 GPU 报的最大值，通常 16）。
    * 移动端封到 4 或 8 肉眼通常无差，采样成本明显下降。只影响**之后创建**的纹理。
    */
@@ -246,6 +253,17 @@ export interface S3MViewerOptions {
    * 图集（UV 已重映射）不受影响。手机上 1024 与 2048 肉眼几乎无差，显存差 4 倍。
    */
   maxTextureSize?: number;
+  /**
+   * 光照模型（默认 `'pbr'`）。
+   *
+   * - `'pbr'`：`MeshStandardMaterial`，GGX + 环境球谐，质感最好也最贵
+   * - `'lambert'`：`MeshLambertMaterial`，只保留漫反射 + 平行光，片元开销约省一半；
+   *   白模 / 纯色 / 按高度着色这类不需要高光的模式肉眼差别很小
+   *
+   * 模块级全局状态：同页多个图层会互相覆盖，后创建的那个决定全局。
+   * 只影响**之后创建**的材质 —— 已加载的瓦片要重新加载才会换。
+   */
+  materialQuality?: 'pbr' | 'lambert';
   /** 自定义瓦片构建器（测试 / 服务端渲染时注入） */
   buildTile?: BuildTileFn | null;
   /**
@@ -492,6 +510,8 @@ export class S3MViewer {
   attributeQuery: AttributeQuery | null = null;
 
   private readonly _enuMatrix = new THREE.Matrix4();
+  /** 每帧复用：MVP 来自宿主，不要每帧 new（高频分配会带来 GC 抖动） */
+  private readonly _frameMvp = new THREE.Matrix4();
   /** 颜色换算用的临时对象，避免每帧 new */
   private readonly _colorScratch = new THREE.Color();
   private _needsRepaint = true;
@@ -540,6 +560,7 @@ export class S3MViewer {
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
+    setMaterialQuality(options.materialQuality ?? 'pbr');
     if (options.light) {
       Object.assign(this._lightOptions, options.light);
     }
@@ -885,7 +906,8 @@ export class S3MViewer {
           this._requestRepaint();
         },
       },
-      this.options.maxTriangles ?? Infinity
+      this.options.maxTriangles ?? Infinity,
+      this.options.maxImageCache ?? 128
     );
     return entry;
   }
@@ -2311,7 +2333,7 @@ export class S3MViewer {
     const camera = this.camera;
     if (!r || !scene || !camera) return;
 
-    const mats: THREE.MeshStandardMaterial[] = [];
+    const mats: StyledMaterial[] = [];
     const seen = new Set<THREE.Material>();
     for (const p of this._pickables.values()) {
       const m = styledMaterialOf(p.mesh);
@@ -3515,6 +3537,29 @@ export class S3MViewer {
     return Math.min(canvasHeight, cssHeight * cap);
   }
 
+  /** 当前纹理缓存条数上限 */
+  get maxImageCache(): number {
+    return this.options.maxImageCache ?? 128;
+  }
+
+  /**
+   * 调整纹理缓存条数。不传 `datasetId` 时对所有已存在数据集立即生效，
+   * 并作为之后新增数据集的默认值。缓存是 LRU，降下来不会立刻释放，下次淘汰时生效。
+   */
+  setMaxImageCache(n: number, datasetId?: string): void {
+    const next = Number.isFinite(n) ? Math.max(1, Math.floor(n)) : 128;
+    if (datasetId) {
+      const entry = this.datasets.get(datasetId);
+      if (entry?.tileset) entry.tileset.maxImageCache = next;
+    } else {
+      this.options.maxImageCache = next;
+      for (const entry of this.datasets.values()) {
+        if (entry.tileset) entry.tileset.maxImageCache = next;
+      }
+    }
+    this._requestRepaint();
+  }
+
   /** 当前每个数据集的驻留面数预算。Infinity = 不限制 */
   get maxTriangles(): number {
     return this.options.maxTriangles ?? Infinity;
@@ -3634,7 +3679,7 @@ export class S3MViewer {
 
     // 正交模式由宿主在传入 mvp 前自行替换（见 s3m-maplibre 的 S3MLayer._applyOrtho），
     // 视图矩阵是从宿主输入反推的（P⁻¹×MVP），不会和宿主的 pan/zoom/pitch 错位。
-    const mvp = new THREE.Matrix4().fromArray(opts.mvp as number[]);
+    const mvp = this._frameMvp.fromArray(opts.mvp as number[]);
     mvp.multiply(this._enuMatrix);
     this.camera.projectionMatrix.copy(mvp);
     this.camera.projectionMatrixInverse.copy(mvp).invert();

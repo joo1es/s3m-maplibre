@@ -247,6 +247,8 @@ export class S3MLayer {
       lodRangeScale: options.lodRangeScale,
       lodPixelRatioCap: options.lodPixelRatioCap,
       maxTriangles: options.maxTriangles,
+      maxImageCache: options.maxImageCache,
+      materialQuality: options.materialQuality,
       anisotropyCap: options.anisotropyCap,
       maxTextureSize: options.maxTextureSize,
       buildTile: options.buildTile,
@@ -990,6 +992,20 @@ export class S3MLayer {
    */
   setLodPixelRatioCap(cap: number): void {
     this.viewer.setLodPixelRatioCap(cap);
+  }
+
+  /** 当前纹理缓存条数上限 */
+  get maxImageCache(): number {
+    return this.viewer.maxImageCache;
+  }
+
+  /**
+   * 动态调整纹理缓存条数（默认 128）。
+   * 一条对应一张已解码的瓦片纹理，1024² RGBA 约 4MB；低端设备建议 32~48。
+   * 与 `maxTextureSize` 配合：后者降单张尺寸，这条降张数。
+   */
+  setMaxImageCache(n: number, datasetId?: string): void {
+    this.viewer.setMaxImageCache(n, datasetId);
   }
 
   /** 当前每个数据集的驻留面数预算。Infinity = 不限制 */

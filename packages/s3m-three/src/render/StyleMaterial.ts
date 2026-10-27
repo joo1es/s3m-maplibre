@@ -168,7 +168,33 @@ export const DEFAULT_STYLE: S3MStyle = {
   fadeIn: 0,
 };
 
-export interface StyledMaterial extends THREE.MeshStandardMaterial {
+/** 光照模型：pbr（默认，MeshStandardMaterial）| lambert（省 GGX 与环境球谐） */
+export type MaterialQuality = 'pbr' | 'lambert';
+
+/**
+ * 当前光照模型。模块级全局 —— 与 anisotropy / maxTextureSize 同一套设计，
+ * 同页多个图层会互相覆盖，后创建的那个决定全局。只影响**之后创建**的材质。
+ */
+let materialQuality: MaterialQuality = 'pbr';
+
+/**
+ * 切换光照模型。
+ *
+ * 'pbr'（默认）= `MeshStandardMaterial`，GGX + 环境球谐，质感最好也最贵。
+ * 'lambert' = `MeshLambertMaterial`，只保留漫反射 + 平行光，片元开销约省一半；
+ * 白模 / 纯色 / 按高度着色这类不需要高光的模式，肉眼差别很小。
+ *
+ * 注意：只影响之后创建的材质 —— 已加载的瓦片要重新加载才会换。
+ */
+export function setMaterialQuality(q: MaterialQuality): void {
+  materialQuality = q === 'lambert' ? 'lambert' : 'pbr';
+}
+
+export function getMaterialQuality(): MaterialQuality {
+  return materialQuality;
+}
+
+export type StyledMaterial = (THREE.MeshStandardMaterial | THREE.MeshLambertMaterial) & {
   userData: {
     uSelBatch: { value: number };
     uSelWhole: { value: number };
@@ -785,11 +811,11 @@ export interface StyledMaterialOptions {
  */
 export function createStyledMaterial(opts: StyledMaterialOptions): StyledMaterial {
   const uniforms = opts.uniforms;
-  const mat = new THREE.MeshStandardMaterial({
+  // 两种光照模型共用的参数。注入的 chunk 只动 diffuseColor / normal / transformed，
+  // 在 Standard 与 Lambert 的 shader 里都存在同名 include，所以模板不用分支。
+  const baseParams = {
     color: opts.color ?? new THREE.Color(0xffffff),
     map: opts.map ?? null,
-    roughness: opts.roughness ?? 0.95,
-    metalness: 0,
     side: opts.side ?? THREE.DoubleSide,
     transparent: !!opts.transparent,
     opacity: opts.opacity ?? 1,
@@ -800,7 +826,16 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
     // 顶点色、贴图全部在自定义 chunk 里处理，不让 three 插手
     vertexColors: false,
     alphaTest: opts.alphaTest ?? 0,
-  }) as StyledMaterial;
+  };
+  const mat = (
+    materialQuality === 'lambert'
+      ? new THREE.MeshLambertMaterial(baseParams)
+      : new THREE.MeshStandardMaterial({
+          ...baseParams,
+          roughness: opts.roughness ?? 0.95,
+          metalness: 0,
+        })
+  ) as StyledMaterial;
 
   // 选中单体编号：每个 Mesh 独立，默认 -1 表示无选中
   const uSelBatch = { value: -1 };

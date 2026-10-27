@@ -22,6 +22,8 @@ export interface S3MDatasetOptions {
   maxTiles?: number;
   /** 该数据集驻留三角形总数的软上限（默认跟随图层级设置；都不传则不限制） */
   maxTriangles?: number;
+  /** 该数据集的纹理缓存条数上限（默认跟随图层级设置，图层不传则 128） */
+  maxImageCache?: number;
   lodRangeScale?: number;
   /**
    * 垂直对齐基准（默认 'origin'）：
@@ -167,7 +169,8 @@ export class DatasetManager {
     maxTiles: number,
     maxConcurrent: number,
     callbacks: DatasetManagerCallbacks,
-    maxTriangles: number = Infinity
+    maxTriangles: number = Infinity,
+    maxImageCache: number = 128
   ): Promise<S3MDatasetEntry> {
     const existing = this.datasets.get(ds.id);
     if (existing) return existing;
@@ -198,6 +201,7 @@ export class DatasetManager {
       maxTiles: ds.maxTiles ?? maxTiles,
       maxConcurrent: maxConcurrent,
       maxTriangles: ds.maxTriangles ?? maxTriangles,
+      maxImageCache: ds.maxImageCache ?? maxImageCache,
       lodRangeScale: ds.lodRangeScale ?? defaultLodRangeScale,
       buildTile: buildTile ?? null,
       useWorker: ds.useWorker,

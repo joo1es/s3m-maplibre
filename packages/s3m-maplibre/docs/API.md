@@ -129,6 +129,8 @@ new S3MLayer(options?: S3MLayerOptions)
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 DPR 上限（不截断）。默认按绘图缓冲物理像素算，3x DPR 手机上会显著多拉瓦片；传 `2` 即按「CSS 高度 × 2」截断，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = GPU 最大值，通常 16）。移动端 4 / 8 通常肉眼无差，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。手机上 1024 即可，显存降到 1/4；图集与 DXT 直传不受影响 |
+| `maxImageCache` | `number` | `128` | 纹理缓存条数上限，1024² RGBA 约 4MB / 条。低端设备 32~48，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
+| `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型，`lambert` 片元约省一半。模块级全局，只影响之后创建的材质 |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 字段着色章节](../s3m-three/docs/API.md#按业务字段着色) |
 | `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
 | `nearPlaneScale` | `number` | `1` | 近裁剪面缩放系数（`0 < scale < 1`，1 = 不改）。MapLibre 的 near 是硬编码的 `canvasHeight/50`，zoom 16.5 时约合 13 米，相机贴近模型会把楼面整片裁掉；缩放后 fov / far 不变，见[近裁剪面](#近裁剪面贴脸看时不消失) |
@@ -279,12 +281,14 @@ setLodRangeScale(scale: number, datasetId?: string): void  // 缩放 LOD 切换�
 readonly lodRangeScale: number
 setLodPixelRatioCap(cap: number): void                    // LOD 判定屏幕高度的 DPR 上限，Infinity = 不截断（默认）
 readonly lodPixelRatioCap: number
+setMaxImageCache(n: number, datasetId?: string): void    // 纹理缓存条数，默认 128
 setMaxTriangles(n: number, datasetId?: string): void      // 驻留面数软上限，Infinity = 不限制（默认）
 readonly maxTriangles: number
 setAnisotropyCap(cap: number): void                       // 各向异性上限，Infinity = 取 GPU 最大值（默认）
 readonly anisotropyCap: number
 setMaxTextureSize(n: number): void                        // 纹理长边像素上限，Infinity = 不限制（默认）
 readonly maxTextureSize: number
+readonly maxImageCache: number
 readonly stats: Stats
 readonly fps: number
 readonly projection: 'perspective' | 'orthographic'
