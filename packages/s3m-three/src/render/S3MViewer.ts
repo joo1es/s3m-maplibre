@@ -234,6 +234,13 @@ export interface S3MViewerOptions {
   onReady?: (entry: S3MDatasetEntry) => void;
   onPick?: (result: PickResult | null) => void;
   onError?: (error: unknown) => void;
+  /**
+   * 首次出现瓦片后自动预热另一种 `shading` 变体（默认开）。
+   *
+   * `flat` / `smooth` 是编译期变体，不预热的话第一次 `setStyle({ shading })` 会同步
+   * 编译着色器、卡一帧。预热在首帧之后异步做，期间跳一两帧渲染，肉眼不可见。
+   */
+  prewarmShading?: boolean;
 }
 
 /* ------------------------------------------------------------------ 内部类型 */
@@ -280,6 +287,21 @@ function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
 function isPointCloudObject(o: THREE.Object3D): o is THREE.Points {
   return (o as unknown as THREE.Points).isPoints === true;
 }
+
+/**
+ * 全局透明度钳到 [0, 1]，**允许到 0**。
+ *
+ * 以前这里有个 0.05 下限，本意是「别让整层彻底看不见、又还在挡东西」。但那个问题
+ * 真正的来源不是透明度，而是「透明物体仍然写深度」：全透明还写深度就会在底图上挖洞。
+ * 现在到 0 时 `renderFrame()` 直接跳过绘制（不写颜色也不写深度），语义就干净了。
+ */
+function clampOpacity(v: number | null | undefined): number {
+  const n = v ?? 1;
+  return n < 0 ? 0 : n > 1 ? 1 : n;
+}
+
+/** 低于这个透明度就当作完全不可见：跳过绘制，避免全透明物体写深度 */
+const OPACITY_EPS = 1e-3;
 
 /* ------------------------------------------------------------------ 可动画的样式键 */
 
@@ -410,10 +432,18 @@ export class S3MViewer {
   private _tileFadeSeq = 0;
   /** setMode 编排的代次，用来作废被新调用顶掉的旧编排 */
   private _modeGen = 0;
+  /** `shading` 另一种变体是否已预热（每个 viewer 只做一次） */
+  private _shadingPrewarmed = false;
+  /** 是否允许自动预热（选项 `prewarmShading`，默认开） */
+  private _prewarmShadingEnabled = true;
+  /** 预热进行中：期间跳过渲染，避免把「翻转后的变体」画到屏幕上 */
+  private _prewarming = false;
   /** 路径运动的规格表：通道 key → 路径 + 偏移 */
   private readonly _pathSpecs = new Map<string, { path: Path; offset: [number, number, number] }>();
   /** 路径采样临时对象，避免每帧 new */
   private readonly _pathScratch = new Float32Array(3);
+  /** 求切线用的第二个采样点（包围盒换算 GPU 路径朝向时用） */
+  private readonly _pathScratch2 = new Float32Array(3);
   /** 预制棱线缓存（Crease Cache）：从外部 source-creases 载入的全局统一 LineSegments，性能最高、视觉最干净 */
   private _creaseLines: THREE.LineSegments | null = null;
   /** 数据自带的棱线对象（LineSegments），改棱线颜色时只刷这些，不再全场景 traverse */
@@ -491,6 +521,7 @@ export class S3MViewer {
     this.onReady = options.onReady ?? (() => {});
     this.onPick = options.onPick ?? (() => {});
     this.onError = options.onError ?? ((e) => console.warn('[s3m]', e));
+    this._prewarmShadingEnabled = options.prewarmShading !== false;
 
     this.groundManager = new GroundManager(options.ground);
     if (!this.scene) {
@@ -621,7 +652,7 @@ export class S3MViewer {
     }
     try {
       // 旧上下文已失效，dispose 可能抛错，忽略即可
-      this.renderer?.dispose();
+      this.renderer?.dispose?.();
     } catch {
       /* noop */
     }
@@ -660,7 +691,7 @@ export class S3MViewer {
     this._pathSpecs.clear();
     this._heightMin = Infinity;
     this._heightMax = -Infinity;
-    this.renderer?.dispose();
+    this.renderer?.dispose?.();
     this.renderer = null;
     this.canvas = null;
   }
@@ -1139,6 +1170,52 @@ export class S3MViewer {
     this.animator.cancel(key);
     this.animator.unregister(key);
     this._pathSpecs.delete(key);
+  }
+
+  /**
+   * 换算 GPU 路径单体在**当前时间**的位置与朝向。
+   *
+   * 位移发生在顶点着色器里，JS 侧要拿到「屏幕上现在在哪」只能按同一套公式在 CPU 复算：
+   * `t = phase + uPathTime * speed`，再按 loop 模式夹到 0~1，最后查弧长表。
+   * 与 StyleMaterial 的 row5 分支逐行对应，改那边时这里必须同步。
+   */
+  private _gpuPathPoseAt(smid: number): { pos: [number, number, number]; yaw: number } | null {
+    const gp = this._featureStyleManager.getFeatureStyle(smid)?.gpuPath;
+    if (!gp) return null;
+    const path = this.gpuPathManager.getPath(gp.pathId);
+    if (!path || path.length <= 0) return null;
+
+    const time = this.uniforms.uPathTime?.value ?? 0;
+    let t = (gp.phase ?? 0) + time * (gp.speed ?? 0);
+    const loop = gp.loop;
+    if (loop === 'clamp' || loop === false) {
+      t = Math.min(1, Math.max(0, t));
+    } else if (loop === 'pingpong') {
+      t = t % 2;
+      if (t < 0) t += 2;
+      t = t > 1 ? 2 - t : t;
+    } else {
+      t = t - Math.floor(t);
+    }
+
+    path.sampleAt(t, this._pathScratch);
+    const pos: [number, number, number] = [this._pathScratch[0], this._pathScratch[1], this._pathScratch[2]];
+
+    let yaw = 0;
+    if (gp.autoHeading !== false) {
+      const d = 1e-3;
+      path.sampleAt(Math.min(1, t + d), this._pathScratch2);
+      let dx = this._pathScratch2[0] - pos[0];
+      let dy = this._pathScratch2[1] - pos[1];
+      if (dx * dx + dy * dy < 1e-8) {
+        // 已经在终点：退回用「后一点减前一点」求切线
+        path.sampleAt(Math.max(0, t - d), this._pathScratch2);
+        dx = pos[0] - this._pathScratch2[0];
+        dy = pos[1] - this._pathScratch2[1];
+      }
+      if (dx * dx + dy * dy >= 1e-8) yaw = Math.atan2(dy, dx);
+    }
+    return { pos, yaw };
   }
 
   /**
@@ -1679,7 +1756,7 @@ export class S3MViewer {
       } else {
         const mat = styledMaterialOf(mesh);
         if (mat) {
-          const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
+          const o = clampOpacity(this.style.opacity);
           // 不写 mat.opacity：全局透明度走共享 uOpacity，材质自身 opacity 保留模型自带 alpha
           mat.transparent = o < 0.999;
           const keepDepth = this.style.depthWrite !== false;
@@ -2110,7 +2187,7 @@ export class S3MViewer {
       u.uAmbientGain.value = s.ambientGain;
     }
     if (u.uOpacity && s.opacity != null) {
-      u.uOpacity.value = Math.min(1, Math.max(0.05, s.opacity));
+      u.uOpacity.value = clampOpacity(s.opacity);
     }
     if (this.outlineMaterial) {
       if (this.outlineMaterial.uniforms.uElevation && s.selectElevation != null) {
@@ -2135,7 +2212,7 @@ export class S3MViewer {
    * 现在逐帧只写一个 float（`uOpacity`），混合开关只在**真正跨过阈值**时切一次。
    */
   private _applyOpacity(): void {
-    const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
+    const o = clampOpacity(this.style.opacity);
     if (this.uniforms.uOpacity) this.uniforms.uOpacity.value = o;
 
     const transparent = o < 0.999;
@@ -2183,6 +2260,59 @@ export class S3MViewer {
       m.needsUpdate = true;
     }
     this._requestRepaint();
+  }
+
+  /**
+   * 预热另一种 `shading` 变体，让首次切换不再同步编译着色器。
+   *
+   * 做法是「把材质翻到另一种变体 → 编译 → 翻回来」：three 的 program 缓存按
+   * cacheKey（含 flatShading / defines）分桶，编译一次就留在缓存里，之后
+   * `_applyShading()` 切过去只是取缓存。
+   *
+   * 翻转期间材质是「错误变体」，所以用 `_prewarming` 让 renderFrame 跳过渲染——
+   * 少画一两帧看不出来，把平滑的楼画成平面的就很明显。
+   * 优先用 `compileAsync`（KHR_parallel_shader_compile），没有就退回同步 `compile`。
+   */
+  async prewarmShading(): Promise<void> {
+    if (this._shadingPrewarmed || this._prewarming) return;
+    const r = this.renderer;
+    const scene = this.scene;
+    const camera = this.camera;
+    if (!r || !scene || !camera) return;
+
+    const mats: THREE.MeshStandardMaterial[] = [];
+    const seen = new Set<THREE.Material>();
+    for (const p of this._pickables.values()) {
+      const m = styledMaterialOf(p.mesh);
+      if (!m || seen.has(m)) continue;
+      seen.add(m);
+      mats.push(m);
+    }
+    if (mats.length === 0) return;
+
+    this._shadingPrewarmed = true;
+    this._prewarming = true;
+    // 当前是 smooth（flatShading = false）就预热 flat，反之预热 smooth
+    const target = this.style.shading === 'smooth';
+    const saved = mats.map((m) => m.flatShading);
+    for (const m of mats) m.flatShading = target;
+
+    try {
+      const anyR = r as unknown as {
+        compileAsync?: (s: THREE.Object3D, c: THREE.Camera) => Promise<unknown>;
+      };
+      if (typeof anyR.compileAsync === 'function') await anyR.compileAsync(scene, camera);
+      else r.compile(scene, camera);
+    } catch {
+      // 预热失败不影响主流程：最坏情况退回「首次切换时编译一次」
+    } finally {
+      for (let i = 0; i < mats.length; i++) {
+        mats[i].flatShading = saved[i];
+        mats[i].needsUpdate = true;
+      }
+      this._prewarming = false;
+      this._requestRepaint();
+    }
   }
 
   /**
@@ -2381,7 +2511,7 @@ export class S3MViewer {
     const mat = new THREE.LineBasicMaterial({
       color: new THREE.Color(s.edgeColor),
       transparent: true,
-      opacity: Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * Math.min(1, Math.max(0.05, s.opacity ?? 1)),
+      opacity: Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * clampOpacity(s.opacity),
       depthWrite: false,
     });
     const lines = new THREE.LineSegments(geo, mat);
@@ -2416,7 +2546,7 @@ export class S3MViewer {
     const fade = this.uniforms.uEdgeFade?.value ?? 1;
     const opacity =
       Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) *
-      Math.min(1, Math.max(0.05, s.opacity ?? 1)) *
+      clampOpacity(s.opacity) *
       fade;
     const u = this.edgeMaterial.uniforms;
     u.uColor.value.set(s.edgeColor);
@@ -2438,7 +2568,7 @@ export class S3MViewer {
     const baseOpacity = this.style.edgeOpacity ?? 0.6;
     mat.opacity =
       baseOpacity *
-      Math.min(1, Math.max(0.05, this.style.opacity ?? 1)) *
+      clampOpacity(this.style.opacity) *
       (this.uniforms.uEdgeFade?.value ?? 1);
     mat.transparent = true;
     mat.polygonOffset = true;
@@ -2997,10 +3127,27 @@ export class S3MViewer {
           rotPiv = off.pivot ? new THREE.Vector3(off.pivot[0], off.pivot[1], off.pivot[2]) : new THREE.Vector3(0, 0, 0);
         }
 
+        // GPU 路径：位移发生在顶点着色器里，包围盒要按同一套公式在 CPU 复算，
+        // 否则「运动中的车」的包围盒会停在路径原点（相机 fitBounds / 属性过滤都会错）。
+        const gpuPose = smid != null ? this._gpuPathPoseAt(smid) : null;
+        let headM3: THREE.Matrix3 | null = null;
+        if (gpuPose && gpuPose.yaw !== 0) {
+          const c = Math.cos(gpuPose.yaw);
+          const s = Math.sin(gpuPose.yaw);
+          // 与着色器的 mat3( c, s, 0, -s, c, 0, 0, 0, 1 ) 等价：GLSL 是列优先，
+          // three 的 Matrix3.set 是行优先，所以这里写成 (c, -s; s, c) 才是同一个矩阵。
+          headM3 = new THREE.Matrix3().set(c, -s, 0, s, c, 0, 0, 0, 1);
+        }
+
         for (const c of corners) {
           if (rotM3 && rotPiv) c.sub(rotPiv).applyMatrix3(rotM3).add(rotPiv);
+          if (headM3) {
+            const piv = rotPiv ?? new THREE.Vector3(0, 0, 0);
+            c.sub(piv).applyMatrix3(headM3).add(piv);
+          }
           if (trans) c.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
           else if (elev) c.z += elev;
+          if (gpuPose) c.add(new THREE.Vector3(gpuPose.pos[0], gpuPose.pos[1], gpuPose.pos[2]));
 
           c.applyMatrix4(mesh.matrixWorld);
           const s = this.sceneAnchor.meterInMercator;
@@ -3243,7 +3390,7 @@ export class S3MViewer {
     const u = this.selectionEdgeMaterial.uniforms;
     u.uColor.value.set(s.outlineColor ?? s.selectColor);
     u.uWidth.value = Math.max(0.1, s.outlineWidthPx ?? 3);
-    u.uOpacity.value = Math.min(1, Math.max(0.05, s.opacity ?? 1));
+    u.uOpacity.value = clampOpacity(s.opacity);
     // 只加全局 selectElevation：单体自己的拔高已经写在状态纹理第 2 行 z 里，
     // 顶点着色器采样时带出来了，这里再加一次就会双重拔高
     if (u.uElevation) u.uElevation.value = s.selectElevation ?? 0;
@@ -3340,6 +3487,10 @@ export class S3MViewer {
     const gl = this.renderer.getContext() as WebGLRenderingContext | null;
     if (gl && typeof gl.isContextLost === 'function' && gl.isContextLost()) return false;
 
+    // shading 预热期间材质是「另一种变体」，这一帧先不画：少画一两帧看不出来，
+    // 把平滑的楼画成平面的一眼就能看出来。
+    if (this._prewarming) return true;
+
     // 先推进动画，再刷脏标记，最后渲染 —— 保证本帧画出来的是最新值
     const animating = this.animator.tick();
 
@@ -3407,7 +3558,11 @@ export class S3MViewer {
 
     this.renderer.setViewport(0, 0, canvas.width, canvas.height);
     this.renderer.resetState();
-    this.renderer.render(this.scene, this.camera);
+    // 完全透明时什么都不画：透明物体照样写深度，画了会在底图上挖出一个洞。
+    // 这里跳过的是「本层的绘制」，宿主自己的清屏 / 底图照旧。
+    if ((this.uniforms.uOpacity?.value ?? 1) > OPACITY_EPS) {
+      this.renderer.render(this.scene, this.camera);
+    }
 
     this._frame++;
     const now = performance.now();
@@ -3419,13 +3574,19 @@ export class S3MViewer {
 
     // 动态着色 / 动画进行中 / 瓦片加载中 / 瓦片层级或可见性改变，都需要宿主继续驱动下一帧。
     // 动画结束那一帧必须精确回到 false，否则 MapLibre 会永远重绘（耗电、发热）。
-    return (
+    const needsNextFrame =
       animating ||
       this.style.mode === STYLE.DYNAMIC ||
       gpuPathActive ||
       this.stats.loading > 0 ||
-      tilesetChanged
-    );
+      tilesetChanged;
+
+    // 首帧画完、场上有材质了，再把另一种 shading 变体编出来（异步，不挡当前帧）
+    if (this._prewarmShadingEnabled && !this._shadingPrewarmed && this._pickables.size > 0) {
+      void this.prewarmShading();
+    }
+
+    return needsNextFrame;
   }
 
   /* ---------------------------------------------------------------- 只读属性 */

@@ -1,6 +1,6 @@
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { S3MLayer, STYLE, AttributeQuery } from 's3m-maplibre';
+import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat } from 's3m-maplibre';
 import pkg from 's3m-maplibre/package.json';
 
 
@@ -1105,6 +1105,118 @@ $('btnOrbitStop').addEventListener('click', () => {
   if (smid == null) return;
   layer.stopPath(smid);
   animStatus('已停止（停在当前位置）');
+});
+
+/* ---------------------------------------------------------------- 拐弯路线（验自动朝向） */
+
+let turnSmid = null;
+let turnPathId = null;
+/** 上一次量好的数据集局部 ENU 基准点，重复点同一栋楼时直接复用 */
+let turnBase = null;
+
+/**
+ * 单体 → 数据集局部 ENU 坐标（米，XY）。
+ *
+ * GPU 路径的坐标是**数据集局部 ENU**：它在顶点着色器里直接叠加到局部顶点上，
+ * 所以路线必须以单体自身位置为原点来铺，否则一绑定就把楼搬到数据集原点去。
+ *
+ * 取点按可靠性分三层退让，任一层成功即可：
+ *   1. 拾取结果的 `point` —— 已经是场景 ENU 米制坐标，最准
+ *   2. 拾取结果的 `lngLat` / `centerLngLat` —— 用与渲染同一个 worldFromLngLat 反算
+ *   3. `getFeatureBounds` 的包围盒中心 —— 兜底
+ *
+ * 注意这里**不能**先判断 `viewer.geo`：MapLibre 上 `createMapLibreGeoAdapter()` 拿不到
+ * `WorldCoordinateHelper` 就返回 null（5.24 的 dist 里根本没这个成员），`viewer.geo`
+ * 因此常年是 null，而渲染层本来就走标准 Web 墨卡托兜底。加了判断只会把能用的路径挡掉。
+ */
+const featureEnu = (feat) => {
+  const v = layer.viewer;
+  const anchor = v?.sceneAnchor;
+  if (!feat || !anchor) return null;
+  const s = anchor.meterInMercator;
+  // 数据集根节点自带 offset（root.position），路径是叠在它内部的局部空间里的，
+  // 不减掉就会整体偏一个数据集偏移。
+  const off = layer.datasets.get(feat.datasetId)?.offset ?? [0, 0, 0];
+  // 拾取点里含了当前 translation（绕圈跑过之后不为 0），扣掉才是「原始位置」
+  const tr = (feat.smid != null ? layer.getFeatureStyle(feat.smid)?.translation : null) ?? [0, 0, 0];
+
+  if (feat.point) {
+    return [feat.point[0] - off[0] - tr[0], feat.point[1] - off[1] - tr[1]];
+  }
+
+  const toEnu = (lng, lat) => {
+    const w = worldFromLngLat(v.geo ?? null, lng, lat);
+    return [(w.x - anchor.x) / s - off[0] - tr[0], -(w.y - anchor.y) / s - off[1] - tr[1]];
+  };
+
+  const ll = feat.lngLat ?? feat.centerLngLat;
+  if (ll) return toEnu(ll[0], ll[1]);
+
+  const b = feat.smid != null ? layer.getFeatureBounds(feat.smid) : null;
+  if (b) return toEnu((b[0][0] + b[1][0]) / 2, (b[0][1] + b[1][1]) / 2);
+
+  return null;
+};
+
+const stopTurn = () => {
+  if (turnSmid == null) return;
+  layer.unbindGPUPath(turnSmid);
+  // 只要路径库非空 renderFrame 就一直返回 true，必须把路径本身也注销掉
+  if (turnPathId != null) layer.unregisterGPUPath(turnPathId);
+  turnSmid = null;
+  turnPathId = null;
+};
+
+$('btnTurn').addEventListener('click', () => {
+  const feat = currentFeature;
+  if (feat?.smid == null) {
+    alert('请先在地图上点击选中一栋建筑');
+    return;
+  }
+  // 同一个单体重复点：直接复用上一次量好的基准点。路径跑起来之后单体已经不在原位，
+  // 这时候再拿拾取点算 base 会累积偏移。
+  const reuse = turnSmid === feat.smid ? turnBase : null;
+  stopTurn();
+  const base = reuse ?? featureEnu(feat);
+  if (!base) {
+    animStatus('拿不到单体位置（场景锚点还没就绪），稍后再试');
+    return;
+  }
+
+  // 120m 见方的方形回路：四个直角弯。直线看不出朝向对不对，拐弯才看得出来。
+  const R = 120;
+  const route = [
+    [0, 0],
+    [R, 0],
+    [R, R],
+    [0, R],
+    [0, 0],
+  ].map(([x, y]) => [base[0] + x, base[1] + y, 0]);
+
+  // 绕自己转：pivot 取单体自己的位置，否则会绕数据集原点甩出去
+  layer.setFeatureStyle(feat.smid, {
+    ...(layer.getFeatureStyle(feat.smid) ?? {}),
+    pivot: [base[0], base[1], 0],
+  });
+  turnSmid = feat.smid;
+  turnBase = base;
+  turnPathId = layer.bindGPUPath(feat.smid, route, {
+    speed: 0.06,
+    phase: 0,
+    loop: 'loop',
+    autoHeading: true,
+  });
+  animStatus(`SMID ${feat.smid} 走方形回路（4 个直角弯 · 自动朝向）`);
+});
+
+$('btnTurnStop').addEventListener('click', () => {
+  if (turnSmid == null) {
+    animStatus('没有正在跑的回路');
+    return;
+  }
+  const smid = turnSmid;
+  stopTurn();
+  animStatus(`SMID ${smid} 已解绑（回到原位）`);
 });
 
 $('btnRaise').addEventListener('click', () => {

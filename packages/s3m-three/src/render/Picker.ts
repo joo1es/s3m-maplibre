@@ -25,12 +25,25 @@ const PICK_VERT = /* glsl */ `
   #endif
   uniform float uObjectId;
   uniform sampler2D uBatchTex;
+  uniform sampler2D uBatchTex2;
+  uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
+  uniform sampler2D uPathTex;
+  uniform float uPathCount;
+  uniform float uPathTime;
+  uniform int uPathTexActive;
   uniform float uSelBatch;
   uniform float uSelWhole;
   uniform float uSelElevation;
   varying float vBatch;
+
+  /** 交叉淡化期间也要读「屏幕上正在显示的那份」，否则过渡中点到的是旧位置 */
+  vec4 s3mPickSample( vec2 uv ) {
+    vec4 a = texture2D( uBatchTex, uv );
+    if ( uBatchMix <= 0.0001 ) return a;
+    return mix( a, texture2D( uBatchTex2, uv ), uBatchMix );
+  }
 
   void main() {
     float s3mBatch;
@@ -43,20 +56,80 @@ const PICK_VERT = /* glsl */ `
       vBatch = aBatchId;
     #endif
 
-    // 单体状态（平移 / 隐藏）必须和主着色器用同一份数据、同一套算法：
-    // 平移只发生在顶点着色器里，拾取这一趟如果还按原始坐标画，移位的楼就点不中。
+    // 单体状态必须和主着色器用同一份数据、同一套算法：位移 / 旋转 / 隐藏 / GPU 路径
+    // 全都只发生在顶点着色器里，拾取这一趟如果还按原始坐标画，动过的楼就点不中。
+    // 状态纹理共 6 行，行序与 StyleMaterial 的 VERT_SETUP 严格一一对应。
     vec3 p = position;
+    mat3 rot = mat3( 1.0 );
+    vec3 pivot = vec3( 0.0 );
+    vec3 offset = vec3( 0.0 );
+    bool hidden = false;
+
     if ( uBatchTexActive > 0 && s3mBatch >= 0.0 ) {
-      vec4 state = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.25 ) );
+      float u = ( s3mBatch + 0.5 ) / uBatchTexWidth;
+      // Row 0：rgb = 配色，a = 抬高 / < -0.5 表示隐藏
+      vec4 state = s3mPickSample( vec2( u, 0.08333333 ) );
       if ( state.a < -0.5 ) {
-        p = vec3( 0.0 );
+        hidden = true;
       } else {
-        vec4 offset = texture2D( uBatchTex, vec2( ( s3mBatch + 0.5 ) / uBatchTexWidth, 0.75 ) );
-        p += offset.xyz;
-        if ( offset.z == 0.0 && state.a > 0.0 ) {
-          p.z += state.a;
+        // Row 1：平移（z 已包含抬高）
+        vec4 r1 = s3mPickSample( vec2( u, 0.25 ) );
+        offset = r1.xyz;
+        if ( offset.z == 0.0 && state.a > 0.0 ) offset.z = state.a;
+
+        // Row 2/3/4：3x3 姿态矩阵（列优先）+ 轴心
+        vec4 r2 = s3mPickSample( vec2( u, 0.41666667 ) );
+        vec4 r3 = s3mPickSample( vec2( u, 0.58333333 ) );
+        vec4 r4 = s3mPickSample( vec2( u, 0.75 ) );
+        rot = mat3(
+          vec3( r2.x, r3.x, r4.x ),
+          vec3( r2.y, r3.y, r4.y ),
+          vec3( r2.z, r3.z, r4.z )
+        );
+        pivot = vec3( r2.w, r3.w, r4.w );
+
+        // Row 5：GPU 路径动画，与主着色器逐行对齐（含 loop / pingpong / clamp 与自动朝向）
+        if ( uPathTexActive > 0 && uPathCount > 0.0 ) {
+          vec4 r5 = s3mPickSample( vec2( u, 0.91666667 ) );
+          float pathId = r5.x;
+          float speed = r5.y;
+          float phase = r5.z;
+          float mode = r5.w;
+          if ( pathId >= 0.0 && mode > 0.5 ) {
+            float t = phase + uPathTime * speed;
+            bool autoHeading = true;
+            if ( mode >= 4.0 ) {
+              autoHeading = false;
+              mode -= 3.0;
+            }
+            if ( mode < 1.5 ) {
+              t = fract( t );
+            } else if ( mode < 2.5 ) {
+              t = clamp( t, 0.0, 1.0 );
+            } else {
+              t = mod( t, 2.0 );
+              t = ( t > 1.0 ) ? ( 2.0 - t ) : t;
+            }
+            vec4 pathSample = texture2D(
+              uPathTex,
+              vec2( ( t * 255.0 + 0.5 ) / 256.0, ( pathId + 0.5 ) / uPathCount )
+            );
+            if ( autoHeading ) {
+              float c = cos( pathSample.w );
+              float s = sin( pathSample.w );
+              // 列优先：(c, s) 是第 0 列 → 绕 Z 转 +yaw，与 StyleMaterial / EdgeLines 逐位一致
+              rot = mat3( c, s, 0.0, -s, c, 0.0, 0.0, 0.0, 1.0 ) * rot;
+            }
+            offset += pathSample.xyz;
+          }
         }
       }
+    }
+
+    if ( hidden ) {
+      p = vec3( 0.0 );
+    } else {
+      p = rot * ( p - pivot ) + pivot + offset;
     }
 
     // 选中单体自身的拔高（selectElevation）
@@ -114,13 +187,28 @@ const DUMMY_STATE_TEX = (() => {
   return tex;
 })();
 
+/** 没有 GPU 路径库时用的占位（1x1 全 0，采样出来 pathId = 0 但 uPathTexActive = 0 会跳过） */
+const DUMMY_PATH_TEX = (() => {
+  const tex = new THREE.DataTexture(new Float32Array([0, 0, 0, 0]), 1, 1, THREE.RGBAFormat, THREE.FloatType);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.needsUpdate = true;
+  return tex;
+})();
+
 function createPickMaterial(objectId: number): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     uniforms: {
       uObjectId: { value: objectId },
       uBatchTex: { value: DUMMY_STATE_TEX },
+      uBatchTex2: { value: DUMMY_STATE_TEX },
+      uBatchMix: { value: 0 },
       uBatchTexWidth: { value: 1 },
       uBatchTexActive: { value: 0 },
+      uPathTex: { value: DUMMY_PATH_TEX },
+      uPathCount: { value: 1 },
+      uPathTime: { value: 0 },
+      uPathTexActive: { value: 0 },
       uSelBatch: { value: -1 },
       uSelWhole: { value: 0 },
       uSelElevation: { value: 0 },
@@ -214,29 +302,40 @@ export class Picker {
       if (!ud.pickMaterial) ud.pickMaterial = createPickMaterial(ud.pickId);
       if ((mesh as THREE.InstancedMesh).isInstancedMesh) instancedPickIds.add(ud.pickId);
 
-      // 把当前的「单体状态纹理」抄给拾取材质：抬高量是逐单体写在里面的，
-      // 抄的是同一个纹理对象，主材质那边更新后这里自动跟着变。
+      // 把当前的「单体状态纹理」抄给拾取材质：抬高 / 平移 / 姿态 / GPU 路径都是逐单体
+      // 写在里面的，抄的是同一个纹理与同一批 uniform 对象，主材质那边更新后这里自动跟着变。
       const prev = mesh.material;
       const pm = ud.pickMaterial as THREE.ShaderMaterial;
       const src = (Array.isArray(prev) ? prev[0] : prev) as THREE.Material & {
         userData?: Record<string, THREE.IUniform>;
+        uniforms?: Record<string, THREE.IUniform>;
       };
       const batchTex = src?.userData?.uBatchTex;
       if (batchTex) {
         pm.uniforms.uBatchTex.value = batchTex.value;
+        pm.uniforms.uBatchTex2.value = src?.userData?.uBatchTex2?.value ?? batchTex.value;
         pm.uniforms.uBatchTexWidth.value = (src?.userData?.uBatchTexWidth?.value as number) ?? 1;
         pm.uniforms.uBatchTexActive.value = (src?.userData?.uBatchTexActive?.value as number) ?? 0;
       } else {
         pm.uniforms.uBatchTex.value = DUMMY_STATE_TEX;
+        pm.uniforms.uBatchTex2.value = DUMMY_STATE_TEX;
         pm.uniforms.uBatchTexWidth.value = 1;
         pm.uniforms.uBatchTexActive.value = 0;
       }
+      // 交叉淡化与 GPU 路径的 uniform 是共享对象（挂在材质 userData 上），
+      // 抄引用即可，不需要每帧同步数值
+      pm.uniforms.uBatchMix.value = (src?.userData?.uBatchMix?.value as number) ?? 0;
+      pm.uniforms.uPathTex.value = src?.userData?.uPathTex?.value ?? DUMMY_PATH_TEX;
+      pm.uniforms.uPathCount.value = (src?.userData?.uPathCount?.value as number) ?? 1;
+      pm.uniforms.uPathTime.value = (src?.userData?.uPathTime?.value as number) ?? 0;
+      pm.uniforms.uPathTexActive.value = (src?.userData?.uPathTexActive?.value as number) ?? 0;
       // 选中那栋自身的拔高也要算，否则选中后再点它会点空
       pm.uniforms.uSelBatch.value = (src?.userData?.uSelBatch?.value as number) ?? -1;
       pm.uniforms.uSelWhole.value = (src?.userData?.uSelWhole?.value as number) ?? 0;
-      // uSelElevation 是共享 uniform，挂在材质 uniforms 上而不是 userData
       pm.uniforms.uSelElevation.value =
-        ((src as THREE.ShaderMaterial | undefined)?.uniforms?.uSelElevation?.value as number) ?? 0;
+        (src?.userData?.uSelElevation?.value as number) ??
+        (src?.uniforms?.uSelElevation?.value as number) ??
+        0;
 
       swapped.push([mesh, prev]);
       mesh.material = pm;

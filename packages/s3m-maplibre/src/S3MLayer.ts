@@ -205,6 +205,7 @@ export class S3MLayer {
       toneMappingExposure: options.toneMappingExposure,
       totalMaxTiles: options.totalMaxTiles,
       attributes: options.attributes,
+      prewarmShading: options.prewarmShading,
       // 三个宿主能力全部走回调注入，viewer 不碰任何地图 API
       onRequestRepaint: () => this.map?.triggerRepaint(),
       getBearing: () => this.map?.getBearing?.() ?? 0,
@@ -567,6 +568,16 @@ export class S3MLayer {
   /** 全局棱线开关，可带淡入淡出 */
   setEdges(enabled: boolean, transition?: TransitionOptions): void {
     this.viewer.setEdges(enabled, transition);
+  }
+
+  /**
+   * 手动预热另一种 `shading` 变体（`flat` / `smooth`）。
+   *
+   * 构造选项 `prewarmShading` 默认已开，首帧后会自动做一次；只有在你关掉自动预热、
+   * 又想在某个时机（比如进入编辑模式前）自己预热时才需要调它。
+   */
+  prewarmShading(): Promise<void> {
+    return this.viewer.prewarmShading();
   }
 
   /** 挂载预制棱线缓存（source-creases.f32 这类 Float32 段缓冲），比逐网格现算快得多 */

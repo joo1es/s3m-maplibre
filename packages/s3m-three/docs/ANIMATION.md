@@ -281,10 +281,10 @@ animator.to(key, 1, { duration, easing, onComplete: () => { if (loop) run(); } }
 
 两条路线，按规模选：
 
-- **CPU 路线（N ≤ 几千，已实现）**：每帧对每个 mover 调一次 `sample()`，结果写进 texel。N 个 mover 分摊在 M 个 mesh 上，每帧 M 次纹理上传。1000 个 mover 分布在 50 个 mesh 是舒服的区间。
-- **GPU 路线（N 上万，未做）**：路径采样表烘成一张 `RGBA32F` 纹理（`x, y, z, s`），单体参数（`pathId / phase / speed`）写进状态纹理第 4 行，顶点着色器自己算位置，CPU 每帧只写一个 `uTime`。代价是每顶点多两次纹理采样，且二分查表要改成「按归一化 s 直接索引采样表」，精度靠采样表密度换。
+- **CPU 路线（N ≤ 几千，`followPath`）**：每帧对每个 mover 调一次 `sample()`，结果写进 texel。N 个 mover 分摊在 M 个 mesh 上，每帧 M 次纹理上传。1000 个 mover 分布在 50 个 mesh 是舒服的区间。
+- **GPU 路线（N 上万，`bindGPUPath`）**：路径按等弧长烘成 `RGBA32F` 纹理（`x, y, z, yaw`，256 采样点/条），单体参数（`pathId / speed / phase / mode`）写进状态纹理第 5 行，顶点着色器自己算位置与朝向，CPU 每帧只写一个 `uPathTime`。
 
-先做 CPU 路线，量到瓶颈再上 GPU。实际业务里路径运动通常只有几百个目标。
+两条路线并存，按规模选。GPU 路线要注意三点：① 位移只在着色器里，JS 侧要「当前在哪」必须复算——拾取着色器（`PICK_VERT`）已经采样同一份路径纹理，`getFeatureBounds()` 也按同一公式在 CPU 算，改一处就要同步另外两处；② 路径 ID 决定纹理行，别用稀疏大 ID；③ 只要路径库非空 `renderFrame()` 就返回 `true`，暂停时记得 `unbindGPUPath` + `unregisterGPUPath`，否则一直空转重绘。
 
 注意 `followPath` 和 `moveFeature` 都写 `translation`，**别同时驱动同一个单体**。
 
@@ -438,9 +438,15 @@ layer.animation.timeline([a, b, c]);       // 顺序 / 并行编排
 | 1 | `Animator` + 曲线库 + 通道表；uniform 通道；`setOpacity` 改 `uOpacity` | ✅ 已完成 |
 | 2 | 单体通道补全（颜色 / 抬高 / 透明度 / 位移）+ `stagger` | ✅ 已完成 |
 | 3 | 移动配套：视锥剔除 + 棱线跟随（含选中棱线） | ✅ 已完成 |
-| 4 | 结构编排：`setEdges` 淡入淡出、`setMode` fade-through、`shading` 预热 | 部分（shading 预热未做） |
-| 5 | 姿态：状态纹理扩到 3 行（旋转 / 缩放），四处着色器同步改 | 待做 |
-| 6 | 路径运动（CPU 弧长 ✅）→ GPU 侧；双纹理交叉淡化 | 部分（GPU / 双纹理待做） |
+| 4 | 结构编排：`setEdges` 淡入淡出、`setMode` fade-through、`shading` 预热 | ✅ 已完成（预热在首帧后自动做一次） |
+| 5 | 姿态：状态纹理扩到 6 行（姿态矩阵 + 轴心），四处着色器同步改 | ✅ 已完成 |
+| 6 | 路径运动（CPU 弧长 → GPU 纹理）→ 双纹理交叉淡化 | ✅ 已完成 |
+| 7 | 移动后的「JS 侧位置」：拾取着色器采样路径纹理、`getFeatureBounds` CPU 复算 | ✅ 已完成 |
+| 8 | 全局 `opacity` 允许到 0（到 0 时跳过绘制，不写深度） | ✅ 已完成 |
+
+> 状态纹理当前是 **6 行**：`0` 配色/抬高/隐藏、`1` 平移（z 含抬高）、`2~4` 姿态矩阵 + 轴心、`5` GPU 路径参数。
+> 采样常量 `0.0833 / 0.25 / 0.4167 / 0.5833 / 0.75 / 0.9167` 散落在 `StyleMaterial`（主 + 描边）、
+> `EdgeLines`、`Picker` 四处，改行数必须四处一起改。
 
 ### 已完成部分的实际 API
 
@@ -477,6 +483,9 @@ await layer.setMode(STYLE.HEIGHT, { duration: 300, dim: 0.4 });
 
 // 新瓦片淡入（初次加载 / LOD 换瓦都生效）
 layer.setStyle({ fadeIn: 500 });
+
+// shading 切换：首帧后已自动预热另一种变体，这里只是显式再来一次
+await layer.prewarmShading();
 
 // 调度器直连
 layer.animation.cancel('style.opacity');  // 停在当前值
@@ -528,7 +537,8 @@ layer.animation.budgetMs = 3;             // 单帧写入预算
 8. **移动的配套**：视锥剔除与棱线跟随都已修（§6.1①②）。拾取与包围盒本来就跟着走，不用改。
 9. **路径运动的恒速**：缓动必须作用在弧长上，不是顶点索引（§6.3）。否则顶点疏密直接变成速度疏密。
 10. **spring 不收敛**：没有收敛判据的 spring 会让 `needsNextFrame` 永远为 true。判据要卡到位（位移与速度同时 < 1e-3）。
-11. **纹理行数改动是全局的**：状态纹理从 2 行扩到 3 行时，`0.25 / 0.75` 这些采样常量散落在四个着色器里，必须一起改（§6.2）。
+11. **纹理行数改动是全局的**：状态纹理现在 6 行，`0.0833 / 0.25 / 0.4167 / 0.5833 / 0.75 / 0.9167` 这些采样常量散落在 `StyleMaterial`（主 + 描边）、`EdgeLines`、`Picker` 四处，必须一起改（§6.2）。漏掉 `Picker` 的后果是「看得见、点不中」。
 12. **启动动画必须踢帧循环**：MapLibre 按需驱动，`animator.to()` 不请求重绘的话动画永远等不到第一帧，表现为「点了没反应，取消选中才跳到终态」。见 §9 的 `onActive`。
 13. **移动与 LOD 的关系**：位移不参与 LOD 判定，瓦片按原位置切；把单体移到很远的地方不会触发更细的瓦片。这是已知限制，不是 bug，别试图在 animator 里修。
+14. **GLSL 列优先 vs three 行优先**：自动朝向的旋转矩阵在四处着色器里都写成 `mat3( c, s, 0, -s, c, 0, 0, 0, 1 )`（第 0 列 = `(c, s)`，即绕 Z 转 **+yaw**），而 `getFeatureBounds()` 里等价的 three 写法是 `Matrix3().set(c, -s, 0, s, c, 0, 0, 0, 1)`。这两串数字看起来不一样，其实是同一个矩阵；抄错顺序的后果是模型**左右镜像**着走——直线完全正常，一拐弯就露馅，很难一眼看出来。`tests/unit/gpu-path-bounds.test.ts` 会读源码把四处一起钉住。
 

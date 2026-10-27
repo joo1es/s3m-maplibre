@@ -10,6 +10,7 @@
 - [快速开始](#快速开始)
 - [与 s3m-three 的分界](#与-s3m-three-的分界)
 - [`S3MLayer`](#s3mlayer)
+- [动画与过渡](#动画与过渡)
 - [投影](#投影)
 - [宿主兼容与已知限制](#宿主兼容与已知限制)
 - [数据与许可](#数据与许可)
@@ -91,6 +92,7 @@ map.on('load', () => map.addLayer(layer));
 以下内容本文档不再重复，见 [s3m-three API 参考](../s3m-three/docs/API.md)：
 
 - **样式系统**（`S3MStyle` 全字段、着色模式、`shading` / 光照细节）
+- **动画内核**（完整的通道表、曲线库、`Animator` / `Path` / GPU 路径实现细节，见 [s3m-three 动画与过渡](../s3m-three/docs/API.md#动画与过渡)）
 - **核心概念**（坐标链路、锚点、瓦片与 LOD、单体化与 batch 粒度）
 - **按业务字段着色 / 过滤 / 抬高**（`colorByField` / `filterByField` / `elevateByField` / `AttributeQuery`）
 - **底层 API**（`parseS3MB` / MeshOpt / `S3MTileset` / 单体属性工具）
@@ -161,18 +163,22 @@ https://host/iserver/services/3D-xxx/rest/realspace/datas/<数据源名>/config
 ### 样式
 
 ```ts
-setStyle(patch?: Partial<S3MStyle>): void
+setStyle(patch?: Partial<S3MStyle>, transition?: TransitionOptions): void
 getStyle(): S3MStyle & { modeLabel: string }
-setOpacity(opacity: number): void
+setOpacity(opacity: number, transition?: TransitionOptions): void
 ```
 
-`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）之外，其余字段都是 uniform / 材质状态更新，热切换零成本。字段含义见 [s3m-three 样式章节](../s3m-three/docs/API.md#样式s3mstyle)。
+`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）、`edges` / `edgeThreshold`（结构变更）之外，其余字段都是 uniform / 材质状态更新，热切换成本很低。字段含义见 [s3m-three 样式章节](../s3m-three/docs/API.md#样式s3mstyle)。
+
+带 `transition` 时，能插值的字段逐帧过渡，不能插值的仍即时生效，详见[动画与过渡](#动画与过渡)。
 
 ### 棱线
 
 ```ts
-setEdges(enabled: boolean): void
+setEdges(enabled: boolean, transition?: TransitionOptions): void
 ```
+
+带 `transition` 时只对屏幕空间等宽棱线做淡入淡出（`uEdgeFade`），几何仍按 8ms 切片构建；关闭时淡完才释放几何。数据自带的线段包直接切 `visible`，不会淡入。详见[动画与过渡](#动画与过渡)。
 
 优先用**数据自带的棱线包**（`primitiveType === 13` 的索引包，本质是线段对）：解析时就建好 `LineSegments`，开关只是切 `visible`，成本为零，颜色跟随 `style.edgeColor`。
 
@@ -260,12 +266,14 @@ setExcavationBounds(bounds: [number, number, number, number] | null): void
 
 ```ts
 getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
-setProjection(mode: 'perspective' | 'orthographic'): void  // 投影模式，见[投影](#投影)
+setProjection(mode: 'perspective' | 'orthographic', transition?: TransitionOptions): void  // 投影模式，可平滑过渡，见[投影](#投影)
 setLodRangeScale(scale: number, datasetId?: string): void  // 缩放 LOD 切换距离阈值（>1 更倾向粗模，<1 提前细化）
 readonly lodRangeScale: number
 readonly stats: Stats
 readonly fps: number
 readonly projection: 'perspective' | 'orthographic'
+readonly projectionT: number                              // 0 = 纯透视，1 = 纯正交
+readonly animation: S3MViewer['animator']                 // 动画调度器，见[动画与过渡](#动画与过渡)
 dispose(): void
 ```
 
@@ -278,11 +286,219 @@ interface Stats {
 
 ---
 
+## 动画与过渡
+
+> 完整的通道表、曲线库、`Animator` / `Path` / `GPUPathManager` API 与实现细节见 [s3m-three 动画与过渡](../s3m-three/docs/API.md#动画与过渡)。本节只列 `S3MLayer` 的入口，以及 MapLibre 宿主下的差异。
+
+动画能力全部来自内部 `viewer.animator`。**不需要自己开 `requestAnimationFrame`**：`layer.render()` 每帧调用 `viewer.renderFrame()` → `animator.tick()`，返回 `true` 时自动 `map.triggerRepaint()`；启动动画时 `animator.onActive` 也会主动踢一帧。
+
+```ts
+// 调度器直连
+layer.animation.cancel('style.opacity');   // 停在当前值，不回弹
+layer.animation.finish('style.opacity');   // 直接跳到终值
+layer.animation.budgetMs = 3;              // 单帧写入预算（默认 2.5ms）
+layer.animation.activeCount;               // 当前活跃 track 数
+```
+
+`layer.animation` 是只读 getter，返回 `viewer.animator`，不能整体赋值。也不要手动调 `tick()`，否则会双倍推进。
+
+### 过渡参数
+
+`TransitionOptions` 与 s3m-three 完全一致：
+
+```ts
+interface TransitionOptions {
+  duration?: number;       // 毫秒，0 / 不传 = 立即生效
+  delay?: number;
+  easing?: EasingName | EasingFn;  // 默认 'linear'
+  retarget?: 'proportional' | 'fixed';
+  spring?: { stiffness: number; damping: number; epsilon?: number };
+  stagger?: number;        // 仅 animateFeatures 消费
+  onComplete?: () => void; // cancel 不回调
+}
+```
+
+语义见 [s3m-three 过渡参数](../s3m-three/docs/API.md#过渡参数transitionoptions)。两个最容易踩的点：**默认曲线是 `linear`**（不是 CSS `ease`）；**一次调用的参数对所有通道生效**，要不同时长请分开调用。
+
+### 样式 / 棱线 / 模式
+
+```ts
+setStyle(patch?: Partial<S3MStyle>, transition?: TransitionOptions): void
+setOpacity(opacity: number, transition?: TransitionOptions): void
+setEdges(enabled: boolean, transition?: TransitionOptions): void
+setMode(mode: S3MStyle['mode'], options?: { duration?: number; dim?: number }): Promise<void>
+prewarmShading(): Promise<void>
+```
+
+```ts
+// 能插值的字段走过渡
+layer.setStyle({ colorA: '#ef4444', opacity: 0.6 }, { duration: 600, easing: 'easeOutCubic' });
+layer.setOpacity(0.5, { duration: 400 });
+
+// 棱线淡入淡出（几何仍按 8ms 切片建）
+layer.setEdges(true, { duration: 400 });
+layer.setEdges(false, { duration: 300 });
+
+// uMode 是 int，插不了值：压暗 → 换 → 亮回来
+await layer.setMode(STYLE.HEIGHT, { duration: 300, dim: 0.35 });
+```
+
+- 可动画字段表、颜色空间、`fadeIn` 的代价见 [s3m-three 样式过渡](../s3m-three/docs/API.md#样式过渡)。
+- `mode` / `shading` / `edges` / `edgeThreshold` 不参与插值：`mode` 用 `setMode`，`edges` 用 `setEdges`，`shading` 是编译期宏，`edgeThreshold` 会重建棱线几何。
+- `getStyle()` 立即返回目标值，动画进行中也一样；当前显示值在 `viewer.style`。
+- 全局 `opacity` 允许到 0：到 0 时本层跳过绘制（不写颜色也不写深度），底图不会被挖洞。`getStyle().opacity` 与屏幕一致。
+- `setStyle({ fadeIn: 500 })` 让**之后新加载的瓦片**（含 LOD 换瓦）淡入，默认 0；淡入期间这些瓦片会进透明队列。
+- `shading` 首次切换不再现场编译：首帧后会自动预热另一种变体（构造选项 `prewarmShading`，默认开）。要自己挑时机就关掉它再调 `layer.prewarmShading()`。
+
+### 单体动画
+
+```ts
+animateFeature(smid: number, style: Partial<FeatureStyle>, transition?: TransitionOptions): void
+animateFeatures(smids: number[], style: Partial<FeatureStyle>, transition?: TransitionOptions): void
+moveFeature(smid: number, translation: [number, number, number], transition?: TransitionOptions): void
+moveFeatureBy(smid: number, delta: [number, number, number], transition?: TransitionOptions): void
+rotateFeature(smid: number, rotation: FeatureStyle['rotation'], pivot?: [number, number, number], transition?: TransitionOptions): void
+rotateFeatureBy(smid: number, deltaRotation: number | [number, number, number], pivot?: [number, number, number], transition?: TransitionOptions): void
+```
+
+```ts
+// 点击单体后抬高并变色
+map.on('click', (e) => {
+  const hit = layer.pickFromEvent(e);
+  if (hit?.smid != null) {
+    layer.animateFeature(
+      hit.smid,
+      { elevation: 80, color: '#ef4444' },
+      { duration: 600, easing: 'easeOutBack' },
+    );
+  }
+});
+
+// 批量错峰：每个单体延迟 i × 8ms
+layer.animateFeatures(smids, { opacity: 0.2 }, { duration: 500, stagger: 8 });
+```
+
+- `translation` 是相对原始位置的**绝对**偏移（米，场景 ENU）；增量用 `moveFeatureBy`。
+- `rotation` 支持数字（绕 Z 轴弧度）、欧拉角、四元数或 three 的 `Euler` / `Quaternion` / `Matrix`；`pivot` 是**局部坐标**轴心，绕模型原点转通常会把楼甩出去。
+- `hidden` 不可插值，立即生效；要淡出再隐藏，用 `animateFeature({ opacity: 0 }, { onComplete: () => layer.setFeatureStyle(smid, { hidden: true }) })`。
+- 位移 / 旋转会自动关闭受影响网格的视锥剔除，值归零后恢复。
+- `removeFeatureStyle` / `clearFeatureStyles` 会回收该单体的动画通道，动画随之中断且不回调。
+
+完整字段语义与坑见 [s3m-three 单体动画](../s3m-three/docs/API.md#单体动画)。
+
+### 路径运动
+
+```ts
+followPath(smid: number, points: Path | ArrayLike<number> | Array<[number, number, number]>, options?: PathFollowOptions): void
+stopPath(smid: number): void
+```
+
+```ts
+layer.followPath(smid, [[0, 0, 0], [80, 0, 0], [80, 60, 0]], {
+  duration: 6000,
+  loop: true,
+  offset: [baseX, baseY, 0],
+});
+layer.stopPath(smid);   // 停在当前位置
+```
+
+- 路径点是**数据集局部 ENU 米坐标**（相对该单体所属数据集的锚点；单数据集时就是场景 ENU），不是经纬度；需要经纬度路线时先换算成 ENU 再加 `offset`。
+- 缓动作用在**弧长**上，不是顶点索引，顶点疏密不均也不会忽快忽慢。
+- `duration` 与 `speed`（米/秒）二选一，都不给默认 2000ms；`loop` 每次从起点重来，`closed` + `loop` 才是无缝循环。
+- 对同一 smid 再次 `followPath` 会从新路径的**起点**重新开始，不是从当前位置接续；要接续就先 `stopPath`，自行裁掉已走路段并换算 `offset`。
+- 不要和 `moveFeature` 同时驱动同一个单体，两者都写 `translation`。
+- 几十到几千个 mover 用 `followPath`；上万个用下面的 GPU 路径。
+
+### GPU 路径动画（万级）
+
+```ts
+registerGPUPath(points, opts?: { id?: number; name?: string; closed?: boolean }): number
+unregisterGPUPath(id: number): boolean
+getGPUPathManager(): GPUPathManager
+bindGPUPath(smid, path: number | Path | ArrayLike<number> | Array<[number, number, number]>, options?: Omit<GPUPathOptions, 'pathId'>): number
+unbindGPUPath(smid: number): void
+setGPUPathProgress(smid: number, progress: number): void
+setGPUPathTime(time: number, autoAdvance?: boolean): void
+getGPUPathTime(): number
+```
+
+```ts
+const pathId = layer.registerGPUPath([[0, 0, 0], [200, 0, 0], [200, 120, 0]]);
+
+// 共享同一条路径的车流；速度是「归一化进度/秒」
+for (const smid of vehicleSmids) {
+  layer.bindGPUPath(smid, pathId, { speed: 0.05, phase: Math.random(), loop: 'loop' });
+}
+
+layer.setGPUPathTime(0);   // 冻结自动推进，改由调用方每帧给时间
+```
+
+- 路径按等弧长烘成 `RGBA32F` 纹理（每行一条路径、256 个采样点，`RGBA = x, y, z, yaw`），单体参数写进状态纹理第 5 行；CPU 每帧只写一个 `uPathTime`。
+- `speed` 是归一化进度/秒（`0.05` ≈ 20 秒一圈），`phase` 是初始相位，`loop` 支持 `'loop' | 'pingpong' | 'clamp'`，`autoHeading` 默认按切线自动转向。
+- 路径 ID 决定纹理行，避免使用很大的稀疏 ID；不传 `id` 时自增分配。
+- **自动推进按帧累加 `0.016` 秒**，低帧率下会变慢。需要严格速度时用 `setGPUPathTime(elapsedSeconds)` 自己驱动（默认会冻结自动推进），再传 `true` 恢复。
+- `setGPUPathProgress(smid, t)` 会把该单体的 `speed` 置 0、`phase` 设为进度，用于手动定位。
+- `unbindGPUPath` 删除 `gpuPath` 配置；绑定后该网格的视锥剔除会被关闭（解绑不会自动恢复）。
+- **拾取与包围盒都跟着走**：拾取着色器与主着色器采样同一份路径纹理，`getFeatureBounds()` 用同一公式在 CPU 复算位置与朝向。仍按原位置的只有属性过滤这类不涉及空间的逻辑。
+
+### 整批过渡（双纹理交叉淡化）
+
+```ts
+crossFadeStyles(
+  targetStyles: Map<number, FeatureStyle> | Record<string | number, FeatureStyle>,
+  transition?: TransitionOptions
+): void
+```
+
+```ts
+// 目标表是全量替换：这里只保留 101 / 102 的自定义样式
+layer.crossFadeStyles(new Map([
+  [101, { color: '#22c55e', elevation: 0 }],
+  [102, { color: '#3b82f6', elevation: 20 }],
+]), { duration: 800, easing: 'easeInOutCubic' });
+```
+
+- 目标表是**全量替换**，不是合并。提交时会清空现有 `featureStyles` 再写入目标表；没出现在表里的单体将失去自定义样式。
+- 适合「全城换色 / 换高度 / 换显隐」，CPU 每帧只写一个 `uBatchMix`；`colorByField` / `setThematicColors` 本身不会自动过渡，需要过渡就自己构造目标表。
+- 不要手动 `animator.cancel('batch.mix')`（会停在中间混合值且不提交）；要终止就再调一次 `crossFadeStyles`，或 `finish('batch.mix')` 走完提交。
+- 过渡按调用时的网格快照准备，中途新加载的瓦片不参与本次混合。
+
+### 投影过渡
+
+```ts
+layer.setProjection('orthographic', { duration: 800, easing: 'easeInOutCubic' });
+layer.projection;    // 目标模式，立即更新
+layer.projectionT;   // 0 = 纯透视，1 = 纯正交，过渡中在两者之间
+```
+
+`projection.t` 是 `S3MLayer` 自己注册到 `viewer.animator` 的通道，打断时从当前插值比例续走。默认曲线 `easeInOutCubic`；`duration` 为 0 且无 `spring` 时立即切换。**正交只作用于本层**，底图 / 地形 / DOM 仍是透视，见[投影](#投影)。
+
+### 相机动画
+
+不要 tween 内部 `viewer.camera`：MapLibre 每帧都会用宿主矩阵覆盖它，表现为抖动。相机一律走宿主：
+
+```ts
+map.easeTo({ center, zoom, pitch, bearing, duration: 800 });
+map.flyTo({ center, zoom, duration: 1200 });
+layer.flyToFeature(smid);   // 内部 map.fitBounds
+```
+
+### MapLibre 侧注意事项
+
+- **按需重绘**：动画靠 `animator.onActive` + `render()` 返回值驱动 `triggerRepaint`。不要为了动画去关闭 MapLibre 的按需渲染，也不要自己再开一条 `requestAnimationFrame` 调 `tick()`。
+- **GPU 路径会持续重绘**：只要路径库里还有已注册路径，`renderFrame()` 就返回 `true`，即使没有单体绑定或 `uPathTime` 已冻结。暂停 / 结束时应 `unbindGPUPath` 并 `unregisterGPUPath`。
+- **`onComplete` 是通道级的**：一次驱动多个字段（`setStyle` 多个键、`animateFeature` 多个属性）会回调多次；需要聚合就自己计数。
+- **空闲时零成本**：动画结束后 `renderFrame()` 返回 `false`，帧循环停止；如果发现一直重绘，先查是否有未收敛的 `spring`、已注册的 GPU 路径或未结束的瓦片加载。
+- **不要绕过 animator 写 uniform**：动画期间 animator 是唯一写者，公开 API 走 `setStyle` / `animateFeature`。
+- **交叉淡化是全量替换**（不是合并）、**opacity 到 0 时整层不绘制**、**GPU 路径的位移只在着色器与包围盒里体现**这三点在调试时最容易被误判成 bug。
+
+---
+
 ## 投影
 
 ```ts
 new S3MLayer({ projection: 'orthographic' })   // 构造时指定
-layer.setProjection('orthographic' | 'perspective')  // 运行时切换，下一帧生效
+layer.setProjection('orthographic' | 'perspective', { duration: 800 })  // 运行时切换，可平滑过渡
 layer.projection  // 当前模式
 ```
 
@@ -310,6 +526,7 @@ V = P⁻¹ × MVP
 - **遮挡靠的是深度来源，不是「开没开地形」**：本层全程不清深度缓冲（`autoClear = false`），凡是往同一深度缓冲写了更近深度的东西都能遮挡建筑。MapLibre 地形网格与本层（`renderingMode: '3d'`）共用主 framebuffer、同一 `depthRangeFor3D`、同一 `LEQUAL + ReadWrite` 深度模式，所以地形可以遮挡；前提是宿主开启 `map.setTerrain({ source: 'dem' })`、提供 DEM 源，且地形需要有 raster / hillshade 层供图（否则地形面空白）。另外 S3M 数据通常按海拔 0 建模，需要用 `setDatasetHeight()` 把模型抬到真实地面高程，否则深度虽可比但空间位置对不上。不想接 DEM 时用 `setGroundOcclude(true)` 让自带物理地表充当遮挡源（平面一刀切）。
 - **物理地表（地下透视 / 基坑）**与 terrain 是两个维度但不是两套机制：前者表达模型自身的地上 / 地下结构覆盖关系，后者表达真实地面的起伏遮挡；两者只是都往同一个深度缓冲写深度。平面代理表达不了山体起伏，而地形已写入更近深度的像素上平面也写不进去，所以地铁站 / 基坑这类没有真实 DEM 的数据靠前者，有 DEM 的山地靠后者。
 - **正交投影**需要 MapLibre ≥ 5；v4 / v5 以下（含 Mapbox v2）只给合并矩阵，会告警一次并保持透视，见[投影](#投影)。
+- **`layer.viewer.geo` 在 MapLibre 上经常是 `null`，这是正常的**：`createMapLibreGeoAdapter()` 只有从宿主拿到 `WorldCoordinateHelper`（`transform.worldCoordinateHelper` 等 4 个候选位置）时才生效，拿不到就返回 `null`，渲染层自动回退标准 Web 墨卡托——正是 MapLibre 的默认 CRS，数值完全一致。当前 MapLibre 5.24 的 dist 里并没有这个成员，所以在 MapLibre 上这条 adapter 分支实际是空跑的。**自己换算经纬度时不要用 `if (viewer.geo)` 当门槛**，直接用 `worldFromLngLat(viewer.geo, lng, lat)`（`s3m-three` 导出，内部自带兜底），否则会把本来能用的墨卡托路径挡掉。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
 
 解析 / 几何 / 纹理 / 单体化相关的已知限制（Draco 回归覆盖、实例化单体、CRN 判定、切线流、KTX2、骨骼动画）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。

@@ -154,9 +154,12 @@ const VERT = /* glsl */ `
           if ( autoHeading ) {
             float c = cos( pathYaw );
             float s = sin( pathYaw );
+
+            // GLSL 的 mat3 是列优先：下面两行是「第 0 列 = (c, s)」，等价于绕 Z 转 +yaw，
+            // 把模型 +X 朝向对到切线方向（yaw = atan2(dy, dx)）。写成 (c,-s; s,c) 会左右镜像。
             mat3 rotHeading = mat3(
-              c, -s, 0.0,
-              s,  c, 0.0,
+              c,  s, 0.0,
+              -s, c, 0.0,
               0.0, 0.0, 1.0
             );
             s3mRot = rotHeading * s3mRot;

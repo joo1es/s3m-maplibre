@@ -14,6 +14,7 @@
 - [拾取与属性](#拾取与属性)
 - [投影](#投影)
 - [按业务字段着色](#按业务字段着色)
+- [动画与过渡](#动画与过渡)
 - [纯 three.js 使用](#纯-threejs-使用)
 - [底层 API](#底层-api)
 - [性能调优](#性能调优)
@@ -176,6 +177,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `onReady` | `(entry) => void` | — | 某个数据集就绪 |
 | `onPick` | `(f: PickResult \| null) => void` | — | 拾取结果 |
 | `onError` | `(e: unknown) => void` | — | 瓦片加载 / 解析错误 |
+| `prewarmShading` | `boolean` | `true` | 首帧后自动预热另一种 `shading` 变体，避免首次切换时现场编译着色器卡一帧。见[样式过渡](#样式过渡) |
 
 `configUrl` 与 `datasets` 二选一；同时给时以 `datasets` 为准。
 
@@ -190,6 +192,7 @@ renderFrame(opts: {
   fovRad: number;                      // 本帧垂直视场角（弧度）
   canvasHeight: number;                // 绘图缓冲高度，供 LOD 屏幕误差计算
 }): boolean                            // 返回 true = 本帧有变化，宿主应继续驱动下一帧
+prewarmShading(): Promise<void>        // 手动预热另一种 shading 变体（默认已在首帧后自动做一次）
 ```
 
 `mvp` 由宿主负责给出：地图宿主（如 s3m-maplibre）从 `render()` 入参提取；纯 three 宿主用自己的投影 × 视图矩阵。viewer 会在其后再乘 ENU → Mercator 矩阵，所以**传进来的 mvp 作用在 Mercator 归一化坐标上**，不是场景米制坐标。
@@ -238,13 +241,15 @@ interface S3MDatasetOptions {
 ### 样式与棱线
 
 ```ts
-setStyle(patch?: Partial<S3MStyle>): void
+setStyle(patch?: Partial<S3MStyle>, transition?: TransitionOptions): void
 getStyle(): S3MStyle & { modeLabel: string }
-setOpacity(opacity: number): void
-setEdges(enabled: boolean): void
+setOpacity(opacity: number, transition?: TransitionOptions): void
+setEdges(enabled: boolean, transition?: TransitionOptions): void
 ```
 
-`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）之外，其余字段都是 uniform / 材质状态更新，热切换零成本。
+`transition` 用来给能插值的字段加过渡，语义见[动画与过渡](#动画与过渡)；不传则和旧版一样即时生效。
+
+`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）、`edges` / `edgeThreshold`（结构变更，走 `setEdges` / 重建棱线）之外，其余字段都是 uniform / 材质状态更新，热切换成本很低。
 
 棱线优先用**数据自带的棱线包**（`primitiveType === 13` 的索引包）：解析时就建好 `LineSegments`，开关只是切 `visible`，成本为零。数据里没有时才用 `EdgesGeometry` 在 CPU 端现算（8ms 一帧切片，超过 12 万索引直接跳过）。棱线画成**屏幕空间等宽线**（`packages/s3m-three/src/render/EdgeLines.ts`）：WebGL 的 `lineWidth` 恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。
 
@@ -376,8 +381,8 @@ interface Stats {
 ### 投影
 
 ```ts
-setProjection(mode: 'perspective' | 'orthographic'): void  // 运行时切换，下一帧生效
-readonly projection: 'perspective' | 'orthographic'
+// S3MViewer 不提供投影切换：内核只消费宿主传入的 mvp。
+// 需要正交时由宿主自行替换 mvp；s3m-maplibre 的 S3MLayer 封装了 setProjection(..., transition?)。
 ```
 
 内核只消费宿主给的 `mvp`；正交 MVP 由宿主在传入前自行替换，数学工具（`buildOrthoMVP` / `extractFovRadians` / `extractNearFar` / `extractProjectionMatrix`）从本包导出，见[投影](#投影)。
@@ -652,6 +657,355 @@ attributes: {
 | `DataSource_erwei:cheng`（二维） | json（自动） | 2.1 KB/条 |
 
 `AttributeQuery` 还提供 `format`、`chunkSize`、`fields` 三个开关，以及 `query.stats`（`{ requests, bytes, ms }`）用来观察实际开销。
+
+---
+
+## 动画与过渡
+
+> 设计取舍与性能模型见仓库内 `packages/s3m-three/docs/ANIMATION.md`；本节是面向调用方的 API 契约。
+
+动画系统只有一个判据：
+
+> **能不能在不碰 material / program / geometry 的前提下，用一个 float 把这一帧画出来？**
+
+能，就走 `Animator` 逐帧插值，成本 O(1)（单体是 O(受影响网格)）；不能，就只能编排「淡出 → 换 → 淡入」，不要试图对结构做插值。
+
+三条必须知道的约定：
+
+1. **单一写者**：每帧只有 `Animator.tick()` 写渲染状态。公开 API 只写目标值，所以 `getStyle()` 会立刻返回终值，屏幕上的值由 `viewer.style` / uniforms 逐步推进。
+2. **同 key 覆盖，不排队**：连续调用不会积压，新动画从**当前显示值**续走。
+3. **空闲零成本**：没有活跃 track 时 `tick()` 第一行就返回 `false`，宿主据此停止重绘。
+
+### 快速开始
+
+```ts
+import { S3MViewer, STYLE, Path } from 's3m-three';
+
+const viewer = new S3MViewer({ /* ... */ });
+
+// 样式过渡：能插值的字段走动画，不能插值的仍即时生效
+viewer.setStyle({ colorA: '#ef4444', opacity: 0.6 }, { duration: 600, easing: 'easeOutCubic' });
+viewer.setOpacity(0.5, { duration: 400 });
+
+// 单体：抬高与变色各走一条通道，互不覆盖
+viewer.animateFeature(smid, { elevation: 120, color: '#ef4444' }, { duration: 800 });
+viewer.animateFeatures(smids, { opacity: 0 }, { duration: 500, stagger: 8 });
+
+// 位移 / 姿态
+viewer.moveFeature(smid, [120, 0, 0], { duration: 1200, easing: 'easeInOutCubic' });
+viewer.rotateFeature(smid, Math.PI / 2, [pivotX, pivotY, 0], { duration: 600 });
+
+// 沿折线运动（弧长参数化）
+viewer.followPath(smid, [[0, 0, 0], [80, 0, 0], [80, 60, 0]], {
+  duration: 6000,
+  loop: true,
+  offset: [baseX, baseY, 0],
+});
+viewer.stopPath(smid);
+
+// 整批换色 / 换高度：双纹理交叉淡化（目标表是全量替换，先复制现有表）
+const nextStyles = new Map(viewer.getFeatureStyles());
+nextStyles.set(smid, { ...(nextStyles.get(smid) ?? {}), color: '#22c55e' });
+viewer.crossFadeStyles(nextStyles, { duration: 800 });
+
+// 结构变更：只能编排
+viewer.setEdges(true, { duration: 400 });
+await viewer.setMode(STYLE.HEIGHT, { duration: 300, dim: 0.35 });
+
+// 调度器直连
+viewer.animator.cancel('style.opacity');   // 停在当前值
+viewer.animator.finish('style.opacity');   // 直接到终值
+```
+
+### 过渡参数（TransitionOptions）
+
+```ts
+interface TransitionOptions {
+  /** 时长（毫秒）。0 / 不传 = 立即生效 */
+  duration?: number;
+  /** 延迟（毫秒） */
+  delay?: number;
+  /** 缓动曲线：内置名或自定义 (t) => number。默认 'linear' */
+  easing?: EasingName | EasingFn;
+  /** 打断策略，默认 'proportional' */
+  retarget?: 'proportional' | 'fixed';
+  /** 弹簧。给了它就忽略 duration / easing */
+  spring?: { stiffness: number; damping: number; epsilon?: number };
+  /** 批量错峰间隔（毫秒），仅 animateFeatures 消费 */
+  stagger?: number;
+  /** 自然结束或 finish() 时回调；cancel() 不调用 */
+  onComplete?: () => void;
+}
+```
+
+- **`duration: 0` 且没有 `delay` / `spring` 时立即写入**，不建 track；带 `delay` 仍会建 track，延迟结束后瞬间到位。`animator.to()` 的立即分支会同步调用 `onComplete`，但 `setStyle` / `setEdges` 的即时分支不会回调；要确保回调触发，就给一个大于 0 的时长、加 `delay`，或自己调用。
+- **`easing` 首次默认 `linear`；retarget 时省略 `easing` 会沿用该通道上一次的曲线**（不是重置成 linear）。要固定观感就每次都显式传。
+- **`onComplete` 是通道级的**：一次调用驱动 N 条通道（例如 `setStyle({ colorA, opacity }, ...)` 或 `animateFeature` 同时改多个属性），回调就会在各通道结束时各触发一次。需要「全部结束只回调一次」就自己在调用方计数，或拆成多次单属性调用。retarget 时旧的 `onComplete` 会被新调用的值覆盖（不传就是清空）。
+- **打断保速**（`retarget: 'proportional'`，默认）：新时长为 `base × 剩余距离 / 总距离`，并夹在 `[15%, 100%] × base`；`base` 是本次传入的 `duration`，不传则沿用上一次。只差 1% 的修正不会也走完整 600ms。`'fixed'` 则每次都走完整时长。
+- **spring**：没有时长概念，靠物理收敛，中途改目标位置和速度都连续。收敛判据是位移与速度同时小于 `epsilon`（默认 `1e-3`），判定后 track 结束；`epsilon` 设得过小会长时间不收敛，让 `tick()` 一直返回 `true`。典型 `{ stiffness: 120, damping: 14 }`。
+- **一次调用的参数对所有通道生效**。要「透明度 800ms、颜色 200ms」，分两次 `setStyle` 调用，不要指望一个对象里逐通道配置（目前没有 per-channel transition 表）。
+- `easing` 默认是 **`linear`**，不是 CSS 的 `ease`。想要网页常见手感就显式写 `easeInOutCubic` / `cubicBezier(...)`。
+
+#### 曲线库
+
+```ts
+import { easing, cubicBezier, steps, EASING_NAMES } from 's3m-three';
+
+easing('easeOutCubic');
+cubicBezier(0.4, 0, 0.2, 1);   // 与 CSS cubic-bezier() 数值对齐
+steps(6, 'end');                // 6 档离散跳变
+easing((t) => t * t);           // 自定义曲线：(t: number) => number
+EASING_NAMES;                   // 全部内置名，适合生成下拉框
+```
+
+内置 31 条：`linear`，以及 `{In, Out, InOut} × {Quad, Cubic, Quart, Quint, Sine, Expo, Circ, Back, Elastic, Bounce}`。名字拼错会直接抛错，不会静默退化成「没动画」。自定义曲线约定 `0 → 0`、`1 → 1`；库不做钳制。
+
+打断时缓动会从 `t=0` 重新起算。`easeOutCubic` 恰恰是起点速度最大，方向突变会有点「顿」；连续拖拽 / 跟随类交互优先用 `spring`，或者把 `retarget` 保速交给默认策略。
+
+### 样式过渡
+
+```ts
+setStyle(patch?: Partial<S3MStyle>, transition?: TransitionOptions): void
+setOpacity(opacity: number, transition?: TransitionOptions): void
+setEdges(enabled: boolean, transition?: TransitionOptions): void
+setMode(mode: StyleMode, opts?: { duration?: number; dim?: number }): Promise<void>
+```
+
+已注册的样式通道（其余键即使带了 `transition` 也即时生效）：
+
+| 通道 | 维度 | 写回 |
+|---|---|---|
+| `style.opacity` | 1 | 共享 `uOpacity`；混合开关只在跨 `0.999` 时切一次 |
+| `style.colorA` / `colorB` / `colorC` / `selectColor` / `edgeColor` | 3 | 线性空间 RGB |
+| `style.texMix` / `floorHeight` / `selectOpacity` / `selectEmissive` / `selectElevation` / `dimFactor` / `roofThreshold` / `ambientGain` / `edgeWidth` / `edgeOpacity` / `outlineWidth` | 1 | 直接写 uniform / 字段 |
+| `style.edgeFade` | 1 | 棱线淡入乘子，`setEdges` 内部使用 |
+| `style.fade` | 1 | 整体压暗乘子，`setMode` 内部使用 |
+
+**不能插值的字段**：`mode`（用 `setMode`）、`shading`（编译期变体，切换会取预热好的 program）、`edges`（用 `setEdges`，走 `uEdgeFade` 淡入淡出）、`edgeThreshold`（要重建棱线几何）、`selectMode` / `outline` / `outlineStyle` / `outlineColor` / `outlineWidthPx`、`speed` / `depthWrite` / `fadeIn`。它们会即时生效，过渡参数对它们无效。
+
+几个容易误解的点：
+
+- **颜色在线性空间插值**。端点严格吻合，但中间色比 CSS 的 sRGB 过渡更亮、更灰。目前没有 `colorSpace: 'srgb'` 开关；要 CSS 观感就自己算中间色再分段 set，或接受这个差异。
+- **`getStyle()` 返回目标值**，动画进行中也一样。判断「现在显示到哪」读 `viewer.style` 或对应 uniform，不要拿 `getStyle()` 做帧间逻辑。
+- **全局透明度允许到 0**。`setOpacity(0)` 就是彻底看不见：`uOpacity` 写 0，同时 `renderFrame()` 跳过本层绘制——**不画颜色也不写深度**，所以不会出现「看不见却把底图挡出一个洞」的经典问题。`getStyle().opacity` 与屏幕值一致。
+- **`transparent` 只在跨阈值时切一次**，不会逐帧抖 program。但「从 1 到 0.5」的第一帧仍会有一次 program 切换/编译，几十毫秒级的首帧卡顿落在这里。
+- **`setEdges(true, { duration })` 只对屏幕空间等宽棱线做 `uEdgeFade` 淡入**：几何仍旧 8ms 一片地建，建好一块亮一块。数据自带的线段包是直接切 `visible`，不会淡入。关闭时淡完才 `dispose`，避免「啪」一下消失。
+- **`setMode` 是压暗 → 换 → 亮回来**：`duration` 默认 300ms，`dim` 默认 0.35（夹在 0.05~1），Promise 在亮回来后 resolve。重复调用靠代次号作废旧编排；切到当前模式是空操作。`uFade` 与 `dimFactor` 是两条独立通道，不会打架。
+- **`fadeIn` 只作用于之后新加载的瓦片**（首次加载 / LOD 换瓦），不是「当前瓦片淡入」。默认 0；开启后淡入期间瓦片进透明队列，几百块同时淡入有一小段额外开销。
+
+### 单体动画
+
+```ts
+animateFeature(smid: number, style: Partial<FeatureStyle>, transition?: TransitionOptions): void
+animateFeatures(smids: number[], style: Partial<FeatureStyle>, transition?: TransitionOptions): void
+moveFeature(smid: number, translation: [number, number, number], transition?: TransitionOptions): void
+moveFeatureBy(smid: number, delta: [number, number, number], transition?: TransitionOptions): void
+rotateFeature(smid: number, rotation: FeatureStyle['rotation'], pivot?: [number, number, number], transition?: TransitionOptions): void
+rotateFeatureBy(smid: number, deltaRotation: number | [number, number, number], pivot?: [number, number, number], transition?: TransitionOptions): void
+```
+
+`animateFeature` 能动画的属性：
+
+| 字段 | 通道 | 维度 | 说明 |
+|---|---|---|---|
+| `translation` | `feature.<smid>.translation` | 3 | 相对原始位置的**绝对**偏移（米，数据集局部 ENU：x 东 / y 北 / z 天；多数据集相对各自锚点） |
+| `elevation` | `feature.<smid>.elevation` | 1 | 单体垂直拔高（米） |
+| `opacity` | `feature.<smid>.opacity` | 1 | 单体透明度（batch 粒度；`<= 0` 等价 `hidden`） |
+| `color` | `feature.<smid>.color` | 3 | 单体自定义色，线性空间插值 |
+| `rotation` | `feature.<smid>.rotation` | 3 | 姿态旋转（欧拉角分量插值） |
+
+- **每个属性一条独立通道**，同一单体「一边抬高一边变色一边平移」互不覆盖。重复设置同一属性会 retarget，不会排队。
+- **`translation` 是绝对偏移**，不是增量。增量用 `moveFeatureBy`；它的起点读当前 `translation`，连续调用会累加。
+- **`rotation` 的写法**：`number` = 绕 Z 轴（天向）的弧度；`[rx, ry, rz]` = 欧拉角；`[x, y, z, w]` = 四元数；也接受 `THREE.Euler` / `Quaternion` / `Matrix3` / `Matrix4`。`pivot` 是**局部坐标**的旋转轴心，默认 `[0,0,0]`——绕模型原点转通常会把楼甩出去，记得传包围盒中心。
+- **旋转按欧拉角三分量线性插值**。目标与当前相差接近 ±π 时可能走「长边」。连续自转别用一次性大角度，改用 `rotateFeatureBy` 每次加小角度，或拆成多段。
+- **`hidden` 不可插值**，会立即生效。要「淡出再隐藏」：
+  ```ts
+  viewer.animateFeature(smid, { opacity: 0 }, {
+    duration: 300,
+    onComplete: () => viewer.setFeatureStyle(smid, { hidden: true }),
+  });
+  ```
+- **`stagger` 只被 `animateFeatures` 消费**：第 i 个单体的延迟 = `delay + i × stagger`。一万个单体错峰 8ms，总时长不变，但每帧只推进一小批，峰值自然摊平。
+- **位移 / 旋转会自动关掉受影响网格的 `frustumCulled`**，否则移出原始包围球后整块瓦片会凭空消失；值回到 0 时恢复。
+- **未加载的 smid 也会保留目标样式**，等对应瓦片加载后自动套用。通道写入对空网格是无害的。
+- **`removeFeatureStyle` / `clearFeatureStyles` 会回收该单体的全部通道**，动画随之中断（不会回调 `onComplete`）。
+
+`FeatureStyle` 里剩下的 `hidden` 是即时字段；`gpuPath` 不通过 `animateFeature` 驱动，见下一节。
+
+### 路径运动（CPU）
+
+```ts
+class Path {
+  constructor(points: ArrayLike<number> | Array<[number, number, number]>, opts?: { closed?: boolean });
+  readonly length: number;                       // 总弧长（米）
+  sample(s: number, out: Float32Array | number[]): void;   // 按已走距离取点
+  sampleAt(t: number, out: Float32Array | number[]): void; // 按归一化进度取点
+}
+
+followPath(smid, points: Path | ArrayLike<number> | Array<[number, number, number]>, opts?: PathFollowOptions): void
+stopPath(smid: number): void
+```
+
+```ts
+interface PathFollowOptions {
+  duration?: number;          // 走完全程的时长（毫秒）
+  speed?: number;             // 线速度（米/秒）；给了 duration 就以 duration 为准
+  loop?: boolean;             // 循环
+  closed?: boolean;           // 折线首尾相连（传 Path 实例时无效，构造时决定）
+  easing?: EasingName | EasingFn;  // 作用在**已走距离**上，默认 linear（恒速）
+  offset?: [number, number, number]; // 路径整体偏移（米）
+  onComplete?: () => void;    // 非循环走完时回调
+}
+```
+
+- 缓动作用在**弧长**上，不是顶点索引。顶点疏密不均也不会忽快忽慢；`easeInQuad` 半程只走 1/4 距离。
+- `duration` 与 `speed` 都不给时默认 2000ms。`speed` 按米/秒换算时长。
+- 路径点是**数据集局部 ENU 米坐标**（相对该单体所属数据集的锚点；单数据集时就是场景 ENU），不是经纬度；`offset` 相当于路径原点。落点写进 `translation`，所以拾取、选中描边、棱线会整体跟随。
+- `loop: true` 时每次走完从起点重来（进度通道的 `read` 恒为 0）；`onComplete` 只在非循环时回调。闭合路径 + 循环才是无缝的。
+- 对同一 smid 再次 `followPath` 也会从新路径的**起点**重新开始，不是从当前位置接续；要接续就先 `stopPath`，自行裁掉已走路段并换算 `offset`。
+- `stopPath` 停在当前位置并回收通道，不回弹。零长路径直接忽略，不建 track。
+- **不要和 `moveFeature` 同时驱动同一个单体**：两者都写 `translation`，后写的会覆盖前者。
+- CPU 路线适合几十到几千个 mover；上万个请用下面的 GPU 路径。
+
+### GPU 路径动画（万级）
+
+```ts
+registerGPUPath(points, opts?: { id?: number; name?: string; closed?: boolean }): number
+unregisterGPUPath(id: number): boolean
+getGPUPathManager(): GPUPathManager
+
+bindGPUPath(smid: number, path: number | Path | ArrayLike<number> | Array<[number, number, number]>, options?: Omit<GPUPathOptions, 'pathId'>): number
+unbindGPUPath(smid: number): void
+setGPUPathProgress(smid: number, progress: number): void
+setGPUPathTime(time: number, autoAdvance?: boolean): void
+getGPUPathTime(): number
+```
+
+```ts
+interface GPUPathOptions {
+  pathId: number;                 // registerGPUPath 返回的 ID
+  speed?: number;                 // 归一化进度/秒，0.05 ≈ 20 秒一圈
+  phase?: number;                 // 初始相位（0~1）
+  loop?: 'loop' | 'pingpong' | 'clamp' | boolean;  // boolean false = clamp
+  autoHeading?: boolean;          // 按路径切线自动转向（默认 true）
+}
+```
+
+- 路径按**等弧长**烘成一张 `RGBA32F` 纹理：每行一条路径，256 个采样点，`RGBA = x, y, z, yaw`。yaw 做了连续角度展开，避免 ±π 处插值回旋。GPU 双线性采样得到平滑位置与朝向。路径点同样是**数据集局部 ENU**。
+- `autoHeading` 把模型 **+X 轴**转到路径切线方向（`yaw = atan2(dy, dx)`，逆时针为正）。如果你的模型正前方不是 +X，需要自己在建模侧转好，或用 `autoHeading: false` 自己算朝向。
+- 单体参数写进状态纹理第 5 行 `[pathId, speed, phase, modeFlag]`，顶点着色器自己算位置，CPU 每帧只写一个 `uPathTime`。几万个单体也只有一次 uniform 写入。
+- **路径 ID 决定纹理行**。`height = maxId + 1`，不要用很大的稀疏 ID；不传 `id` 时自增分配。
+- `bindGPUPath` 传折线时会自动注册并返回 pathId；传数字则复用已注册路径。绑定后该网格的视锥剔除会被关闭（解绑不会自动恢复）。
+- `setGPUPathProgress` 会把该单体的 `speed` 置 0、`phase` 设为进度，用于手动定位。`setGPUPathTime(t, false)`（默认）会冻结自动推进并写入指定秒数；`setGPUPathTime(t, true)` 写入后恢复自动推进。
+- **自动推进按帧累加 `0.016` 秒**，不是真实时钟。低帧率下会变慢；需要严格速度时每帧用 `setGPUPathTime(elapsedSeconds, false)` 自己驱动。
+- **只要 GPU 路径库非空，`renderFrame()` 就会一直返回 `true`**（即使没有单体绑定、或你把 `uPathTime` 冻结），宿主会持续重绘。暂停 / 结束时应 `unbindGPUPath` 并 `unregisterGPUPath`，否则等于空转烧电。
+- `unbindGPUPath` 删除 `FeatureStyle.gpuPath`，单体回到静态状态。
+- **拾取与包围盒都跟着走**：`PICK_VERT` 与主着色器采样同一份路径纹理（row5 → 路径纹理 → 位置 + yaw），所以运动中的单体点得中；`getFeatureBounds()` 用同一套公式（`phase + uPathTime × speed`，再按 loop 模式夹取）在 CPU 复算位置与朝向。三者共用一份语义，改其中一处必须同步另外两处。
+- **仍然按原位置的**：属性过滤、以及你自己按 `pickId` 建的空间索引——它们不碰渲染状态，没有「当前显示位置」的概念。
+- GPU 路径与 `followPath` / `moveFeature` 不要同时作用于同一个单体。
+
+`getGPUPathManager()` 返回的 `GPUPathManager` 还提供 `registerPath` / `unregisterPath` / `getPath` / `hasPath` / `getPathIds` / `clear` / `count` / `getTexture` / `dispose`，一般用上面的 viewer 包装即可。
+
+### 双纹理交叉淡化（crossFadeStyles）
+
+```ts
+crossFadeStyles(
+  targetStyles: Map<number, FeatureStyle> | Record<string | number, FeatureStyle>,
+  transition?: TransitionOptions
+): void
+```
+
+把目标单体状态烘到第二张状态纹理，只动一个 `uBatchMix` 从 0 到 1，顶点 / 片元采样状态纹理时按它 `mix(A, B)`。整套状态（颜色 / 抬高 / 平移 / 透明度 / 隐藏 / 姿态 / GPU 路径参数）都能过渡，CPU 每帧只写一个 float；`hidden` 这种布尔量在 50% 处切换。
+
+- **目标表是「全量替换」，不是合并**。提交时会 `clear()` 现有 `featureStyles` 再写入 `targetStyles`；没出现在目标表里的单体将失去自定义样式。要保留的条目必须自己带上。
+- 没有过渡（`duration` 为 0 且无 `spring`）时直接提交，不建 track。
+- 过渡期间状态纹理多一次采样；大规模换色 / 换高时这仍比逐单体建动画通道便宜几个数量级。
+- 这是「全城换色」的正确入口。`setThematicColors` / `colorByField` 本身是即时批量操作，不会自动走交叉淡化；需要过渡就自己构造目标样式表再调 `crossFadeStyles`。
+- **不要手动 `animator.cancel('batch.mix')`**：它只会停在中间混合值，且不提交目标。要终止就再调一次 `crossFadeStyles`（会重置 mix 并重新准备），或用 `animator.finish('batch.mix')` 让它走完提交。
+- 过渡按调用时的网格快照准备，中途新加载的瓦片不参与这次混合，会按提交前状态显示。瓦片频繁进出的场景建议等稳定后再切。
+
+### 调度器直连（Animator）
+
+`viewer.animator` 是公开的 `Animator` 实例；也可以脱离 three 单独使用（纯数学，Node 可跑）。
+
+```ts
+import { Animator, type Channel } from 's3m-three';
+
+const animator = new Animator(() => performance.now()); // 可注入时钟，便于测试
+
+let value = 0;
+const channel: Channel = {
+  dim: 1,
+  read: (out) => { out[0] = value; },
+  write: (v) => { value = v[0]; },   // 必须 O(1) 且不分配
+};
+
+animator.register('demo.value', channel);
+animator.onActive = () => requestAnimationFrame(loop);
+animator.to('demo.value', 1, { duration: 600, easing: 'easeOutCubic' });
+
+function loop(now: number) {
+  if (animator.tick(now)) requestAnimationFrame(loop);
+}
+```
+
+| 成员 | 说明 |
+|---|---|
+| `register(key, channel)` / `unregister(key)` / `unregisterPrefix(prefix)` | 通道注册与回收；注册同名会覆盖 |
+| `has(key)` / `isActive(key)` | 通道是否存在 / 是否有活跃 track |
+| `to(key, target, opts?)` | 推向目标；未注册的 key 抛错；`dim=3` 必须传三元数组 |
+| `cancel(key)` | 停在当前值，不写终值、不回调 |
+| `finish(key)` | 直接写终值并结束，回调 `onComplete` |
+| `clear()` | 丢弃全部 track（不回调） |
+| `tick(now?)` | 推进一帧，返回是否还有活跃动画；无 track 时零成本早退 |
+| `onActive` | 新建 track / 立即写值 / `finish` 时触发，宿主用它踢一帧重绘；retarget 不触发 |
+| `budgetMs` | 单帧写入预算，默认 2.5ms；超了把剩余通道推到下一帧 |
+| `skippedLastTick` | 上一帧因超预算没推进的通道数 |
+| `activeCount` / `active` | 活跃 track 数量 / 是否有动画 |
+
+内置通道 key：
+
+| 前缀 | 用途 |
+|---|---|
+| `style.*` | 样式字段（见上表）、`style.edgeFade`、`style.fade` |
+| `feature.<smid>.translation` / `.elevation` / `.opacity` / `.color` / `.rotation` | 单体属性，按需惰性注册 |
+| `feature.<smid>.path` | 路径进度 0→1 |
+| `tile.<seq>.fade` | 新瓦片淡入，用完即回收 |
+| `batch.mix` | 交叉淡化混合系数 |
+| `projection.t` | 仅 `S3MLayer` 注册，正交投影插值 |
+
+超预算时被跳过的通道**这一帧完全不推进**，下一帧按绝对时间追上——跳一帧不丢状态，只是晚一帧显示。`budgetMs` 是整帧写入预算，不是每通道预算；相机也在动时不要把它吃满。
+
+### 帧驱动与生命周期
+
+`S3MViewer.renderFrame()` 内部已经在渲染前调用 `animator.tick()`，并把「是否还有动画」并入返回值。宿主只需要：
+
+```ts
+function frame(now: number) {
+  const needsNextFrame = viewer.renderFrame({ /* mvp / cameraEnu / fovRad / canvasHeight */ });
+  if (needsNextFrame) requestAnimationFrame(frame);
+}
+```
+
+- **不要自己再调一次 `animator.tick()`**，会双倍推进。
+- `renderFrame()` 返回 `true` 的条件：动画进行中、`STYLE.DYNAMIC`、GPU 路径活跃、瓦片加载中、瓦片层级变化。动画结束那一帧必须回到 `false`，否则宿主会永远重绘。
+- 时钟是 `performance.now()` 的绝对时间。标签页切回来不会补帧，而是直接到当前时间对应的进度；弹簧则会因长时间未推进直接判定收敛。
+- `onActive` 负责在空闲时踢第一帧。宿主是按需渲染的（MapLibre 尤其如此），漏了这一步的现象就是「点了按钮没反应，直到别的操作触发重绘才跳到终态」。
+- **动画期间不要绕过 animator 直写 uniform**（例如 `viewer.uniforms.uColorA.value.set(...)`），否则会和动画互相覆盖。公开 API 一律走 `setStyle` / `animateFeature`。
+
+### 已知边界
+
+下面这些是**设计上就不会做**的，不是待办：
+
+- `mode` / `shading` / `edgeThreshold` 不是可插值属性：`mode` 是着色分支，`shading` 是编译期变体，`edgeThreshold` 要重建 `EdgesGeometry`。前者用 `setMode` 的 fade-through，后两者即时切换。`edges` 的开关本身有 `uEdgeFade` 淡入淡出（`setEdges(true, { duration })`），只是几何构建仍然分片。
+- `fadeIn` 会让淡入中的瓦片进入透明队列；首次加载几百块瓦片时有一小段额外开销，默认关闭。想彻底躲开透明队列只能改成抖动透明，观感会变成「点状渐显」，没有做。
+- 地图宿主（MapLibre / Mapbox）下相机矩阵每帧由宿主喂入，**不要自己 tween `camera.position`**，相机动效走 `map.easeTo` / `flyTo` / `fitBounds`（`flyToFeature` 已经是这个路子）。纯 three 宿主没人覆盖相机，才可以在 animator 里做轨道插值。
+
+下面这些是**已经解决、但需要知道实现口径**的：
+
+- `shading` 首次切换不再现场编译：首帧后会自动预热另一种变体（选项 `prewarmShading`，默认开），切换时直接取 program 缓存。预热期间跳一两帧渲染，肉眼不可见；要自己挑时机就关掉选项、手动调 `prewarmShading()`。
+- 全局 `opacity` 可以到 0：到 0 时本层**跳过绘制**，不写颜色也不写深度，不会在底图上留洞。
+- GPU 路径运动中的单体：**拾取已经准确**（`PICK_VERT` 与主着色器采样同一份路径纹理，含 loop / pingpong / clamp 与自动朝向），**`getFeatureBounds()` 也按同一公式在 CPU 复算**。仍按原位置计算的只剩「属性过滤」这类不涉及空间的逻辑，以及你自己按 `pickId` 做的空间索引。
 
 ---
 

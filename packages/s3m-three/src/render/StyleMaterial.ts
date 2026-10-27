@@ -402,9 +402,12 @@ const VERT_SETUP = /* glsl */ `
           if ( autoHeading ) {
             float c = cos( pathYaw );
             float s = sin( pathYaw );
+
+            // GLSL 的 mat3 是列优先：下面两行是「第 0 列 = (c, s)」，等价于绕 Z 转 +yaw，
+            // 把模型 +X 朝向对到切线方向（yaw = atan2(dy, dx)）。写成 (c,-s; s,c) 会左右镜像。
             mat3 rotHeading = mat3(
-              c, -s, 0.0,
-              s,  c, 0.0,
+              c,  s, 0.0,
+              -s, c, 0.0,
               0.0, 0.0, 1.0
             );
             s3mRot = rotHeading * s3mRot;
@@ -869,6 +872,14 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
 
   mat.userData.uSelBatch = uSelBatch;
   mat.userData.uSelWhole = uSelWhole;
+  // 拾取材质要读这些共享 uniform 的当前值：挂引用而不是拷数值，主材质更新后拾取自动跟上
+  // （单测里可能不传共享 uniforms，这里按可选处理）
+  mat.userData.uSelElevation = uniforms?.uSelElevation;
+  mat.userData.uBatchMix = uniforms?.uBatchMix;
+  mat.userData.uPathTex = uniforms?.uPathTex;
+  mat.userData.uPathCount = uniforms?.uPathCount;
+  mat.userData.uPathTime = uniforms?.uPathTime;
+  mat.userData.uPathTexActive = uniforms?.uPathTexActive;
   mat.userData.uBatchTex = uBatchTex;
   mat.userData.uBatchTex2 = uBatchTex2;
   mat.userData.uBatchTexWidth = uBatchTexWidth;
@@ -959,9 +970,12 @@ const OUTLINE_VERT = /* glsl */ `
             if ( autoHeading ) {
               float c = cos( pathYaw );
               float s = sin( pathYaw );
+
+              // GLSL 的 mat3 是列优先：下面两行是「第 0 列 = (c, s)」，等价于绕 Z 转 +yaw，
+              // 把模型 +X 朝向对到切线方向（yaw = atan2(dy, dx)）。写成 (c,-s; s,c) 会左右镜像。
               mat3 rotHeading = mat3(
-                c, -s, 0.0,
-                s,  c, 0.0,
+                c,  s, 0.0,
+                -s, c, 0.0,
                 0.0, 0.0, 1.0
               );
               s3mRot = rotHeading * s3mRot;

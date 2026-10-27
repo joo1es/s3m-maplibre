@@ -124,6 +124,14 @@ export default function SelectSection() {
             停止
           </button>
         </div>
+        <div style="display: flex; gap: 5px; margin-bottom: 6px;">
+          <button id="btnTurn" class="btn" style="flex:1;">
+            方形回路（四个直角弯）
+          </button>
+          <button id="btnTurnStop" class="btn" style="flex:1;">
+            解绑回路
+          </button>
+        </div>
         <div style="display: flex; gap: 5px;">
           <button id="btnRaise" class="btn" style="flex:1;">
             抬高 100m
