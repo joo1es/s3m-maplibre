@@ -189,6 +189,64 @@ export function buildOrthoMVP(input: OrthoInput, params: OrthoParams): OrthoMVP 
 }
 
 /**
+ * 只缩小近裁剪面的透视 MVP（视场角、远平面完全不变）。
+ *
+ * 为什么要它：MapLibre 的近裁剪面是**硬编码**的 `nearZ = canvasHeight / 50`（CSS 像素），
+ * 在 zoom 16.5 / 纬度 31° 时 1 px ≈ 0.72 m，也就是近平面离相机约 **13 米**——
+ * 相机推进到楼体 13 米以内，整个楼面就被裁掉，画面变成一片空白。
+ * MapLibre 没有公开 API 改它，所以只能在自定义图层里自己换一个投影矩阵。
+ *
+ * 数学上只动两个元素：标准透视矩阵里只有
+ *   e[10] = -(far + near) / (far - near)
+ *   e[14] = -2 · far · near / (far - near)
+ * 依赖 near/far，其余元素（含 e[0] = 2n/(r-l)、e[5]）都不动 —— 这等价于把
+ * left/right/top/bottom 按 near 的比例等比缩放，所以**视场角逐点重合**，
+ * 缩放后画面与原画面完全一致，只是近处的几何不再被裁。
+ *
+ * 代价是深度缓冲的非线性变陡：near/far 比值每缩小 10 倍，远处可用的深度精度
+ * 就少一截。所以默认不启用，由接入方按「要不要贴脸看」决定。
+ *
+ * @param scale (0, 1) 之间：near' = near × scale。传 1 或 <= 0 表示不处理（返回 null）
+ * @returns null = 输入不是标准透视矩阵 / 参数不可用，调用方应保持原 MVP
+ */
+export function buildNearScaledMVP(input: OrthoInput, scale: number): THREE.Matrix4 | null {
+  if (!(scale > 0) || scale >= 1) return null;
+  const p = input.projectionMatrix;
+  if (!p || p.length < 16) return null;
+
+  const P = new THREE.Matrix4().fromArray(Array.from(p));
+  if (!Number.isFinite(P.determinant()) || P.determinant() === 0) return null;
+  // 只对标准透视投影生效：makePerspective 的 e[11] 恒为 -1，正交矩阵不是
+  if (Math.abs((P.elements[11] as number) + 1) > 1e-6) return null;
+
+  // near/far 优先用宿主给的；缺失就从矩阵反解
+  //   A = -e[10] = (f+n)/(f-n)  →  n = -e[14]/(A+1),  f = n(A+1)/(A-1)
+  let near = input.nearZ != null && input.nearZ > 0 ? input.nearZ : NaN;
+  let far = input.farZ != null && input.farZ > near ? input.farZ : NaN;
+  if (!(near > 0) || !(far > near)) {
+    const A = -P.elements[10];
+    if (!(A > 1)) return null;
+    near = -P.elements[14] / (A + 1);
+    far = (near * (A + 1)) / (A - 1);
+    if (!(near > 0) || !(far > near)) return null;
+  }
+
+  const near2 = near * scale;
+  if (!(near2 > 0) || !(near2 < far)) return null;
+
+  const scaled = P.clone();
+  scaled.elements[10] = -(far + near2) / (far - near2);
+  scaled.elements[14] = (-2 * far * near2) / (far - near2);
+
+  // MVP' = P' × P⁻¹ × MVP：等价于「同一视图矩阵换个投影」，不需要显式解 V
+  const out = scaled.multiply(P.clone().invert()).multiply(new THREE.Matrix4().fromArray(Array.from(input.mvp)));
+  for (let i = 0; i < 16; i++) {
+    if (!Number.isFinite(out.elements[i] as number)) return null;
+  }
+  return out;
+}
+
+/**
  * 平滑过渡正交与透视 MVP：
  * t = 0 时纯透视，t = 1 时纯正交，0 < t < 1 时在投影矩阵元素级平滑线性插值。
  * 因为半高以目标焦平面距离为基准，目标平面上的几何在过渡期间零位移零跳变。

@@ -109,7 +109,7 @@ export type {
 export { buildTileObjects } from './render/GeometryBuilder.js';
 export type { BuildTileOptions, BuildTileResult, TileBuildStats } from './render/GeometryBuilder.js';
 
-export { createTexture, PixelFormat, setMaxAnisotropy } from './render/TextureFactory.js';
+export { createTexture, PixelFormat, setMaxAnisotropy, setMaxTextureSize } from './render/TextureFactory.js';
 export type { DecodedTexture } from './render/TextureFactory.js';
 
 export { resolveTextureKind, dxtPixelFormatOf, TextureCompress } from './core/TextureFormat.js';
@@ -137,6 +137,7 @@ export type {
 export {
   buildOrthoMVP,
   buildBlendedMVP,
+  buildNearScaledMVP,
   extractProjectionMatrix,
   extractNearFar,
   extractFovRadians,

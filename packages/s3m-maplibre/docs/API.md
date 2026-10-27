@@ -119,12 +119,17 @@ new S3MLayer(options?: S3MLayerOptions)
 | `ground` | `GroundOptions` | — | 3D 物理地表面 / 基坑开挖配置 |
 | `pickable` | `boolean` | `true` | 是否响应点击 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
+| `maxTriangles` | `number` | `Infinity` | 每个数据集驻留三角形总数的软上限（不限制）。`maxTiles` 管不住的场景用来做刹车，见[s3m-three 性能调优](../s3m-three/docs/API.md#移动端--差设备) |
 | `totalMaxTiles` | `number` | — | 多数据集全局瓦片总预算，在可见数据集间动态均衡分配配额，防止多图层叠合爆显存 |
 | `light` | `LightOptions` | — | 场景光照配置（环境光、主光、方位角、高度角及 headlamp/fixed 模式） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
+| `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 DPR 上限（不截断）。默认按绘图缓冲物理像素算，3x DPR 手机上会显著多拉瓦片；传 `2` 即按「CSS 高度 × 2」截断，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
+| `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = GPU 最大值，通常 16）。移动端 4 / 8 通常肉眼无差，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
+| `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。手机上 1024 即可，显存降到 1/4；图集与 DXT 直传不受影响 |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 字段着色章节](../s3m-three/docs/API.md#按业务字段着色) |
 | `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
+| `nearPlaneScale` | `number` | `1` | 近裁剪面缩放系数（`0 < scale < 1`，1 = 不改）。MapLibre 的 near 是硬编码的 `canvasHeight/50`，zoom 16.5 时约合 13 米，相机贴近模型会把楼面整片裁掉；缩放后 fov / far 不变，见[近裁剪面](#近裁剪面贴脸看时不消失) |
 | `onStats` | `(s: Stats) => void` | — | 统计更新 |
 | `onReady` | `(entry) => void` | — | 某个数据集就绪 |
 | `onPick` | `(f: PickResult \| null) => void` | — | 点击拾取结果 |
@@ -267,8 +272,17 @@ setExcavationBounds(bounds: [number, number, number, number] | null): void
 ```ts
 getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
 setProjection(mode: 'perspective' | 'orthographic', transition?: TransitionOptions): void  // 投影模式，可平滑过渡，见[投影](#投影)
+setNearPlaneScale(scale: number): void                    // 近裁剪面缩放，1 = 恢复 MapLibre 原值
 setLodRangeScale(scale: number, datasetId?: string): void  // 缩放 LOD 切换距离阈值（>1 更倾向粗模，<1 提前细化）
 readonly lodRangeScale: number
+setLodPixelRatioCap(cap: number): void                    // LOD 判定屏幕高度的 DPR 上限，Infinity = 不截断（默认）
+readonly lodPixelRatioCap: number
+setMaxTriangles(n: number, datasetId?: string): void      // 驻留面数软上限，Infinity = 不限制（默认）
+readonly maxTriangles: number
+setAnisotropyCap(cap: number): void                       // 各向异性上限，Infinity = 取 GPU 最大值（默认）
+readonly anisotropyCap: number
+setMaxTextureSize(n: number): void                        // 纹理长边像素上限，Infinity = 不限制（默认）
+readonly maxTextureSize: number
 readonly stats: Stats
 readonly fps: number
 readonly projection: 'perspective' | 'orthographic'
@@ -519,6 +533,40 @@ V = P⁻¹ × MVP
 
 底层数学在 `packages/s3m-three/src/render/OrthoProjection.ts`（从 `s3m-three` 入口导出），`npm test` 里的 `tools/test-ortho.mjs` 用合成矩阵钉住：视图矩阵还原、目标平面重合、正交语义、zoom 映射、near/far 深度映射、三类非法输入拒绝。
 
+### 近裁剪面（贴脸看时不消失）
+
+**现象**：相机推进到楼体十几米以内，模型整片消失，退回来又出现。这不是瓦片被隐藏，是**近裁剪面把几何裁掉了**。
+
+MapLibre v5 的 near 是写死的（`transform.ts`，dist 里也能直接看到）：
+
+```js
+this._helper._nearZ = this._helper._height / 50;   // 画布高度 / 50，CSS 像素单位
+```
+
+投影单位是 CSS 像素，zoom 16.5 / 纬度 31° 时 1 px ≈ 0.72 m，所以 near 平面离相机约 **13 米**。MapLibre 没有公开 API 改它，只能在自定义图层里换一个投影矩阵：
+
+```ts
+new S3MLayer({ nearPlaneScale: 0.1 });   // 13 m → 1.3 m，可以贴到墙上看
+layer.setNearPlaneScale(0.1);            // 运行时调节；传 1 恢复原样
+```
+
+实现上只改透视矩阵的两个元素（其余不动，所以**视场角逐点重合**）：
+
+```
+e[10] = -(far + near') / (far - near')
+e[14] = -2 · far · near' / (far - near')
+```
+
+这等价于把 `left / right / top / bottom` 按 `near'/near` 等比缩放 —— 画面与原画面完全一致，只是近处不再被裁。`near'/far` 比值怎么取：
+
+| 场景 | 建议 |
+|---|---|
+| 只做城市级漫游，不会贴近建筑 | 不用开（默认 1） |
+| 允许相机推近看外立面 | `0.1`（13 m → 1.3 m） |
+| 允许进入建筑内部 | `0.02`（13 m → 0.26 m），注意深度精度 |
+
+**代价**：near/far 比值变小会让深度缓冲的非线性变陡，远处可用精度下降，极端值下远景可能出现 z-fighting；另外本层写入的深度值与 MapLibre 地形不再完全同尺度，**近处**的地形遮挡判定会有偏差（远处因为都趋近 1，几乎无差）。所以默认关闭，由接入方按「要不要贴脸看」决定。只作用于透视模式——正交模式的 near 由它自己的视锥构造决定。
+
 ---
 
 ## 宿主兼容与已知限制
@@ -526,6 +574,7 @@ V = P⁻¹ × MVP
 - **遮挡靠的是深度来源，不是「开没开地形」**：本层全程不清深度缓冲（`autoClear = false`），凡是往同一深度缓冲写了更近深度的东西都能遮挡建筑。MapLibre 地形网格与本层（`renderingMode: '3d'`）共用主 framebuffer、同一 `depthRangeFor3D`、同一 `LEQUAL + ReadWrite` 深度模式，所以地形可以遮挡；前提是宿主开启 `map.setTerrain({ source: 'dem' })`、提供 DEM 源，且地形需要有 raster / hillshade 层供图（否则地形面空白）。另外 S3M 数据通常按海拔 0 建模，需要用 `setDatasetHeight()` 把模型抬到真实地面高程，否则深度虽可比但空间位置对不上。不想接 DEM 时用 `setGroundOcclude(true)` 让自带物理地表充当遮挡源（平面一刀切）。
 - **物理地表（地下透视 / 基坑）**与 terrain 是两个维度但不是两套机制：前者表达模型自身的地上 / 地下结构覆盖关系，后者表达真实地面的起伏遮挡；两者只是都往同一个深度缓冲写深度。平面代理表达不了山体起伏，而地形已写入更近深度的像素上平面也写不进去，所以地铁站 / 基坑这类没有真实 DEM 的数据靠前者，有 DEM 的山地靠后者。
 - **正交投影**需要 MapLibre ≥ 5；v4 / v5 以下（含 Mapbox v2）只给合并矩阵，会告警一次并保持透视，见[投影](#投影)。
+- **贴近模型时整片消失**大概率是 MapLibre 的近裁剪面（默认离相机约 13 米）裁的，不是瓦片调度问题：用 `nearPlaneScale` 调，见[近裁剪面](#近裁剪面贴脸看时不消失)。另一条路是瓦片预算——相机贴近会让 LOD 深度暴涨、超过 `hardCap` 后可能强制淘汰正在显示的瓦片（开洞），表现为「局部空洞、过几秒补上」，与近裁剪的「整片空白、退回来立刻恢复」可区分。
 - **`layer.viewer.geo` 在 MapLibre 上经常是 `null`，这是正常的**：`createMapLibreGeoAdapter()` 只有从宿主拿到 `WorldCoordinateHelper`（`transform.worldCoordinateHelper` 等 4 个候选位置）时才生效，拿不到就返回 `null`，渲染层自动回退标准 Web 墨卡托——正是 MapLibre 的默认 CRS，数值完全一致。当前 MapLibre 5.24 的 dist 里并没有这个成员，所以在 MapLibre 上这条 adapter 分支实际是空跑的。**自己换算经纬度时不要用 `if (viewer.geo)` 当门槛**，直接用 `worldFromLngLat(viewer.geo, lng, lat)`（`s3m-three` 导出，内部自带兜底），否则会把本来能用的墨卡托路径挡掉。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
 

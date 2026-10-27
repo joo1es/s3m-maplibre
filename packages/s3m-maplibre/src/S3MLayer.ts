@@ -46,6 +46,7 @@ import { Matrix4 } from 'three';
 import {
   buildOrthoMVP,
   buildBlendedMVP,
+  buildNearScaledMVP,
   extractFovRadians,
   extractNearFar,
   extractProjectionMatrix,
@@ -75,6 +76,31 @@ export interface S3MLayerOptions extends S3MViewerOptions {
    * 会与本层对不齐，需要 App 自行退出，详见 README「正交投影」。
    */
   projection?: ProjectionMode;
+  /**
+   * 近裁剪面缩放系数（0 < scale < 1，默认 1 = 不改，行为与旧版一致）。
+   *
+   * MapLibre 的近裁剪面是硬编码的 `nearZ = canvasHeight / 50`（CSS 像素单位），
+   * zoom 16.5 / 纬度 31° 时约合**离相机 13 米**——相机推进到楼体十几米以内，
+   * 楼面整片被裁掉，画面变成空白。MapLibre 没有公开 API 改这个值，所以只能
+   * 在本层换一个投影矩阵：只改透视矩阵的 near，视场角与远平面完全不动，
+   * 画面与原画面逐点重合，只是近处不再被裁。
+   *
+   * ```js
+   * new S3MLayer({ nearPlaneScale: 0.1 })   // 13 m → 1.3 m，可以贴脸看
+   * ```
+   *
+   * **代价（必须知道）**：near/far 比值变小会让深度缓冲的非线性变陡，远处可用
+   * 的深度精度下降，极端值下远景可能出现 z-fighting；同时本层写入的深度值与
+   * MapLibre 地形/底图不再完全同尺度，近处的地形遮挡判定会有偏差（远处几乎无差）。
+   * 只影响透视模式——正交模式的 near 由它自己的视锥构造决定。
+   */
+  nearPlaneScale?: number;
+}
+
+/** 近裁剪缩放系数的合法化：非数字 / <=0 / >=1 一律视为「不改」 */
+function normalizeNearPlaneScale(v: number | undefined): number {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 1;
+  return v > 0 && v < 1 ? v : 1;
 }
 
 export class S3MLayer {
@@ -104,9 +130,28 @@ export class S3MLayer {
   /** 底层渲染内核（s3m-three）。直接暴露，方便高级用法绕过图层自己喂帧 */
   readonly viewer: S3MViewer;
 
+  /** 当前近裁剪面缩放系数（1 = 不改，用 MapLibre 的 canvasHeight/50） */
+  get nearPlaneScale(): number {
+    return this._nearPlaneScale;
+  }
+
+  /**
+   * 动态调整近裁剪面缩放（0 < scale < 1）。传 1 / 0 / 非法值 = 恢复 MapLibre 原始 near。
+   *
+   * 解决「相机推进到楼体十几米以内，楼面整片消失」：MapLibre 的 near 是
+   * `canvasHeight / 50`，zoom 16.5 时约合 13 米。缩放后 fov 与 far 完全不变，
+   * 画面逐点重合，只有近处不再被裁。代价见 `nearPlaneScale` 选项说明（深度精度）。
+   */
+  setNearPlaneScale(scale: number): void {
+    this._nearPlaneScale = normalizeNearPlaneScale(scale);
+    this.map?.triggerRepaint?.();
+  }
+
   /** 正交不可用只告警一次 */
   private _orthoWarned = false;
   private _projection: ProjectionMode = 'perspective';
+  /** 近裁剪面缩放系数，1 = 不改（默认） */
+  private _nearPlaneScale = 1;
   /** 正交插值参数：0 = 纯透视，1 = 纯正交，过渡期间由 animator 平滑推进 */
   private _projectionT = 0;
 
@@ -183,6 +228,7 @@ export class S3MLayer {
     this.options = options;
     this.pickable = options.pickable !== false;
     this._projection = options.projection === 'orthographic' ? 'orthographic' : 'perspective';
+    this._nearPlaneScale = normalizeNearPlaneScale(options.nearPlaneScale);
     this._projectionT = this._projection === 'orthographic' ? 1 : 0;
     this.onStats = options.onStats ?? (() => {});
     this.onReady = options.onReady ?? (() => {});
@@ -199,6 +245,10 @@ export class S3MLayer {
       maxConcurrent: options.maxConcurrent,
       useWorker: options.useWorker,
       lodRangeScale: options.lodRangeScale,
+      lodPixelRatioCap: options.lodPixelRatioCap,
+      maxTriangles: options.maxTriangles,
+      anisotropyCap: options.anisotropyCap,
+      maxTextureSize: options.maxTextureSize,
       buildTile: options.buildTile,
       light: options.light,
       toneMapping: options.toneMapping,
@@ -377,9 +427,25 @@ export class S3MLayer {
     const matrix = this._extractMatrix(arg);
     if (!matrix) return;
 
+    let mvpMat = new Matrix4().fromArray(matrix as number[]);
+
+    // 近平面缩放：MapLibre 的 nearZ 是写死的 canvasHeight/50，贴近模型时会把
+    // 整面墙裁掉。这里只在纯透视下换一个 near 更小的投影矩阵，fov / far 不动，
+    // 画面与原画面逐点重合；正交模式的 near 由 buildOrthoMVP 自己决定。
+    if (this._nearPlaneScale < 1 && this._projectionT < 0.0001) {
+      const scaled = buildNearScaledMVP(
+        {
+          projectionMatrix: extractProjectionMatrix(arg),
+          mvp: mvpMat.elements,
+          ...extractNearFar(arg),
+        },
+        this._nearPlaneScale
+      );
+      if (scaled) mvpMat = scaled;
+    }
+
     // 正交模式：视图矩阵从 MapLibre 输入反推（P⁻¹×MVP），不是自建相机，
     // 支持按 _projectionT 在透视与正交之间平滑插值过渡。
-    let mvpMat = new Matrix4().fromArray(matrix as number[]);
     if (this._projectionT > 0.0001) {
       mvpMat = this._applyOrtho(arg, mvpMat, this._projectionT) ?? mvpMat;
     }
@@ -908,6 +974,61 @@ export class S3MLayer {
    */
   setLodRangeScale(scale: number, datasetId?: string): void {
     this.viewer.setLodRangeScale(scale, datasetId);
+  }
+
+  /** 当前 LOD 判定屏幕高度的 DPR 上限。Infinity = 不截断 */
+  get lodPixelRatioCap(): number {
+    return this.viewer.lodPixelRatioCap;
+  }
+
+  /**
+   * 动态调整 LOD 判定屏幕高度的 DPR 上限（默认 Infinity = 不截断，行为与旧版一致）。
+   *
+   * 3x DPR 手机上 LOD 是按物理像素高度算的，细化层数与瓦片数都远多于桌面；
+   * 传 2 即「按 CSS 高度 × 2 截断」，砍掉超采样余量。代价是每块瓦片的屏幕投影
+   * 放大同样倍数，几何与纹理精度同步变差，所以默认不开、由接入方按设备档位决定。
+   */
+  setLodPixelRatioCap(cap: number): void {
+    this.viewer.setLodPixelRatioCap(cap);
+  }
+
+  /** 当前每个数据集的驻留面数预算。Infinity = 不限制 */
+  get maxTriangles(): number {
+    return this.viewer.maxTriangles;
+  }
+
+  /**
+   * 动态调整每个数据集驻留三角形总数的软上限（默认 Infinity = 不限制）。
+   * 与 `maxTiles` 并行生效：瓦片数管不住的场景（精模大面片）用这条做刹车。
+   */
+  setMaxTriangles(n: number, datasetId?: string): void {
+    this.viewer.setMaxTriangles(n, datasetId);
+  }
+
+  /** 当前各向异性过滤上限。Infinity = 取 GPU 最大值 */
+  get anisotropyCap(): number {
+    return this.viewer.anisotropyCap;
+  }
+
+  /**
+   * 调整各向异性过滤上限（默认 Infinity = 取 GPU 最大值，通常 16）。
+   * 移动端封到 4 或 8 肉眼通常无差，采样成本明显下降。只影响之后创建的纹理。
+   */
+  setAnisotropyCap(cap: number): void {
+    this.viewer.setAnisotropyCap(cap);
+  }
+
+  /** 当前纹理长边像素上限。Infinity = 不限制 */
+  get maxTextureSize(): number {
+    return this.viewer.maxTextureSize;
+  }
+
+  /**
+   * 调整纹理长边像素上限（默认 Infinity = 不限制）。
+   * 非图集的 RGBA / WebP 纹理会按 2× 盒式滤波减半到上限内，DXT 压缩直传与图集不受影响。
+   */
+  setMaxTextureSize(n: number): void {
+    this.viewer.setMaxTextureSize(n);
   }
 
   /* ---------------------------------------------------------------- 只读属性 */
