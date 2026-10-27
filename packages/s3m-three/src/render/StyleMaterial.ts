@@ -115,8 +115,23 @@ export interface S3MStyle {
   roofThreshold?: number;
   /** 是否与模型原色贴图叠加混合（0 = 纯色覆盖，1 = 叠乘原色贴图） */
   texMix?: number;
+  /**
+   * 基础漫反射底色增益 / 直通自发光微调（0~1，默认 0.0，建议开启 TOP_SIDE 时可设 0.15~0.3）。
+   * 绕过光照夹角直接补偿表面暗部底色，让 TOP_SIDE / 自定义等模式下的背光阴影面保持通透、不至于过黑。
+   */
+  ambientGain?: number;
   /** 半透明时是否保持深度写入（默认 true，保持写入可彻底遮挡背面与内部棱线，避免背面透出） */
   depthWrite?: boolean;
+  /**
+   * 新瓦片首次出现时的淡入时长（毫秒，0 = 关闭）。
+   *
+   * 只影响「刚加载进来」的瓦片，已经显示的不会被重播。LOD 细化换瓦片时也会淡入，
+   * 视觉上比「啪」一下换掉柔和得多。
+   *
+   * 注意代价：淡入期间该瓦片会进透明渲染队列（混合 + 前后排序），首次加载
+   * 几百块瓦片同时淡入时会有一小段额外开销，所以默认关闭、按需开启。
+   */
+  fadeIn?: number;
 }
 
 export const DEFAULT_STYLE: S3MStyle = {
@@ -147,7 +162,9 @@ export const DEFAULT_STYLE: S3MStyle = {
   edgeThreshold: 55,
   roofThreshold: 0.65,
   texMix: 0,
+  ambientGain: 0,
   depthWrite: true,
+  fadeIn: 0,
 };
 
 export interface StyledMaterial extends THREE.MeshStandardMaterial {
@@ -157,6 +174,8 @@ export interface StyledMaterial extends THREE.MeshStandardMaterial {
     uBatchTex: { value: THREE.Texture };
     uBatchTexWidth: { value: number };
     uBatchTexActive: { value: number };
+    /** 单块瓦片的淡入系数（1 = 完全显示） */
+    uTileFade: { value: number };
     isStyled: true;
     [key: string]: unknown;
   };
@@ -205,9 +224,25 @@ export function createSharedUniforms(): StyleUniforms {
     uRoofThreshold: { value: 0.65 },
     /** 与模型原色贴图混合强度：0 = 纯色覆盖，1 = 叠乘原色贴图 */
     uTexMix: { value: 0 },
+    /** 基础底色增益 / 暗部补偿（0~1，默认 0.0） */
+    uAmbientGain: { value: 0 },
+    /**
+     * 图层整体透明度：在片元里乘进 diffuseColor.a。
+     *
+     * 为什么不做成 `material.opacity`：那是逐材质写入，几百块瓦片就是 O(meshes)，
+     * 而且跨 0.999 改 `material.transparent` 会换 program（`opaque` 参与缓存键）。
+     * 放到共享 uniform 里，透明度动画就退化成一次 float 赋值。
+     */
+    uOpacity: { value: 1 },
+    /** 棱线淡入淡出乘子：setEdges 过渡期间 0→1，新插入的瓦片自动继承 */
+    uEdgeFade: { value: 1 },
+    /**
+     * 整体压暗乘子：`mode` 这类不可插值的切换用它做 fade-through
+     * （压暗 → 换模式 → 亮回来），比硬切自然得多。
+     */
+    uFade: { value: 1 },
   };
 }
-
 const VERT_PARS = /* glsl */ `
   attribute float aBatchId;
   attribute vec3 aColor;
@@ -391,6 +426,10 @@ const FRAG_PARS = /* glsl */ `
   uniform float uSelWhole;
   uniform float uRoofThreshold;
   uniform float uTexMix;
+  uniform float uAmbientGain;
+  uniform float uOpacity;
+  uniform float uTileFade;
+  uniform float uFade;
   varying float vBatchId;
   varying vec3 vVertColor;
   varying float vWorldZ;
@@ -430,6 +469,8 @@ const FRAG_PARS = /* glsl */ `
 const FRAG_COLOR = /* glsl */ `
   float s3mH = clamp( ( vWorldZ - uHeightMin ) / max( uHeightMax - uHeightMin, 0.001 ), 0.0, 1.0 );
   vec3 s3mBase = diffuseColor.rgb;   // 已含 diffuse × map
+  // 图层整体透明度（共享 uniform）+ 单瓦片淡入系数（逐材质），逐帧改都不产生重编译
+  diffuseColor.a *= uOpacity * uTileFade;
   // 所有按单体取值（配色 / 状态纹理 / 选中判定）都走取整后的 id，避免插值噪声
   float s3mBid = s3mBatchId();
 
@@ -531,6 +572,10 @@ const FRAG_COLOR = /* glsl */ `
   } else {
     diffuseColor.rgb *= mix( 1.0, uDimFactor, uDim );
   }
+
+  // 压暗乘子放在最后：mode 分支会整体覆写 diffuseColor.rgb，
+  // 放在前面会被覆盖掉。setMode 的 fade-through 就靠它。
+  diffuseColor.rgb *= uFade;
 `;
 
 const FRAG_EMISSIVE = /* glsl */ `
@@ -538,6 +583,10 @@ const FRAG_EMISSIVE = /* glsl */ `
   // glowOnly 模式下表面不自发光，只保留描边边框；其他模式下适度发光
   if ( uSelMode != 3 ) {
     totalEmissiveRadiance += uSelColor * s3mSelE * uSelMix * ( uSelEmissive * 0.4 );
+  }
+  // 直通自发光微调 / 环境光底色提升：补偿背光阴影面（尤其 TOP_SIDE 立面），避免光照阴影面过暗
+  if ( uAmbientGain > 0.001 ) {
+    totalEmissiveRadiance += diffuseColor.rgb * uAmbientGain;
   }
 `;
 
@@ -596,6 +645,8 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   const uBatchTex = { value: DUMMY_BATCH_TEX };
   const uBatchTexWidth = { value: 1.0 };
   const uBatchTexActive = { value: 0 };
+  /** 单块瓦片的淡入系数：逐材质独享（每块网格一份材质），默认 1 = 完全显示 */
+  const uTileFade = { value: 1 };
 
   // 图集材质：只有几何确实带了 aAtlasRect 才开这个宏，否则缺属性会采到 (0,0) 的默认值
   const atlas = !!opts.atlas && !!opts.map;
@@ -613,6 +664,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       uBatchTex,
       uBatchTexWidth,
       uBatchTexActive,
+      uTileFade,
       uSecMap: { value: secMap },
       uAtlasDim,
       uAtlasDim1,
@@ -656,6 +708,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   mat.userData.uBatchTex = uBatchTex;
   mat.userData.uBatchTexWidth = uBatchTexWidth;
   mat.userData.uBatchTexActive = uBatchTexActive;
+  mat.userData.uTileFade = uTileFade;
   mat.userData.isStyled = true;
   return mat;
 }

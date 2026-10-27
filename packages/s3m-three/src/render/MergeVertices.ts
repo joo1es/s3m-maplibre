@@ -14,6 +14,16 @@
  */
 import * as THREE from 'three';
 
+/**
+ * 位置量化 key：坐标落到 tolerance 网格上取整。
+ *
+ * 单独导出是因为棱线的「位置 → batchId」回填（见 EdgeLines.buildPositionBatchMap）
+ * 必须用同一套网格，否则焊过的顶点对不上号。
+ */
+export function positionQuantKey(x: number, y: number, z: number, inv: number): string {
+  return `${Math.round(x * inv)},${Math.round(y * inv)},${Math.round(z * inv)}`;
+}
+
 export function mergeVerticesByPosition(
   geometry: THREE.BufferGeometry,
   tolerance: number
@@ -31,7 +41,7 @@ export function mergeVerticesByPosition(
     const x = pos.getX(i);
     const y = pos.getY(i);
     const z = pos.getZ(i);
-    const key = `${Math.round(x * inv)},${Math.round(y * inv)},${Math.round(z * inv)}`;
+    const key = positionQuantKey(x, y, z, inv);
     let id = map.get(key);
     if (id === undefined) {
       id = out.length / 3;

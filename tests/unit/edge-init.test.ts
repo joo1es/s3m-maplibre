@@ -154,3 +154,45 @@ describe('_ensureEdges：顶点焊合 + 临界角 + 过滤', () => {
     expect((e.getAttribute('position').array as Float32Array).length / 6).toBe(5);
   });
 });
+
+describe('edgeThreshold：运行中修改必须真正重建棱线', () => {
+  /**
+   * 修复前：setStyle({ edgeThreshold }) 会调 setEdges(true)，但 setEdges 只挑
+   * 「还没有棱线」的网格来建（filter: !ud.edges），已经建好的全被跳过 ——
+   * 于是临界角改了却什么都没发生，滑块拖到底也没反应。
+   */
+  function edgeSegmentCount(mesh: THREE.Mesh): number {
+    const lines = (mesh.userData as any).edges as THREE.Mesh | null | undefined;
+    if (!lines) return 0;
+    const attr = lines.geometry.getAttribute('position');
+    return attr ? attr.count / 4 : 0; // 每段 4 个顶点
+  }
+
+  test('调大临界角后，90° 折边被过滤掉', () => {
+    // 立方体各面夹角 90°
+    const v = new S3MViewer({ style: { edges: true, edgeThreshold: 89 } });
+    const mesh = registerBox(v);
+    expect(edgeSegmentCount(mesh)).toBeGreaterThan(0);
+
+    // 阈值抬到 120° → 90° 不再算棱，棱线应被移除
+    v.setStyle({ edgeThreshold: 120 });
+    expect(edgeSegmentCount(mesh)).toBe(0);
+  });
+
+  test('调回小临界角后能重新长出来', () => {
+    const v = new S3MViewer({ style: { edges: true, edgeThreshold: 120 } });
+    const mesh = registerBox(v);
+    expect(edgeSegmentCount(mesh)).toBe(0);
+
+    v.setStyle({ edgeThreshold: 30 });
+    expect(edgeSegmentCount(mesh)).toBeGreaterThan(0);
+  });
+
+  test('临界角变化在 edges 关闭时不做无谓重建', () => {
+    const v = new S3MViewer({ style: { edges: false, edgeThreshold: 55 } });
+    const mesh = registerBox(v);
+    expect((mesh.userData as any).edges).toBeFalsy();
+    v.setStyle({ edgeThreshold: 30 });
+    expect((mesh.userData as any).edges).toBeFalsy();
+  });
+});

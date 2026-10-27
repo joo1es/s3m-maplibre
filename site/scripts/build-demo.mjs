@@ -82,9 +82,14 @@ async function main() {
   const assets = await readdir(path.join(TARGET, 'assets'));
   console.log(`  ✓ demo/index.html  ${(size / 1024).toFixed(0)} KB，assets ${assets.length} 个`);
 
-  // dist-demo/ 与 dist-demo-ssr/ 只是中转站，产物已经落到 demo/，留着只会越积越多
-  await rm(SSR_OUT, { recursive: true, force: true });
-  await rm(DIST, { recursive: true, force: true });
+  // dist-demo/ 与 dist-demo-ssr/ 只是中转站，产物已经落到 demo/，留着只会越积越多。
+  // 清理是尽力而为：这两个目录都在 .gitignore 里，删不掉只占点磁盘，
+  // 不该让一次已经成功的构建被判失败（个别环境的安全删除钩子会拦截 rm）。
+  for (const dir of [SSR_OUT, DIST]) {
+    await rm(dir, { recursive: true, force: true }).catch((err) => {
+      console.warn(`[demo] 清理 ${path.basename(dir)} 失败（可忽略）: ${err?.message ?? err}`);
+    });
+  }
   console.log(`[demo] 输出 demo/ （${((Date.now() - started) / 1000).toFixed(1)}s）`);
 }
 

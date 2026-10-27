@@ -83,6 +83,11 @@ export default function SelectSection() {
           <input type="range" id="optEdgeWidth" min="10" max="60" step="5" value="12" />
           <b id="edgeWidthVal">1.2px</b>
         </label>
+        <label class="rng" id="wrapEdgeThreshold" style="display:none; margin-top: 4px;">
+          <span>棱线临界角</span>
+          <input type="range" id="optEdgeThreshold" min="5" max="120" step="5" value="55" />
+          <b id="edgeThresholdVal">55°</b>
+        </label>
         <label class="chk">
           <input type="checkbox" id="optOccludeBack" checked /> 遮挡内部与背面线条 (深度防透)
         </label>
@@ -107,6 +112,27 @@ export default function SelectSection() {
           <b id="filterMaxHVal">全部</b>
         </label>
         <div id="filterStatus" style="font-size: 11px; color: #64748b; margin-top: 3px; min-height: 16px;" />
+      </section>
+
+      <section>
+        <h2>单体动画（演示）</h2>
+        <div style="display: flex; gap: 5px; margin-bottom: 6px;">
+          <button id="btnOrbit" class="btn" style="flex:1;">
+            选中单体绕圈
+          </button>
+          <button id="btnOrbitStop" class="btn" style="flex:1;">
+            停止
+          </button>
+        </div>
+        <div style="display: flex; gap: 5px;">
+          <button id="btnRaise" class="btn" style="flex:1;">
+            抬高 100m
+          </button>
+          <button id="btnFadeOut" class="btn" style="flex:1;">
+            淡出 / 淡入
+          </button>
+        </div>
+        <div id="animStatus" style="font-size: 11px; color: #64748b; margin-top: 3px; min-height: 16px;" />
       </section>
 
       <section>

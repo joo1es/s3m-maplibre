@@ -45,6 +45,11 @@ export default function StyleSection() {
           <input type="range" id="optOpacity" min="20" max="100" step="1" value="100" />
           <b id="opacityVal">100%</b>
         </label>
+        <label class="rng">
+          <span>瓦片淡入</span>
+          <input type="range" id="optFadeIn" min="0" max="1200" step="100" value="0" />
+          <b id="fadeInVal">关闭</b>
+        </label>
         <label class="chk">
           <input type="checkbox" id="optFlat" checked /> 平面着色（白模更干净）
         </label>

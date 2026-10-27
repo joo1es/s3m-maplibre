@@ -915,6 +915,14 @@ $('optEdges').addEventListener('change', (e) => {
   layer.setEdges(on);
   $('wrapEdgeOpacity').style.display = on ? '' : 'none';
   $('wrapEdgeWidth').style.display = on ? '' : 'none';
+  $('wrapEdgeThreshold').style.display = on ? '' : 'none';
+});
+
+$('optEdgeThreshold').addEventListener('input', (e) => {
+  const v = Number(e.target.value);
+  $('edgeThresholdVal').textContent = `${v}°`;
+  // 会重建 CPU 棱线（EdgesGeometry 参数变了），分片建，拖快了也只是慢一点
+  layer.setStyle({ edgeThreshold: v });
 });
 
 $('optEdgeWidth').addEventListener('input', (e) => {
@@ -933,6 +941,13 @@ $('optOpacity').addEventListener('input', (e) => {
   const v = Number(e.target.value);
   $('opacityVal').textContent = `${v}%`;
   layer.setStyle({ opacity: v / 100 });
+});
+
+$('optFadeIn').addEventListener('input', (e) => {
+  const v = Number(e.target.value);
+  $('fadeInVal').textContent = v > 0 ? `${v}ms` : '关闭';
+  // 只影响之后新加载的瓦片；想立刻看到效果可以转动视角触发 LOD 换瓦
+  layer.setStyle({ fadeIn: v });
 });
 $('optFlat').addEventListener('change', (e) => layer.setStyle({ shading: e.target.checked ? 'flat' : 'smooth' }));
 
@@ -978,14 +993,14 @@ if ($('optLightAltitude')) {
   $('optLightAltitude').addEventListener('input', (e) => {
     const deg = Number(e.target.value);
     $('lightAltitudeVal').textContent = `${deg}°`;
-    layer.setLight({ altitude: (deg * Math.PI) / 180 });
+    layer.setLight({ altitude: deg });
   });
 }
 if ($('optLightAzimuth')) {
   $('optLightAzimuth').addEventListener('input', (e) => {
     const deg = Number(e.target.value);
     $('lightAzimuthVal').textContent = `${deg}°`;
-    layer.setLight({ azimuth: (deg * Math.PI) / 180 });
+    layer.setLight({ azimuth: deg });
   });
 }
 if ($('optLightMainColor')) {
@@ -1058,6 +1073,62 @@ $('btnFilterReset').addEventListener('click', () => {
   $('filterMaxHVal').textContent = '全部';
   layer.clearFilter();
   updateFilterStatus();
+});
+
+/* ---------------------------------------------------------------- 单体动画演示 */
+
+const animStatus = (msg) => {
+  const el = $('animStatus');
+  if (el) el.textContent = msg;
+};
+
+$('btnOrbit').addEventListener('click', () => {
+  const smid = currentFeature?.smid;
+  if (smid == null) {
+    alert('请先在地图上点击选中一栋建筑');
+    return;
+  }
+  // 半径 40m 的圆：translation 是相对原位的偏移，所以看起来是绕自己转圈
+  const points = [];
+  const R = 40;
+  const N = 48;
+  for (let i = 0; i < N; i++) {
+    const a = (i / N) * Math.PI * 2;
+    points.push([Math.cos(a) * R, Math.sin(a) * R, 0]);
+  }
+  layer.followPath(smid, points, { duration: 8000, loop: true, closed: true });
+  animStatus(`SMID ${smid} 绕圈中（弧长参数化，恒速）`);
+});
+
+$('btnOrbitStop').addEventListener('click', () => {
+  const smid = currentFeature?.smid;
+  if (smid == null) return;
+  layer.stopPath(smid);
+  animStatus('已停止（停在当前位置）');
+});
+
+$('btnRaise').addEventListener('click', () => {
+  const smid = currentFeature?.smid;
+  if (smid == null) {
+    alert('请先在地图上点击选中一栋建筑');
+    return;
+  }
+  const cur = layer.getFeatureStyle(smid)?.elevation ?? 0;
+  const next = cur > 0 ? 0 : 100;
+  layer.animateFeature(smid, { elevation: next }, { duration: 700, easing: 'easeOutCubic' });
+  animStatus(`抬高 → ${next}m`);
+});
+
+$('btnFadeOut').addEventListener('click', () => {
+  const smid = currentFeature?.smid;
+  if (smid == null) {
+    alert('请先在地图上点击选中一栋建筑');
+    return;
+  }
+  const cur = layer.getFeatureStyle(smid)?.opacity ?? 1;
+  const next = cur < 0.9 ? 1 : 0.15;
+  layer.animateFeature(smid, { opacity: next }, { duration: 600 });
+  animStatus(`透明度 → ${next}`);
 });
 
 $('optFilterMaxH').addEventListener('input', (e) => {

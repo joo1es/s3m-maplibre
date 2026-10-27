@@ -281,5 +281,13 @@ export interface StyleUniforms {
   uFilterHeightActive?: { value: number };
   uRoofThreshold?: { value: number };
   uTexMix?: { value: number };
+  /** 基础漫反射底色增益 / 直通自发光微调（0~1，默认 0.0） */
+  uAmbientGain?: { value: number };
+  /** 图层整体透明度（共享 uniform，透明度动画靠它做到 O(1)） */
+  uOpacity?: { value: number };
+  /** 棱线淡入淡出乘子（setEdges 过渡期间 0→1） */
+  uEdgeFade?: { value: number };
+  /** 整体压暗乘子（mode 切换的 fade-through） */
+  uFade?: { value: number };
   [key: string]: { value: unknown } | undefined;
 }

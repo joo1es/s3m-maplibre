@@ -1178,7 +1178,9 @@ export class S3MTileset {
       if (inRange) node.lastSeen = this._frame;
 
       const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
-      const needRefine = childUrls.length > 0 && (byDistance ? metric < threshold : metric > threshold);
+      // 加入 8% 迟滞区间（Hysteresis Band），防止相机在 LOD 临界距离处发生父子瓦片逐帧来回横跳闪烁
+      const hFactor = node.needRefine ? (byDistance ? 1.08 : 0.92) : 1.0;
+      const needRefine = childUrls.length > 0 && (byDistance ? metric < threshold * hFactor : metric > threshold * hFactor);
       node.needRefine = needRefine;
 
       const dbgSeen = ((globalThis as { __S3M_LOD_SEEN?: Set<string> }).__S3M_LOD_SEEN ??= new Set<string>());

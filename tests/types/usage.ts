@@ -58,7 +58,21 @@ const layer = new S3MLayer({
   ],
   maxTiles: 48,
   maxConcurrent: 3,
-  style: { mode: STYLE.WHITE, opacity: 0.9, shading: 'flat', floorHeight: 3.3 },
+  style: {
+    mode: STYLE.WHITE,
+    opacity: 0.9,
+    shading: 'flat',
+    floorHeight: 3.3,
+    // 棱线相关：构造时就要能配，且 edgeThreshold / roofThreshold 必须在类型里
+    edges: true,
+    edgeWidth: 1.5,
+    edgeOpacity: 0.6,
+    edgeColor: '#334155',
+    edgeThreshold: 40,
+    roofThreshold: 0.65,
+    // 瓦片淡入时长（毫秒，0 = 关闭）
+    fadeIn: 500,
+  },
   onStats: (s: Stats) => s.triangles.toFixed(0),
   onReady: (e: S3MDatasetEntry) => e.offset[0],
   onPick: (f: PickResult | null) => {

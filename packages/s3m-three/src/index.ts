@@ -96,6 +96,7 @@ export type {
   GroundMode,
   GroundOptions,
   LightOptions,
+  PathFollowOptions,
 } from './render/S3MViewer.js';
 
 export { buildTileObjects } from './render/GeometryBuilder.js';
@@ -116,6 +117,15 @@ export type { StyleMode, SelectMode, StyledMaterial, StyledMaterialOptions, Outl
 
 export { Picker } from './render/Picker.js';
 export type { PickHit } from './render/Picker.js';
+
+export { Animator, Path, easing, cubicBezier, steps, EASING_NAMES } from './anim/index.js';
+export type {
+  Channel,
+  SpringSpec,
+  TransitionOptions,
+  EasingFn,
+  EasingName,
+} from './anim/index.js';
 
 export {
   buildOrthoMVP,

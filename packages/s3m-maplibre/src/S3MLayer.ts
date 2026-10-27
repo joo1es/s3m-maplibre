@@ -35,8 +35,11 @@ import type {
   BatchAudit,
   GroundMode,
   LightOptions,
+  TransitionOptions,
+  Path,
+  PathFollowOptions,
 } from 's3m-three';
-import type { Ray } from 'three';
+import type { Ray, ToneMapping } from 'three';
 import { Matrix4 } from 'three';
 import {
   buildOrthoMVP,
@@ -178,6 +181,8 @@ export class S3MLayer {
       lodRangeScale: options.lodRangeScale,
       buildTile: options.buildTile,
       light: options.light,
+      toneMapping: options.toneMapping,
+      toneMappingExposure: options.toneMappingExposure,
       totalMaxTiles: options.totalMaxTiles,
       attributes: options.attributes,
       // 三个宿主能力全部走回调注入，viewer 不碰任何地图 API
@@ -487,23 +492,33 @@ export class S3MLayer {
     return this.viewer.getLight();
   }
 
-  /** 动态设置图层整体透明度 (0.0 ~ 1.0) */
-  setOpacity(opacity: number): void {
-    this.viewer.setOpacity(opacity);
+  /** 动态设置色调映射模式与曝光度（可传 THREE.NoToneMapping 还原真实材质与底图通透度） */
+  setToneMapping(toneMapping: ToneMapping, exposure = 1.0): void {
+    this.viewer.setToneMapping(toneMapping, exposure);
   }
 
-  /** 合并并应用样式。只改 uniform 的项不会触发几何/着色器重建。 */
-  setStyle(patch: Partial<S3MStyle> = {}): void {
-    this.viewer.setStyle(patch);
+  /** 获取当前色调映射模式与曝光度 */
+  getToneMapping(): { toneMapping: ToneMapping; toneMappingExposure: number } {
+    return this.viewer.getToneMapping();
+  }
+
+  /** 动态设置图层整体透明度 (0.0 ~ 1.0)，可带过渡 */
+  setOpacity(opacity: number, transition?: TransitionOptions): void {
+    this.viewer.setOpacity(opacity, transition);
+  }
+
+  /** 合并并应用样式。只改 uniform 的项不会触发几何/着色器重建。可带过渡。 */
+  setStyle(patch: Partial<S3MStyle> = {}, transition?: TransitionOptions): void {
+    this.viewer.setStyle(patch, transition);
   }
 
   getStyle(): S3MStyle & { modeLabel: string } {
     return this.viewer.getStyle();
   }
 
-  /** 全局棱线开关 */
-  setEdges(enabled: boolean): void {
-    this.viewer.setEdges(enabled);
+  /** 全局棱线开关，可带淡入淡出 */
+  setEdges(enabled: boolean, transition?: TransitionOptions): void {
+    this.viewer.setEdges(enabled, transition);
   }
 
   /** 挂载预制棱线缓存（source-creases.f32 这类 Float32 段缓冲），比逐网格现算快得多 */
@@ -524,6 +539,62 @@ export class S3MLayer {
 
   setFeaturesStyle(smids: number[], style: FeatureStyle): void {
     this.viewer.setFeaturesStyle(smids, style);
+  }
+
+  /** 单体平移动画（米，场景 ENU 增量）。平移后拾取 / 描边 / 棱线自动跟随 */
+  moveFeature(
+    smid: number,
+    translation: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    this.viewer.moveFeature(smid, translation, transition);
+  }
+
+  /** 单体按增量平移（相对当前位置） */
+  moveFeatureBy(
+    smid: number,
+    delta: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    this.viewer.moveFeatureBy(smid, delta, transition);
+  }
+
+  /** 单体样式过渡：颜色 / 抬高 / 透明度 / 平移可任意组合 */
+  animateFeature(smid: number, style: Partial<FeatureStyle>, transition?: TransitionOptions): void {
+    this.viewer.animateFeature(smid, style, transition);
+  }
+
+  /** 批量单体样式过渡，支持 `stagger` 错峰 */
+  animateFeatures(
+    smids: number[],
+    style: Partial<FeatureStyle>,
+    transition?: TransitionOptions
+  ): void {
+    this.viewer.animateFeatures(smids, style, transition);
+  }
+
+  /** 切换着色模式，用「压暗 → 换 → 亮回来」代替硬切 */
+  setMode(mode: S3MStyle['mode'], options?: { duration?: number; dim?: number }): Promise<void> {
+    return this.viewer.setMode(mode, options);
+  }
+
+  /** 单体沿折线运动（弧长参数化，缓动作用在距离上） */
+  followPath(
+    smid: number,
+    points: Path | ArrayLike<number> | Array<[number, number, number]>,
+    options?: PathFollowOptions
+  ): void {
+    this.viewer.followPath(smid, points, options);
+  }
+
+  /** 停下路径运动（停在当前位置） */
+  stopPath(smid: number): void {
+    this.viewer.stopPath(smid);
+  }
+
+  /** 动画调度器：取消 / 直跳 / 改预算都走这里 */
+  get animation(): S3MViewer['animator'] {
+    return this.viewer.animator;
   }
 
   getFeatureStyle(smid: number): FeatureStyle | null {

@@ -116,9 +116,13 @@ async function main() {
     if (name.endsWith('.css')) await rm(path.join(assetsDir, name), { force: true });
   }
 
-  // dist/ 与 dist-ssr/ 只是中转站，产物已经落到 docs/，留着只会越积越多
-  await rm(SSR_OUT, { recursive: true, force: true });
-  await rm(DIST, { recursive: true, force: true });
+  // dist/ 与 dist-ssr/ 只是中转站，产物已经落到 docs/，留着只会越积越多。
+  // 同 build-demo：清理是尽力而为，删不掉只占磁盘，不该让成功的构建判失败。
+  for (const dir of [SSR_OUT, DIST]) {
+    await rm(dir, { recursive: true, force: true }).catch((err) => {
+      console.warn(`[docs] 清理 ${path.basename(dir)} 失败（可忽略）: ${err?.message ?? err}`);
+    });
+  }
 
   console.log(
     `[docs] 输出 docs/ （${PAGES.length} 页，${((Date.now() - started) / 1000).toFixed(1)}s）`,

@@ -185,7 +185,15 @@ export class FeatureStyleManager {
     private readonly _triggerRepaint: () => void,
     private readonly _onStyleChanged: () => void,
     private readonly _getAllMeshes?: () => Iterable<THREE.Mesh>,
-    private readonly _applyOverrideHook?: (mesh: THREE.Mesh) => void
+    private readonly _applyOverrideHook?: (mesh: THREE.Mesh) => void,
+    /**
+     * 图层自身是否处于半透明状态。
+     *
+     * 以前这里读 `material.opacity` 来判断「要不要把 transparent 还原」——自从全局
+     * 透明度改走共享 `uOpacity` 之后，`material.opacity` 不再等于图层透明度，
+     * 再读它就会在图层半透明时把材质错判成不透明、把整层透明效果抹掉。
+     */
+    private readonly _isLayerTransparent: () => boolean = () => false
   ) {}
 
   setFeatureStyle(smid: number, style: FeatureStyle, meshes?: Iterable<THREE.Mesh>): void {
@@ -565,7 +573,7 @@ export class FeatureStyleManager {
         mat.userData.uBatchTexActive.value = 0;
       }
       // 单体淡化清除后，把材质 transparent 还原成全局透明度语义
-      if (mat.transparent && mat.opacity >= 0.999) mat.transparent = false;
+      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
       return;
     }
 
@@ -573,7 +581,7 @@ export class FeatureStyleManager {
       if (mat.userData.uBatchTexActive) {
         mat.userData.uBatchTexActive.value = 0;
       }
-      if (mat.transparent && mat.opacity >= 0.999) mat.transparent = false;
+      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
       return;
     }
 
@@ -731,7 +739,7 @@ export class FeatureStyleManager {
 
     // 有淡化单体时整块材质要开混合才有透明效果；清除后还原为全局透明度语义
     if (hasFade && !mat.transparent) mat.transparent = true;
-    else if (!hasFade && mat.transparent && mat.opacity >= 0.999) mat.transparent = false;
+    else if (!hasFade && mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
 
     let conflicts = 0;
     for (const [bId, owners] of ownersOfBatch) {

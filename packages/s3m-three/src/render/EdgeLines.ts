@@ -13,6 +13,7 @@
  * B 端算出来的法线正好和 A 端相反，反号一次才能拼成同一个四边形。
  */
 import * as THREE from 'three';
+import { DUMMY_BATCH_TEX } from './StyleMaterial.js';
 
 /** 所有等宽线材质共享的分辨率 uniform（每帧更新一次即可） */
 export interface LineSharedUniforms {
@@ -20,14 +21,34 @@ export interface LineSharedUniforms {
   uDpr: { value: number };
 }
 
+/**
+ * 等宽线的「外观」uniform（颜色 / 粗细 / 透明度 / 拔高）。
+ *
+ * 棱线材质是**逐网格一份**的（见 createThickLineMaterial 的 batchUniforms 参数），
+ * 但外观必须全局统一——所以这些 `{ value }` 对象由调用方持有并共享给每一份材质，
+ * 改一次全场景生效，棱线淡入淡出才能保持 O(1)。
+ */
+export interface ThickLineStyleUniforms {
+  uColor: { value: THREE.Color };
+  uWidth: { value: number };
+  uOpacity: { value: number };
+  uElevation?: { value: number };
+}
+
+/** 等宽线的「单体状态」uniform：直接复用主材质 userData 里那几个对象，自动跟随 */
+export interface ThickLineBatchUniforms {
+  uBatchTex: { value: THREE.Texture };
+  uBatchTexWidth: { value: number };
+  uBatchTexActive: { value: number };
+}
+
 export interface ThickLineMaterial extends THREE.ShaderMaterial {
-  uniforms: LineSharedUniforms & {
-    uColor: { value: THREE.Color };
-    uOpacity: { value: number };
-    uWidth: { value: number };
-    uElevation: { value: number };
-    [uniform: string]: THREE.IUniform;
-  };
+  uniforms: LineSharedUniforms &
+    ThickLineStyleUniforms &
+    Required<ThickLineBatchUniforms> & {
+      uTranslation: { value: THREE.Vector3 };
+      [uniform: string]: THREE.IUniform;
+    };
 }
 
 export function createLineSharedUniforms(): LineSharedUniforms {
@@ -40,18 +61,42 @@ export function createLineSharedUniforms(): LineSharedUniforms {
 const VERT = /* glsl */ `
   attribute vec3 aOther;
   attribute float aSide;
+  attribute float aBatchId;
 
   uniform vec2 uResolution;
   uniform float uDpr;
   uniform float uWidth;
   uniform float uElevation;
   uniform vec3 uTranslation;
+  uniform sampler2D uBatchTex;
+  uniform float uBatchTexWidth;
+  uniform int uBatchTexActive;
 
   void main() {
+    // 单体平移 / 拔高 / 隐藏：与主着色器同一份状态纹理、同一套口径。
+    // 不采样的话，单体一动棱线就留在原地——这正是「棱线跟随」要解决的。
+    vec3 s3mA = position;
+    vec3 s3mB = aOther;
+    if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
+      vec4 bState = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.25 ) );
+      if ( bState.a < -0.5 ) {
+        // 该单体被隐藏：顶点着色器不能 discard，扔到裁剪空间外
+        gl_Position = vec4( 2.0, 2.0, 2.0, 1.0 );
+        return;
+      }
+      vec4 bOffset = texture2D( uBatchTex, vec2( ( aBatchId + 0.5 ) / uBatchTexWidth, 0.75 ) );
+      vec3 s3mOffset = bOffset.xyz;
+      if ( s3mOffset.z == 0.0 && bState.a > 0.0 ) {
+        s3mOffset.z = bState.a;
+      }
+      s3mA += s3mOffset;
+      s3mB += s3mOffset;
+    }
+
     // 选中单体平移/拔高：与着色器里 transformed += uTranslation 保持同一口径（物体空间）
     vec3 offset = uTranslation + vec3( 0.0, 0.0, uElevation );
-    vec4 clipA = projectionMatrix * modelViewMatrix * vec4( position + offset, 1.0 );
-    vec4 clipB = projectionMatrix * modelViewMatrix * vec4( aOther + offset, 1.0 );
+    vec4 clipA = projectionMatrix * modelViewMatrix * vec4( s3mA + offset, 1.0 );
+    vec4 clipB = projectionMatrix * modelViewMatrix * vec4( s3mB + offset, 1.0 );
 
     if ( clipA.w <= 0.0 || clipB.w <= 0.0 ) {
       // 端点跑到相机后面，整段丢弃（裁到近平面的线段会有轻微截断，可接受）
@@ -87,19 +132,50 @@ const FRAG = /* glsl */ `
   }
 `;
 
+/**
+ * 创建一份等宽线材质。
+ *
+ * @param styleUniforms  外观 uniform（颜色 / 粗细 / 透明度 / 拔高）。传入时**直接
+ *   复用这些 `{ value }` 对象**而不是新建——棱线材质逐网格一份，但外观必须全局统一，
+ *   共享对象才能让 `_syncEdgeStyle()` 的一次赋值作用到所有棱线上。
+ * @param batchUniforms  单体状态纹理 uniform。传入时同样直接复用主材质 userData 里
+ *   的那几个对象，主材质换纹理 / 开关 active 时棱线自动跟着走，零同步成本。
+ *   不传（或几何没有 aBatchId）时棱线不参与单体状态。
+ */
 export function createThickLineMaterial(
   shared: LineSharedUniforms,
-  opts: { color?: THREE.ColorRepresentation; opacity?: number; width?: number; elevation?: number } = {}
+  opts: { color?: THREE.ColorRepresentation; opacity?: number; width?: number; elevation?: number } = {},
+  styleUniforms?: ThickLineStyleUniforms,
+  batchUniforms?: ThickLineBatchUniforms
 ): ThickLineMaterial {
+  const style: ThickLineStyleUniforms = styleUniforms ?? {
+    uColor: { value: new THREE.Color(opts.color ?? '#ffffff') },
+    uOpacity: { value: opts.opacity ?? 1 },
+    uWidth: { value: opts.width ?? 1.5 },
+    uElevation: { value: opts.elevation ?? 0 },
+  };
+  if (opts.color !== undefined && styleUniforms) style.uColor.value.set(opts.color);
+  if (opts.opacity !== undefined && styleUniforms) style.uOpacity.value = opts.opacity;
+  if (opts.width !== undefined && styleUniforms) style.uWidth.value = opts.width;
+
+  const batch: Required<ThickLineBatchUniforms> = batchUniforms ?? {
+    uBatchTex: { value: DUMMY_BATCH_TEX },
+    uBatchTexWidth: { value: 1 },
+    uBatchTexActive: { value: 0 },
+  };
+
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uResolution: shared.uResolution,
       uDpr: shared.uDpr,
-      uColor: { value: new THREE.Color(opts.color ?? '#ffffff') },
-      uOpacity: { value: opts.opacity ?? 1 },
-      uWidth: { value: opts.width ?? 1.5 },
-      uElevation: { value: opts.elevation ?? 0 },
+      uColor: style.uColor,
+      uOpacity: style.uOpacity,
+      uWidth: style.uWidth,
+      uElevation: style.uElevation ?? { value: opts.elevation ?? 0 },
       uTranslation: { value: new THREE.Vector3(0, 0, 0) },
+      uBatchTex: batch.uBatchTex,
+      uBatchTexWidth: batch.uBatchTexWidth,
+      uBatchTexActive: batch.uBatchTexActive,
     },
     vertexShader: VERT,
     fragmentShader: FRAG,
@@ -117,14 +193,22 @@ export function createThickLineMaterial(
 
 /**
  * 线段对（每 6 个 float：x1 y1 z1 x2 y2 z2）→ 可绘制等宽线的几何体。
+ *
+ * @param batchIds 每段所属的单体 batchId（长度 = 段数）。给了它，顶点着色器才能
+ *   按单体从状态纹理取平移/拔高——棱线跟随移动靠的就是这个。不传全部填 -1，
+ *   着色器会跳过采样（等于不参与单体状态）。
  */
-export function buildThickLineGeometry(segments: ArrayLike<number>): THREE.BufferGeometry {
+export function buildThickLineGeometry(
+  segments: ArrayLike<number>,
+  batchIds?: ArrayLike<number>
+): THREE.BufferGeometry {
   const count = Math.floor(segments.length / 6);
   const vertexCount = count * 4;
 
   const position = new Float32Array(vertexCount * 3);
   const other = new Float32Array(vertexCount * 3);
   const side = new Float32Array(vertexCount);
+  const batch = new Float32Array(vertexCount);
   const index = vertexCount > 65535 ? new Uint32Array(count * 6) : new Uint16Array(count * 6);
 
   for (let i = 0; i < count; i++) {
@@ -135,6 +219,7 @@ export function buildThickLineGeometry(segments: ArrayLike<number>): THREE.Buffe
     const bx = segments[s + 3];
     const by = segments[s + 4];
     const bz = segments[s + 5];
+    const b = batchIds ? Number(batchIds[i] ?? -1) : -1;
 
     const v = i * 4;
     // A 端两枚
@@ -143,6 +228,7 @@ export function buildThickLineGeometry(segments: ArrayLike<number>): THREE.Buffe
     // B 端两枚（side 反号）
     setVertex(v + 2, bx, by, bz, ax, ay, az, 1);
     setVertex(v + 3, bx, by, bz, ax, ay, az, -1);
+    for (let k = 0; k < 4; k++) batch[v + k] = b;
 
     const o = i * 6;
     index[o] = v;
@@ -177,9 +263,39 @@ export function buildThickLineGeometry(segments: ArrayLike<number>): THREE.Buffe
   geometry.setAttribute('position', new THREE.BufferAttribute(position, 3));
   geometry.setAttribute('aOther', new THREE.BufferAttribute(other, 3));
   geometry.setAttribute('aSide', new THREE.BufferAttribute(side, 1));
+  geometry.setAttribute('aBatchId', new THREE.BufferAttribute(batch, 1));
   geometry.setIndex(new THREE.BufferAttribute(index, 1));
   geometry.computeBoundingSphere();
   return geometry;
+}
+
+/**
+ * 从带 `aBatchId` 的几何里建「量化位置 → batchId」的查找表。
+ *
+ * `EdgesGeometry` 输出的线段只有坐标、没有顶点号，要知道每段棱线属于哪个单体，
+ * 只能拿端点坐标回来查。key 的量化方式必须和 `mergeVerticesByPosition` 完全一致，
+ * 否则焊过的顶点会对不上。返回 null 表示这个几何没有单体化信息。
+ */
+export function buildPositionBatchMap(
+  geometry: THREE.BufferGeometry,
+  tolerance: number
+): Map<string, number> | null {
+  const pos = geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+  const bid = geometry.getAttribute('aBatchId') as THREE.BufferAttribute | undefined;
+  if (!pos || !bid || pos.count === 0 || pos.count !== bid.count) return null;
+
+  const inv = 1 / Math.max(tolerance, 1e-9);
+  const map = new Map<string, number>();
+  for (let i = 0; i < pos.count; i++) {
+    const key = positionQuantKey(pos.getX(i), pos.getY(i), pos.getZ(i), inv);
+    if (!map.has(key)) map.set(key, bid.getX(i));
+  }
+  return map.size > 0 ? map : null;
+}
+
+/** 位置量化 key：与 mergeVerticesByPosition 同一套网格，保证焊过的顶点对得上 */
+export function positionQuantKey(x: number, y: number, z: number, inv: number): string {
+  return `${Math.round(x * inv)},${Math.round(y * inv)},${Math.round(z * inv)}`;
 }
 
 /* ------------------------------------------------------------------ 单体棱线提取 */

@@ -138,5 +138,39 @@ describe('光照可调 (Adjustable Lighting)', () => {
 
     layer.setLight({ keyLightIntensity: 1.8 });
     expect(layer.getLight().keyLightIntensity).toBeCloseTo(1.8, 2);
+
+    // mainIntensity 兼容别名
+    layer.setLight({ mainIntensity: 2.2 });
+    expect(layer.getLight().keyLightIntensity).toBeCloseTo(2.2, 2);
+  });
+
+  test('7. 支持 toneMapping 配置，且默认 THREE.NoToneMapping', () => {
+    const viewer = new S3MViewer();
+    expect(viewer.getToneMapping().toneMapping).toBe(THREE.NoToneMapping);
+
+    viewer.setToneMapping(THREE.ACESFilmicToneMapping, 1.2);
+    expect(viewer.getToneMapping().toneMapping).toBe(THREE.ACESFilmicToneMapping);
+    expect(viewer.getToneMapping().toneMappingExposure).toBeCloseTo(1.2, 2);
+
+    const customViewer = new S3MViewer({
+      toneMapping: THREE.ReinhardToneMapping,
+      toneMappingExposure: 1.5,
+    });
+    expect(customViewer.getToneMapping().toneMapping).toBe(THREE.ReinhardToneMapping);
+    expect(customViewer.getToneMapping().toneMappingExposure).toBeCloseTo(1.5, 2);
+  });
+
+  test('8. StyleMaterial 支持 ambientGain（基础漫反射底色直通增益）', () => {
+    const viewer = new S3MViewer({
+      style: {
+        ambientGain: 0.25,
+      },
+    });
+
+    expect(viewer.uniforms.uAmbientGain?.value).toBeCloseTo(0.25, 2);
+    expect(viewer.style.ambientGain).toBeCloseTo(0.25, 2);
+
+    viewer.setStyle({ ambientGain: 0.4 });
+    expect(viewer.uniforms.uAmbientGain?.value).toBeCloseTo(0.4, 2);
   });
 });

@@ -413,7 +413,9 @@ interface S3MStyle {
   edgeColor: string;    // 棱线颜色
   edgeWidth?: number;   // 全局棱线粗细（像素，默认 1.2）
   edgeOpacity?: number; // 棱线透明度（0.1 ~ 1.0），默认 0.45
+  edgeThreshold?: number; // 棱线临界角（度，默认 55）：相邻面法线夹角超过它才描边，调大滤掉浅坡
   roofThreshold?: number; // 顶面法线判定阈值，默认 0.65
+  fadeIn?: number;      // 新瓦片淡入时长（毫秒，默认 0 = 关闭）
 }
 ```
 

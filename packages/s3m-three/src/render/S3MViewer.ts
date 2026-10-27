@@ -36,13 +36,19 @@ import {
 import type { OutlineMaterial, StyledMaterial, StyleMode, SelectMode, S3MStyle } from './StyleMaterial.js';
 import { applyPointCloudStyle, isOwnedPointCloudMaterial } from './PointCloudMaterial.js';
 import { Picker } from './Picker.js';
+import { Animator } from '../anim/Animator.js';
+import type { Channel, TransitionOptions } from '../anim/Animator.js';
+import { Path } from '../anim/Path.js';
+import type { EasingFn, EasingName } from '../anim/easing.js';
+import type { LineSharedUniforms, ThickLineMaterial, ThickLineStyleUniforms } from './EdgeLines.js';
 import {
   buildFeatureEdgeSegments,
+  buildPositionBatchMap,
   buildThickLineGeometry,
   createLineSharedUniforms,
   createThickLineMaterial,
+  positionQuantKey,
 } from './EdgeLines.js';
-import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
 import { mergeVerticesByPosition } from './MergeVertices.js';
 import {
   resolveFeature,
@@ -159,8 +165,12 @@ export interface LightOptions {
   hemisphereGroundColor?: number | string;
   /** 主平行光强度，默认 1.0 */
   keyLightIntensity?: number;
+  /** 主平行光强度别名（兼容写法） */
+  mainIntensity?: number;
   /** 主平行光颜色，默认 0xffffff */
   keyLightColor?: number | string;
+  /** 主平行光颜色别名（兼容写法） */
+  mainColor?: number | string;
   /** 补光强度，默认 0.35 */
   fillLightIntensity?: number;
   /** 补光颜色，默认 0xffffff */
@@ -180,6 +190,13 @@ export interface LightOptions {
 export interface S3MViewerOptions {
   /** 光照参数配置（强度、颜色、朝向模式、太阳方位角/仰角等） */
   light?: LightOptions;
+  /**
+   * 色调映射模式（默认 THREE.NoToneMapping，避免 ACESFilmic 压暗中暗部及导致底图与建筑色彩失真；
+   * 可传入 THREE.ACESFilmicToneMapping、THREE.LinearToneMapping、THREE.ReinhardToneMapping 等）
+   */
+  toneMapping?: THREE.ToneMapping;
+  /** 色调映射曝光度，默认 1.0 */
+  toneMappingExposure?: number;
   /** 全局总驻留瓦片上限（多数据集多图层共享预算），在所有可见数据集之间动态均衡分配，彻底防止爆显存 */
   totalMaxTiles?: number;
   /** 单数据集简写 */
@@ -243,6 +260,8 @@ interface MeshUserData {
   isThickEdge?: boolean;
   /** 选中单体的棱线对象 */
   isSelectionEdge?: boolean;
+  /** 该网格正在淡入时占用的动画通道 key，瓦片淘汰时要回收 */
+  tileFadeKey?: string;
   pickMaterial?: THREE.Material;
   [key: string]: unknown;
 }
@@ -256,6 +275,54 @@ function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
 /** 点云是 THREE.Points 不是 Mesh，样式 / 拾取 / 卸载链路都靠这个判定放行 */
 function isPointCloudObject(o: THREE.Object3D): o is THREE.Points {
   return (o as unknown as THREE.Points).isPoints === true;
+}
+
+/* ------------------------------------------------------------------ 可动画的样式键 */
+
+/**
+ * 能逐帧插值的标量样式键。
+ *
+ * 判据：写一次只是「改一个 uniform 或一个字段」，不重建几何、不换 program。
+ * `mode` / `shading` / `edges` 不在此列——它们是结构变更，只能编排不能插值。
+ */
+const STYLE_SCALAR_KEYS = [
+  'opacity',
+  'floorHeight',
+  'selectOpacity',
+  'selectEmissive',
+  'selectElevation',
+  'dimFactor',
+  'texMix',
+  'roofThreshold',
+  'ambientGain',
+  'edgeWidth',
+  'edgeOpacity',
+  'outlineWidth',
+] as const;
+
+/** 能逐帧插值的颜色键（在线性空间插值，与 shader 消费端一致） */
+const STYLE_COLOR_KEYS = ['colorA', 'colorB', 'colorC', 'selectColor', 'edgeColor'] as const;
+
+/** 可动画的单体属性 */
+const FEATURE_PROPS = ['translation', 'elevation', 'opacity', 'color'] as const;
+type FeatureProp = (typeof FEATURE_PROPS)[number];
+
+/** 单体沿折线运动的参数 */
+export interface PathFollowOptions {
+  /** 走完全程的时长（毫秒）。不传则按 speed 或默认 2000ms 推算 */
+  duration?: number;
+  /** 线速度（米/秒）。给了 duration 就以 duration 为准 */
+  speed?: number;
+  /** 是否循环 */
+  loop?: boolean;
+  /** 是否把折线首尾相连 */
+  closed?: boolean;
+  /** 缓动曲线：作用在**已走距离**上，默认 linear（恒速） */
+  easing?: EasingName | EasingFn;
+  /** 路径整体偏移（米），相当于路径原点 */
+  offset?: [number, number, number];
+  /** 单次走完（非循环）时回调 */
+  onComplete?: () => void;
 }
 
 /* ------------------------------------------------------------------ 图层 */
@@ -278,15 +345,22 @@ export class S3MViewer {
   picker: Picker | null = null;
 
   readonly uniforms: StyleUniforms;
+  /** 当前**显示**的样式（动画推进中会逐帧变） */
   style: S3MStyle;
+  /** 用户想要的样式（getStyle 返回它，动画目标以它为准） */
+  private _styleTarget: S3MStyle;
   readonly outlineMaterial: OutlineMaterial;
 
   /** 等宽线共享的分辨率 uniform（全局棱线 + 选中棱线共用） */
   readonly lineShared: LineSharedUniforms;
-  /** 全局棱线材质 */
+  /** 全局棱线材质（外观 uniform 的持有者，逐网格棱线材质共享它的对象） */
   readonly edgeMaterial: ThickLineMaterial;
-  /** 选中棱线材质 */
+  /** 选中棱线材质（同上，选中棱线的逐网格材质共享它的对象） */
   readonly selectionEdgeMaterial: ThickLineMaterial;
+  /** 全局棱线的外观 uniform：逐网格棱线材质直接复用这些对象 */
+  private readonly _edgeStyleUniforms: ThickLineStyleUniforms;
+  /** 选中棱线的外观 uniform */
+  private readonly _selEdgeStyleUniforms: ThickLineStyleUniforms;
 
   /** 3D 物理地表面 / 基坑开挖管理器 */
   readonly groundManager: GroundManager;
@@ -325,13 +399,37 @@ export class S3MViewer {
   private _selectionEdges: THREE.Mesh | null = null;
   private _selectionEdgeMeshes: THREE.Mesh[] = [];
   private _edgesEnabled = false;
+  /** 瓦片淡入通道的自增序号（不用 pickId：pickId 会被回收复用） */
+  private _tileFadeSeq = 0;
+  /** setMode 编排的代次，用来作废被新调用顶掉的旧编排 */
+  private _modeGen = 0;
+  /** 路径运动的规格表：通道 key → 路径 + 偏移 */
+  private readonly _pathSpecs = new Map<string, { path: Path; offset: [number, number, number] }>();
+  /** 路径采样临时对象，避免每帧 new */
+  private readonly _pathScratch = new Float32Array(3);
   /** 预制棱线缓存（Crease Cache）：从外部 source-creases 载入的全局统一 LineSegments，性能最高、视觉最干净 */
   private _creaseLines: THREE.LineSegments | null = null;
+  /** 数据自带的棱线对象（LineSegments），改棱线颜色时只刷这些，不再全场景 traverse */
+  private readonly _nativeEdgeLines = new Set<THREE.LineSegments>();
+  /** 点云对象集合：透明度动画时只刷它们，避免每帧遍历全部 pickables */
+  private readonly _pointClouds = new Set<THREE.Points>();
+  /** 当前材质是否处于 transparent 状态，用来避免逐帧重复切换 program */
+  private _opacityTransparent = false;
+
+  /**
+   * 统一动画调度器。
+   *
+   * 所有「有过渡」的样式 / 单体 / 棱线变更都经由它推进；公开 API 只写目标值，
+   * 真正的逐帧写入由注册在这里的通道完成。
+   */
+  readonly animator = new Animator();
 
   /** 业务属性查询（可选，配了 `attributes` 才有） */
   attributeQuery: AttributeQuery | null = null;
 
   private readonly _enuMatrix = new THREE.Matrix4();
+  /** 颜色换算用的临时对象，避免每帧 new */
+  private readonly _colorScratch = new THREE.Color();
   private _needsRepaint = true;
   private _frame = 0;
   private readonly _fps = { value: 0, last: 0 };
@@ -339,7 +437,7 @@ export class S3MViewer {
   private _hemiLight!: THREE.HemisphereLight;
   private _keyLight!: THREE.DirectionalLight;
   private _fillLight!: THREE.DirectionalLight;
-  private readonly _lightOptions: Required<LightOptions> = {
+  private readonly _lightOptions: Required<Omit<LightOptions, 'mainIntensity' | 'mainColor'>> = {
     ambientIntensity: 0.4,
     ambientColor: 0xffffff,
     hemisphereIntensity: 0.8,
@@ -400,26 +498,40 @@ export class S3MViewer {
         if (this._selection) this._syncSelectionStyle();
       },
       () => this.getAllMeshes(),
-      (mesh) => this._applyOverridesToMesh(mesh)
+      (mesh) => this._applyOverridesToMesh(mesh),
+      // 图层自身是否半透明：全局透明度改走 uOpacity 后，材质 opacity 不再代表它
+      () => this._opacityTransparent
     );
 
     this.uniforms = createSharedUniforms();
     // 纹理解码优先派给共享解析 Worker（崩溃自动回主线程，见 decodeTextureWithWorker）
     setTextureOffThreadDecode(decodeTextureWithWorker);
     this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
+    this._styleTarget = { ...this.style };
+    this._opacityTransparent = (this.style.opacity ?? 1) < 0.999;
+    this._applyStyleUniforms();
+    this._registerAnimChannels();
+    // 动画启动必须把按需驱动的帧循环踢起来：MapLibre 空闲时不渲染，
+    // 不踢的话动画「卡住不动」，直到别的什么碰巧触发了重绘
+    this.animator.onActive = () => this._requestRepaint();
     this.outlineMaterial = createOutlineMaterial(this.uniforms);
 
     this.lineShared = createLineSharedUniforms();
-    this.edgeMaterial = createThickLineMaterial(this.lineShared, {
-      color: this.style.edgeColor,
-      opacity: this.style.edgeOpacity ?? 0.45,
-      width: this.style.edgeWidth ?? 1.2,
-    });
-    this.selectionEdgeMaterial = createThickLineMaterial(this.lineShared, {
-      color: this.style.outlineColor ?? this.style.selectColor,
-      opacity: 1,
-      width: this.style.outlineWidthPx ?? 3,
-    });
+    // 棱线外观 uniform：全局棱线材质与逐网格棱线材质**共用同一批对象**，
+    // _syncEdgeStyle 改一次，所有棱线（含淡入乘子）同时生效，保持 O(1)。
+    this._edgeStyleUniforms = {
+      uColor: { value: new THREE.Color(this.style.edgeColor) },
+      uWidth: { value: Math.max(0.1, this.style.edgeWidth ?? 1.5) },
+      uOpacity: { value: 0.6 },
+    };
+    this.edgeMaterial = createThickLineMaterial(this.lineShared, {}, this._edgeStyleUniforms);
+    this._selEdgeStyleUniforms = {
+      uColor: { value: new THREE.Color(this.style.outlineColor ?? this.style.selectColor) },
+      uWidth: { value: Math.max(0.1, this.style.outlineWidthPx ?? 3) },
+      uOpacity: { value: 1 },
+      uElevation: { value: this.style.selectElevation ?? 0 },
+    };
+    this.selectionEdgeMaterial = createThickLineMaterial(this.lineShared, {}, this._selEdgeStyleUniforms);
 
     // 关键：style.edges 是个开关，但构造函数从没据此启用过棱线，导致
     // `style: { edges: true }` 形同虚设、_edgesEnabled 永远是 false。
@@ -445,9 +557,9 @@ export class S3MViewer {
     });
     r.autoClear = false;
     r.setPixelRatio(1);
-    // 白模 albedo 接近 1，不做色调映射会过曝成一片纯白、丢失明暗关系
-    r.toneMapping = THREE.ACESFilmicToneMapping;
-    r.toneMappingExposure = 1.0;
+    // 允许外部传入色调映射模式，默认使用 THREE.NoToneMapping 还原真实材质与底图通透度，避免 ACESFilmic 压暗阴影与偏色
+    r.toneMapping = this.options.toneMapping !== undefined ? this.options.toneMapping : THREE.NoToneMapping;
+    r.toneMappingExposure = this.options.toneMappingExposure ?? 1.0;
     return r;
   }
 
@@ -531,6 +643,11 @@ export class S3MViewer {
     this._selectionEdges = null;
     this._smidMeshes.clear();
     this._meshHeight.clear();
+    // 场景已经清空，还挂着的动画通道（瓦片淡入 / 单体位移）不能再对着死对象写
+    this.animator.clear();
+    this.animator.unregisterPrefix('tile.');
+    this.animator.unregisterPrefix('feature.');
+    this._pathSpecs.clear();
     this._heightMin = Infinity;
     this._heightMax = -Infinity;
     this.renderer?.dispose();
@@ -580,7 +697,14 @@ export class S3MViewer {
    * 动态设置光照配置
    */
   setLight(options: Partial<LightOptions>): void {
-    Object.assign(this._lightOptions, options);
+    const normalized: Partial<LightOptions> = { ...options };
+    if (normalized.mainColor !== undefined && normalized.keyLightColor === undefined) {
+      normalized.keyLightColor = normalized.mainColor;
+    }
+    if (normalized.mainIntensity !== undefined && normalized.keyLightIntensity === undefined) {
+      normalized.keyLightIntensity = normalized.mainIntensity;
+    }
+    Object.assign(this._lightOptions, normalized);
     this._applyLightOptions();
     this._updateLights();
     this._needsRepaint = true;
@@ -592,6 +716,30 @@ export class S3MViewer {
    */
   getLight(): LightOptions {
     return { ...this._lightOptions };
+  }
+
+  /**
+   * 动态设置色调映射模式与曝光度
+   */
+  setToneMapping(toneMapping: THREE.ToneMapping, exposure = 1.0): void {
+    this.options.toneMapping = toneMapping;
+    this.options.toneMappingExposure = exposure;
+    if (this.renderer) {
+      this.renderer.toneMapping = toneMapping;
+      this.renderer.toneMappingExposure = exposure;
+      this._needsRepaint = true;
+      this.triggerRepaint();
+    }
+  }
+
+  /**
+   * 获取当前色调映射模式与曝光度
+   */
+  getToneMapping(): { toneMapping: THREE.ToneMapping; toneMappingExposure: number } {
+    return {
+      toneMapping: this.renderer ? this.renderer.toneMapping : (this.options.toneMapping ?? THREE.NoToneMapping),
+      toneMappingExposure: this.renderer ? this.renderer.toneMappingExposure : (this.options.toneMappingExposure ?? 1.0),
+    };
   }
 
   /**
@@ -774,6 +922,276 @@ export class S3MViewer {
     this._featureStyleManager.setFeaturesStyle(smids, style, this._meshesOf(smids));
   }
 
+  /**
+   * 把单体平移到新位置（米，场景 ENU 坐标的增量）。
+   *
+   * 平移写进状态纹理第 2 行，所以拾取、选中描边、棱线都会自动跟随——
+   * 但**视锥剔除不会**：three 用的是几何原始包围球，移出包围球后整块瓦片会被剔掉。
+   * 所以这里顺手把「有位移」的网格关掉 frustumCulled，归零时再恢复。
+   */
+  moveFeature(
+    smid: number,
+    translation: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    const key = this._ensureFeatureChannel(smid, 'translation');
+    this.animator.to(key, translation, transition);
+  }
+
+  /** 让单体沿某个轴移动的便捷写法（单位米） */
+  moveFeatureBy(
+    smid: number,
+    delta: [number, number, number],
+    transition?: TransitionOptions
+  ): void {
+    const cur = this._featureStyleManager.getFeatureStyle(smid)?.translation ?? [0, 0, 0];
+    this.moveFeature(smid, [cur[0] + delta[0], cur[1] + delta[1], cur[2] + delta[2]], transition);
+  }
+
+  /**
+   * 让单体沿折线运动。
+   *
+   * 路径先做**弧长参数化**（见 anim/Path.ts）：缓动作用在「已走距离」上，而不是
+   * 顶点索引上，所以顶点疏密不均也不会忽快忽慢。
+   *
+   * 实现上没有引入新的 track 类型——把「进度 0→1」当成一条普通补间，通道的 write
+   * 把进度映射成弧长再查表得位置。这样打断、循环、缓动、预算全部复用现有调度器。
+   *
+   * 注意：不要和 `moveFeature` 同时驱动同一个单体，两者都写 `translation`。
+   */
+  followPath(
+    smid: number,
+    points: Path | ArrayLike<number> | Array<[number, number, number]>,
+    opts: PathFollowOptions = {}
+  ): void {
+    const path = points instanceof Path ? points : new Path(points, { closed: opts.closed });
+    if (path.length <= 0) return;
+
+    const offset = opts.offset ?? [0, 0, 0];
+    const duration =
+      opts.duration ??
+      (opts.speed && opts.speed > 0 ? (path.length / opts.speed) * 1000 : 2000);
+
+    const key = `feature.${smid}.path`;
+    this._pathSpecs.set(key, { path, offset });
+    if (!this.animator.has(key)) {
+      this.animator.register(key, {
+        dim: 1,
+        // 每次都从起点开始：进度通道没有「当前值」的概念，循环时正好重置
+        read: (out) => {
+          out[0] = 0;
+        },
+        write: (v) => {
+          const spec = this._pathSpecs.get(key);
+          if (!spec) return;
+          spec.path.sampleAt(v[0], this._pathScratch);
+          const meshes = this._meshesOf([smid]);
+          const cur = this._featureStyleManager.getFeatureStyle(smid) ?? {};
+          this._featureStyleManager.setFeatureStyle(
+            smid,
+            {
+              ...cur,
+              translation: [
+                spec.offset[0] + this._pathScratch[0],
+                spec.offset[1] + this._pathScratch[1],
+                spec.offset[2] + this._pathScratch[2],
+              ],
+            },
+            meshes
+          );
+          // 轨迹可能跑到原始包围球外，关掉视锥剔除免得整块瓦片被剔掉
+          for (const mesh of meshes) mesh.frustumCulled = false;
+        },
+      });
+    }
+
+    const run = (): void => {
+      this.animator.to(key, 1, {
+        duration,
+        easing: opts.easing ?? 'linear',
+        onComplete: () => {
+          if (opts.loop) run();
+          else opts.onComplete?.();
+        },
+      });
+    };
+    run();
+  }
+
+  /** 停下路径运动（停在当前位置，不回弹） */
+  stopPath(smid: number): void {
+    const key = `feature.${smid}.path`;
+    this.animator.cancel(key);
+    this.animator.unregister(key);
+    this._pathSpecs.delete(key);
+  }
+  /**
+   * 单体样式过渡：颜色 / 抬高 / 透明度 / 平移可以任意组合。
+   *
+   * 各属性各走一条通道，互不覆盖——同一个单体上「一边抬高一边变色」是两条独立的
+   * track，写回时都是「读当前 → 改一个字段 → 写回」，不会互相冲掉。
+   * `hidden` 不可插值，直接生效。
+   */
+  animateFeature(smid: number, style: Partial<FeatureStyle>, transition?: TransitionOptions): void {
+    if (style.translation) this.moveFeature(smid, style.translation, transition);
+    if (style.elevation != null) {
+      this.animator.to(this._ensureFeatureChannel(smid, 'elevation'), style.elevation, transition);
+    }
+    if (style.opacity != null) {
+      this.animator.to(this._ensureFeatureChannel(smid, 'opacity'), style.opacity, transition);
+    }
+    if (style.color) {
+      this._colorScratch.set(style.color);
+      this.animator.to(
+        this._ensureFeatureChannel(smid, 'color'),
+        [this._colorScratch.r, this._colorScratch.g, this._colorScratch.b],
+        transition
+      );
+    }
+    if (style.hidden != null) {
+      const cur = this._featureStyleManager.getFeatureStyle(smid) ?? {};
+      this.setFeatureStyle(smid, { ...cur, hidden: style.hidden });
+    }
+  }
+
+  /**
+   * 批量单体样式过渡，支持 `stagger` 错峰。
+   *
+   * 错峰是这类系统性价比最高的选项：一万个单体错峰 8ms，总时长不变，但每帧只推进
+   * 一小批，把峰值摊平——比任何「每帧上限」都自然。
+   */
+  animateFeatures(
+    smids: number[],
+    style: Partial<FeatureStyle>,
+    transition?: TransitionOptions
+  ): void {
+    const stagger = transition?.stagger ?? 0;
+    if (stagger <= 0) {
+      for (const smid of smids) this.animateFeature(smid, style, transition);
+      return;
+    }
+    const baseDelay = transition?.delay ?? 0;
+    for (let i = 0; i < smids.length; i++) {
+      this.animateFeature(smids[i], style, { ...transition, delay: baseDelay + i * stagger });
+    }
+  }
+
+  /**
+   * 切换着色模式，用 fade-through 代替硬切。
+   *
+   * `uMode` 是 int，插不了值；能做的就是「压暗 → 换 → 亮回来」。
+   * 编排走 onComplete 回调而不是 Promise 链，这样换模式发生在同一帧的回调里，
+   * 不会多出一帧的空白。返回的 Promise 在整段编排结束后 resolve。
+   */
+  setMode(mode: StyleMode, opts: { duration?: number; dim?: number } = {}): Promise<void> {
+    const d = Math.max(0, opts.duration ?? 300);
+    const dim = Math.min(1, Math.max(0.05, opts.dim ?? 0.35));
+    if (this.style.mode === mode) return Promise.resolve();
+    if (d <= 0) {
+      this.setStyle({ mode });
+      return Promise.resolve();
+    }
+
+    const gen = ++this._modeGen;
+    return new Promise<void>((resolve) => {
+      this.animator.to('style.fade', dim, {
+        duration: d,
+        easing: 'easeInOutQuad',
+        onComplete: () => {
+          // 中途又切了一次：这次编排作废，收尾交给新的那次
+          if (gen !== this._modeGen) {
+            resolve();
+            return;
+          }
+          this.setStyle({ mode });
+          this.animator.to('style.fade', 1, {
+            duration: d,
+            easing: 'easeInOutQuad',
+            onComplete: resolve,
+          });
+        },
+      });
+    });
+  }
+
+  /**
+   * 按需注册「单体属性」通道。
+   *
+   * 通道按 smid 惰性创建：绝大多数场景只动几十个单体，没必要给全城几万个 smid
+   * 预先建通道。`removeFeatureStyle` / `clearFeatureStyles` 会顺手回收。
+   *
+   * 写回统一走 `setFeatureStyle`：它内部已经按 `_meshesOf([smid])` 收敛脏网格，
+   * 所以单个单体动画每帧只重烘「含这个单体」的那一两块，不会全场景重算。
+   */
+  private _ensureFeatureChannel(smid: number, prop: FeatureProp): string {
+    const key = `feature.${smid}.${prop}`;
+    if (this.animator.has(key)) return key;
+
+    const channel: Channel = prop === 'translation' || prop === 'color'
+      ? {
+          dim: 3,
+          read: (out) => {
+            if (prop === 'translation') {
+              const t = this._featureStyleManager.getFeatureStyle(smid)?.translation;
+              out[0] = t?.[0] ?? 0;
+              out[1] = t?.[1] ?? 0;
+              out[2] = t?.[2] ?? 0;
+            } else {
+              // 没有自定义色时以图层主色为起点，插值才连续
+              const hex = this._featureStyleManager.getFeatureStyle(smid)?.color ?? this.style.colorA;
+              this._colorScratch.set(hex);
+              out[0] = this._colorScratch.r;
+              out[1] = this._colorScratch.g;
+              out[2] = this._colorScratch.b;
+            }
+          },
+          write: (v) => {
+            const meshes = this._meshesOf([smid]);
+            const cur = this._featureStyleManager.getFeatureStyle(smid) ?? {};
+            if (prop === 'translation') {
+              this._featureStyleManager.setFeatureStyle(
+                smid,
+                { ...cur, translation: [v[0], v[1], v[2]] },
+                meshes
+              );
+              // 有位移就关掉视锥剔除，否则移出原始包围球后整块瓦片会凭空消失
+              const moving = Math.abs(v[0]) > 1e-6 || Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6;
+              for (const mesh of meshes) mesh.frustumCulled = !moving;
+            } else {
+              const c = this._colorScratch.setRGB(v[0], v[1], v[2]);
+              this._featureStyleManager.setFeatureStyle(
+                smid,
+                { ...cur, color: `#${c.getHexString()}` },
+                meshes
+              );
+            }
+          },
+        }
+      : {
+          dim: 1,
+          read: (out) => {
+            const st = this._featureStyleManager.getFeatureStyle(smid);
+            out[0] = (prop === 'elevation' ? st?.elevation : st?.opacity) ?? (prop === 'opacity' ? 1 : 0);
+          },
+          write: (v) => {
+            const cur = this._featureStyleManager.getFeatureStyle(smid) ?? {};
+            const next: FeatureStyle = prop === 'elevation' ? { ...cur, elevation: v[0] } : { ...cur, opacity: v[0] };
+            this._featureStyleManager.setFeatureStyle(smid, next, this._meshesOf([smid]));
+          },
+        };
+
+    this.animator.register(key, channel);
+    return key;
+  }
+
+  /** 回收某个单体的动画通道（单体被删除 / 样式被清空时调用） */
+  private _releaseFeatureChannels(smid: number): void {
+    for (const prop of FEATURE_PROPS) this.animator.unregister(`feature.${smid}.${prop}`);
+    const pathKey = `feature.${smid}.path`;
+    this.animator.unregister(pathKey);
+    this._pathSpecs.delete(pathKey);
+  }
+
   /** 获取指定单体的自定义样式 */
   getFeatureStyle(smid: number): FeatureStyle | null {
     return this._featureStyleManager.getFeatureStyle(smid);
@@ -786,11 +1204,15 @@ export class S3MViewer {
 
   /** 移除指定单体的自定义样式，恢复为图层全局样式 */
   removeFeatureStyle(smid: number): void {
+    this._releaseFeatureChannels(smid);
     this._featureStyleManager.removeFeatureStyle(smid, this._meshesOf([smid]));
   }
 
   /** 清空所有单体的自定义样式 */
   clearFeatureStyles(): void {
+    for (const smid of this._featureStyleManager.getFeatureStyles().keys()) {
+      this._releaseFeatureChannels(smid);
+    }
     this._featureStyleManager.clearFeatureStyles();
   }
 
@@ -998,6 +1420,7 @@ export class S3MViewer {
       // 数据自带的棱线包：只跟着 edges 开关显示，不参与拾取、不参与着色
       if ((child as THREE.LineSegments).isLineSegments && (child.userData as MeshUserData).isEdgeLines) {
         child.visible = this._edgesEnabled;
+        this._nativeEdgeLines.add(child as THREE.LineSegments);
         this._styleEdgeLine(child as THREE.LineSegments);
         continue;
       }
@@ -1006,6 +1429,7 @@ export class S3MViewer {
       const isPoints = isPointCloudObject(child);
       const mesh = child as THREE.Mesh;
       if (!mesh.isMesh && !isPoints) continue;
+      if (isPoints) this._pointClouds.add(child as THREE.Points);
       const ud = mesh.userData as MeshUserData;
       ud.pickId = this._allocPickId();
       ud.datasetId = entry.id;
@@ -1032,12 +1456,13 @@ export class S3MViewer {
         const mat = styledMaterialOf(mesh);
         if (mat) {
           const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
-          mat.opacity = o;
+          // 不写 mat.opacity：全局透明度走共享 uOpacity，材质自身 opacity 保留模型自带 alpha
           mat.transparent = o < 0.999;
           mat.depthWrite = o >= 0.999;
           mat.flatShading = this.style.shading !== 'smooth';
           mat.needsUpdate = true;
           this._featureStyleManager.applyOverridesToMesh(mesh);
+          this._startTileFade(mesh, mat);
         }
       }
 
@@ -1045,6 +1470,53 @@ export class S3MViewer {
       // 不重放就出现「点中的那栋楼一拉近就没高亮了」
       this._replaySelectionOnto(mesh);
     }
+  }
+
+  /**
+   * 新瓦片淡入。
+   *
+   * 每块网格有自己的材质实例，所以给一个逐材质的 `uTileFade` 就够，不需要动共享
+   * uniform、也不需要重建任何东西。淡入期间该网格进透明队列（混合 + 排序），
+   * 淡完立刻把 `transparent` 还给图层状态，避免长期留在透明通道里。
+   *
+   * 通道 key 用自增序号而不是 pickId：pickId 会被回收复用，用它会串到新瓦片上。
+   */
+  private _startTileFade(mesh: THREE.Mesh, mat: StyledMaterial): void {
+    const duration = this.style.fadeIn ?? 0;
+    if (duration <= 0) return;
+    const uFade = mat.userData.uTileFade;
+    if (!uFade) return;
+
+    uFade.value = 0;
+    mat.transparent = true;
+    // 淡入期间保持深度写入：否则能透过正在淡入的楼看到后面的东西，像在「漏」
+    mat.depthWrite = true;
+
+    const key = `tile.${this._tileFadeSeq++}.fade`;
+    (mesh.userData as MeshUserData).tileFadeKey = key;
+    this.animator.register(key, {
+      dim: 1,
+      read: (out) => {
+        out[0] = uFade.value;
+      },
+      write: (v) => {
+        uFade.value = v[0];
+      },
+    });
+    this.animator.to(key, 1, {
+      duration,
+      easing: 'easeOutQuad',
+      onComplete: () => {
+        uFade.value = 1;
+        (mesh.userData as MeshUserData).tileFadeKey = undefined;
+        this.animator.unregister(key);
+        // 淡入期间强制开了 transparent + depthWrite，结束时不能自己拍板关掉——
+        // 图层可能本来就半透明、单体也可能还有淡化。交给淡化流程重新裁决一次。
+        this._featureStyleManager.applyOverridesToMesh(mesh);
+        if (!mat.transparent) mat.depthWrite = true;
+        this._requestRepaint();
+      },
+    });
   }
 
   /**
@@ -1111,6 +1583,15 @@ export class S3MViewer {
   private _unregisterTile(node: TileNode, entry: S3MDatasetEntry): void {
     node.group.traverse((child) => {
       const obj = child as any;
+      if ((child as THREE.LineSegments).isLineSegments && obj.userData?.isEdgeLines) {
+        this._nativeEdgeLines.delete(child as THREE.LineSegments);
+      }
+      if (isPointCloudObject(child)) this._pointClouds.delete(child);
+      // 淡入还没结束就被淘汰：把通道收掉，否则会对着已释放的材质继续写
+      if (obj.userData?.tileFadeKey) {
+        this.animator.unregister(obj.userData.tileFadeKey);
+        obj.userData.tileFadeKey = undefined;
+      }
       if (obj.userData?.pickId != null) {
         this._pickables.delete(obj.userData.pickId);
         this._releasePickId(obj.userData.pickId);
@@ -1181,23 +1662,183 @@ export class S3MViewer {
   /* ---------------------------------------------------------------- 样式 */
 
   /** 动态设置图层整体透明度 (0.0 ~ 1.0) */
-  setOpacity(opacity: number): void {
-    this.setStyle({ opacity });
+  setOpacity(opacity: number, transition?: TransitionOptions): void {
+    this.setStyle({ opacity }, transition);
   }
 
-  /** 合并并应用样式。只改 uniform 的项不会触发几何/着色器重建。 */
-  setStyle(patch: Partial<S3MStyle> = {}): void {
-    this.style = { ...this.style, ...patch };
+  /**
+   * 合并并应用样式。
+   *
+   * 只改 uniform 的项不会触发几何 / 着色器重建。带 `transition` 时，能插值的项
+   * 交给动画调度器逐帧推进；不能插值的项（`mode` / `shading` / `edges`）走各自的
+   * 编排逻辑（`edges` 由 setEdges 做淡入淡出，`mode` 建议配 fade-through）。
+   */
+  setStyle(patch: Partial<S3MStyle> = {}, transition?: TransitionOptions): void {
+    Object.assign(this._styleTarget, patch);
+
+    const duration = transition?.duration ?? 0;
+    const wantAnim = duration > 0 || !!transition?.spring;
+
+    // 棱线开关是结构变更，不是插值：交给 setEdges 编排
+    let rest = patch;
+    if ('edges' in patch) {
+      const { edges, ...others } = patch;
+      rest = others;
+      this.setEdges(!!edges, wantAnim ? transition : undefined);
+      if (Object.keys(rest).length === 0) {
+        this._requestRepaint();
+        return;
+      }
+    }
+
+    const animated: string[] = [];
+    const immediate: Record<string, unknown> = {};
+    for (const key of Object.keys(rest) as (keyof S3MStyle)[]) {
+      if (wantAnim && this.animator.has(`style.${String(key)}`)) animated.push(String(key));
+      else immediate[key] = rest[key];
+    }
+
+    if (Object.keys(immediate).length > 0) {
+      Object.assign(this.style, immediate);
+      this._applyStyleEffects(immediate as Partial<S3MStyle>);
+    }
+
+    for (const key of animated) {
+      this.animator.to(`style.${key}`, this._animTargetOf(key, rest), {
+        ...transition,
+        duration,
+      });
+    }
+
+    this._requestRepaint();
+  }
+
+  getStyle(): S3MStyle & { modeLabel: string } {
+    return { ...this._styleTarget, modeLabel: STYLE_LABELS[this._styleTarget.mode] };
+  }
+
+  /** 把某个样式键的取值转成动画通道能吃的形状（标量 or 线性 RGB 三元组） */
+  private _animTargetOf(key: string, patch: Partial<S3MStyle>): number | number[] {
+    const value = (patch as Record<string, unknown>)[key];
+    const dim = this._animDimOf(key);
+    if (dim === 1) return Number(value);
+    this._colorScratch.set(String(value));
+    return [this._colorScratch.r, this._colorScratch.g, this._colorScratch.b];
+  }
+
+  /** 该样式键的动画维度：3 = 颜色，1 = 标量 */
+  private _animDimOf(key: string): 1 | 3 {
+    return STYLE_COLOR_KEYS.includes(key as (typeof STYLE_COLOR_KEYS)[number]) ? 3 : 1;
+  }
+
+  /**
+   * 注册样式动画通道。
+   *
+   * 每个通道的 write 都是 O(1)：只改 `this.style` 的一个字段 + 一次 uniform 赋值。
+   * 这里不注册 `mode` / `shading` / `edges`——它们不可插值，见类文档。
+   */
+  private _registerAnimChannels(): void {
+    for (const key of STYLE_SCALAR_KEYS) {
+      this.animator.register(`style.${key}`, {
+        dim: 1,
+        read: (out) => {
+          out[0] = Number((this.style as unknown as Record<string, number>)[key] ?? 0);
+        },
+        write: (v) => {
+          (this.style as unknown as Record<string, number>)[key] = v[0];
+          this._onStyleChannelWrote(key);
+        },
+      });
+    }
+
+    for (const key of STYLE_COLOR_KEYS) {
+      this.animator.register(`style.${key}`, {
+        dim: 3,
+        read: (out) => {
+          const c = this._uniformColorOf(key);
+          out[0] = c.r;
+          out[1] = c.g;
+          out[2] = c.b;
+        },
+        write: (v) => {
+          const c = this._uniformColorOf(key);
+          // 直接写线性分量：shader 消费的就是线性值，端点严格吻合
+          c.setRGB(v[0], v[1], v[2]);
+          (this.style as unknown as Record<string, string>)[key] = `#${c.getHexString()}`;
+          this._onStyleChannelWrote(key);
+        },
+      });
+    }
+
+    // 棱线淡入淡出乘子：不属于 S3MStyle，单独一条通道
+    this.animator.register('style.edgeFade', {
+      dim: 1,
+      read: (out) => {
+        out[0] = this.uniforms.uEdgeFade?.value ?? 1;
+      },
+      write: (v) => {
+        if (this.uniforms.uEdgeFade) this.uniforms.uEdgeFade.value = v[0];
+        this._syncEdgeStyle();
+      },
+    });
+
+    // 整体压暗乘子：setMode 的 fade-through 用它，也不是 S3MStyle 字段
+    this.animator.register('style.fade', {
+      dim: 1,
+      read: (out) => {
+        out[0] = this.uniforms.uFade?.value ?? 1;
+      },
+      write: (v) => {
+        if (this.uniforms.uFade) this.uniforms.uFade.value = v[0];
+        this._requestRepaint();
+      },
+    });
+  }
+
+  /** 通道写完一个样式键后的最小副作用（全部 O(1)） */
+  private _onStyleChannelWrote(key: string): void {
+    if (key === 'opacity') {
+      this._applyOpacity();
+      return;
+    }
+    this._applyStyleUniforms();
+    if (key === 'edgeColor' || key === 'edgeWidth' || key === 'edgeOpacity') {
+      this._refreshEdgeLines();
+    }
+  }
+
+  /** 取某个颜色键对应的共享 uniform Color 对象 */
+  private _uniformColorOf(key: string): THREE.Color {
+    const u = this.uniforms;
+    switch (key) {
+      case 'colorA':
+        return u.uColorA.value;
+      case 'colorB':
+        return u.uColorB.value;
+      case 'colorC':
+        return u.uColorC.value;
+      case 'selectColor':
+        return u.uSelColor.value;
+      case 'edgeColor':
+        return this.edgeMaterial.uniforms.uColor.value;
+      default:
+        return u.uColorA.value;
+    }
+  }
+
+  /** 应用一批样式键带来的副作用（uniform / 材质 / 棱线 / 选中态） */
+  private _applyStyleEffects(patch: Partial<S3MStyle>): void {
     this._applyStyleUniforms();
     if ('opacity' in patch || 'depthWrite' in patch) this._applyOpacity();
     // 点云不走 StyleMaterial 的 uMode，模式切换要单独同步它的材质
     if ('mode' in patch) this._applyPointCloudStyles();
     if ('shading' in patch) this._applyShading();
-    // 临界角变了要重建 CPU 棱线（EdgesGeometry 参数），开/关走 setEdges 整体刷新
+    // 临界角变了要重建 CPU 棱线（EdgesGeometry 的参数），开 / 关走 setEdges 整体刷新。
+    // 必须先 _disposeEdges()：setEdges 只挑「还没有棱线」的网格来建，
+    // 不先拆掉的话已经建好的会被全部跳过，临界角改了等于没改。
     if ('edgeThreshold' in patch && this._edgesEnabled) {
+      this._disposeEdges();
       this.setEdges(true);
-    } else if ('edges' in patch) {
-      this.setEdges(!!this.style.edges);
     } else if ('edgeColor' in patch || 'edgeWidth' in patch || 'opacity' in patch || 'edgeOpacity' in patch) {
       this._refreshEdgeLines();
     }
@@ -1206,11 +1847,6 @@ export class S3MViewer {
       if ('outline' in patch || 'outlineStyle' in patch) this.select(this._selection, { silent: true });
       else this._syncSelectionStyle();
     }
-    this._requestRepaint();
-  }
-
-  getStyle(): S3MStyle & { modeLabel: string } {
-    return { ...this.style, modeLabel: STYLE_LABELS[this.style.mode] };
   }
 
   private _applyStyleUniforms(): void {
@@ -1245,6 +1881,9 @@ export class S3MViewer {
     if (u.uTexMix && s.texMix != null) {
       u.uTexMix.value = s.texMix;
     }
+    if (u.uAmbientGain && s.ambientGain != null) {
+      u.uAmbientGain.value = s.ambientGain;
+    }
     if (this.outlineMaterial) {
       if (this.outlineMaterial.uniforms.uElevation && s.selectElevation != null) {
         this.outlineMaterial.uniforms.uElevation.value = s.selectElevation;
@@ -1258,23 +1897,40 @@ export class S3MViewer {
     }
   }
 
-  /** 透明度：只改材质状态，不触发着色器重编译，所以可以跟着滑块实时拖 */
+  /**
+   * 透明度：写共享 uniform，**不再逐 mesh 改材质**。
+   *
+   * 原来的写法每次都要遍历全部 pickables 改 `material.opacity` + `material.transparent`，
+   * 是 O(meshes)；而且 `opaque` 参与 three 的 program 缓存键，跨 0.999 会换一次 program。
+   * 拖滑块时一秒钟几十次调用，几十万面的场景就是明显掉帧。
+   *
+   * 现在逐帧只写一个 float（`uOpacity`），混合开关只在**真正跨过阈值**时切一次。
+   */
   private _applyOpacity(): void {
     const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
+    if (this.uniforms.uOpacity) this.uniforms.uOpacity.value = o;
+
     const transparent = o < 0.999;
-    // 关键：若 depthWrite 开启（默认开启），即使半透明也保持深度写入，完美遮挡背面棱线，防止背面线条透出
-    const keepDepth = this.style.depthWrite !== false;
-    for (const p of this._pickables.values()) {
-      if (isPointCloudObject(p.mesh)) {
-        this._applyPointCloudStyle(p.mesh);
-        continue;
+    if (transparent !== this._opacityTransparent) {
+      this._opacityTransparent = transparent;
+      // 关键：若 depthWrite 开启（默认开启），即使半透明也保持深度写入，完美遮挡背面棱线，防止背面线条透出
+      const keepDepth = this.style.depthWrite !== false;
+      for (const p of this._pickables.values()) {
+        if (isPointCloudObject(p.mesh)) continue;
+        const m = styledMaterialOf(p.mesh);
+        if (!m) continue;
+        // 有单体淡化 / 正在淡入的材质，transparent 由各自的流程管，这里不要抢
+        if (m.userData.uBatchTexActive?.value) continue;
+        if ((m.userData.uTileFade?.value ?? 1) < 1) continue;
+        m.transparent = transparent;
+        m.depthWrite = transparent ? keepDepth : true;
       }
-      const m = styledMaterialOf(p.mesh);
-      if (!m) continue;
-      m.opacity = o;
-      m.transparent = transparent;
-      m.depthWrite = transparent ? keepDepth : true;
     }
+
+    // 点云不走 StyleMaterial，自己有一套 uOpacity，逐帧刷的只有这几个对象
+    for (const pc of this._pointClouds) this._applyPointCloudStyle(pc);
+
+    this._syncEdgeStyle();
     this._requestRepaint();
   }
 
@@ -1285,9 +1941,7 @@ export class S3MViewer {
 
   /** 全部点云刷新：着色模式切换时用（uniform 是共享引用，改色不用走这里） */
   private _applyPointCloudStyles(): void {
-    for (const p of this._pickables.values()) {
-      if (isPointCloudObject(p.mesh)) this._applyPointCloudStyle(p.mesh);
-    }
+    for (const pc of this._pointClouds) this._applyPointCloudStyle(pc);
     this._requestRepaint();
   }
 
@@ -1400,10 +2054,16 @@ export class S3MViewer {
    *
    * 棱线本身用「屏幕空间等宽线」画（见 EdgeLines.ts）：WebGL 的 lineWidth 基本无效，
    * 只有摊成面向屏幕的四边形，`edgeWidth` 才能真正调粗。
+   *
+   * 带 `transition` 时做「淡入 / 淡出」，**不对几何做插值**（几何没法插值）：
+   * 开：立刻置位 + 开始分片建线，同时 `uEdgeFade` 0→1 —— 建好一块亮一块，视觉上是渐显；
+   * 关：`uEdgeFade` 1→0，淡完才 dispose，避免棱线「啪」一下消失。
    */
-  setEdges(enabled: boolean): void {
+  setEdges(enabled: boolean, transition?: TransitionOptions): void {
+    const wantAnim = !!transition && ((transition.duration ?? 0) > 0 || !!transition.spring);
     this._edgesEnabled = enabled;
     this.style.edges = enabled;
+    this._styleTarget.edges = enabled;
 
     // 数据自带的棱线：直接切可见性
     for (const entry of this.datasets.values()) {
@@ -1418,7 +2078,19 @@ export class S3MViewer {
     this._syncEdgeStyle();
 
     if (!enabled) {
-      for (const p of this._pickables.values()) this._removeEdges(p.mesh);
+      if (wantAnim) {
+        this.animator.to('style.edgeFade', 0, {
+          ...transition,
+          onComplete: () => {
+            this._disposeEdges();
+            this._requestRepaint();
+            transition?.onComplete?.();
+          },
+        });
+      } else {
+        this._setEdgeFade(1);
+        this._disposeEdges();
+      }
       this._requestRepaint();
       return;
     }
@@ -1438,6 +2110,25 @@ export class S3MViewer {
       else this._requestRepaint();
     };
     step();
+
+    if (wantAnim) {
+      // 从 0 起淡入：新建出来的棱线自动继承当前进度，不会半路冒出一条满亮度的线
+      this._setEdgeFade(0);
+      this.animator.to('style.edgeFade', 1, transition);
+    } else {
+      this._setEdgeFade(1);
+    }
+  }
+
+  /** 直接写棱线淡入乘子（不走动画通道） */
+  private _setEdgeFade(v: number): void {
+    if (this.uniforms.uEdgeFade) this.uniforms.uEdgeFade.value = v;
+    this._syncEdgeStyle();
+  }
+
+  /** 释放所有现算棱线几何 */
+  private _disposeEdges(): void {
+    for (const p of this._pickables.values()) this._removeEdges(p.mesh);
   }
 
   /**
@@ -1486,19 +2177,28 @@ export class S3MViewer {
     this._requestRepaint();
   }
 
-  /** 让全局棱线材质跟上 style.edgeColor / edgeWidth / edgeOpacity */
+  /**
+   * 让全局棱线材质跟上 style.edgeColor / edgeWidth / edgeOpacity。
+   *
+   * 全程 O(1)：只有一份共享 edgeMaterial（所有逐 mesh 棱线都用它）+ 一份预制缓存，
+   * 所以棱线淡入淡出只要改一个 uniform，新建瓦片自动继承当前进度。
+   */
   private _syncEdgeStyle(): void {
     const s = this.style;
+    const fade = this.uniforms.uEdgeFade?.value ?? 1;
+    const opacity =
+      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) *
+      Math.min(1, Math.max(0.05, s.opacity ?? 1)) *
+      fade;
     const u = this.edgeMaterial.uniforms;
     u.uColor.value.set(s.edgeColor);
     u.uWidth.value = Math.max(0.1, s.edgeWidth ?? 1.5);
-    u.uOpacity.value =
-      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * Math.min(1, Math.max(0.05, s.opacity ?? 1));
+    u.uOpacity.value = opacity;
     // 预制棱线缓存（LineBasicMaterial）同步颜色 / 不透明度
     if (this._creaseLines) {
       const m = this._creaseLines.material as THREE.LineBasicMaterial;
       m.color.set(s.edgeColor);
-      m.opacity = Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * Math.min(1, Math.max(0.05, s.opacity ?? 1));
+      m.opacity = opacity;
     }
   }
 
@@ -1508,7 +2208,10 @@ export class S3MViewer {
     if (!mat || !mat.color) return;
     mat.color.set(this.style.edgeColor);
     const baseOpacity = this.style.edgeOpacity ?? 0.6;
-    mat.opacity = baseOpacity * Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
+    mat.opacity =
+      baseOpacity *
+      Math.min(1, Math.max(0.05, this.style.opacity ?? 1)) *
+      (this.uniforms.uEdgeFade?.value ?? 1);
     mat.transparent = true;
     mat.polygonOffset = true;
     mat.polygonOffsetFactor = -1;
@@ -1516,12 +2219,17 @@ export class S3MViewer {
     mat.needsUpdate = true;
   }
 
+  /**
+   * 刷新所有棱线外观。
+   *
+   * 数据自带的棱线是逐对象的 LineBasicMaterial，改颜色只能一个个写；但原来每次都要
+   * 遍历整个数据集树（几千个节点），颜色动画逐帧跑就是灾难。改成只刷注册时收集好的
+   * 那批 LineSegments，复杂度降到 O(棱线条数)。
+   */
   private _refreshEdgeLines(): void {
     this._syncEdgeStyle();
-    for (const entry of this.datasets.values()) {
-      entry.root.traverse((o) => {
-        if ((o.userData as MeshUserData).isEdgeLines) this._styleEdgeLine(o as THREE.LineSegments);
-      });
+    for (const lines of this._nativeEdgeLines) {
+      if (lines.parent) this._styleEdgeLine(lines);
     }
   }
 
@@ -1572,7 +2280,26 @@ export class S3MViewer {
     source.dispose();
     if (!segments || segments.length < 6) return;
 
-    const lines = new THREE.Mesh(buildThickLineGeometry(segments), this.edgeMaterial);
+    // 3. 回填每段棱线所属的单体 batchId。
+    //    EdgesGeometry 只输出坐标不输出顶点号，只能拿端点坐标去查「位置 → batchId」表。
+    //    没有这张表，单体一动棱线就留在原地——这正是「棱线跟随」的关键一环。
+    const TOL = 0.005;
+    const batchMap = buildPositionBatchMap(mesh.geometry, TOL);
+    let batchIds: Float32Array | undefined;
+    if (batchMap) {
+      const segCount = segments.length / 6;
+      batchIds = new Float32Array(segCount);
+      for (let i = 0; i < segCount; i++) {
+        const s = i * 6;
+        batchIds[i] =
+          batchMap.get(positionQuantKey(segments[s], segments[s + 1], segments[s + 2], 1 / TOL)) ?? -1;
+      }
+    }
+
+    const lines = new THREE.Mesh(
+      buildThickLineGeometry(segments, batchIds),
+      this._createEdgeMaterial(mesh)
+    );
     lines.renderOrder = 2;
     // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
     lines.frustumCulled = false;
@@ -1582,12 +2309,52 @@ export class S3MViewer {
     mesh.add(lines); // 作为子节点，自动继承 mesh 的世界变换
   }
 
+  /**
+   * 给一块网格造专属的棱线材质。
+   *
+   * 棱线材质必须逐网格一份，因为它要绑定**这个网格**的单体状态纹理；但外观
+   * （颜色 / 粗细 / 透明度）必须全局统一——所以外观 uniform 直接复用
+   * `_edgeStyleUniforms` 里的对象，`_syncEdgeStyle()` 改一次全部生效，
+   * program 也因为着色器相同而只编译一次。
+   */
+  private _createEdgeMaterial(mesh: THREE.Mesh): ThickLineMaterial {
+    const styled = styledMaterialOf(mesh);
+    const batch = styled?.userData?.uBatchTex
+      ? {
+          uBatchTex: styled.userData.uBatchTex,
+          uBatchTexWidth: styled.userData.uBatchTexWidth,
+          uBatchTexActive: styled.userData.uBatchTexActive,
+        }
+      : undefined;
+    return createThickLineMaterial(this.lineShared, {}, this._edgeStyleUniforms, batch);
+  }
+
+  /** 选中棱线的逐网格材质，道理同上 */
+  private _createSelectionEdgeMaterial(mesh: THREE.Mesh): ThickLineMaterial {
+    const styled = styledMaterialOf(mesh);
+    const batch = styled?.userData?.uBatchTex
+      ? {
+          uBatchTex: styled.userData.uBatchTex,
+          uBatchTexWidth: styled.userData.uBatchTexWidth,
+          uBatchTexActive: styled.userData.uBatchTexActive,
+        }
+      : undefined;
+    return createThickLineMaterial(this.lineShared, {}, this._selEdgeStyleUniforms, batch);
+  }
+
   private _removeEdges(mesh: THREE.Mesh): void {
     const ud = mesh.userData as MeshUserData;
     const lines = ud.edges;
     if (!lines) return;
     mesh.remove(lines);
     (lines as THREE.Mesh).geometry?.dispose();
+    // 棱线材质现在是逐网格一份（要绑各自的 batch 纹理），得跟着释放
+    const mat = (lines as THREE.Mesh).material;
+    if (Array.isArray(mat)) {
+      mat.forEach((m) => (m as any)?.dispose?.());
+    } else {
+      (mat as any)?.dispose?.();
+    }
     ud.edges = null;
   }
 
@@ -2112,23 +2879,36 @@ export class S3MViewer {
       const ud = mesh.userData as MeshUserData;
       const geoRef = ud.geoRef;
       let segments: PickSegment[] = [];
+      // 这块网格上的棱线全部属于选中的那个单体，整批填同一个 batchId，
+      // 顶点着色器才能从状态纹理里取到平移 / 拔高——选中跟随移动靠它。
+      let batchId = -1;
       if (mesh === result.mesh && result.instanceIndex != null) {
         // 实例化几何没有逐单体的顶点区间，整个 base mesh 就是这一栋的外形
         segments = [{ vertexOffset: 0, vertexCount: mesh.geometry.getAttribute('position')?.count ?? 0 }];
+        const pickInfo = geoRef?.pickInfo;
+        const entry = (pickInfo as Record<string | number, unknown> | undefined)?.[result.smid ?? ''] ??
+          (pickInfo as Record<string | number, unknown> | undefined)?.[String(result.smid)];
+        batchId = entry ? pickEntryId(entry as any) : -1;
       } else if (result.smid != null) {
         const pickInfo = geoRef?.pickInfo;
         const entry = (pickInfo as Record<string | number, unknown> | undefined)?.[result.smid] ??
           (pickInfo as Record<string | number, unknown> | undefined)?.[String(result.smid)];
         const bId = entry ? pickEntryId(entry as any) : -1;
+        batchId = bId;
         segments = (entry as any)?.segments ?? (bId >= 0 ? resolveFeature(geoRef, bId).segments : []);
       } else if (mesh === result.mesh) {
         const localGeo = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(result.batchId) ?? geoRef;
         segments = resolveFeature(localGeo, result.batchId).segments;
+        batchId = result.batchId;
       }
 
       const pairs = buildFeatureEdgeSegments(mesh.geometry, segments);
       if (pairs && pairs.length > 0) {
-        const lines = new THREE.Mesh(buildThickLineGeometry(pairs), this.selectionEdgeMaterial);
+        const batchIds = batchId >= 0 ? new Float32Array(pairs.length / 6).fill(batchId) : undefined;
+        const lines = new THREE.Mesh(
+          buildThickLineGeometry(pairs, batchIds),
+          this._createSelectionEdgeMaterial(mesh)
+        );
         lines.renderOrder = 4;
         // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
         lines.frustumCulled = false;
@@ -2197,7 +2977,9 @@ export class S3MViewer {
     u.uColor.value.set(s.outlineColor ?? s.selectColor);
     u.uWidth.value = Math.max(0.1, s.outlineWidthPx ?? 3);
     u.uOpacity.value = Math.min(1, Math.max(0.05, s.opacity ?? 1));
-    u.uElevation.value = this._selection ? this._selectionElevation(this._selection) : 0;
+    // 只加全局 selectElevation：单体自己的拔高已经写在状态纹理第 2 行 z 里，
+    // 顶点着色器采样时带出来了，这里再加一次就会双重拔高
+    if (u.uElevation) u.uElevation.value = s.selectElevation ?? 0;
 
     // 外扩描边是另一个材质实例，单体状态纹理的开关是建的时候抄过去的。
     // 先选中、再抬高（或反过来）时模板会停留在旧值，这里补一次同步。
@@ -2291,6 +3073,9 @@ export class S3MViewer {
     const gl = this.renderer.getContext() as WebGLRenderingContext | null;
     if (gl && typeof gl.isContextLost === 'function' && gl.isContextLost()) return false;
 
+    // 先推进动画，再刷脏标记，最后渲染 —— 保证本帧画出来的是最新值
+    const animating = this.animator.tick();
+
     // 脏标记正常由微任务刷掉；这里再兜一次底，保证「本帧画出来的」一定是最新样式
     this.flushOverrides();
 
@@ -2359,8 +3144,14 @@ export class S3MViewer {
       this._fps.last = now;
     }
 
-    // 动态着色 / 瓦片加载中 / 瓦片层级或可见性改变，都需要宿主继续驱动下一帧
-    return this.style.mode === STYLE.DYNAMIC || this.stats.loading > 0 || tilesetChanged;
+    // 动态着色 / 动画进行中 / 瓦片加载中 / 瓦片层级或可见性改变，都需要宿主继续驱动下一帧。
+    // 动画结束那一帧必须精确回到 false，否则 MapLibre 会永远重绘（耗电、发热）。
+    return (
+      animating ||
+      this.style.mode === STYLE.DYNAMIC ||
+      this.stats.loading > 0 ||
+      tilesetChanged
+    );
   }
 
   /* ---------------------------------------------------------------- 只读属性 */
