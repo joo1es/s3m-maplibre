@@ -43,6 +43,82 @@ export interface DecodeOptions {
    * flipY 纹理走不了压缩上传（WebGL 对压缩纹理忽略 UNPACK_FLIP_Y），自动回退解码。
    */
   compressed?: boolean;
+  /**
+   * 解码产物长边的像素上限（默认不限制）。
+   *
+   * 手机上 1024 与 2048 肉眼几乎无差，但显存与上传带宽差 4 倍，所以允许接入方封顶。
+   * 只处理 RGBA / WebP 位图产物；**压缩直传（blocks）不缩放**——DXT 块不能重采样，
+   * 而且要直传的场合本就是想省显存。图集（flipY / packed / composed）的 UV 已经
+   * 重映射到子区域，缩放会整体错位，必须由调用方排除，这里不做判断。
+   */
+  maxSize?: number;
+}
+
+/** 2×2 盒式滤波减半（RGBA8）。奇数边丢弃最后一行/列，保证输出尺寸为 ⌊w/2⌋ × ⌊h/2⌋ */
+function halveRgba(
+  src: Uint8Array,
+  w: number,
+  h: number
+): { rgba: Uint8Array; width: number; height: number } {
+  const nw = Math.max(1, w >> 1);
+  const nh = Math.max(1, h >> 1);
+  const out = new Uint8Array(nw * nh * 4);
+  const row = w * 4;
+  for (let y = 0; y < nh; y++) {
+    const r0 = y * 2 * row;
+    const r1 = r0 + row;
+    let o = y * nw * 4;
+    for (let x = 0; x < nw; x++) {
+      const i0 = r0 + x * 8;
+      const i1 = r1 + x * 8;
+      out[o++] = (src[i0] + src[i0 + 4] + src[i1] + src[i1 + 4]) >> 2;
+      out[o++] = (src[i0 + 1] + src[i0 + 5] + src[i1 + 1] + src[i1 + 5]) >> 2;
+      out[o++] = (src[i0 + 2] + src[i0 + 6] + src[i1 + 2] + src[i1 + 6]) >> 2;
+      out[o++] = (src[i0 + 3] + src[i0 + 7] + src[i1 + 3] + src[i1 + 7]) >> 2;
+    }
+  }
+  return { rgba: out, width: nw, height: nh };
+}
+
+/**
+ * 按 `maxSize` 把产物缩到长边不超过上限（逐次 2× 减半，不引入任意比例插值）。
+ * 未配置或没超限时原样返回**同一个对象**，调用方不会多一次拷贝。
+ */
+async function applyMaxSize(
+  data: DecodedTextureData,
+  maxSize: number | undefined
+): Promise<DecodedTextureData> {
+  if (!maxSize || !Number.isFinite(maxSize) || maxSize < 1) return data;
+  const longest = Math.max(data.width, data.height);
+  if (longest <= maxSize) return data;
+
+  // 压缩块不能重采样；真要省显存就在调用侧关掉压缩直传
+  if (data.blocks) return data;
+
+  if (data.bitmap) {
+    const scale = maxSize / longest;
+    const w = Math.max(1, Math.round(data.width * scale));
+    const h = Math.max(1, Math.round(data.height * scale));
+    const resized = await createImageBitmap(data.bitmap, {
+      resizeWidth: w,
+      resizeHeight: h,
+      resizeQuality: 'high',
+    });
+    (data.bitmap as ImageBitmap & { close?: () => void }).close?.();
+    return { ...data, width: w, height: h, bitmap: resized };
+  }
+
+  let rgba = data.rgba;
+  if (!rgba) return data;
+  let w = data.width;
+  let h = data.height;
+  while (Math.max(w, h) > maxSize && w >= 2 && h >= 2) {
+    const next = halveRgba(rgba, w, h);
+    rgba = next.rgba;
+    w = next.width;
+    h = next.height;
+  }
+  return { ...data, width: w, height: h, rgba };
 }
 
 /** 行序翻转（原地）。S3MBLOCK 图集按 GL 方向存储（v=0 在最后一行），解码后要翻一次行 */
@@ -121,6 +197,17 @@ export function expectedDxtByteLength(width: number, height: number, format: 'dx
 
 /** 主线程 / Worker 共用的解码入口。不抛错：失败与不支持都体现在返回值里 */
 export async function decodeTextureData(
+  tex: S3MTexture,
+  options: DecodeOptions = {}
+): Promise<DecodedTextureData> {
+  // 尺寸收口放在这一层：raw 里各分支（DXT / CRN / raw / WebP）有多个 return，
+  // 统一在外层套一次就不会漏掉任何一条路径。
+  const data = await decodeTextureDataRaw(tex, options);
+  return applyMaxSize(data, options.maxSize);
+}
+
+/** 各解码分支的原样产物（尺寸未收口），由上面的导出函数包一层 */
+async function decodeTextureDataRaw(
   tex: S3MTexture,
   options: DecodeOptions = {}
 ): Promise<DecodedTextureData> {

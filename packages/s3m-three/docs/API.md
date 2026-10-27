@@ -161,6 +161,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `ground` | `GroundOptions` | — | 3D 物理地表面 / 基坑开挖配置 |
 | `pickable` | `boolean` | `true` | 是否响应拾取 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
+| `maxTriangles` | `number` | `Infinity` | 每个数据集**驻留三角形总数**的软上限（不限制）。`maxTiles` 数不了「一块精模几十万面」，这条按实际面数做刹车，走同一套 make-before-break 淘汰，不开洞 |
 | `totalMaxTiles` | `number` | — | 多数据集全局驻留瓦片总预算；开启后在可见数据集间动态均衡分配，防止叠加爆显存 |
 | `light` | `LightOptions` | — | 场景光照配置，可配环境光与主平行光的颜色、强度、模式与方位角/高度角 |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
@@ -169,6 +170,9 @@ new S3MViewer(options?: S3MViewerOptions)
 | （随 `useWorker`）几何组装 | `boolean` | `true` | 顶点解交错 / 法线计算 / 同材质合批合并（`core/TileGeometry.ts`）随解析在 Worker 完成，主线程只做 three 对象包装；Worker 不可用时主线程跑同一份实现，产物一致 |
 | （随 `useWorker`）DXT 压缩直传 | 自动 | 自动 | 宿主 GL 同时支持 `WEBGL_compressed_texture_s3tc`(+srgb) 时，dxt1/dxt5（含 CRN 转码产物）不解码直接 `CompressedTexture` 上传，显存与上传带宽降为 1/4~1/8；块长与 4×4 对齐公式不符、flipY 图集、移动端无扩展时自动回退 RGBA 解码 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
+| `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 **DPR 上限**（不截断）。默认按 `canvasHeight` 物理像素算，与官方 `calcPixFromCam` 同口径；3x DPR 手机上由此会多细化、多拉瓦片，传 `2` 即按「CSS 高度 × 2」截断 |
+| `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = 取 GPU 最大值，通常 16）。移动端封到 4 / 8 肉眼通常无差，采样成本明显下降。只影响之后创建的纹理 |
+| `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。非图集的 RGBA / WebP 产物按 2× 盒式滤波减半到上限内；DXT 压缩直传与图集不受影响 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，配了才能 `colorByField()`，见[按业务字段着色](#按业务字段着色) |
 | `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
@@ -366,10 +370,20 @@ getFeatureBounds(smid: number): [[number, number], [number, number]] | null
 ```ts
 setLodRangeScale(scale: number, datasetId?: string): void
 readonly lodRangeScale: number
+setLodPixelRatioCap(cap: number): void        // Infinity = 不截断（默认）
+readonly lodPixelRatioCap: number
+setMaxTriangles(n: number, datasetId?: string): void   // Infinity = 不限制（默认）
+readonly maxTriangles: number
+setAnisotropyCap(cap: number): void           // Infinity = 取 GPU 最大值（默认）
+readonly anisotropyCap: number
+setMaxTextureSize(n: number): void            // Infinity = 不限制（默认）
+readonly maxTextureSize: number
 readonly stats: Stats
 readonly fps: number
 getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
 ```
+
+`lodPixelRatioCap` 只在**有限值**时才去读 `canvas.clientHeight`，默认状态下不产生任何额外开销；离屏 canvas（`clientHeight` 为 0）自动退回物理像素口径。截断会把每块瓦片的屏幕投影放大同样倍数，几何误差与纹理密度同步变差，取舍见[性能调优](#性能调优与显存管理)。
 
 ```ts
 interface Stats {
@@ -1189,6 +1203,10 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 |---|---|
 | `totalMaxTiles` | 多数据集全局瓦片总预算（如 `96` 或 `128`），自动在可见数据集间均衡分配配额，隐藏数据集时自动回收预算，防止多图层叠加爆显存 |
 | `maxTiles` | 单数据集瓦片驻留上限，默认 64。叠加多个数据集时建议配合 `totalMaxTiles` 或下调至 32~48 |
+| `maxTriangles` | 单数据集驻留面数软上限，默认不限制。`maxTiles` 只数瓦片个数，精模场景（一块几十万面）建议配 60 万~120 万 |
+| `lodPixelRatioCap` | LOD 判定用屏幕高度的 DPR 上限，默认不截断。见下方「移动端 / 差设备」 |
+| `anisotropyCap` | 各向异性过滤上限，默认取 GPU 最大值。移动端 4 / 8 通常肉眼无差 |
+| `maxTextureSize` | 纹理长边像素上限，默认不限制。手机上 1024 即可，显存降到 1/4 |
 | `maxImageCache` | 原始图集与 leaf 段图像记录的 LRU 缓存容量上限（默认 128），超限自动淘汰旧缓存，防止漫游时内存不断累积 |
 | 纹理引用计数 | 瓦片淘汰时按引用计数释放未被其他瓦片复用的 `Texture` 并调用 `dispose()`，真正归还 GPU 显存 |
 | 几何/材质深度释放 | 瓦片注销时深度遍历对象树，彻底释放 `Mesh`、`Points`（点云/高斯泼溅）以及 `LineSegments`（棱线包）的 `BufferGeometry` 与材质 |
@@ -1200,6 +1218,49 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 | `pick` 只渲染 1 个像素 | 已内置；hover 高亮、框选这类高频拾取不再有整屏开销 |
 
 实测（上海某区，5 数据集叠加，45 万三角面，1440×900）：**85~90 fps**。
+
+### 移动端 / 差设备
+
+库本身不检测设备，所有刹车都由接入方按档位决定，**默认全部不启用，行为与旧版一致**：
+
+```ts
+// 低端档
+new S3MLayer({
+  lodPixelRatioCap: 2,      // 3x 屏 → 判定高度 2556 压到 ~1704，少约半层细化
+  maxTriangles: 800_000,    // 驻留面数超了就淘汰最久没用的瓦片
+  maxTiles: 40,
+  maxConcurrent: 2,         // 并发 4 → 2：Worker 省了解析，但几何组装与纹理上传仍在主线程
+  anisotropyCap: 4,         // 各向异性 16 → 4
+  maxTextureSize: 1024,     // 纹理长边 2048 → 1024，显存降到 1/4
+});
+```
+
+五个开关性质不同，按「改不改画质」分两类：
+
+| 开关 | 性质 | 观感代价 |
+|---|---|---|
+| `lodPixelRatioCap` | 画质换性能 | 有，见下表 |
+| `maxTextureSize` | 画质换显存 | 贴图略软；1024 与 2048 在手机上肉眼几乎无差 |
+| `anisotropyCap` | 画质换采样成本 | 斜视角立面清晰度略降；4 / 8 通常看不出 |
+| `maxConcurrent` | 纯加载节奏 | 无（只是瓦片到达得慢一点，掉帧少） |
+| `maxTriangles` | 兜底刹车 | 正常无感，见下 |
+
+**为什么 `lodPixelRatioCap` 在手机上收益最大**：LOD 的屏幕空间误差按 `canvasHeight` 物理像素算（与官方 `calcPixFromCam` 同口径），而手机 DPR 3 的绘图缓冲高度比 1440×900 桌面还高——细化层数与瓦片请求会多出近 3 倍，同时片元填充量再乘 2 倍多。截断只吃掉超采样的那部分，代价是每块瓦片在屏幕上铺得更开，几何误差与纹理密度同步变差：
+
+| 力度 | 判定高度（iPhone 15） | 几何误差 / 纹理密度 | 体感 |
+|---|---|---|---|
+| 不截断（默认） | 2556 | 基准 | 最清晰，最费 |
+| `2` | 1704 | ×1.5 / ×1/1.5 | 近景细看略软，整体几乎无感 |
+| `1.5` | 1278 | ×2 / ×1/2 | 立面与地面贴图明显变软 |
+| `1`（等价于按 CSS 高度） | 852 | ×2.84 / ×1/2.84 | 糊，圆形构件出棱角，不建议 |
+
+**`maxTextureSize` 的三个边界**（都需要知道，否会踩意外的坑）：
+
+- **图集不缩放**：S3MBLOCK 的 `AtlasPack` 大图与 leaf 组合画布的 UV 已重映射到子区域，缩放会让整体错位，`createTexture` 里直接跳过。
+- **压缩直传不缩放**：走 `CompressedTexture`（DXT / CRN 转码）时纹理在 GPU 里就是块数据，重采样没意义；真要省显存就在调用侧关掉压缩直传，或接受它已经是 1/4~1/8 的体积。
+- **缩放发生在 Worker 里**：`maxSize` 随解码请求一起传给共享 Worker，主线程零成本；Worker 不可用时才回落到主线程（4096² 减半一次约 10~50ms，属于一次性成本）。
+
+**`maxTriangles` 是兜底刹车而不是画质档位**：没超预算时代码路径不触发，画质零损失；超了只在「不显示」或「位置已被可见子瓦接手」的瓦片里淘汰，所以不会开洞。
 
 ### 批量改单体样式
 

@@ -17,8 +17,28 @@ export { PixelFormat } from '../core/TextureFormat.js';
 /** 由 S3MLayer 在拿到 GL 上下文后注入，用于斜视角下保持纹理清晰 */
 let maxAnisotropy = 1;
 
-export function setMaxAnisotropy(n: number): void {
+/**
+ * 各向异性过滤的**上限**（默认 Infinity = 不封顶，取 GPU 报的最大值）。
+ *
+ * 各向异性对斜视角立面清晰度的提升比提高分辨率更直接，所以默认全量启用；
+ * 但它每像素要多采样，移动端 GPU 上封到 4 或 8 通常肉眼无差、成本明显下降。
+ * 由 `setMaxAnisotropy(gpuMax, cap)` 一起注入，接入方通过 `anisotropyCap` 配置。
+ */
+let anisotropyCap = Infinity;
+
+export function setMaxAnisotropy(n: number, cap = Infinity): void {
   maxAnisotropy = Math.max(1, n | 0);
+  anisotropyCap = Number.isFinite(cap) && cap > 0 ? Math.max(1, cap) : Infinity;
+}
+
+/**
+ * 纹理长边像素上限（默认 Infinity = 不限制）。
+ * 只作用于非图集的 RGBA / WebP 产物，见 `core/TextureDecode.ts` 的 `maxSize`。
+ */
+let maxTextureSize = Infinity;
+
+export function setMaxTextureSize(n: number): void {
+  maxTextureSize = Number.isFinite(n) && n >= 1 ? n : Infinity;
 }
 
 /**
@@ -42,23 +62,28 @@ export interface DecodedTexture {
 /**
  * 注入「离线解码」实现（S3MViewer 装配：走共享解析 Worker）。
  * 返回 null = Worker 不可用 / 崩溃，createTexture 自动退回主线程 decodeTextureData。
+ * `maxSize` 一并带过去，缩放也在 Worker 里做（同样是 CPU 活）。
  */
 let offThreadDecode:
-  | ((tex: S3MTexture, compressed: boolean) => Promise<DecodedTextureData | null>)
+  | ((tex: S3MTexture, compressed: boolean, maxSize?: number) => Promise<DecodedTextureData | null>)
   | null = null;
 
 export function setTextureOffThreadDecode(
-  fn: ((tex: S3MTexture, compressed: boolean) => Promise<DecodedTextureData | null>) | null
+  fn: ((tex: S3MTexture, compressed: boolean, maxSize?: number) => Promise<DecodedTextureData | null>) | null
 ): void {
   offThreadDecode = fn;
 }
 
-async function decodeTexture(tex: S3MTexture, compressed: boolean): Promise<DecodedTextureData> {
+async function decodeTexture(
+  tex: S3MTexture,
+  compressed: boolean,
+  maxSize: number
+): Promise<DecodedTextureData> {
   if (offThreadDecode) {
-    const viaWorker = await offThreadDecode(tex, compressed);
+    const viaWorker = await offThreadDecode(tex, compressed, maxSize);
     if (viaWorker) return viaWorker;
   }
-  return decodeTextureData(tex, { compressed });
+  return decodeTextureData(tex, { compressed, maxSize });
 }
 
 function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
@@ -68,7 +93,7 @@ function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
   tex.minFilter = THREE.LinearMipmapLinearFilter;
   tex.generateMipmaps = true;
   // 各向异性过滤对斜视角立面清晰度的提升比提高分辨率更直接
-  tex.anisotropy = maxAnisotropy;
+  tex.anisotropy = anisotropyCap === Infinity ? maxAnisotropy : Math.min(maxAnisotropy, anisotropyCap);
   if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
   tex.flipY = false;
   tex.needsUpdate = true;
@@ -103,7 +128,9 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
 
   // 压缩直传只在「宿主 GL 支持 + 非图集」时开：图集要 flipY / 无 mip，压缩上传做不了翻行
   const wantCompressed = compressedTexturesSupported && !isAtlas;
-  const data = await decodeTexture(tex, wantCompressed);
+  // 尺寸上限同样跳过图集：UV 已重映射到子区域，缩放会让整体错位
+  const sizeCap = isAtlas ? Infinity : maxTextureSize;
+  const data = await decodeTexture(tex, wantCompressed, sizeCap);
 
   if (!data.rgba && !data.blocks && !data.bitmap) {
     if (data.error) {

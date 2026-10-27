@@ -23,7 +23,7 @@
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
-import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode } from './TextureFactory.js';
+import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
@@ -219,6 +219,33 @@ export interface S3MViewerOptions {
   useWorker?: boolean;
   /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
   lodRangeScale?: number;
+  /**
+   * LOD 判定用屏幕高度时的「设备像素比上限」（默认不限制，行为与旧版一致）。
+   *
+   * LOD 的屏幕空间误差按 `canvasHeight` 物理像素算（与官方 `calcPixFromCam` 同口径），
+   * 于是 3x DPR 的手机上判定高度是 2556 而不是 852，细化层数与瓦片数都会远多于桌面。
+   * 传 2 表示「按 CSS 高度 × 2 截断」，砍掉 3x 屏的超采样余量；传 `Infinity` = 不截断。
+   *
+   * 代价：截断会把每块瓦片的屏幕投影放大同样倍数，几何误差与纹理密度同步变差，
+   * 所以默认不启用，由接入方按设备档位自行决定。运行时可用 `setLodPixelRatioCap()` 调整。
+   */
+  lodPixelRatioCap?: number;
+  /**
+   * 每个数据集驻留三角形总数的软上限（默认不限制）。
+   * 见 `S3MTilesetOptions.maxTriangles`：瓦片数管不住的场景（精模、大面片）用这条刹车。
+   */
+  maxTriangles?: number;
+  /**
+   * 各向异性过滤上限（默认不封顶，取 GPU 报的最大值，通常 16）。
+   * 移动端封到 4 或 8 肉眼通常无差，采样成本明显下降。只影响**之后创建**的纹理。
+   */
+  anisotropyCap?: number;
+  /**
+   * 纹理长边像素上限（默认不限制）。
+   * 非图集的 RGBA / WebP 纹理会按 2× 盒式滤波逐次减半到上限内；DXT 压缩直传与
+   * 图集（UV 已重映射）不受影响。手机上 1024 与 2048 肉眼几乎无差，显存差 4 倍。
+   */
+  maxTextureSize?: number;
   /** 自定义瓦片构建器（测试 / 服务端渲染时注入） */
   buildTile?: BuildTileFn | null;
   /**
@@ -495,6 +522,8 @@ export class S3MViewer {
   private _onRequestRepaint: () => void = () => {};
   private _getBearing: (() => number) | undefined;
   private _lodRangeScale = 1.0;
+  /** LOD 判定屏幕高度的 DPR 上限。Infinity = 不截断（默认，行为同旧版） */
+  private _lodPixelRatioCap = Infinity;
 
   /** 宿主请求重画（MapLibre 传 triggerRepaint，纯 three 宿主传自己的渲染循环） */
   private _requestRepaint(): void {
@@ -509,6 +538,8 @@ export class S3MViewer {
     this.options = options;
     this.pickable = options.pickable !== false;
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
+    this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
+    setTextureSizeCap(options.maxTextureSize ?? Infinity);
     if (options.light) {
       Object.assign(this._lightOptions, options.light);
     }
@@ -543,8 +574,7 @@ export class S3MViewer {
 
     this.uniforms = createSharedUniforms();
     // 纹理解码优先派给共享解析 Worker（崩溃自动回主线程，见 decodeTextureWithWorker）
-    setTextureOffThreadDecode(decodeTextureWithWorker);
-    this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
+    setTextureOffThreadDecode(decodeTextureWithWorker);    this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
     this._styleTarget = { ...this.style };
     this._opacityTransparent = (this.style.opacity ?? 1) < 0.999;
     this._applyStyleUniforms();
@@ -615,7 +645,7 @@ export class S3MViewer {
     this.canvas = canvas;
 
     this.renderer = this._createRenderer(canvas, gl);
-    setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
+    setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
     this._syncTextureCapabilities(gl);
 
     this.scene = new THREE.Scene();
@@ -657,7 +687,7 @@ export class S3MViewer {
       /* noop */
     }
     this.renderer = this._createRenderer(this.canvas, gl);
-    setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy());
+    setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
     this._syncTextureCapabilities(gl);
     this.picker?.dispose();
     this.picker = new Picker(this.renderer);
@@ -854,7 +884,8 @@ export class S3MViewer {
         triggerRepaint: () => {
           this._requestRepaint();
         },
-      }
+      },
+      this.options.maxTriangles ?? Infinity
     );
     return entry;
   }
@@ -3449,6 +3480,99 @@ export class S3MViewer {
     return this._lodRangeScale;
   }
 
+  /* ------------------------------------------------ LOD 屏幕高度 / 面数预算 */
+
+  /** 当前 LOD 判定用的 DPR 上限。Infinity = 不截断 */
+  get lodPixelRatioCap(): number {
+    return this._lodPixelRatioCap;
+  }
+
+  /**
+   * 调整 LOD 判定屏幕高度的 DPR 上限（默认 Infinity = 不截断，行为与旧版一致）。
+   *
+   * 传 2 = 「按 CSS 高度 × 2 截断」：3x DPR 手机上把 2556 的判定高度压到 ~1704，
+   * 少约半层 LOD 的细化，观感几乎无损。传 `Infinity` 恢复原口径。
+   */
+  setLodPixelRatioCap(cap: number): void {
+    const next = cap > 0 ? cap : Infinity;
+    this._lodPixelRatioCap = next;
+    this.options.lodPixelRatioCap = next;
+    this._requestRepaint();
+  }
+
+  /**
+   * 计算 LOD 判定用的屏幕高度（像素）。
+   *
+   * 默认原样返回 `canvasHeight`（绘图缓冲物理像素，官方 `calcPixFromCam` 的口径）。
+   * 只有在 `lodPixelRatioCap` 有限时才去读 `clientHeight` 并按 CSS 高度截断——
+   * 离屏 canvas 没有布局尺寸（clientHeight 为 0）时退回原口径。
+   */
+  private _lodScreenHeight(canvasHeight: number): number {
+    const cap = this._lodPixelRatioCap;
+    if (!Number.isFinite(cap)) return canvasHeight;
+    const cssHeight = this.canvas?.clientHeight ?? 0;
+    if (cssHeight <= 0) return canvasHeight;
+    return Math.min(canvasHeight, cssHeight * cap);
+  }
+
+  /** 当前每个数据集的驻留面数预算。Infinity = 不限制 */
+  get maxTriangles(): number {
+    return this.options.maxTriangles ?? Infinity;
+  }
+
+  /**
+   * 调整每个数据集驻留三角形总数的软上限（默认 Infinity = 不限制）。
+   * 不传 `datasetId` 时对所有已存在数据集立即生效，并作为之后新增数据集的默认值。
+   * 实际裁剪发生在下一次 `update()` 末尾，不会当场掉内容。
+   */
+  setMaxTriangles(n: number, datasetId?: string): void {
+    const next = n > 0 ? n : Infinity;
+    if (datasetId) {
+      const entry = this.datasets.get(datasetId);
+      if (entry?.tileset) entry.tileset.setMaxTriangles(next);
+    } else {
+      this.options.maxTriangles = next;
+      for (const entry of this.datasets.values()) {
+        if (entry.tileset) entry.tileset.setMaxTriangles(next);
+      }
+    }
+  }
+
+  /** 当前各向异性过滤上限。Infinity = 不封顶 */
+  get anisotropyCap(): number {
+    return this.options.anisotropyCap ?? Infinity;
+  }
+
+  /**
+   * 调整各向异性过滤上限（默认 Infinity = 取 GPU 最大值）。
+   * 只影响**之后创建**的纹理——已上传的纹理需要重新上传才会变，代价远大于收益，
+   * 所以切换档位请在建图层前决定，或接受「新瓦片按新档位、旧瓦片保持原样」。
+   */
+  setAnisotropyCap(cap: number): void {
+    const next = Number.isFinite(cap) && cap > 0 ? Math.max(1, cap) : Infinity;
+    this.options.anisotropyCap = next;
+    const gpuMax = this.renderer?.capabilities.getMaxAnisotropy?.() ?? 1;
+    setMaxAnisotropy(gpuMax, next);
+    this._requestRepaint();
+  }
+
+  /** 当前纹理长边像素上限。Infinity = 不限制 */
+  get maxTextureSize(): number {
+    return this.options.maxTextureSize ?? Infinity;
+  }
+
+  /**
+   * 调整纹理长边像素上限（默认 Infinity = 不限制）。
+   * 只影响之后解码的纹理；非图集的 RGBA / WebP 产物按 2× 减半逼近上限。
+   * 注意这是**模块级**设置（图集 / 解码 Worker 共享），多 viewer 实例会互相覆盖。
+   */
+  setMaxTextureSize(n: number): void {
+    const next = Number.isFinite(n) && n >= 1 ? n : Infinity;
+    this.options.maxTextureSize = next;
+    setTextureSizeCap(next);
+    this._requestRepaint();
+  }
+
   /**
    * 动态调整 LOD 切换范围缩放系数。
    * scale > 1 时倾向保留粗模（降低瓦片请求与面数）；scale < 1 时提前细化加载高精瓦片。
@@ -3529,6 +3653,9 @@ export class S3MViewer {
     // 弧度视场角。MapLibre v5 起 transform.fov 是「度」，当弧度用会让
     // LOD 屏幕误差算大 20% 以上（提前加载更细的瓦片）—— 换算由宿主负责。
     let tilesetChanged = false;
+    // LOD 判定高度：默认就是绘图缓冲高度（物理像素，与官方口径一致）；
+    // 配了 lodPixelRatioCap 才按 CSS 高度截断，默认状态下这两行不产生任何开销。
+    const lodScreenHeight = this._lodScreenHeight(opts.canvasHeight);
     for (const entry of this.datasets.values()) {
       if (!entry.visible || !entry.tileset) continue;
       const local: [number, number, number] = [
@@ -3536,7 +3663,7 @@ export class S3MViewer {
         camEnu[1] - entry.offset[1],
         camEnu[2] - entry.offset[2],
       ];
-      if (entry.tileset.update(local, opts.fovRad, opts.canvasHeight)) {
+      if (entry.tileset.update(local, opts.fovRad, lodScreenHeight)) {
         tilesetChanged = true;
       }
     }

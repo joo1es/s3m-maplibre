@@ -29,7 +29,7 @@ type ParseRequest = {
   assemble?: boolean;
   batching?: boolean;
 };
-type TexRequest = { type: 'tex'; id: number; tex: S3MTexture; compressed?: boolean };
+type TexRequest = { type: 'tex'; id: number; tex: S3MTexture; compressed?: boolean; maxSize?: number };
 type Request = ParseRequest | TexRequest;
 
 type ParseResponse =
@@ -65,7 +65,7 @@ ctx.onmessage = async (e: MessageEvent<Request>) => {
         ctx.postMessage({ id, ok: true, tile } satisfies ParseResponse, collectTransferables(tile));
       }
     } else {
-      const data = await decodeTextureData(msg.tex, { compressed: msg.compressed });
+      const data = await decodeTextureData(msg.tex, { compressed: msg.compressed, maxSize: msg.maxSize });
       ctx.postMessage({ id, ok: true, data } satisfies TexResponse, texTransferList(data));
     }
   } catch (err) {

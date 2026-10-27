@@ -262,6 +262,16 @@ export interface S3MTilesetOptions {
   /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
   lodRangeScale?: number;
   /**
+   * 本数据集**驻留三角形总数**的软上限（默认不限制）。
+   *
+   * `maxTiles` 只数瓦片个数：一块精模瓦片几十万面，64 块照样能把差设备压垮，
+   * 所以在瓦片数之外再给一条按面数的刹车。超了走同一套 make-before-break 淘汰
+   * （只踢「当前不显示」或「位置已被可见子瓦接管」的瓦片），不在画面上开洞。
+   *
+   * 不传 = 不限制，行为与旧版完全一致。运行时可用 `setMaxTriangles()` 调整。
+   */
+  maxTriangles?: number;
+  /**
    * 是否请求 `.texblock` 子图集（S3MBLOCK 根图集的清晰版）。**默认关**。
    *
    * 不是没实现，而是「换图不换归一化 rect」这条规则只在部分链上成立：实测三对样本里
@@ -315,6 +325,11 @@ export class S3MTileset {
 
   maxConcurrent: number;
   maxTiles: number;
+  /**
+   * 驻留三角形总数的软上限。`Infinity` = 不限制（默认），此时 `_trimBudget` 的
+   * 判据与旧版逐字一致，不会多算一次面数。
+   */
+  maxTriangles: number;
   lodRangeScale: number;
 
   /** 数据集配置声明的高度范围（米），若配置未声明则返回 null */
@@ -369,6 +384,7 @@ export class S3MTileset {
     // 并发与总量限制：iServer 公开服务上别把人家打爆
     this.maxConcurrent = options.maxConcurrent ?? 4;
     this.maxTiles = options.maxTiles ?? 64;
+    this.maxTriangles = options.maxTriangles ?? Infinity;
     this.maxImageCache = options.maxImageCache ?? 128;
     // 硬上限 = 软上限 + 余量。淘汰只在「新瓦片已经落地并接管显示」之后做（make-before-break），
     // 所以中间态允许临时超出 maxTiles；硬上限只用来挡住失控的请求量，不用于挤掉正在显示的内容。
@@ -566,17 +582,40 @@ export class S3MTileset {
     return true;
   }
 
+  /** 当前驻留瓦片的三角形总数（只算已落地的；在途瓦片还没构建，统计不到） */
+  private _residentTriangles(): number {
+    let total = 0;
+    for (const node of this.nodes.values()) total += node.stats?.triangles ?? 0;
+    return total;
+  }
+
+  /**
+   * 运行时调整面数预算。`Infinity` = 不限制（默认）。
+   * 收紧后不会立刻掉内容，要等下一次 `_trimBudget`（下一帧 update）才生效。
+   */
+  setMaxTriangles(n: number): void {
+    this.maxTriangles = n > 0 ? n : Infinity;
+  }
+
   /**
    * 预算裁剪 —— 必须在可见性算完之后调用（make-before-break）：
    * 新瓦片已经落地、也已经决定由谁负责显示，这时候才把没人依赖的那块裁掉。
    * 只踢「当前不显示」或「位置已被可见子瓦接手」的瓦片；挑不出安全候选时允许
-   * 暂时超出 maxTiles，等下一帧再裁 —— 宁可多占一会儿内存，也不在画面上开洞。
+   * 暂时超出预算，等下一帧再裁 —— 宁可多占一会儿内存，也不在画面上开洞。
+   *
+   * 两条预算并行：瓦片数（`maxTiles`）与三角形总数（`maxTriangles`，默认不限制）。
+   * `maxTriangles` 为 Infinity 时短路，行为与只有瓦片数预算时完全一致。
    */
   private _trimBudget(): boolean {
     let removed = false;
     let guard = 0;
     // 在途的也算进"预期驻留数"：不然一批瓦片同时落地时会先把画面撑爆再疯狂裁
-    while (this.nodes.size + this.pending.size > this.maxTiles && guard++ <= this.maxTiles + 8) {
+    const overTiles = () => this.nodes.size + this.pending.size > this.maxTiles;
+    const overTriangles = () =>
+      Number.isFinite(this.maxTriangles) && this._residentTriangles() > this.maxTriangles;
+    // 面数预算生效时可能要连踢多块，迭代上限跟着驻留规模走；不生效时根本进不了循环
+    const iterationCap = this.nodes.size + this.maxTiles + 16;
+    while ((overTiles() || overTriangles()) && guard++ <= iterationCap) {
       if (!this._evictOne(this.nodes.size + this.pending.size > this.hardCap)) break;
       removed = true;
     }

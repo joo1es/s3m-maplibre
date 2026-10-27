@@ -510,7 +510,7 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 | 拾取单次 | < 1 ms（与面数无关） |
 | 棱线构建 | 8ms 一帧切片，20 网格约 1.9s 总计，不阻塞交互 |
 
-调优建议见 [s3m-three API 文档#性能调优](./packages/s3m-three/docs/API.md#性能调优)。
+调优建议见 [s3m-three API 文档#性能调优](./packages/s3m-three/docs/API.md#性能调优)。移动端与差设备另有几个可选刹车，**默认都不启用**（行为与旧版一致）：`lodPixelRatioCap`（LOD 判定屏幕高度的 DPR 上限，3x 屏上收益最大）、`maxTriangles`（按驻留面数淘汰）、`anisotropyCap`（各向异性上限）、`maxTextureSize`（纹理长边上限），见[移动端 / 差设备](./packages/s3m-three/docs/API.md#移动端--差设备)。
 
 ---
 
