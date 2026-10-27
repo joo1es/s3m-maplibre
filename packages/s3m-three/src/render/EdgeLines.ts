@@ -14,6 +14,7 @@
  */
 import * as THREE from 'three';
 import { DUMMY_BATCH_TEX } from './StyleMaterial.js';
+import { GPUPathManager } from './GPUPathManager.js';
 
 /** 所有等宽线材质共享的分辨率 uniform（每帧更新一次即可） */
 export interface LineSharedUniforms {
@@ -42,6 +43,10 @@ export interface ThickLineBatchUniforms {
   uBatchMix?: { value: number };
   uBatchTexWidth: { value: number };
   uBatchTexActive: { value: number };
+  uPathTex?: { value: unknown };
+  uPathCount?: { value: number };
+  uPathTime?: { value: number };
+  uPathTexActive?: { value: number };
 }
 
 export interface ThickLineMaterial extends THREE.ShaderMaterial {
@@ -75,6 +80,10 @@ const VERT = /* glsl */ `
   uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
+  uniform sampler2D uPathTex;
+  uniform float uPathCount;
+  uniform float uPathTime;
+  uniform int uPathTexActive;
 
   vec4 s3mSampleBatch( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
     vec4 vA = texture2D( texA, uv );
@@ -84,7 +93,7 @@ const VERT = /* glsl */ `
   }
 
   void main() {
-    // 单体平移 / 旋转 / 拔高 / 隐藏：与主着色器同一份 5 行状态纹理、同一套变换口径。
+    // 单体平移 / 旋转 / 拔高 / 隐藏：与主着色器同一份 6 行状态纹理、同一套变换口径。
     // 不采样的话，单体一动或一转棱线就留在原地——这正是「棱线跟随」要解决的。
     vec3 s3mA = position;
     vec3 s3mB = aOther;
@@ -94,26 +103,67 @@ const VERT = /* glsl */ `
 
     if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
       float s3mU = ( aBatchId + 0.5 ) / uBatchTexWidth;
-      vec4 bState = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
+      vec4 bState = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.08333333 ), uBatchMix );
       if ( bState.a < -0.5 ) {
         // 该单体被隐藏：顶点着色器不能 discard，扔到裁剪空间外
         gl_Position = vec4( 2.0, 2.0, 2.0, 1.0 );
         return;
       }
-      vec4 bOffset = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
+      vec4 bOffset = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.25 ), uBatchMix );
       s3mCustomOffset = bOffset.xyz;
       if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
         s3mCustomOffset.z = bState.a;
       }
-      vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.5 ), uBatchMix );
-      vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.7 ), uBatchMix );
-      vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.9 ), uBatchMix );
+      vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.41666667 ), uBatchMix );
+      vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.58333333 ), uBatchMix );
+      vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.75 ), uBatchMix );
       s3mRot = mat3(
         vec3( r2.x, r3.x, r4.x ),
         vec3( r2.y, r3.y, r4.y ),
         vec3( r2.z, r3.z, r4.z )
       );
       s3mPivot = vec3( r2.w, r3.w, r4.w );
+
+      // Row 5: GPU 路径动画计算
+      if ( uPathTexActive > 0 ) {
+        vec4 r5 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.91666667 ), uBatchMix );
+        float pathId = r5.x;
+        float speed = r5.y;
+        float phase = r5.z;
+        float mode = r5.w;
+        if ( pathId >= 0.0 && mode > 0.5 && uPathCount > 0.0 ) {
+          float t = phase + uPathTime * speed;
+          bool autoHeading = true;
+          if ( mode >= 4.0 ) {
+            autoHeading = false;
+            mode -= 3.0;
+          }
+          if ( mode < 1.5 ) {
+            t = fract( t );
+          } else if ( mode < 2.5 ) {
+            t = clamp( t, 0.0, 1.0 );
+          } else {
+            t = mod( t, 2.0 );
+            t = ( t > 1.0 ) ? ( 2.0 - t ) : t;
+          }
+          float pathU = ( t * 255.0 + 0.5 ) / 256.0;
+          float pathV = ( pathId + 0.5 ) / uPathCount;
+          vec4 pathSample = texture2D( uPathTex, vec2( pathU, pathV ) );
+          vec3 pathPos = pathSample.xyz;
+          float pathYaw = pathSample.w;
+          if ( autoHeading ) {
+            float c = cos( pathYaw );
+            float s = sin( pathYaw );
+            mat3 rotHeading = mat3(
+              c, -s, 0.0,
+              s,  c, 0.0,
+              0.0, 0.0, 1.0
+            );
+            s3mRot = rotHeading * s3mRot;
+          }
+          s3mCustomOffset += pathPos;
+        }
+      }
     }
 
     s3mA = s3mRot * ( s3mA - s3mPivot ) + s3mPivot + s3mCustomOffset;
@@ -190,6 +240,10 @@ export function createThickLineMaterial(
     uBatchMix: batchUniforms?.uBatchMix ?? { value: 0 },
     uBatchTexWidth: batchUniforms?.uBatchTexWidth ?? { value: 1 },
     uBatchTexActive: batchUniforms?.uBatchTexActive ?? { value: 0 },
+    uPathTex: batchUniforms?.uPathTex ?? { value: GPUPathManager.DUMMY_PATH_TEX },
+    uPathCount: batchUniforms?.uPathCount ?? { value: 1 },
+    uPathTexActive: batchUniforms?.uPathTexActive ?? { value: 0 },
+    uPathTime: batchUniforms?.uPathTime ?? { value: 0 },
   };
 
   const mat = new THREE.ShaderMaterial({
@@ -206,6 +260,10 @@ export function createThickLineMaterial(
       uBatchMix: batch.uBatchMix,
       uBatchTexWidth: batch.uBatchTexWidth,
       uBatchTexActive: batch.uBatchTexActive,
+      uPathTex: batch.uPathTex,
+      uPathCount: batch.uPathCount,
+      uPathTexActive: batch.uPathTexActive,
+      uPathTime: batch.uPathTime,
     },
     vertexShader: VERT,
     fragmentShader: FRAG,

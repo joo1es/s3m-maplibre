@@ -11,6 +11,7 @@
 import * as THREE from 'three';
 import type { StyleUniforms } from '../core/types.js';
 import { DEFAULT_FLOOR_HEIGHT } from '../core/FeatureInfo.js';
+import { GPUPathManager } from './GPUPathManager.js';
 
 /** 着色模式，数值与着色器里的 uMode 一一对应 */
 export const STYLE = {
@@ -188,8 +189,9 @@ const DUMMY_DATA = new Float32Array([
   1, 0, 0, 0,    // Row 2: rot row 0, pivot.x
   0, 1, 0, 0,    // Row 3: rot row 1, pivot.y
   0, 0, 1, 0,    // Row 4: rot row 2, pivot.z
+  -1, 0, 0, 0,   // Row 5: pathId (-1=none), speed, phase, modeFlag
 ]);
-export const DUMMY_BATCH_TEX = new THREE.DataTexture(DUMMY_DATA, 1, 5, THREE.RGBAFormat, THREE.FloatType);
+export const DUMMY_BATCH_TEX = new THREE.DataTexture(DUMMY_DATA, 1, 6, THREE.RGBAFormat, THREE.FloatType);
 DUMMY_BATCH_TEX.minFilter = THREE.NearestFilter;
 DUMMY_BATCH_TEX.magFilter = THREE.NearestFilter;
 DUMMY_BATCH_TEX.needsUpdate = true;
@@ -235,6 +237,14 @@ export function createSharedUniforms(): StyleUniforms {
     uAmbientGain: { value: 0 },
     /** 双纹理交叉淡化插值系数（0 = 纯 uBatchTex, 1 = 纯 uBatchTex2） */
     uBatchMix: { value: 0 },
+    /** GPU 路径数据采样纹理 */
+    uPathTex: { value: GPUPathManager.DUMMY_PATH_TEX },
+    /** GPU 路径纹理中包含的路径条数（高度） */
+    uPathCount: { value: 1 },
+    /** 是否激活 GPU 路径动画（0 = 未激活，1 = 激活） */
+    uPathTexActive: { value: 0 },
+    /** GPU 路径时间戳（秒） */
+    uPathTime: { value: 0 },
     /**
      * 图层整体透明度：在片元里乘进 diffuseColor.a。
      *
@@ -277,6 +287,10 @@ const VERT_PARS = /* glsl */ `
   uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
+  uniform sampler2D uPathTex;
+  uniform float uPathCount;
+  uniform float uPathTime;
+  uniform int uPathTexActive;
   varying float vBatchId;
   varying vec3 vVertColor;
   varying float vWorldZ;
@@ -341,22 +355,63 @@ const VERT_SETUP = /* glsl */ `
   float s3mBatchSetup = s3mBatchRaw();
   if ( uBatchTexActive > 0 && s3mBatchSetup >= 0.0 ) {
     float s3mU = ( s3mBatchSetup + 0.5 ) / uBatchTexWidth;
-    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
+    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.08333333 ), uBatchMix );
     if ( bState.a >= -0.5 ) {
-      vec4 bOffset = s3mSampleBatchRow1( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
+      vec4 bOffset = s3mSampleBatchRow1( uBatchTex, uBatchTex2, vec2( s3mU, 0.25 ), uBatchMix );
       s3mCustomOffset = bOffset.xyz;
       if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
         s3mCustomOffset.z = bState.a;
       }
-      vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.5 ), uBatchMix );
-      vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.7 ), uBatchMix );
-      vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.9 ), uBatchMix );
+      vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.41666667 ), uBatchMix );
+      vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.58333333 ), uBatchMix );
+      vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.75 ), uBatchMix );
       s3mRot = mat3(
         vec3( r2.x, r3.x, r4.x ),
         vec3( r2.y, r3.y, r4.y ),
         vec3( r2.z, r3.z, r4.z )
       );
       s3mPivot = vec3( r2.w, r3.w, r4.w );
+
+      // Row 5: GPU 路径动画计算
+      if ( uPathTexActive > 0 ) {
+        vec4 r5 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.91666667 ), uBatchMix );
+        float pathId = r5.x;
+        float speed = r5.y;
+        float phase = r5.z;
+        float mode = r5.w;
+        if ( pathId >= 0.0 && mode > 0.5 && uPathCount > 0.0 ) {
+          float t = phase + uPathTime * speed;
+          bool autoHeading = true;
+          if ( mode >= 4.0 ) {
+            autoHeading = false;
+            mode -= 3.0;
+          }
+          if ( mode < 1.5 ) {
+            t = fract( t );
+          } else if ( mode < 2.5 ) {
+            t = clamp( t, 0.0, 1.0 );
+          } else {
+            t = mod( t, 2.0 );
+            t = ( t > 1.0 ) ? ( 2.0 - t ) : t;
+          }
+          float pathU = ( t * 255.0 + 0.5 ) / 256.0;
+          float pathV = ( pathId + 0.5 ) / uPathCount;
+          vec4 pathSample = texture2D( uPathTex, vec2( pathU, pathV ) );
+          vec3 pathPos = pathSample.xyz;
+          float pathYaw = pathSample.w;
+          if ( autoHeading ) {
+            float c = cos( pathYaw );
+            float s = sin( pathYaw );
+            mat3 rotHeading = mat3(
+              c, -s, 0.0,
+              s,  c, 0.0,
+              0.0, 0.0, 1.0
+            );
+            s3mRot = rotHeading * s3mRot;
+          }
+          s3mCustomOffset += pathPos;
+        }
+      }
     }
   }
   objectNormal = normalize( s3mRot * objectNormal );
@@ -366,7 +421,7 @@ const VERT_ELEVATION = /* glsl */ `
   float s3mBatchElev = s3mBatchRaw();
   if ( uBatchTexActive > 0 && s3mBatchElev >= 0.0 ) {
     float s3mU = ( s3mBatchElev + 0.5 ) / uBatchTexWidth;
-    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
+    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.08333333 ), uBatchMix );
     if ( bState.a < -0.5 ) {
       transformed = vec3( 0.0 );
     }
@@ -637,7 +692,7 @@ const FRAG_COLOR = /* glsl */ `
   if ( uBatchTexActive > 0 && s3mBid >= 0.0 ) {
     // 用取整后的 id 采样：否则逐像素的插值误差会让纹素在边界上来回跳，同样出彩色噪点
     float s3mU = ( s3mBid + 0.5 ) / uBatchTexWidth;
-    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
+    vec4 bState = s3mSampleBatchRow0( uBatchTex, uBatchTex2, vec2( s3mU, 0.08333333 ), uBatchMix );
     if ( bState.a < -0.5 ) {
       discard; // 属于被过滤隐藏的单体
     }
@@ -648,7 +703,7 @@ const FRAG_COLOR = /* glsl */ `
     }
     // 单体独立透明度（状态纹理第 2 行 alpha，0 = 无覆盖）。
     // 与全局 uOpacity（diffuseColor.a 初值）和图集贴图自带 alpha 逐级叠乘
-    vec4 bOffset = s3mSampleBatchRow1( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
+    vec4 bOffset = s3mSampleBatchRow1( uBatchTex, uBatchTex2, vec2( s3mU, 0.25 ), uBatchMix );
     if ( bOffset.a > 0.0 ) {
       diffuseColor.a *= bOffset.a;
     }
@@ -836,6 +891,10 @@ const OUTLINE_VERT = /* glsl */ `
   uniform float uBatchMix;
   uniform float uBatchTexWidth;
   uniform int uBatchTexActive;
+  uniform sampler2D uPathTex;
+  uniform float uPathCount;
+  uniform float uPathTime;
+  uniform int uPathTexActive;
   varying float vSel;
 
   vec4 s3mSampleBatch( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
@@ -852,24 +911,64 @@ const OUTLINE_VERT = /* glsl */ `
     vec3 s3mPivot = vec3( 0.0 );
     if ( uBatchTexActive > 0 && aBatchId >= 0.0 ) {
       float s3mU = ( aBatchId + 0.5 ) / uBatchTexWidth;
-      vec4 bState = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.1 ), uBatchMix );
+      vec4 bState = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.08333333 ), uBatchMix );
       if ( bState.a < -0.5 ) {
         vSel = 0.0; // 过滤隐藏的单体不显示描边
       } else {
-        vec4 bOffset = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.3 ), uBatchMix );
+        vec4 bOffset = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.25 ), uBatchMix );
         s3mCustomOffset = bOffset.xyz;
         if ( s3mCustomOffset.z == 0.0 && bState.a > 0.0 ) {
           s3mCustomOffset.z = bState.a;
         }
-        vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.5 ), uBatchMix );
-        vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.7 ), uBatchMix );
-        vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.9 ), uBatchMix );
+        vec4 r2 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.41666667 ), uBatchMix );
+        vec4 r3 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.58333333 ), uBatchMix );
+        vec4 r4 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.75 ), uBatchMix );
         s3mRot = mat3(
           vec3( r2.x, r3.x, r4.x ),
           vec3( r2.y, r3.y, r4.y ),
           vec3( r2.z, r3.z, r4.z )
         );
         s3mPivot = vec3( r2.w, r3.w, r4.w );
+
+        if ( uPathTexActive > 0 ) {
+          vec4 r5 = s3mSampleBatch( uBatchTex, uBatchTex2, vec2( s3mU, 0.91666667 ), uBatchMix );
+          float pathId = r5.x;
+          float speed = r5.y;
+          float phase = r5.z;
+          float mode = r5.w;
+          if ( pathId >= 0.0 && mode > 0.5 && uPathCount > 0.0 ) {
+            float t = phase + uPathTime * speed;
+            bool autoHeading = true;
+            if ( mode >= 4.0 ) {
+              autoHeading = false;
+              mode -= 3.0;
+            }
+            if ( mode < 1.5 ) {
+              t = fract( t );
+            } else if ( mode < 2.5 ) {
+              t = clamp( t, 0.0, 1.0 );
+            } else {
+              t = mod( t, 2.0 );
+              t = ( t > 1.0 ) ? ( 2.0 - t ) : t;
+            }
+            float pathU = ( t * 255.0 + 0.5 ) / 256.0;
+            float pathV = ( pathId + 0.5 ) / uPathCount;
+            vec4 pathSample = texture2D( uPathTex, vec2( pathU, pathV ) );
+            vec3 pathPos = pathSample.xyz;
+            float pathYaw = pathSample.w;
+            if ( autoHeading ) {
+              float c = cos( pathYaw );
+              float s = sin( pathYaw );
+              mat3 rotHeading = mat3(
+                c, -s, 0.0,
+                s,  c, 0.0,
+                0.0, 0.0, 1.0
+              );
+              s3mRot = rotHeading * s3mRot;
+            }
+            s3mCustomOffset += pathPos;
+          }
+        }
       }
     }
     vec3 p = position + ( s3mRot * normal ) * uWidth * vSel;
@@ -899,6 +998,10 @@ export interface OutlineMaterial extends THREE.ShaderMaterial {
     uBatchMix: { value: number };
     uBatchTexWidth: { value: number };
     uBatchTexActive: { value: number };
+    uPathTex: { value: unknown };
+    uPathCount: { value: number };
+    uPathTexActive: { value: number };
+    uPathTime: { value: number };
     uColor: { value: THREE.Color };
   };
 }
@@ -916,6 +1019,10 @@ export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9)
       uBatchMix: shared.uBatchMix ?? { value: 0 },
       uBatchTexWidth: { value: 1.0 },
       uBatchTexActive: { value: 0 },
+      uPathTex: shared.uPathTex ?? { value: GPUPathManager.DUMMY_PATH_TEX },
+      uPathCount: shared.uPathCount ?? { value: 1 },
+      uPathTexActive: shared.uPathTexActive ?? { value: 0 },
+      uPathTime: shared.uPathTime ?? { value: 0 },
       uColor: { value: shared.uSelColor.value.clone() },
     },
     vertexShader: OUTLINE_VERT,

@@ -57,8 +57,8 @@ describe('2. 单体 xy/z 平移（状态纹理第 2 行）', () => {
 
     const tex = mat.userData.uBatchTex.value;
     expect(tex).toBeTruthy();
-    // 扩容为 5 行（Row 0 颜色/显隐，Row 1 平移/透明度，Row 2~4 旋转/轴心）
-    expect(tex.image.height).toBe(5);
+    // 扩容为 6 行（Row 0 颜色/显隐，Row 1 平移/透明度，Row 2~4 旋转/轴心，Row 5 GPU路径动画）
+    expect(tex.image.height).toBe(6);
 
     const data = tex.image.data;
     const w = tex.image.width;

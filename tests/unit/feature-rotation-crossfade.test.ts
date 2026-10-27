@@ -100,7 +100,7 @@ describe('P2. 单体姿态旋转 (5 行状态纹理与 3x3 矩阵)', () => {
 
     const tex = (mesh.material as any).userData.uBatchTex.value as THREE.DataTexture;
     expect(tex).toBeTruthy();
-    expect(tex.image.height).toBe(5);
+    expect(tex.image.height).toBe(6);
 
     const data = tex.image.data as Float32Array;
     const w = tex.image.width;
@@ -271,7 +271,7 @@ describe('P1. GPU 双纹理交叉淡化 (crossFadeStyles)', () => {
     (v as any)._applyOverridesToMesh(mesh);
 
     const tex = edgeMat.uniforms.uBatchTex.value as THREE.DataTexture;
-    expect(tex.image.height).toBe(5);
+    expect(tex.image.height).toBe(6);
 
     const data = tex.image.data as Float32Array;
     const w = tex.image.width;

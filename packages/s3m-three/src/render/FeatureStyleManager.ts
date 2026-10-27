@@ -21,6 +21,19 @@ import {
 import type { AttributeQuery, AttributeQueryOptions, AttributeRow } from '../core/AttributeQuery.js';
 import type { StyledMaterial } from './StyleMaterial.js';
 
+export interface GPUPathOptions {
+  /** 绑定的路径索引 ID（0, 1, 2...） */
+  pathId: number;
+  /** 进度的运动速率（归一化进度/秒，例如 0.05 即 20 秒一圈；为 0 则靠 progress/phase 驱动） */
+  speed?: number;
+  /** 初始相位 / 进度偏移（0.0 ~ 1.0） */
+  phase?: number;
+  /** 循环模式：'loop'（循环，默认） | 'pingpong'（往返） | 'clamp'（单次到达终点停止） */
+  loop?: 'loop' | 'pingpong' | 'clamp' | boolean;
+  /** 是否根据路径切线自动旋转朝向（偏航角 yaw，默认 true） */
+  autoHeading?: boolean;
+}
+
 export interface FeatureStyle {
   /** 自定义单体颜色 */
   color?: string;
@@ -50,6 +63,8 @@ export interface FeatureStyle {
     | THREE.Matrix4;
   /** 旋转中心轴心点 [px, py, pz]（局部坐标，默认 [0, 0, 0]） */
   pivot?: [number, number, number];
+  /** GPU 路径动画配置 */
+  gpuPath?: GPUPathOptions;
 }
 
 export type RotationMatrix9 = [
@@ -762,6 +777,13 @@ export class FeatureStyleManager {
       data[r4 + 1] = 0;
       data[r4 + 2] = 1;
       data[r4 + 3] = 0;
+
+      // Row 5: [pathId, speed, phase, modeFlag] (默认 -1 表示未绑定 GPU 路径)
+      const r5 = (w * 5 + i) * 4;
+      data[r5 + 0] = -1;
+      data[r5 + 1] = 0;
+      data[r5 + 2] = 0;
+      data[r5 + 3] = 0;
     }
 
     let hasActive = false;
@@ -771,6 +793,7 @@ export class FeatureStyleManager {
     const translationOfBatch = new Map<number, [number, number, number]>();
     const rotationOfBatch = new Map<number, RotationMatrix9>();
     const pivotOfBatch = new Map<number, [number, number, number]>();
+    const gpuPathOfBatch = new Map<number, GPUPathOptions>();
     const opacityOfBatch = new Map<number, number>();
     const ownersOfBatch = new Map<number, number>();
     const filter = this.filter;
@@ -844,12 +867,15 @@ export class FeatureStyleManager {
         translationOfBatch.set(bId, st.translation);
       }
 
-      const rotMat = resolveRotationMatrix(st?.rotation);
-      if (rotMat && !rotationOfBatch.has(bId)) {
-        rotationOfBatch.set(bId, rotMat);
+      if (st?.rotation != null && !rotationOfBatch.has(bId)) {
+        const rotMat = resolveRotationMatrix(st.rotation);
+        if (rotMat) rotationOfBatch.set(bId, rotMat);
       }
       if (st?.pivot && !pivotOfBatch.has(bId)) {
         pivotOfBatch.set(bId, st.pivot);
+      }
+      if (st?.gpuPath && !gpuPathOfBatch.has(bId)) {
+        gpuPathOfBatch.set(bId, st.gpuPath);
       }
     }
 
@@ -925,10 +951,39 @@ export class FeatureStyleManager {
       hasActive = true;
     }
 
+    // Row 5: 烘焙 GPU 路径动画参数 [pathId, speed, phase, modeFlag]
+    for (const [bId, gp] of gpuPathOfBatch) {
+      if (hiddenBatches.has(bId)) continue;
+      const r5 = (w * 5 + bId) * 4;
+      data[r5 + 0] = gp.pathId;
+      data[r5 + 1] = gp.speed ?? 0;
+      data[r5 + 2] = gp.phase ?? 0;
+
+      let mode = 1; // 1 = loop (默认)
+      if (gp.loop === 'clamp' || gp.loop === false) {
+        mode = 2;
+      } else if (gp.loop === 'pingpong') {
+        mode = 3;
+      }
+      if (gp.autoHeading === false) {
+        mode += 3; // 4=loop+noHeading, 5=clamp+noHeading, 6=pingpong+noHeading
+      }
+      data[r5 + 3] = mode;
+      hasActive = true;
+    }
+
     let conflicts = 0;
     for (const [bId, owners] of ownersOfBatch) {
       if (owners < 2) continue;
-      if (!hiddenBatches.has(bId) && !colorOfBatch.has(bId) && !elevOfBatch.has(bId) && !rotationOfBatch.has(bId)) continue;
+      if (
+        !hiddenBatches.has(bId) &&
+        !colorOfBatch.has(bId) &&
+        !elevOfBatch.has(bId) &&
+        !rotationOfBatch.has(bId) &&
+        !gpuPathOfBatch.has(bId)
+      ) {
+        continue;
+      }
       conflicts++;
     }
 
@@ -978,8 +1033,8 @@ export class FeatureStyleManager {
 
     let record = this._meshBatchTextures.get(mesh);
     if (!record || record.width < width) {
-      const data = new Float32Array(width * 5 * 4);
-      const texture = new THREE.DataTexture(data, width, 5, THREE.RGBAFormat, THREE.FloatType);
+      const data = new Float32Array(width * 6 * 4);
+      const texture = new THREE.DataTexture(data, width, 6, THREE.RGBAFormat, THREE.FloatType);
       texture.minFilter = THREE.NearestFilter;
       texture.magFilter = THREE.NearestFilter;
       record = { texture, data, width };
@@ -1037,8 +1092,8 @@ export class FeatureStyleManager {
 
       let record = this._meshBatchTextures.get(mesh);
       if (!record || record.width < width) {
-        const data = new Float32Array(width * 5 * 4);
-        const texture = new THREE.DataTexture(data, width, 5, THREE.RGBAFormat, THREE.FloatType);
+        const data = new Float32Array(width * 6 * 4);
+        const texture = new THREE.DataTexture(data, width, 6, THREE.RGBAFormat, THREE.FloatType);
         texture.minFilter = THREE.NearestFilter;
         texture.magFilter = THREE.NearestFilter;
         record = { texture, data, width };
@@ -1047,9 +1102,9 @@ export class FeatureStyleManager {
         mat.userData.uBatchTexWidth.value = width;
       }
 
-      if (!record.texture2 || !record.data2 || record.data2.length < record.width * 5 * 4) {
-        const data2 = new Float32Array(record.width * 5 * 4);
-        const texture2 = new THREE.DataTexture(data2, record.width, 5, THREE.RGBAFormat, THREE.FloatType);
+      if (!record.texture2 || !record.data2 || record.data2.length < record.width * 6 * 4) {
+        const data2 = new Float32Array(record.width * 6 * 4);
+        const texture2 = new THREE.DataTexture(data2, record.width, 6, THREE.RGBAFormat, THREE.FloatType);
         texture2.minFilter = THREE.NearestFilter;
         texture2.magFilter = THREE.NearestFilter;
         record.data2 = data2;
@@ -1147,5 +1202,69 @@ export class FeatureStyleManager {
     }
     this._markedMeshes.clear();
     this._triggerRepaint();
+  }
+
+  /**
+   * 将单体绑定到 GPU 路径动画
+   * @param smid 单体 ID
+   * @param pathId GPUPathManager 中的路径索引
+   * @param options 速度、初始相位、循环模式与自动转向配置
+   * @param meshes 可选指定的网格集合，不传则全量生效
+   */
+  bindGPUPath(
+    smid: number,
+    pathId: number,
+    options: Omit<GPUPathOptions, 'pathId'> = {},
+    meshes?: Iterable<THREE.Mesh>
+  ): void {
+    const cur = this.getFeatureStyle(smid) ?? {};
+    this.setFeatureStyle(
+      smid,
+      {
+        ...cur,
+        gpuPath: {
+          pathId,
+          speed: options.speed ?? 0,
+          phase: options.phase ?? 0,
+          loop: options.loop ?? 'loop',
+          autoHeading: options.autoHeading ?? true,
+        },
+      },
+      meshes
+    );
+  }
+
+  /**
+   * 解绑单体的 GPU 路径动画
+   */
+  unbindGPUPath(smid: number, meshes?: Iterable<THREE.Mesh>): void {
+    const cur = this.getFeatureStyle(smid);
+    if (!cur || !cur.gpuPath) return;
+    const next = { ...cur };
+    delete next.gpuPath;
+    this.setFeatureStyle(smid, next, meshes);
+  }
+
+  /**
+   * 直接设置单体在 GPU 路径上的归一化进度（0.0 ~ 1.0）
+   * @param smid 单体 ID
+   * @param progress 归一化进度 (0~1)
+   * @param meshes 可选指定的网格集合
+   */
+  setGPUPathProgress(smid: number, progress: number, meshes?: Iterable<THREE.Mesh>): void {
+    const cur = this.getFeatureStyle(smid);
+    if (!cur?.gpuPath) return;
+    this.setFeatureStyle(
+      smid,
+      {
+        ...cur,
+        gpuPath: {
+          ...cur.gpuPath,
+          speed: 0,
+          phase: Math.min(1.0, Math.max(0.0, progress)),
+        },
+      },
+      meshes
+    );
   }
 }

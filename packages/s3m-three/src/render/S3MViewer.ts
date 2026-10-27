@@ -41,6 +41,8 @@ import type { Channel, TransitionOptions } from '../anim/Animator.js';
 import { Path } from '../anim/Path.js';
 import type { EasingFn, EasingName } from '../anim/easing.js';
 import type { LineSharedUniforms, ThickLineMaterial, ThickLineStyleUniforms } from './EdgeLines.js';
+import { GPUPathManager } from './GPUPathManager.js';
+import type { GPUPathOptions } from './FeatureStyleManager.js';
 import {
   buildFeatureEdgeSegments,
   buildPositionBatchMap,
@@ -370,6 +372,9 @@ export class S3MViewer {
   private readonly _datasetManager = new DatasetManager();
   /** 单体样式、专题着色与状态纹理管理器 */
   private readonly _featureStyleManager: FeatureStyleManager;
+  /** GPU 路径动画管理器 */
+  readonly gpuPathManager: GPUPathManager = new GPUPathManager();
+  private _customPathTime = false;
 
   /** 兼容 datasets 映射表暴露 */
   get datasets(): Map<string, S3MDatasetEntry> {
@@ -1131,6 +1136,96 @@ export class S3MViewer {
     this.animator.cancel(key);
     this.animator.unregister(key);
     this._pathSpecs.delete(key);
+  }
+
+  /**
+   * 注册 GPU 路径到路径库
+   * @param points 折线点数组或 Path 实例
+   * @param opts 选项（可指定路径 ID 或闭合）
+   * @returns 路径 ID
+   */
+  registerGPUPath(
+    points: Path | ArrayLike<number> | Array<[number, number, number]>,
+    opts: { id?: number; name?: string; closed?: boolean } = {}
+  ): number {
+    const id = this.gpuPathManager.registerPath(points, opts);
+    this.gpuPathManager.updateUniforms(this.uniforms);
+    return id;
+  }
+
+  /**
+   * 注销 GPU 路径
+   */
+  unregisterGPUPath(id: number): boolean {
+    const res = this.gpuPathManager.unregisterPath(id);
+    this.gpuPathManager.updateUniforms(this.uniforms);
+    return res;
+  }
+
+  /**
+   * 获取 GPUPathManager 实例
+   */
+  getGPUPathManager(): GPUPathManager {
+    return this.gpuPathManager;
+  }
+
+  /**
+   * 将单体绑定到 GPU 路径动画（智慧交通车流 / 大批量巡检无人机）
+   * @param smid 单体 ID
+   * @param path 路径 ID 或新的路径折线
+   * @param options 动画配置（速度、相位、循环模式、自动朝向等）
+   */
+  bindGPUPath(
+    smid: number,
+    path: number | Path | ArrayLike<number> | Array<[number, number, number]>,
+    options: Omit<GPUPathOptions, 'pathId'> = {}
+  ): number {
+    let pathId: number;
+    if (typeof path === 'number') {
+      pathId = path;
+    } else {
+      pathId = this.registerGPUPath(path);
+    }
+    const meshes = this._meshesOf([smid]);
+    this._featureStyleManager.bindGPUPath(smid, pathId, options, meshes);
+    for (const mesh of meshes) mesh.frustumCulled = false;
+    this.gpuPathManager.updateUniforms(this.uniforms);
+    return pathId;
+  }
+
+  /**
+   * 解绑单体的 GPU 路径动画
+   */
+  unbindGPUPath(smid: number): void {
+    const meshes = this._meshesOf([smid]);
+    this._featureStyleManager.unbindGPUPath(smid, meshes);
+    this.gpuPathManager.updateUniforms(this.uniforms);
+  }
+
+  /**
+   * 手动设置单体在 GPU 路径上的归一化进度（0.0 ~ 1.0）
+   */
+  setGPUPathProgress(smid: number, progress: number): void {
+    const meshes = this._meshesOf([smid]);
+    this._featureStyleManager.setGPUPathProgress(smid, progress, meshes);
+    for (const mesh of meshes) mesh.frustumCulled = false;
+  }
+
+  /**
+   * 设置全局 GPU 路径时间（秒）
+   */
+  setGPUPathTime(time: number, autoAdvance = false): void {
+    if (this.uniforms.uPathTime) {
+      this.uniforms.uPathTime.value = time;
+    }
+    this._customPathTime = !autoAdvance;
+  }
+
+  /**
+   * 获取全局 GPU 路径时间（秒）
+   */
+  getGPUPathTime(): number {
+    return this.uniforms.uPathTime?.value ?? 0;
   }
   /**
    * 单体样式过渡：颜色 / 抬高 / 透明度 / 平移可以任意组合。
@@ -2452,6 +2547,10 @@ export class S3MViewer {
           uBatchMix: this.uniforms.uBatchMix,
           uBatchTexWidth: styled.userData.uBatchTexWidth,
           uBatchTexActive: styled.userData.uBatchTexActive,
+          uPathTex: this.uniforms.uPathTex,
+          uPathCount: this.uniforms.uPathCount,
+          uPathTexActive: this.uniforms.uPathTexActive,
+          uPathTime: this.uniforms.uPathTime,
         }
       : undefined;
     return createThickLineMaterial(this.lineShared, {}, this._edgeStyleUniforms, batch);
@@ -2467,6 +2566,10 @@ export class S3MViewer {
           uBatchMix: this.uniforms.uBatchMix,
           uBatchTexWidth: styled.userData.uBatchTexWidth,
           uBatchTexActive: styled.userData.uBatchTexActive,
+          uPathTex: this.uniforms.uPathTex,
+          uPathCount: this.uniforms.uPathCount,
+          uPathTexActive: this.uniforms.uPathTexActive,
+          uPathTime: this.uniforms.uPathTime,
         }
       : undefined;
     return createThickLineMaterial(this.lineShared, {}, this._selEdgeStyleUniforms, batch);
@@ -3284,6 +3387,12 @@ export class S3MViewer {
       this.uniforms.uTime.value += 0.016 * (this.style.speed ?? 1);
     }
 
+    this.gpuPathManager.updateUniforms(this.uniforms);
+    const gpuPathActive = (this.uniforms.uPathTexActive?.value ?? 0) > 0;
+    if (gpuPathActive && !this._customPathTime && this.uniforms.uPathTime) {
+      this.uniforms.uPathTime.value += 0.016;
+    }
+
     this._updateLights();
 
     // 等宽棱线按设备像素撑开，分辨率每帧同步一次
@@ -3306,6 +3415,7 @@ export class S3MViewer {
     return (
       animating ||
       this.style.mode === STYLE.DYNAMIC ||
+      gpuPathActive ||
       this.stats.loading > 0 ||
       tilesetChanged
     );

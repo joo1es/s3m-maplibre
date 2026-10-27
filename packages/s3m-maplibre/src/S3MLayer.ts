@@ -38,6 +38,8 @@ import type {
   TransitionOptions,
   Path,
   PathFollowOptions,
+  GPUPathOptions,
+  GPUPathManager,
 } from 's3m-three';
 import type { Ray, ToneMapping } from 'three';
 import { Matrix4 } from 'three';
@@ -677,6 +679,75 @@ export class S3MLayer {
   /** 停下路径运动（停在当前位置） */
   stopPath(smid: number): void {
     this.viewer.stopPath(smid);
+  }
+
+  /**
+   * 注册 GPU 路径到路径库
+   * @param points 折线点数组或 Path 实例
+   * @param opts 选项（可指定路径 ID 或闭合）
+   * @returns 路径 ID
+   */
+  registerGPUPath(
+    points: Path | ArrayLike<number> | Array<[number, number, number]>,
+    opts?: { id?: number; name?: string; closed?: boolean }
+  ): number {
+    return this.viewer.registerGPUPath(points, opts);
+  }
+
+  /**
+   * 注销 GPU 路径
+   */
+  unregisterGPUPath(id: number): boolean {
+    return this.viewer.unregisterGPUPath(id);
+  }
+
+  /**
+   * 获取 GPUPathManager 实例
+   */
+  getGPUPathManager(): GPUPathManager {
+    return this.viewer.getGPUPathManager();
+  }
+
+  /**
+   * 将单体绑定到 GPU 路径动画（智慧交通车流 / 大批量巡检无人机）
+   * @param smid 单体 ID
+   * @param path 路径 ID 或新的路径折线
+   * @param options 动画配置（速度、相位、循环模式、自动朝向等）
+   */
+  bindGPUPath(
+    smid: number,
+    path: number | Path | ArrayLike<number> | Array<[number, number, number]>,
+    options?: Omit<GPUPathOptions, 'pathId'>
+  ): number {
+    return this.viewer.bindGPUPath(smid, path, options);
+  }
+
+  /**
+   * 解绑单体的 GPU 路径动画
+   */
+  unbindGPUPath(smid: number): void {
+    this.viewer.unbindGPUPath(smid);
+  }
+
+  /**
+   * 手动设置单体在 GPU 路径上的归一化进度（0.0 ~ 1.0）
+   */
+  setGPUPathProgress(smid: number, progress: number): void {
+    this.viewer.setGPUPathProgress(smid, progress);
+  }
+
+  /**
+   * 设置全局 GPU 路径时间（秒）
+   */
+  setGPUPathTime(time: number, autoAdvance = false): void {
+    this.viewer.setGPUPathTime(time, autoAdvance);
+  }
+
+  /**
+   * 获取全局 GPU 路径时间（秒）
+   */
+  getGPUPathTime(): number {
+    return this.viewer.getGPUPathTime();
   }
 
   /** 动画调度器：取消 / 直跳 / 改预算都走这里 */

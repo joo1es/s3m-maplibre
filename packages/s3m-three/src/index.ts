@@ -82,7 +82,9 @@ export {
   resolveRotationMatrix,
   extractEulerAngles,
 } from './render/FeatureStyleManager.js';
-export type { RotationMatrix9 } from './render/FeatureStyleManager.js';
+export type { RotationMatrix9, GPUPathOptions } from './render/FeatureStyleManager.js';
+export { GPUPathManager, SAMPLES_PER_PATH } from './render/GPUPathManager.js';
+export type { GPUPathInfo } from './render/GPUPathManager.js';
 export type {
   DatasetAlignment,
   S3MDatasetOptions,

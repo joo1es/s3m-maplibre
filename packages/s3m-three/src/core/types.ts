@@ -291,5 +291,13 @@ export interface StyleUniforms {
   uEdgeFade?: { value: number };
   /** 整体压暗乘子（mode 切换的 fade-through） */
   uFade?: { value: number };
+  /** GPU 路径数据采样纹理 */
+  uPathTex?: { value: unknown };
+  /** GPU 路径纹理中包含的路径条数（高度） */
+  uPathCount?: { value: number };
+  /** 是否激活 GPU 路径动画（0 = 未激活，1 = 激活） */
+  uPathTexActive?: { value: number };
+  /** GPU 路径全局时间戳（秒） */
+  uPathTime?: { value: number };
   [key: string]: { value: unknown } | undefined;
 }
