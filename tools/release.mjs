@@ -18,8 +18,9 @@
  *   --commit    改完顺手提交一个 `chore: release ...`，**不会 push**
  *   --force     体检发现问题也继续（tag 已被占用仍然拒绝）
  *
- * 这个脚本只改版本、不发布。发布是 push tag 触发 .github/workflows/publish.yml —— 
- * 而那条流水线**不跑测试**，所以打 tag 前自己先 `bun test ./tests/unit`。
+ * 这个脚本只改版本、不发布。发布是 push tag 触发 .github/workflows/publish.yml ——
+ * 那条流水线会跑测试，但 tag 一旦推出去 CI 才报错就晚了（只能删 tag 重打），
+ * 所以打 tag 前自己先 `bun test ./tests/unit`。
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -155,7 +156,7 @@ function nextSteps(next) {
   console.log(C.bold('\n接下来'));
   console.log(`  1. NODE_OPTIONS= bun run build      ${C.dim('重建 demo/ 与 docs/，产物要一起提交')}`);
   console.log(`  2. NODE_OPTIONS= bun run typecheck && NODE_OPTIONS= bun test ./tests/unit`);
-  console.log(`     ${C.yellow('publish.yml 只跑 build + typecheck，不跑测试 —— 这一步不能省')}`);
+  console.log(`     ${C.yellow('publish.yml 也会跑测试，但 tag 推出去才报错就晚了 —— 本地先跑')}`);
   console.log(`  3. git add -A && git commit -m "chore: release ${next.three} / ${next.maplibre}"`);
   console.log(`  4. git tag ${tagThree} && git tag ${tagMaplibre}`);
   console.log(`  5. 先推内核，再推图层；两个连着推，${C.yellow('不要等 npm 出现新版本')}`);

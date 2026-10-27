@@ -178,7 +178,7 @@ CI 里的硬性校验（触发失败会直接中止，不会发出半个包）�
 
 **关键差异，务必记住**：
 
-- `publish.yml` **只跑 build 和 typecheck，不跑测试**。所以打 tag 之前必须自己在本地把 `bun test ./tests/unit` 跑到全绿 —— 否则测试挂了也会照样发版。
+- `publish.yml` 现在会跑 `bun test`（和 `ci.yml` 一样会给 `S3M_REQUIRE_SAMPLES=1` 拉官方样例），所以测试挂了发不出去。但**本地仍然先跑一遍** —— tag 推上去之后 CI 才告诉你失败，这时 tag 已经推出去了，只能删 tag 重打。
 - `publish.yml` 的认证走 `secrets.NPM_TOKEN` + OIDC provenance（`npm publish --access public --provenance`），**本地不需要、也不应该做 `npm login`**。
 - `push main` 只触发 CI + Pages，**不发 npm**。发 npm 的唯一入口是 push tag。
 

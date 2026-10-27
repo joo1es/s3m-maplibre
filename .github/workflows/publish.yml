@@ -46,6 +46,21 @@ jobs:
       - name: Install dependencies via Bun
         run: bun install --frozen-lockfile
 
+      # 测试不能只靠发版前的人肉纪律：tag 可以打在没跑过测试的 commit 上。
+      # 与 ci.yml 同款稀疏拉取：整仓 712MB，只取 data/ 这 1.4MB 官方样例。
+      - name: Fetch s3m-spec sample data
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/SuperMap/s3m-spec.git "$RUNNER_WORKSPACE/s3m-spec"
+          git -C "$RUNNER_WORKSPACE/s3m-spec" sparse-checkout set S3M_SDK/S3M_JS/data
+          find "$RUNNER_WORKSPACE/s3m-spec/S3M_SDK/S3M_JS/data" -name '*.s3mb' | wc -l
+
+      # S3M_REQUIRE_SAMPLES=1：样例没拉到就判失败，而不是悄悄 skip 掉整组解析断言
+      - name: Unit tests
+        run: bun test
+        env:
+          S3M_REQUIRE_SAMPLES: '1'
+
       # 标签 → 发布哪个包。s3m-maplibre 是面向使用方的发布包，v* legacy 别名指向它
       - name: Resolve target package from tag
         id: resolve
