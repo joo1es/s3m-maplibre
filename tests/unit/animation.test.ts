@@ -63,9 +63,9 @@ function makeAnimator(): { anim: Animator; setNow: (t: number) => void; now: () 
   return { anim, setNow: (v) => (t = v), now: () => t };
 }
 
-function makeViewer(): S3MViewer {
+function makeViewer(opts?: any): S3MViewer {
   let t = 0;
-  const v = new S3MViewer();
+  const v = new S3MViewer(opts);
   (v.animator as unknown as { _now: () => number })._now = () => t;
   (v as unknown as { _testSetNow: (n: number) => void })._testSetNow = (n) => (t = n);
   return v;
@@ -456,6 +456,15 @@ describe('5. 图层透明度走共享 uniform', () => {
     expect(mat.transparent).toBe(true);
     expect(v.uniforms.uOpacity.value).toBeCloseTo(0.5, 6);
   });
+
+  test('构造函数传入初始 style.opacity 时，uOpacity 正确初始化生效（非滞留 1.0）', () => {
+    const v = makeViewer({ style: { opacity: 0.35 } } as any);
+    expect(v.getStyle().opacity).toBe(0.35);
+    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.35, 6);
+    expect((v as any)._opacityTransparent).toBe(true);
+    // 棱线不透明度也必须包含图层不透明度因子
+    expect(v.edgeMaterial.uniforms.uOpacity.value).toBeCloseTo(0.6 * 0.35, 5);
+  });
 });
 
 describe('6. 单体平移动画', () => {
@@ -628,6 +637,32 @@ describe('8. 新瓦片淡入', () => {
 
     stepTo(v, 100);
     expect(mat.transparent).toBe(true);
+  });
+
+  test('新瓦片注册与淡入结束时严格遵循 style.depthWrite 配置', () => {
+    // 场景 1: 用户指定 depthWrite: false (默认 fadeIn = 0)
+    const vNoDepthDirect = makeViewer({ style: { depthWrite: false, opacity: 0.5 } } as any);
+    const meshDirect = registerMesh(vNoDepthDirect, 907);
+    const matDirect = meshDirect.material as THREE.MeshStandardMaterial;
+    expect(matDirect.transparent).toBe(true);
+    expect(matDirect.depthWrite).toBe(false);
+
+    // 场景 2: 用户指定 depthWrite: false 且开启 fadeIn
+    const vNoDepthFade = makeViewer({ style: { depthWrite: false, fadeIn: 100, opacity: 0.5 } } as any);
+    const meshFade = registerMesh(vNoDepthFade, 908);
+    const matFade = meshFade.material as THREE.MeshStandardMaterial;
+    // 淡入期间为了遮挡背面临时保持 true
+    expect(matFade.depthWrite).toBe(true);
+    // 淡入结束时还原为 depthWrite: false
+    stepTo(vNoDepthFade, 100);
+    expect(matFade.depthWrite).toBe(false);
+
+    // 场景 3: 用户指定半透明且保持 depthWrite: true
+    const vKeepDepth = makeViewer({ style: { depthWrite: true, opacity: 0.6 } } as any);
+    const meshKeep = registerMesh(vKeepDepth, 909);
+    const matKeep = meshKeep.material as THREE.MeshStandardMaterial;
+    expect(matKeep.transparent).toBe(true);
+    expect(matKeep.depthWrite).toBe(true);
   });
 });
 

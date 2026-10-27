@@ -1,6 +1,6 @@
 {
   "name": "s3m-three",
-  "version": "0.3.10",
+  "version": "0.3.11",
   "description": "SuperMap S3M 三维模型格式的 three.js 渲染内核：浏览器内直接解析 .s3mb 瓦片，无需转 3D Tiles，支持 LOD 调度、白膜/按高度/按单体/动态扫描着色、单体级 GPU 拾取。宿主无关，可单独用于任意 three 场景。",
   "type": "module",
   "repository": {

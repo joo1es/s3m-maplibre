@@ -545,6 +545,9 @@ export class S3MViewer {
     // 这里按 style 实际值调一次 setEdges，让开关真正生效（与 setEdges 后来的手工调用一致）。
     this.setEdges(!!this.style.edges);
 
+    // 初始化图层整体不透明度：确保共享 uniform uOpacity、材质混合开关与棱线外观与初始 style.opacity 严格一致
+    this._applyOpacity();
+
     this._fps.last = performance.now();
     this._datasetQueue = this._normalizeDatasets(options);
     if (options.attributes) this.attributeQuery = new AttributeQuery(options.attributes);
@@ -1679,7 +1682,8 @@ export class S3MViewer {
           const o = Math.min(1, Math.max(0.05, this.style.opacity ?? 1));
           // 不写 mat.opacity：全局透明度走共享 uOpacity，材质自身 opacity 保留模型自带 alpha
           mat.transparent = o < 0.999;
-          mat.depthWrite = o >= 0.999;
+          const keepDepth = this.style.depthWrite !== false;
+          mat.depthWrite = mat.transparent ? keepDepth : (this.style.depthWrite !== false);
           mat.flatShading = this.style.shading !== 'smooth';
           mat.needsUpdate = true;
           this._featureStyleManager.applyOverridesToMesh(mesh);
@@ -1734,7 +1738,7 @@ export class S3MViewer {
         // 淡入期间强制开了 transparent + depthWrite，结束时不能自己拍板关掉——
         // 图层可能本来就半透明、单体也可能还有淡化。交给淡化流程重新裁决一次。
         this._featureStyleManager.applyOverridesToMesh(mesh);
-        if (!mat.transparent) mat.depthWrite = true;
+        mat.depthWrite = this.style.depthWrite !== false;
         this._requestRepaint();
       },
     });
@@ -2104,6 +2108,9 @@ export class S3MViewer {
     }
     if (u.uAmbientGain && s.ambientGain != null) {
       u.uAmbientGain.value = s.ambientGain;
+    }
+    if (u.uOpacity && s.opacity != null) {
+      u.uOpacity.value = Math.min(1, Math.max(0.05, s.opacity));
     }
     if (this.outlineMaterial) {
       if (this.outlineMaterial.uniforms.uElevation && s.selectElevation != null) {
