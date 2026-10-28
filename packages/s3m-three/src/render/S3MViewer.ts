@@ -33,10 +33,22 @@ import {
   DEFAULT_STYLE,
   createSharedUniforms,
   createOutlineMaterial,
+  resolveEdgeModes,
+  sameEdgeModes,
 } from './StyleMaterial.js';
-import type { OutlineMaterial, StyledMaterial, StyleMode, SelectMode, S3MStyle } from './StyleMaterial.js';
+import type {
+  OutlineMaterial,
+  OutlineStyleUniforms,
+  StyledMaterial,
+  StyleMode,
+  SelectMode,
+  S3MStyle,
+  EdgeModes,
+  EdgesOption,
+} from './StyleMaterial.js';
 import { applyPointCloudStyle, isOwnedPointCloudMaterial } from './PointCloudMaterial.js';
 import { Picker } from './Picker.js';
+import { GpuEdgePass } from './GpuEdgePass.js';
 import { Animator } from '../anim/Animator.js';
 import type { Channel, TransitionOptions } from '../anim/Animator.js';
 import { Path } from '../anim/Path.js';
@@ -308,12 +320,18 @@ interface MeshUserData {
   isPointCloud?: boolean;
   /** CPU 端现算的棱线对象（等宽线 Mesh） */
   edges?: THREE.Object3D | null;
+  /** 背面外扩轮廓壳（edges 含 'hull' 时挂上） */
+  edgeHull?: THREE.Mesh | null;
   /** 数据自带棱线包（此时不再用 EdgesGeometry 现算） */
   nativeEdges?: boolean;
+  /** 数据本身有没有棱线包（不受 forceCpuEdges 影响，用来运行中切换时重算 nativeEdges） */
+  nativeEdgesRaw?: boolean;
   /** 数据自带的棱线对象本身 */
   isEdgeLines?: boolean;
   /** CPU 现算的等宽棱线（与 isEdgeLines 区分，便于刷新样式） */
   isThickEdge?: boolean;
+  /** 背面外扩轮廓壳（edges 含 'hull' 时挂上） */
+  isEdgeHull?: boolean;
   /** 选中单体的棱线对象 */
   isSelectionEdge?: boolean;
   /** 该网格正在淡入时占用的动画通道 key，瓦片淘汰时要回收 */
@@ -368,6 +386,8 @@ const STYLE_SCALAR_KEYS = [
   'ambientGain',
   'edgeWidth',
   'edgeOpacity',
+  'edgeOffset',
+  'edgeHullWidth',
   'outlineWidth',
 ] as const;
 
@@ -432,6 +452,8 @@ export class S3MViewer {
   private readonly _edgeStyleUniforms: ThickLineStyleUniforms;
   /** 选中棱线的外观 uniform */
   private readonly _selEdgeStyleUniforms: ThickLineStyleUniforms;
+  /** 全局外扩轮廓的外观 uniform：逐网格轮廓壳共享这些对象 */
+  private readonly _hullStyleUniforms: OutlineStyleUniforms;
 
   /** 3D 物理地表面 / 基坑开挖管理器 */
   readonly groundManager: GroundManager;
@@ -473,6 +495,12 @@ export class S3MViewer {
   private _selectionEdges: THREE.Mesh | null = null;
   private _selectionEdgeMeshes: THREE.Mesh[] = [];
   private _edgesEnabled = false;
+  /** 当前生效的棱线画法（line / offset / hull / gpu），决定要不要建 / 拆哪种装饰 */
+  private _edgeModes: EdgeModes = resolveEdgeModes(false);
+  /** GPU 描边后处理（深度 + 法线），只在 edges 含 'gpu' 时按帧执行 */
+  private _gpuEdge: GpuEdgePass | null = null;
+  /** 给 GPU 描边传色用的临时 Color，避免每帧 new */
+  private readonly _gpuEdgeColor = new THREE.Color();
   /** 瓦片淡入通道的自增序号（不用 pickId：pickId 会被回收复用） */
   private _tileFadeSeq = 0;
   /** setMode 编排的代次，用来作废被新调用顶掉的旧编排 */
@@ -612,6 +640,7 @@ export class S3MViewer {
       uColor: { value: new THREE.Color(this.style.edgeColor) },
       uWidth: { value: Math.max(0.1, this.style.edgeWidth ?? 1.5) },
       uOpacity: { value: 0.6 },
+      uOffset: { value: this.style.edgeOffset ?? 0.15 },
     };
     this.edgeMaterial = createThickLineMaterial(this.lineShared, {}, this._edgeStyleUniforms);
     this._selEdgeStyleUniforms = {
@@ -621,11 +650,17 @@ export class S3MViewer {
       uElevation: { value: this.style.selectElevation ?? 0 },
     };
     this.selectionEdgeMaterial = createThickLineMaterial(this.lineShared, {}, this._selEdgeStyleUniforms);
+    // 全局外扩轮廓的外观 uniform：逐网格轮廓壳复用这几个对象，改一次全场景生效
+    this._hullStyleUniforms = {
+      uColor: { value: new THREE.Color(this.style.edgeColor) },
+      uWidth: { value: Math.max(0, this.style.edgeHullWidth ?? 0.9) },
+      uOpacity: { value: 0.6 },
+    };
 
     // 关键：style.edges 是个开关，但构造函数从没据此启用过棱线，导致
     // `style: { edges: true }` 形同虚设、_edgesEnabled 永远是 false。
     // 这里按 style 实际值调一次 setEdges，让开关真正生效（与 setEdges 后来的手工调用一致）。
-    this.setEdges(!!this.style.edges);
+    this.setEdges(this.style.edges);
 
     // 初始化图层整体不透明度：确保共享 uniform uOpacity、材质混合开关与棱线外观与初始 style.opacity 严格一致
     this._applyOpacity();
@@ -712,6 +747,9 @@ export class S3MViewer {
     this._syncTextureCapabilities(gl);
     this.picker?.dispose();
     this.picker = new Picker(this.renderer);
+    // GPU 描边的 RT / 材质绑定在旧上下文上，整体丢弃，下一帧按需重建
+    this._gpuEdge?.dispose();
+    this._gpuEdge = null;
     // 共享 uniform / 材质引用不变，three 重新编译着色器时会自然接管；
     // 这里只确保下一帧尽快驱动一次渲染。
     this._requestRepaint();
@@ -725,6 +763,8 @@ export class S3MViewer {
     this.picker?.dispose();
     this.picker = null;
     this.outlineMaterial.dispose();
+    this._gpuEdge?.dispose();
+    this._gpuEdge = null;
     this.edgeMaterial.dispose();
     this.selectionEdgeMaterial.dispose();
     this.scene?.clear();
@@ -1769,12 +1809,18 @@ export class S3MViewer {
     node.group.updateMatrixWorld(true);
 
     const hasNativeEdges = node.group.userData.hasNativeEdges === true;
+    // forceCpuEdges：无视数据自带的棱线包，改由 CPU 现算。native 是 1px 的
+    // LineBasicMaterial，edgeWidth / 外扩 / 单体跟随全都吃不上。
+    // gpu 画法由 shader 自己描边，native 线段包同样不能留
+    const useNativeEdges =
+      hasNativeEdges && this.style.forceCpuEdges !== true && !this._edgeModes.gpu;
 
     for (const child of node.group.children) {
       // 数据自带的棱线包：只跟着 edges 开关显示，不参与拾取、不参与着色
       if ((child as THREE.LineSegments).isLineSegments && (child.userData as MeshUserData).isEdgeLines) {
-        child.visible = this._edgesEnabled;
+        // 一律登记进 _nativeEdgeLines：forceCpuEdges 之后又关掉时还要能把它们放出来
         this._nativeEdgeLines.add(child as THREE.LineSegments);
+        child.visible = useNativeEdges && this._edgesEnabled;
         this._styleEdgeLine(child as THREE.LineSegments);
         continue;
       }
@@ -1787,7 +1833,8 @@ export class S3MViewer {
       const ud = mesh.userData as MeshUserData;
       ud.pickId = this._allocPickId();
       ud.datasetId = entry.id;
-      ud.nativeEdges = hasNativeEdges;
+      ud.nativeEdges = useNativeEdges;
+      ud.nativeEdgesRaw = hasNativeEdges;
       this._pickables.set(ud.pickId, {
         datasetId: entry.id,
         mesh,
@@ -1799,8 +1846,11 @@ export class S3MViewer {
       // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义
       // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义。
       // 自动描边受三道开关控制：全局 style.edges / 数据集 enableEdges / 地形绿地等关键字跳过。
-      if (!hasNativeEdges && !isPoints && this._datasetEdgesEnabled(entry) && !this._shouldSkipAutoEdges(ud, entry.name)) {
-        this._ensureEdges(mesh);
+      if (!useNativeEdges && !isPoints && this._datasetEdgesEnabled(entry) && !this._shouldSkipAutoEdges(ud, entry.name)) {
+        // 数据集强制开启（enableEdges: true）时全局画法可能还是关的，退回默认折边线；
+        // 但 gpu 画法本来就不建几何，别在这里多此一举
+        if (this._edgeModes.line || this._edgeModes.hull) this._ensureEdgeDecoration(mesh);
+        else if (!this._edgeModes.gpu) this._ensureEdges(mesh);
       }
 
       // 新瓦片要继承当前的不透明度与着色方式
@@ -2039,7 +2089,7 @@ export class S3MViewer {
     if ('edges' in patch) {
       const { edges, ...others } = patch;
       rest = others;
-      this.setEdges(!!edges, wantAnim ? transition : undefined);
+      this.setEdges(edges as EdgesOption, wantAnim ? transition : undefined);
       if (Object.keys(rest).length === 0) {
         this._requestRepaint();
         return;
@@ -2157,7 +2207,13 @@ export class S3MViewer {
       return;
     }
     this._applyStyleUniforms();
-    if (key === 'edgeColor' || key === 'edgeWidth' || key === 'edgeOpacity') {
+    if (
+      key === 'edgeColor' ||
+      key === 'edgeWidth' ||
+      key === 'edgeOpacity' ||
+      key === 'edgeOffset' ||
+      key === 'edgeHullWidth'
+    ) {
       this._refreshEdgeLines();
     }
   }
@@ -2191,10 +2247,18 @@ export class S3MViewer {
     // 临界角变了要重建 CPU 棱线（EdgesGeometry 的参数），开 / 关走 setEdges 整体刷新。
     // 必须先 _disposeEdges()：setEdges 只挑「还没有棱线」的网格来建，
     // 不先拆掉的话已经建好的会被全部跳过，临界角改了等于没改。
-    if ('edgeThreshold' in patch && this._edgesEnabled) {
+    if (('edgeThreshold' in patch || 'forceCpuEdges' in patch) && this._edgesEnabled) {
       this._disposeEdges();
-      this.setEdges(true);
-    } else if ('edgeColor' in patch || 'edgeWidth' in patch || 'opacity' in patch || 'edgeOpacity' in patch) {
+      this.setEdges(this.style.edges);
+    } else if (
+      'edgeColor' in patch ||
+      'edgeWidth' in patch ||
+      'opacity' in patch ||
+      'edgeOpacity' in patch ||
+      'edgeOffset' in patch ||
+      'edgeHullWidth' in patch
+    ) {
+      // 颜色 / 粗细 / 外推距离 / 外扩厚度都只是 uniform，拖着滑块逐帧改也不重建几何
       this._refreshEdgeLines();
     }
     if (this._selection) {
@@ -2459,8 +2523,15 @@ export class S3MViewer {
   /**
    * 全局棱线开关。
    *
-   * 数据自带棱线包（primitiveType 13）时直接用，成本为零；
-   * 没有的话才用 EdgesGeometry 现算 —— 那是 CPU 端的活，几十万面一次性建会卡住主线程
+   * 取值是 `boolean | EdgeStyle | EdgeStyle[]`（见 resolveEdgeModes）：
+   *   - `true` / `'line'`   折边线（旧口径）
+   *   - `'offset'`          折边线 + 沿边法线外推 `edgeOffset` 米
+   *   - `'hull'`            背面外扩轮廓（选中侧 outlineStyle:'hull' 的整场景版）
+   *   - `'gpu'`             纯片元描边：零几何、零额外 pass，线宽约 1 像素
+   *   - 数组                叠加，例如 `['line', 'hull']`
+   *
+   * 数据自带棱线包（primitiveType 13）时直接用，成本为零；`style.forceCpuEdges`
+   * 可以无视它，改由 CPU 现算 —— 那是 CPU 端的活，几十万面一次性建会卡住主线程
    * （实测 20 个网格 1.9s），所以按 8ms 一帧切片，边建边出。
    *
    * 棱线本身用「屏幕空间等宽线」画（见 EdgeLines.ts）：WebGL 的 lineWidth 基本无效，
@@ -2470,25 +2541,37 @@ export class S3MViewer {
    * 开：立刻置位 + 开始分片建线，同时 `uEdgeFade` 0→1 —— 建好一块亮一块，视觉上是渐显；
    * 关：`uEdgeFade` 1→0，淡完才 dispose，避免棱线「啪」一下消失。
    */
-  setEdges(enabled: boolean, transition?: TransitionOptions): void {
+  setEdges(edges: EdgesOption, transition?: TransitionOptions): void {
     const wantAnim = !!transition && ((transition.duration ?? 0) > 0 || !!transition.spring);
-    this._edgesEnabled = enabled;
-    this.style.edges = enabled;
-    this._styleTarget.edges = enabled;
+    const modes = resolveEdgeModes(edges);
+    // 换画法（line ↔ hull ↔ offset）是结构变更：旧装饰必须拆掉再建，
+    // 否则会出现「切到 hull 了折边线还留着」这种叠影。
+    // 同一画法重复调用（滑块逐帧 setEdges(true)）不重建，几何是复用的。
+    const modesChanged = !sameEdgeModes(this._edgeModes, modes);
 
-    // 数据自带的棱线：直接切可见性
-    for (const entry of this.datasets.values()) {
-      entry.root.traverse((o) => {
-        const ud = o.userData as MeshUserData;
-        if (ud.isEdgeLines) {
-          o.visible = enabled;
-          this._styleEdgeLine(o as THREE.LineSegments);
-        }
-      });
+    this._edgeModes = modes;
+    this._edgesEnabled = modes.enabled;
+    this.style.edges = edges;
+    this._styleTarget.edges = edges;
+
+    // 数据自带的棱线：直接切可见性（forceCpuEdges 时永远收起，改由 CPU 现算）。
+    // 只遍历注册时收集好的那批 LineSegments —— 全数据集 traverse 在几千节点下太贵。
+    // gpu 模式下 shader 自己描边，native 线段包必须收起，否则叠成双线
+    const nativeVisible = modes.enabled && !modes.gpu && this.style.forceCpuEdges !== true;
+    for (const lines of this._nativeEdgeLines) {
+      lines.visible = nativeVisible;
+      this._styleEdgeLine(lines);
     }
     this._syncEdgeStyle();
 
-    if (!enabled) {
+    // 关掉 gpu 画法就把后处理资源还回去（整屏 RT 白占显存没意义）。
+    // 必须放在「整体关闭」的早退之前，否则关棱线时永远轮不到它。
+    if (!modes.gpu && this._gpuEdge) {
+      this._gpuEdge.dispose();
+      this._gpuEdge = null;
+    }
+
+    if (!modes.enabled) {
       if (wantAnim) {
         this.animator.to('style.edgeFade', 0, {
           ...transition,
@@ -2506,17 +2589,23 @@ export class S3MViewer {
       return;
     }
 
+    if (modesChanged) this._disposeEdges();
+
     const pending = [...this._pickables.values()]
       .map((p) => p.mesh)
       .filter((m) => {
         const ud = m.userData as MeshUserData;
         // 点云没有棱可描
-        return !ud.edges && !ud.nativeEdges && !isPointCloudObject(m);
+        if (isPointCloudObject(m)) return false;
+        // native 棱线还算不算数，取决于**当前**的 forceCpuEdges（它可以在运行中切换），
+        // 所以这里按注册时记下的原始标记重算，而不是沿用注册那一刻的结论。
+        ud.nativeEdges = ud.nativeEdgesRaw === true && this.style.forceCpuEdges !== true;
+        return !ud.nativeEdges && this._needsEdgeDecoration(ud);
       });
     let i = 0;
     const step = (): void => {
       const t0 = performance.now();
-      while (i < pending.length && performance.now() - t0 < 8) this._ensureEdges(pending[i++]);
+      while (i < pending.length && performance.now() - t0 < 8) this._ensureEdgeDecoration(pending[i++]);
       if (i < pending.length) setTimeout(step, 0);
       else this._requestRepaint();
     };
@@ -2589,10 +2678,11 @@ export class S3MViewer {
   }
 
   /**
-   * 让全局棱线材质跟上 style.edgeColor / edgeWidth / edgeOpacity。
+   * 让全局棱线材质跟上 style.edgeColor / edgeWidth / edgeOpacity / edgeOffset。
    *
-   * 全程 O(1)：只有一份共享 edgeMaterial（所有逐 mesh 棱线都用它）+ 一份预制缓存，
-   * 所以棱线淡入淡出只要改一个 uniform，新建瓦片自动继承当前进度。
+   * 全程 O(1)：只有一份共享 edgeMaterial（所有逐 mesh 棱线都用它）+ 一份预制缓存
+   * + 一批共享外观对象的轮廓壳，所以棱线淡入淡出只要改一个 uniform，
+   * 新建瓦片自动继承当前进度。
    */
   private _syncEdgeStyle(): void {
     const s = this.style;
@@ -2605,6 +2695,14 @@ export class S3MViewer {
     u.uColor.value.set(s.edgeColor);
     u.uWidth.value = Math.max(0.1, s.edgeWidth ?? 1.5);
     u.uOpacity.value = opacity;
+    // 外推距离只在 offset 画法下非 0；其它画法把线钉在面上（与改动前一致）
+    u.uOffset.value = this._edgeModes.offset ? Math.max(0, s.edgeOffset ?? 0.15) : 0;
+    // 外扩轮廓壳与折边线共用颜色 / 透明度，厚度是米制的单独一项
+    const h = this._hullStyleUniforms;
+    h.uColor.value.set(s.edgeColor);
+    h.uWidth.value = Math.max(0, s.edgeHullWidth ?? 0.9);
+    h.uOpacity.value = opacity;
+    // GPU 描边（edges: 'gpu'）是后处理，参数每帧从 style 现取，这里不用同步 uniform
     // 预制棱线缓存（LineBasicMaterial）同步颜色 / 不透明度
     if (this._creaseLines) {
       const m = this._creaseLines.material as THREE.LineBasicMaterial;
@@ -2664,6 +2762,23 @@ export class S3MViewer {
     return S3MViewer._EDGE_SKIP_KEYWORDS.some((k) => hay.includes(k));
   }
 
+  /**
+   * 这块网格还缺哪种棱线装饰（缺就建，齐了就不动）。
+   *
+   * setEdges 的分片建线靠它筛「还没建完的」，注册新瓦片也靠它决定要不要动手。
+   */
+  private _needsEdgeDecoration(ud: MeshUserData): boolean {
+    if (this._edgeModes.line && !ud.edges) return true;
+    if (this._edgeModes.hull && !ud.edgeHull) return true;
+    return false;
+  }
+
+  /** 按当前画法补齐这块网格的棱线装饰 */
+  private _ensureEdgeDecoration(mesh: THREE.Mesh): void {
+    if (this._edgeModes.line) this._ensureEdges(mesh);
+    if (this._edgeModes.hull) this._ensureHull(mesh);
+  }
+
   private _ensureEdges(mesh: THREE.Mesh): void {
     const ud = mesh.userData as MeshUserData;
     if (ud.edges || ud.nativeEdges || !mesh.geometry) return;
@@ -2683,12 +2798,22 @@ export class S3MViewer {
     const welded = mergeVerticesByPosition(mesh.geometry, 0.005);
     // 2. 调大临界角（默认 55°，可在 style.edgeThreshold 调），过滤浅坡与曲面细分，只保留真正的棱。
     const thresholdAngle = this.style.edgeThreshold ?? 55;
-    const source = new THREE.EdgesGeometry(welded, thresholdAngle);
-    welded.dispose();
 
-    const attr = source.getAttribute('position') as THREE.BufferAttribute | undefined;
-    const segments = attr ? (attr.array as Float32Array) : null;
-    source.dispose();
+    // 'offset' 画法要额外带一条「边法线」才知道往哪推，所以走本地实现（它本来就算好了
+    // 相邻两面法线）；其余画法保持 EdgesGeometry 这条老路，几何输出与改动前逐字一致。
+    let segments: Float32Array | null;
+    let normals: Float32Array | undefined;
+    if (this._edgeModes.offset) {
+      const raw: number[] = [];
+      segments = buildFeatureEdgeSegments(welded, null, thresholdAngle, raw);
+      if (raw.length > 0) normals = new Float32Array(raw);
+    } else {
+      const source = new THREE.EdgesGeometry(welded, thresholdAngle);
+      const attr = source.getAttribute('position') as THREE.BufferAttribute | undefined;
+      segments = attr ? (attr.array as Float32Array) : null;
+      source.dispose();
+    }
+    welded.dispose();
     if (!segments || segments.length < 6) return;
 
     // 3. 回填每段棱线所属的单体 batchId。
@@ -2708,7 +2833,7 @@ export class S3MViewer {
     }
 
     const lines = new THREE.Mesh(
-      buildThickLineGeometry(segments, batchIds),
+      buildThickLineGeometry(segments, batchIds, normals),
       this._createEdgeMaterial(mesh)
     );
     lines.renderOrder = 2;
@@ -2718,6 +2843,49 @@ export class S3MViewer {
     (lines.userData as MeshUserData).isThickEdge = true;
     ud.edges = lines;
     mesh.add(lines); // 作为子节点，自动继承 mesh 的世界变换
+  }
+
+  /**
+   * 给一块网格挂「背面外扩轮廓」（整场景版）。
+   *
+   * 复用选中侧那套 `createOutlineMaterial`：顶点沿法线鼓 `edgeHullWidth` 米、只画背面，
+   * 于是被本体挡住的部分不显示，露出来的那圈就是描边。与折边线的差别在于——
+   * 这里**不建任何新几何**，成本只是把同一块网格多画一遍，折边判定那套 CPU 活全省了。
+   *
+   * 实例化几何拿不到逐实例变换（轮廓壳是 mesh 的子节点，不吃 instanceMatrix），
+   * 直接跳过：宁可这栋没描边，也不要所有实例的壳叠在原点。
+   */
+  private _ensureHull(mesh: THREE.Mesh): void {
+    const ud = mesh.userData as MeshUserData;
+    if (ud.edgeHull || !mesh.geometry) return;
+    if ((mesh as unknown as { isInstancedMesh?: boolean }).isInstancedMesh) return;
+    // 地形 / 绿地 / 道路等不参与自动描边（即使全局开棱线也要跳过）
+    if (this._shouldSkipAutoEdges(ud, '')) return;
+
+    // 逐网格一份材质（各绑各的单体状态纹理），外观 uniform 复用共享对象
+    const mat = createOutlineMaterial(
+      this.uniforms,
+      this.style.edgeHullWidth ?? 0.9,
+      this._hullStyleUniforms,
+      true
+    );
+    // 整块几何都要外扩：选中侧靠 uSelBatch 只扩一栋，全局必须置 whole
+    mat.uniforms.uSelWhole.value = 1;
+    mat.uniforms.uSelBatch.value = -1;
+    const styled = styledMaterialOf(mesh);
+    if (styled?.userData?.uBatchTex) {
+      mat.uniforms.uBatchTex.value = styled.userData.uBatchTex.value as THREE.Texture;
+      mat.uniforms.uBatchTexWidth.value = styled.userData.uBatchTexWidth.value as number;
+      mat.uniforms.uBatchTexActive.value = styled.userData.uBatchTexActive.value as number;
+    }
+
+    const hull = new THREE.Mesh(mesh.geometry, mat);
+    hull.renderOrder = 2;
+    hull.frustumCulled = false;
+    hull.raycast = () => {};
+    (hull.userData as MeshUserData).isEdgeHull = true;
+    ud.edgeHull = hull;
+    mesh.add(hull); // 作为子节点，自动继承 mesh 的世界变换
   }
 
   /**
@@ -2767,18 +2935,30 @@ export class S3MViewer {
 
   private _removeEdges(mesh: THREE.Mesh): void {
     const ud = mesh.userData as MeshUserData;
+
     const lines = ud.edges;
-    if (!lines) return;
-    mesh.remove(lines);
-    (lines as THREE.Mesh).geometry?.dispose();
-    // 棱线材质现在是逐网格一份（要绑各自的 batch 纹理），得跟着释放
-    const mat = (lines as THREE.Mesh).material;
-    if (Array.isArray(mat)) {
-      mat.forEach((m) => (m as any)?.dispose?.());
-    } else {
-      (mat as any)?.dispose?.();
+    if (lines) {
+      mesh.remove(lines);
+      (lines as THREE.Mesh).geometry?.dispose();
+      // 棱线材质现在是逐网格一份（要绑各自的 batch 纹理），得跟着释放
+      const mat = (lines as THREE.Mesh).material;
+      if (Array.isArray(mat)) {
+        mat.forEach((m) => (m as any)?.dispose?.());
+      } else {
+        (mat as any)?.dispose?.();
+      }
+      ud.edges = null;
     }
-    ud.edges = null;
+
+    // 外扩壳的 geometry 是**复用主网格的**，只能释放材质，不能 dispose 几何
+    const hull = ud.edgeHull;
+    if (hull) {
+      mesh.remove(hull);
+      const hmat = hull.material;
+      if (Array.isArray(hmat)) hmat.forEach((m) => (m as any)?.dispose?.());
+      else (hmat as any)?.dispose?.();
+      ud.edgeHull = null;
+    }
   }
 
   /* ---------------------------------------------------------------- 拾取 */
@@ -3488,6 +3668,36 @@ export class S3MViewer {
 
   /* ---------------------------------------------------------------- 渲染 */
 
+  /**
+   * 执行一帧 GPU 描边（法线 + 深度后处理）。
+   *
+   * 参数全部来自 style，不缓存：`edgeWidth` 在这里是「采样偏移」，线宽 ≈ 2×它；
+   * `edgeThreshold` 是折边敏感度（夹角小于它不描），和 CPU 折边线同一口径。
+   */
+  private _renderGpuEdges(canvas: HTMLCanvasElement): void {
+    if (!this.renderer || !this.scene || !this.camera) return;
+    const s = this.style;
+    const fade = this.uniforms.uEdgeFade?.value ?? 1;
+    const opacity =
+      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * clampOpacity(s.opacity) * fade;
+    if (opacity <= 0.004) return;
+
+    if (!this._gpuEdge) this._gpuEdge = new GpuEdgePass();
+    if (!this._gpuEdge.supported(this.renderer)) return;
+
+    // 度数 → 归一化法线差（|Δn| = 2·sin(θ/2)），乘 0.6 让阈值落在「刚好能描出」的位置
+    const deg = Math.min(179, Math.max(1, s.edgeThreshold ?? 55));
+    const normalThreshold = 2 * Math.sin((deg * Math.PI) / 360) * 0.6;
+
+    this._gpuEdge.render(this.renderer, this.scene, this.camera, canvas.width, canvas.height, {
+      color: this._gpuEdgeColor.set(s.edgeColor),
+      opacity,
+      radius: Math.max(1, s.edgeWidth ?? 1.5),
+      normalThreshold,
+      depthThreshold: 0.08,
+    });
+  }
+
   /** 等宽线要按设备像素换算线宽：uResolution 用绘图缓冲尺寸，uDpr 是缓冲 / CSS 的比值 */
   private _updateLineResolution(canvas: HTMLCanvasElement): void {
     const w = canvas.width || 1;
@@ -3734,6 +3944,9 @@ export class S3MViewer {
     // 这里跳过的是「本层的绘制」，宿主自己的清屏 / 底图照旧。
     if ((this.uniforms.uOpacity?.value ?? 1) > OPACITY_EPS) {
       this.renderer.render(this.scene, this.camera);
+      // GPU 描边必须画在主场景之后：它的全屏 quad 参与宿主深度测试，
+      // 依赖本帧已经写好的深度（被地形挡住的地方不该描边）
+      if (this._edgeModes.gpu) this._renderGpuEdges(canvas);
     }
 
     this._frame++;

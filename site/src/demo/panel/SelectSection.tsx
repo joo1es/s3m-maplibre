@@ -73,6 +73,33 @@ export default function SelectSection() {
         <label class="chk">
           <input type="checkbox" id="optEdges" /> 全局棱线
         </label>
+        <div id="wrapEdgeStyle" style="display:none; margin: 2px 0 6px 18px;">
+          <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+            <span style="color:#94a3b8; font-size:11px;">画法</span>
+            <select id="optEdgeStyle" class="form-select" style="padding: 2px 5px; font-size: 11px;">
+              <option value="line" selected>
+                折边线
+              </option>
+              <option value="offset">折边线 + 外推</option>
+              <option value="hull">外扩轮廓</option>
+              <option value="line+hull">折边线 + 外扩</option>
+              <option value="gpu">GPU 片元描边</option>
+            </select>
+          </div>
+          <label class="chk" style="font-size: 11px;">
+            <input type="checkbox" id="optForceCpuEdges" /> 强制 CPU 现算（忽略自带棱线包）
+          </label>
+          <label class="rng" id="wrapEdgeOffset" style="padding:0; display:none;">
+            <span style="font-size:11px;">外推距离</span>
+            <input type="range" id="optEdgeOffset" min="0" max="100" step="5" value="15" />
+            <b id="edgeOffsetVal">0.15m</b>
+          </label>
+          <label class="rng" id="wrapEdgeHullWidth" style="padding:0; display:none;">
+            <span style="font-size:11px;">外扩厚度</span>
+            <input type="range" id="optEdgeHullWidth" min="2" max="40" step="1" value="9" />
+            <b id="edgeHullWidthVal">0.9m</b>
+          </label>
+        </div>
         <label class="rng" id="wrapEdgeOpacity" style="display:none; margin-top: 4px;">
           <span>棱线透明度</span>
           <input type="range" id="optEdgeOpacity" min="10" max="100" step="5" value="45" />

@@ -34,6 +34,8 @@ export interface ThickLineStyleUniforms {
   uWidth: { value: number };
   uOpacity: { value: number };
   uElevation?: { value: number };
+  /** 沿边法线外推的距离（米）。不传或 0 = 线贴在面上，与改动前一致 */
+  uOffset?: { value: number };
 }
 
 /** 等宽线的「单体状态」uniform：直接复用主材质 userData 里那几个对象，自动跟随 */
@@ -54,6 +56,7 @@ export interface ThickLineMaterial extends THREE.ShaderMaterial {
     ThickLineStyleUniforms &
     Required<ThickLineBatchUniforms> & {
       uTranslation: { value: THREE.Vector3 };
+      uOffset: { value: number };
       [uniform: string]: THREE.IUniform;
     };
 }
@@ -69,11 +72,13 @@ const VERT = /* glsl */ `
   attribute vec3 aOther;
   attribute float aSide;
   attribute float aBatchId;
+  attribute vec3 aNormal;
 
   uniform vec2 uResolution;
   uniform float uDpr;
   uniform float uWidth;
   uniform float uElevation;
+  uniform float uOffset;
   uniform vec3 uTranslation;
   uniform sampler2D uBatchTex;
   uniform sampler2D uBatchTex2;
@@ -95,8 +100,11 @@ const VERT = /* glsl */ `
   void main() {
     // 单体平移 / 旋转 / 拔高 / 隐藏：与主着色器同一份 6 行状态纹理、同一套变换口径。
     // 不采样的话，单体一动或一转棱线就留在原地——这正是「棱线跟随」要解决的。
-    vec3 s3mA = position;
-    vec3 s3mB = aOther;
+    // 外推画法：整段沿「边法线」挪出去 uOffset 米（aNormal 全 0 时等于没挪，
+    // 普通折边线走的还是原来那条路径）。必须在旋转 / 拔高之前做，才是物体空间里的外扩。
+    vec3 s3mEdgeOffset = aNormal * uOffset;
+    vec3 s3mA = position + s3mEdgeOffset;
+    vec3 s3mB = aOther + s3mEdgeOffset;
     vec3 s3mCustomOffset = vec3( 0.0 );
     mat3 s3mRot = mat3( 1.0 );
     vec3 s3mPivot = vec3( 0.0 );
@@ -257,6 +265,7 @@ export function createThickLineMaterial(
       uOpacity: style.uOpacity,
       uWidth: style.uWidth,
       uElevation: style.uElevation ?? { value: opts.elevation ?? 0 },
+      uOffset: style.uOffset ?? { value: 0 },
       uTranslation: { value: new THREE.Vector3(0, 0, 0) },
       uBatchTex: batch.uBatchTex,
       uBatchTex2: batch.uBatchTex2,
@@ -288,10 +297,13 @@ export function createThickLineMaterial(
  * @param batchIds 每段所属的单体 batchId（长度 = 段数）。给了它，顶点着色器才能
  *   按单体从状态纹理取平移/拔高——棱线跟随移动靠的就是这个。不传全部填 -1，
  *   着色器会跳过采样（等于不参与单体状态）。
+ * @param normals 每段一条「边法线」（长度 = 段数 × 6，两端点各一份，同一条棱共用）。
+ *   只有外推画法需要；不传就全填 0，`uOffset` 乘上去等于没推，普通折边线的行为不变。
  */
 export function buildThickLineGeometry(
   segments: ArrayLike<number>,
-  batchIds?: ArrayLike<number>
+  batchIds?: ArrayLike<number>,
+  normals?: ArrayLike<number>
 ): THREE.BufferGeometry {
   const count = Math.floor(segments.length / 6);
   const vertexCount = count * 4;
@@ -300,6 +312,7 @@ export function buildThickLineGeometry(
   const other = new Float32Array(vertexCount * 3);
   const side = new Float32Array(vertexCount);
   const batch = new Float32Array(vertexCount);
+  const normal = new Float32Array(vertexCount * 3);
   const index = vertexCount > 65535 ? new Uint32Array(count * 6) : new Uint16Array(count * 6);
 
   for (let i = 0; i < count; i++) {
@@ -311,6 +324,9 @@ export function buildThickLineGeometry(
     const by = segments[s + 4];
     const bz = segments[s + 5];
     const b = batchIds ? Number(batchIds[i] ?? -1) : -1;
+    const nx = normals ? Number(normals[s] ?? 0) : 0;
+    const ny = normals ? Number(normals[s + 1] ?? 0) : 0;
+    const nz = normals ? Number(normals[s + 2] ?? 0) : 0;
 
     const v = i * 4;
     // A 端两枚
@@ -319,7 +335,13 @@ export function buildThickLineGeometry(
     // B 端两枚（side 反号）
     setVertex(v + 2, bx, by, bz, ax, ay, az, 1);
     setVertex(v + 3, bx, by, bz, ax, ay, az, -1);
-    for (let k = 0; k < 4; k++) batch[v + k] = b;
+    for (let k = 0; k < 4; k++) {
+      batch[v + k] = b;
+      const p = (v + k) * 3;
+      normal[p] = nx;
+      normal[p + 1] = ny;
+      normal[p + 2] = nz;
+    }
 
     const o = i * 6;
     index[o] = v;
@@ -355,6 +377,7 @@ export function buildThickLineGeometry(
   geometry.setAttribute('aOther', new THREE.BufferAttribute(other, 3));
   geometry.setAttribute('aSide', new THREE.BufferAttribute(side, 1));
   geometry.setAttribute('aBatchId', new THREE.BufferAttribute(batch, 1));
+  geometry.setAttribute('aNormal', new THREE.BufferAttribute(normal, 3));
   geometry.setIndex(new THREE.BufferAttribute(index, 1));
   geometry.computeBoundingSphere();
   return geometry;
@@ -411,11 +434,15 @@ const QUANT = 100;
  *
  * 非索引几何没有共享顶点，直接用顶点号去重会让每条边都被判成边界边。
  * 所以这里先按位置量化把顶点归一化成 canonical id，再走同一套逻辑。
+ *
+ * @param outNormals 传了就把「边法线」按段追加进去（每段 6 个 float，两端点各一份）。
+ *   折边取相邻两面的平均法线，边界边取唯一那一面的法线。外推画法靠它决定往哪推。
  */
 export function buildFeatureEdgeSegments(
   geometry: THREE.BufferGeometry,
   ranges?: EdgeVertexRange[] | null,
-  creaseAngle = 40
+  creaseAngle = 40,
+  outNormals?: number[]
 ): Float32Array | null {
   const position = geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
   if (!position) return null;
@@ -480,11 +507,12 @@ export function buildFeatureEdgeSegments(
   let ny = 0;
   let nz = 0;
 
-  const emit = (lo: number, hi: number): boolean => {
+  const emit = (lo: number, hi: number, ex: number, ey: number, ez: number): boolean => {
     if (out.length >= MAX_EDGE_SEGMENTS * 6) return false;
     const a = repIdx(lo);
     const b = repIdx(hi);
     out.push(px[a], py[a], pz[a], px[b], py[b], pz[b]);
+    outNormals?.push(ex, ey, ez, ex, ey, ez);
     return true;
   };
 
@@ -502,7 +530,21 @@ export function buildFeatureEdgeSegments(
     // 与首个共用该边的三角形比夹角
     const dot = nx * normals[first * 3] + ny * normals[first * 3 + 1] + nz * normals[first * 3 + 2];
     if (dot < cosLimit) {
-      emit(lo, hi);
+      // 两面的平均法线就是这条棱「往外」的方向；两面接近反向时退回当前面法线
+      let ex = normals[first * 3] + nx;
+      let ey = normals[first * 3 + 1] + ny;
+      let ez = normals[first * 3 + 2] + nz;
+      const l = Math.hypot(ex, ey, ez);
+      if (l > 1e-9) {
+        ex /= l;
+        ey /= l;
+        ez /= l;
+      } else {
+        ex = nx;
+        ey = ny;
+        ez = nz;
+      }
+      emit(lo, hi, ex, ey, ez);
       seen.set(key, -1);
     } else {
       seen.set(key, -2);
@@ -543,7 +585,7 @@ export function buildFeatureEdgeSegments(
     if (first < 0) continue;
     const lo = Math.floor(key / span);
     const hi = key - lo * span;
-    if (!emit(lo, hi)) break;
+    if (!emit(lo, hi, normals[first * 3], normals[first * 3 + 1], normals[first * 3 + 2])) break;
   }
 
   return out.length > 0 ? new Float32Array(out) : null;

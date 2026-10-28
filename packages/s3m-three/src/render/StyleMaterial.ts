@@ -61,6 +61,75 @@ export const SELECT_MODE_LABELS: Record<SelectMode, string> = {
   [SELECT_MODE.GLOW_ONLY]: '仅描边发光 (Glow)',
 };
 
+/* ------------------------------------------------------------------ 棱线画法 */
+
+/**
+ * 全局棱线的画法。
+ *
+ * - `'line'`   CPU 折边线：焊合 → 折边判定 → 屏幕空间等宽四边形（默认口径）
+ * - `'offset'` 同上，但整段沿「边法线」往外推 `edgeOffset` 米。贴在面上的线会被
+ *              面的明暗吃掉，推出去一点才看得清，代价是要多带一条 aNormal 属性
+ * - `'hull'`   背面外扩轮廓：把整块几何沿法线鼓一圈、只画背面，得到「白模 + 卡通
+ *              描边」的观感。不建任何折边几何，成本就是多画一遍网格
+ * - `'gpu'`    纯片元描边：在主材质里用屏幕导数找「法线突变」的像素，直接混成棱线色。
+ *              零几何、零额外 pass，代价是线宽约 1 个设备像素，且描不出几何外轮廓
+ */
+export type EdgeStyle = 'line' | 'offset' | 'hull' | 'gpu';
+
+/**
+ * `style.edges` 的取值。
+ *
+ * boolean 是旧口径（`true` = `'line'`），字符串 / 数组用来选画法，数组可叠加，
+ * 例如 `['line', 'hull']` = 折边线 + 外扩轮廓同时上。
+ * 注意 `'offset'` 隐含折边线：外推是折边线的修饰，不是另一种线。
+ */
+export type EdgesOption = boolean | EdgeStyle | EdgeStyle[];
+
+/** 归一化后的棱线开关 */
+export interface EdgeModes {
+  /** 整体开关：任一画法命中就是 true */
+  enabled: boolean;
+  /** 是否建 CPU 折边线 */
+  line: boolean;
+  /** 折边线是否沿边法线外推 */
+  offset: boolean;
+  /** 是否挂背面外扩轮廓 */
+  hull: boolean;
+  /** 是否在材质里做片元级描边（零几何） */
+  gpu: boolean;
+}
+
+const EDGE_MODE_OFF: EdgeModes = { enabled: false, line: false, offset: false, hull: false, gpu: false };
+
+/**
+ * 把 `EdgesOption` 归一成四个开关。
+ *
+ * 未知值（宿主 JS 里传错字符串 / 脏数组）一律当关，不抛错也不误开——样式这种东西
+ * 出错时最该做的是「保持不动」，而不是把整个图层带崩。
+ */
+export function resolveEdgeModes(value: EdgesOption | null | undefined): EdgeModes {
+  if (value == null || value === false) return { ...EDGE_MODE_OFF };
+  if (value === true) return { ...EDGE_MODE_OFF, enabled: true, line: true };
+
+  const list = Array.isArray(value) ? value : [value];
+  const modes: EdgeModes = { ...EDGE_MODE_OFF };
+  for (const item of list) {
+    if (item === 'line') modes.line = true;
+    else if (item === 'offset') {
+      modes.line = true;
+      modes.offset = true;
+    } else if (item === 'hull') modes.hull = true;
+    else if (item === 'gpu') modes.gpu = true;
+  }
+  modes.enabled = modes.line || modes.hull || modes.gpu;
+  return modes;
+}
+
+/** 两套开关是否等价（只比较有效位，用来判断要不要重建装饰） */
+export function sameEdgeModes(a: EdgeModes, b: EdgeModes): boolean {
+  return a.line === b.line && a.offset === b.offset && a.hull === b.hull && a.gpu === b.gpu;
+}
+
 /* ------------------------------------------------------------------ 样式配置 */
 
 /** 图层整体样式（宿主无关，S3MViewer 与 s3m-maplibre 的 S3MLayer 共用） */
@@ -105,14 +174,31 @@ export interface S3MStyle {
   outlineWidth?: number;
   /** 选中棱线的粗细（像素，默认 3，仅 outlineStyle: 'edges' 生效，缩放时保持恒定） */
   outlineWidthPx?: number;
-  /** 是否显示几何棱线（CPU 端生成，有开销） */
-  edges: boolean;
+  /**
+   * 是否显示几何棱线。
+   *
+   * 取值是 `boolean | EdgeStyle | EdgeStyle[]`：`true` 等价于 `'line'`（旧口径），
+   * `'hull'` 走背面外扩轮廓，`'offset'` 是折边线 + 法线外推，数组可叠加。
+   * 见 `resolveEdgeModes`。
+   */
+  edges: EdgesOption;
   /** 全局棱线粗细（像素，默认 1.2） */
   edgeWidth?: number;
   edgeColor: string;
   edgeOpacity?: number;
   /** 棱线临界角（度）：相邻面法线夹角超过该值才描边，过滤掉浅坡与曲面细分。默认 55° */
   edgeThreshold?: number;
+  /** 折边线沿边法线外推的距离（米，默认 0.15，仅 edges 含 'offset' 生效） */
+  edgeOffset?: number;
+  /** 背面外扩轮廓的厚度（米，默认 0.9，仅 edges 含 'hull' 生效） */
+  edgeHullWidth?: number;
+  /**
+   * 忽略数据自带的棱线包（primitiveType 13），一律 CPU 现算。默认 false。
+   *
+   * 数据自带的棱线是 `LineBasicMaterial`，线宽恒 1px，`edgeWidth` / 外扩 / 单体跟随
+   * 全都吃不上。想让这些能力对所有数据统一生效就打开它，代价是 CPU 要现算折边。
+   */
+  forceCpuEdges?: boolean;
   roofThreshold?: number;
   /** 是否与模型原色贴图叠加混合（0 = 纯色覆盖，1 = 叠乘原色贴图） */
   texMix?: number;
@@ -161,6 +247,9 @@ export const DEFAULT_STYLE: S3MStyle = {
   edgeColor: '#334155',
   edgeOpacity: 0.6,
   edgeThreshold: 55,
+  edgeOffset: 0.15,
+  edgeHullWidth: 0.9,
+  forceCpuEdges: false,
   roofThreshold: 0.65,
   texMix: 0,
   ambientGain: 0,
@@ -1029,18 +1118,34 @@ const OUTLINE_VERT = /* glsl */ `
 
 const OUTLINE_FRAG = /* glsl */ `
   uniform vec3 uColor;
+  uniform float uOpacity;
   varying float vSel;
   void main() {
     if ( vSel < 0.5 ) discard;
-    gl_FragColor = vec4( uColor, 1.0 );
+    if ( uOpacity <= 0.003 ) discard;
+    gl_FragColor = vec4( uColor, uOpacity );
   }
 `;
+
+/**
+ * 外扩轮廓的「外观」uniform。
+ *
+ * 与棱线一样，全局外扩是逐网格一份材质（要各绑各的单体状态纹理），但颜色 / 厚度 /
+ * 不透明度必须全局统一 —— 所以这些 `{ value }` 对象由调用方持有并共享给每一份材质，
+ * 改一次全场景生效。
+ */
+export interface OutlineStyleUniforms {
+  uColor: { value: THREE.Color };
+  uWidth: { value: number };
+  uOpacity: { value: number };
+}
 
 export interface OutlineMaterial extends THREE.ShaderMaterial {
   uniforms: {
     uSelBatch: { value: number };
     uSelWhole: { value: number };
     uWidth: { value: number };
+    uOpacity: { value: number };
     uElevation: { value: number };
     uBatchTex: { value: THREE.Texture };
     uBatchTex2: { value: THREE.Texture };
@@ -1055,13 +1160,34 @@ export interface OutlineMaterial extends THREE.ShaderMaterial {
   };
 }
 
-/** 选中单体的描边材质（背面外扩法） */
-export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9): OutlineMaterial {
+/**
+ * 描边材质（背面外扩法）。
+ *
+ * 选中侧与全局棱线共用这一份实现，差别只在 uniform：
+ *   - 选中：`uSelBatch` = 选中单体的 batchId，只扩那一栋，不透明
+ *   - 全局：`uSelWhole` = 1，整块几何都扩，走 `edgeOpacity` 混合
+ *
+ * @param styleUniforms 传入时**直接复用这些 `{ value }` 对象**，让逐网格材质共享外观
+ * @param transparent   全局外扩要能吃 `edgeOpacity`，选中侧保持不透明（默认 false）
+ */
+export function createOutlineMaterial(
+  shared: StyleUniforms,
+  initialWidth = 0.9,
+  styleUniforms?: OutlineStyleUniforms,
+  transparent = false
+): OutlineMaterial {
+  const style: OutlineStyleUniforms = styleUniforms ?? {
+    uColor: { value: shared.uSelColor.value.clone() },
+    uWidth: { value: initialWidth },
+    uOpacity: { value: 1 },
+  };
+
   const mat = new THREE.ShaderMaterial({
     uniforms: {
       uSelBatch: { value: -1 },
       uSelWhole: { value: 0 },
-      uWidth: { value: initialWidth },
+      uWidth: style.uWidth,
+      uOpacity: style.uOpacity,
       uElevation: { value: 0 },
       uBatchTex: { value: DUMMY_BATCH_TEX },
       uBatchTex2: { value: DUMMY_BATCH_TEX },
@@ -1072,13 +1198,13 @@ export function createOutlineMaterial(shared: StyleUniforms, initialWidth = 0.9)
       uPathCount: shared.uPathCount ?? { value: 1 },
       uPathTexActive: shared.uPathTexActive ?? { value: 0 },
       uPathTime: shared.uPathTime ?? { value: 0 },
-      uColor: { value: shared.uSelColor.value.clone() },
+      uColor: style.uColor,
     },
     vertexShader: OUTLINE_VERT,
     fragmentShader: OUTLINE_FRAG,
     side: THREE.BackSide,
     depthWrite: false,
-    transparent: false,
+    transparent,
     // 描边要压在建筑后面一点，避免和本体 z-fighting
     polygonOffset: true,
     polygonOffsetFactor: 1,

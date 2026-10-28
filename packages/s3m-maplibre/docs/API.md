@@ -177,14 +177,14 @@ getStyle(): S3MStyle & { modeLabel: string }
 setOpacity(opacity: number, transition?: TransitionOptions): void
 ```
 
-`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）、`edges` / `edgeThreshold`（结构变更）之外，其余字段都是 uniform / 材质状态更新，热切换成本很低。字段含义见 [s3m-three 样式章节](../s3m-three/docs/API.md#样式s3mstyle)。
+`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）、`edges` / `edgeThreshold` / `forceCpuEdges`（结构变更）之外，其余字段都是 uniform / 材质状态更新，热切换成本很低。字段含义见 [s3m-three 样式章节](../s3m-three/docs/API.md#样式s3mstyle)。
 
 带 `transition` 时，能插值的字段逐帧过渡，不能插值的仍即时生效，详见[动画与过渡](#动画与过渡)。
 
 ### 棱线
 
 ```ts
-setEdges(enabled: boolean, transition?: TransitionOptions): void
+setEdges(edges: EdgesOption, transition?: TransitionOptions): void
 ```
 
 带 `transition` 时只对屏幕空间等宽棱线做淡入淡出（`uEdgeFade`），几何仍按 8ms 切片构建；关闭时淡完才释放几何。数据自带的线段包直接切 `visible`，不会淡入。详见[动画与过渡](#动画与过渡)。
@@ -197,7 +197,8 @@ setEdges(enabled: boolean, transition?: TransitionOptions): void
 
 - `edgeWidth`（像素）控全局棱线粗细，缩放时线宽恒定；
 - 选中单体的描边默认也走同一套画法（`outlineStyle: 'edges'`），只挑这个单体自己的三角面算折边，`outlineWidthPx` 控粗细；
-- 数据自带的棱线包是原始线段，仍是 1px，只受颜色 / 透明度控制。
+- 数据自带的棱线包是原始线段，仍是 1px，只受颜色 / 透明度控制；想让它们也吃 `edgeWidth` / 外扩 / 单体跟随，把 `style.forceCpuEdges` 打开改由 CPU 现算。
+- `setEdges` 收 `boolean | 'line' | 'offset' | 'hull' | 数组`：`'offset'` 是折边线沿边法线外推（`edgeOffset` 米），`'hull'` 是背面外扩轮廓（`edgeHullWidth` 米，整场景版的「白模 + 卡通描边」），`'gpu'` 是后处理描边（法线 + 深度 RT + 全屏 Sobel，零 CPU 成本、线宽像素级可控，只支持 WebGL2），数组可叠加，如 `['line', 'hull']`、`['gpu', 'line']`。
 
 > 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺，整片模型变成放射状三角面。
 
@@ -345,7 +346,7 @@ interface TransitionOptions {
 ```ts
 setStyle(patch?: Partial<S3MStyle>, transition?: TransitionOptions): void
 setOpacity(opacity: number, transition?: TransitionOptions): void
-setEdges(enabled: boolean, transition?: TransitionOptions): void
+setEdges(edges: EdgesOption, transition?: TransitionOptions): void
 setMode(mode: S3MStyle['mode'], options?: { duration?: number; dim?: number }): Promise<void>
 prewarmShading(): Promise<void>
 ```
@@ -364,7 +365,7 @@ await layer.setMode(STYLE.HEIGHT, { duration: 300, dim: 0.35 });
 ```
 
 - 可动画字段表、颜色空间、`fadeIn` 的代价见 [s3m-three 样式过渡](../s3m-three/docs/API.md#样式过渡)。
-- `mode` / `shading` / `edges` / `edgeThreshold` 不参与插值：`mode` 用 `setMode`，`edges` 用 `setEdges`，`shading` 是编译期宏，`edgeThreshold` 会重建棱线几何。
+- `mode` / `shading` / `edges` / `edgeThreshold` / `forceCpuEdges` 不参与插值：`mode` 用 `setMode`，`edges` 用 `setEdges`，`shading` 是编译期宏，`edgeThreshold` 会重建棱线几何。
 - `getStyle()` 立即返回目标值，动画进行中也一样；当前显示值在 `viewer.style`。
 - 全局 `opacity` 允许到 0：到 0 时本层跳过绘制（不写颜色也不写深度），底图不会被挖洞。`getStyle().opacity` 与屏幕一致。
 - `setStyle({ fadeIn: 500 })` 让**之后新加载的瓦片**（含 LOD 换瓦）淡入，默认 0；淡入期间这些瓦片会进透明队列。

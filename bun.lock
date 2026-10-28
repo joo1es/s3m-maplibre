@@ -21,7 +21,7 @@
     },
     "packages/s3m-maplibre": {
       "name": "s3m-maplibre",
-      "version": "0.4.15",
+      "version": "0.4.16",
       "dependencies": {
         "s3m-three": "workspace:*",
       },
@@ -31,7 +31,7 @@
     },
     "packages/s3m-three": {
       "name": "s3m-three",
-      "version": "0.4.15",
+      "version": "0.4.16",
       "peerDependencies": {
         "three": ">=0.155.0",
       },

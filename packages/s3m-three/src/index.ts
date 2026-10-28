@@ -121,9 +121,13 @@ export {
   createOutlineMaterial,
 } from './render/StyleMaterial.js';
 export type { StyleMode, SelectMode, StyledMaterial, StyledMaterialOptions, OutlineMaterial, MaterialQuality } from './render/StyleMaterial.js';
+export type { EdgeStyle, EdgesOption, EdgeModes, OutlineStyleUniforms } from './render/StyleMaterial.js';
+export { resolveEdgeModes, sameEdgeModes } from './render/StyleMaterial.js';
 export { setMaterialQuality, getMaterialQuality } from './render/StyleMaterial.js';
 
 export { Picker } from './render/Picker.js';
+export { GpuEdgePass } from './render/GpuEdgePass.js';
+export type { GpuEdgeParams } from './render/GpuEdgePass.js';
 export type { PickHit } from './render/Picker.js';
 
 export { Animator, Path, easing, cubicBezier, steps, EASING_NAMES } from './anim/index.js';

@@ -250,14 +250,18 @@ interface S3MDatasetOptions {
 setStyle(patch?: Partial<S3MStyle>, transition?: TransitionOptions): void
 getStyle(): S3MStyle & { modeLabel: string }
 setOpacity(opacity: number, transition?: TransitionOptions): void
-setEdges(enabled: boolean, transition?: TransitionOptions): void
+setEdges(edges: EdgesOption, transition?: TransitionOptions): void
 ```
 
 `transition` 用来给能插值的字段加过渡，语义见[动画与过渡](#动画与过渡)；不传则和旧版一样即时生效。
 
-`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）、`edges` / `edgeThreshold`（结构变更，走 `setEdges` / 重建棱线）之外，其余字段都是 uniform / 材质状态更新，热切换成本很低。
+`setStyle` 是**合并**语义，只传要改的字段。除了 `shading`（编译期宏，需重编译着色器）、`edges` / `edgeThreshold` / `forceCpuEdges`（结构变更，走 `setEdges` / 重建棱线）之外，其余字段都是 uniform / 材质状态更新，热切换成本很低。
 
 棱线优先用**数据自带的棱线包**（`primitiveType === 13` 的索引包）：解析时就建好 `LineSegments`，开关只是切 `visible`，成本为零。数据里没有时才用 `EdgesGeometry` 在 CPU 端现算（8ms 一帧切片，超过 12 万索引直接跳过）。棱线画成**屏幕空间等宽线**（`packages/s3m-three/src/render/EdgeLines.ts`）：WebGL 的 `lineWidth` 恒定 1px，只有把每条棱摊成面向屏幕的四边形才能真的调粗细。
+
+`setEdges` 收 `boolean | 'line' | 'offset' | 'hull' | 数组`：`'offset'` 让折边线沿边法线外推（不再被面的明暗吃掉），`'hull'` 走背面外扩轮廓（白模 + 卡通描边），数组可叠加。细节见[棱线画法](#棱线画法edges)。
+
+数据自带棱线包时 `edgeWidth` / 外扩 / 单体跟随都不生效（那是 `LineBasicMaterial`）；要这些能力就把 `style.forceCpuEdges` 打开，改由 CPU 现算。
 
 > 注意：棱线包**不能**当三角面画。把它当 `TRIANGLES` 提交，每条棱线都会被连成一根几十上百米的尖刺。
 
@@ -431,15 +435,43 @@ interface S3MStyle {
   outlineColor?: string;  // 描边颜色，默认跟随 selectColor
   outlineWidthPx?: number; // 选中棱线粗细（像素，默认 3），仅 outlineStyle: 'edges'
   outlineWidth?: number;   // 外扩轮廓粗细（米，默认 0.9），仅 outlineStyle: 'hull'
-  edges: boolean;       // 全局棱线
+  edges: EdgesOption;   // 全局棱线：boolean | 'line' | 'offset' | 'hull' | 数组
   edgeColor: string;    // 棱线颜色
   edgeWidth?: number;   // 全局棱线粗细（像素，默认 1.2）
   edgeOpacity?: number; // 棱线透明度（0.1 ~ 1.0），默认 0.45
   edgeThreshold?: number; // 棱线临界角（度，默认 55）：相邻面法线夹角超过它才描边，调大滤掉浅坡
+  edgeOffset?: number;  // 折边线沿边法线外推距离（米，默认 0.15），仅 edges 含 'offset'
+  edgeHullWidth?: number; // 背面外扩轮廓厚度（米，默认 0.9），仅 edges 含 'hull'
+  forceCpuEdges?: boolean; // 忽略数据自带的棱线包，一律 CPU 现算（默认 false）
   roofThreshold?: number; // 顶面法线判定阈值，默认 0.65
   fadeIn?: number;      // 新瓦片淡入时长（毫秒，默认 0 = 关闭）
 }
 ```
+
+### 棱线画法（`edges`）
+
+`edges` 从 boolean 扩成了 `boolean | EdgeStyle | EdgeStyle[]`，默认 `false`（不开）。
+
+| 取值 | 效果 | 代价 |
+|---|---|---|
+| `true` / `'line'` | CPU 折边线（旧口径，行为逐字不变） | 焊合 + 折边判定 + 每段 4 顶点几何 |
+| `'offset'` | 折边线 + 沿「边法线」外推 `edgeOffset` 米，线不会被面的明暗吃掉 | 同上，多一条 `aNormal` 属性 |
+| `'hull'` | 背面外扩轮廓（选中侧 `outlineStyle: 'hull'` 的整场景版）：顶点沿法线鼓 `edgeHullWidth` 米、只画背面 | 不建新几何，只是把网格多画一遍 |
+| `'gpu'` | **后处理描边**：法线 + 深度渲进 RT，全屏 Sobel 找折边与轮廓 | 零 CPU 成本、线宽像素级可控；代价是几何多渲一遍（无贴图无光照）+ 一次全屏 pass，且**只支持 WebGL2** |
+| `['line', 'hull']` | 折边线 + 外扩轮廓叠加 | 两者之和 |
+
+几条口径：
+
+- `'offset'` 隐含折边线：外推是折边线的修饰，不是另一种线。
+- `'gpu'` 是**后处理**，不在材质里求导：`dFdx` 只在 2×2 quad 内求差，quad 里跨出三角形的像素是同一三角形的外推值，所以片元着色器看不到三角形边界（平面着色几何的折边恰好就是三角形边界，实测法线导数恒为 0）。实现见 `render/GpuEdgePass.ts`：
+  1. 用 `MeshNormalMaterial` 覆盖材质把场景渲进 RT（颜色 = 法线，深度 = 深度纹理）；
+  2. 全屏 quad 按 `edgeWidth` 像素采样 4 邻域，取「法线差 / 相对深度差」的最大值当描边；
+  3. `gl_FragDepth` 写回该像素深度并开 `depthTest` —— 所以被地形 / 底图挡住的地方描边也会被挡住。
+  `edgeWidth` 在这里是采样偏移（线宽 ≈ 2×），`edgeThreshold` 是折边敏感度。可以和 `'line'` 叠加（`['gpu', 'line']`）。WebGL1 上自动跳过。
+- 数组顺序无关、重复值无副作用；未知值（宿主传错字符串）一律当关，不抛错也不误开。
+- 换画法（`line` ↔ `hull` ↔ `offset`）是结构变更，会先拆掉旧装饰再重建；同一画法重复设置不重建几何，滑块逐帧调样式也不卡。
+- 外扩轮廓对**实例化几何跳过**：壳是 mesh 的子节点，不吃 `instanceMatrix`，硬挂会让所有实例的壳叠在原点。
+- `forceCpuEdges: true` 时无视数据自带的棱线包（`primitiveType 13`），一律 CPU 现算 —— 那批 native 棱线是 `LineBasicMaterial`，线宽恒 1px，`edgeWidth` / 外扩 / 单体跟随全都吃不上。代价是 CPU 要按 8ms 一帧切片建线。
 
 ### 着色模式
 
@@ -784,7 +816,7 @@ EASING_NAMES;                   // 全部内置名，适合生成下拉框
 ```ts
 setStyle(patch?: Partial<S3MStyle>, transition?: TransitionOptions): void
 setOpacity(opacity: number, transition?: TransitionOptions): void
-setEdges(enabled: boolean, transition?: TransitionOptions): void
+setEdges(edges: EdgesOption, transition?: TransitionOptions): void
 setMode(mode: StyleMode, opts?: { duration?: number; dim?: number }): Promise<void>
 ```
 
@@ -794,7 +826,7 @@ setMode(mode: StyleMode, opts?: { duration?: number; dim?: number }): Promise<vo
 |---|---|---|
 | `style.opacity` | 1 | 共享 `uOpacity`；混合开关只在跨 `0.999` 时切一次 |
 | `style.colorA` / `colorB` / `colorC` / `selectColor` / `edgeColor` | 3 | 线性空间 RGB |
-| `style.texMix` / `floorHeight` / `selectOpacity` / `selectEmissive` / `selectElevation` / `dimFactor` / `roofThreshold` / `ambientGain` / `edgeWidth` / `edgeOpacity` / `outlineWidth` | 1 | 直接写 uniform / 字段 |
+| `style.texMix` / `floorHeight` / `selectOpacity` / `selectEmissive` / `selectElevation` / `dimFactor` / `roofThreshold` / `ambientGain` / `edgeWidth` / `edgeOpacity` / `edgeOffset` / `edgeHullWidth` / `outlineWidth` | 1 | 直接写 uniform / 字段 |
 | `style.edgeFade` | 1 | 棱线淡入乘子，`setEdges` 内部使用 |
 | `style.fade` | 1 | 整体压暗乘子，`setMode` 内部使用 |
 

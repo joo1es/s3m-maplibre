@@ -108,6 +108,7 @@ NODE_OPTIONS= bun run serve    # 静态服务，http://localhost:8123/s3m-maplib
 ?vector=1&mvt=<TileJSON|模板>  叠加 MVT 矢量底图 + fill-extrusion 建筑
 ?nos3m=1                       只留底图，隔离问题
 ?orthoDebug=1                  校验接管后 viewProj 的 w 行是否为 (0,0,0,1)
+?edges=gpu                    棱线画法：line | offset | hull | gpu，可叠加（gpu+line、line+hull）
 ```
 
 ### 本机环境坑（Windows）

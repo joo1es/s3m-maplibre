@@ -18,6 +18,7 @@ import { S3MViewer } from 's3m-three';
 import type {
   S3MViewerOptions,
   S3MStyle,
+  EdgesOption,
   PickResult,
   Stats,
   S3MDatasetOptions,
@@ -633,9 +634,14 @@ export class S3MLayer {
     return this.viewer.getStyle();
   }
 
-  /** 全局棱线开关，可带淡入淡出 */
-  setEdges(enabled: boolean, transition?: TransitionOptions): void {
-    this.viewer.setEdges(enabled, transition);
+  /**
+   * 全局棱线开关，可带淡入淡出。
+   *
+   * 传 `true` / `'line'` 是折边线，`'hull'` 是背面外扩轮廓，`'offset'` 是折边线
+   * 沿边法线外推，数组可叠加（如 `['line', 'hull']`）。见 `EdgesOption`。
+   */
+  setEdges(edges: EdgesOption, transition?: TransitionOptions): void {
+    this.viewer.setEdges(edges, transition);
   }
 
   /**

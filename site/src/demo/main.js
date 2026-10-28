@@ -1089,12 +1089,71 @@ $('optOutlineWidth').addEventListener('input', (e) => {
   layer.setStyle({ outlineWidth: v });
 });
 $('optDim').addEventListener('change', (e) => layer.setStyle({ dimOthers: e.target.checked }));
-$('optEdges').addEventListener('change', (e) => {
-  const on = e.target.checked;
-  layer.setEdges(on);
+
+/** 下拉里的「折边线 + 外扩」要变成数组，其余单值直接透传 */
+function currentEdgeOption() {
+  const v = $('optEdgeStyle').value;
+  return v === 'line+hull' ? ['line', 'hull'] : v;
+}
+
+/** 棱线子面板的显隐：外推 / 外扩各自的滑块只在对应画法下露出来 */
+function syncEdgeSubPanels() {
+  const on = $('optEdges').checked;
+  const style = $('optEdgeStyle').value;
+  $('wrapEdgeStyle').style.display = on ? '' : 'none';
   $('wrapEdgeOpacity').style.display = on ? '' : 'none';
-  $('wrapEdgeWidth').style.display = on ? '' : 'none';
-  $('wrapEdgeThreshold').style.display = on ? '' : 'none';
+  // 线宽对折边线 / 外推 / gpu 都有效（gpu 里它是采样偏移，线宽≈2×），只有外扩轮廓按米算
+  $('wrapEdgeWidth').style.display = on && style !== 'hull' ? '' : 'none';
+  $('wrapEdgeThreshold').style.display = on && style !== 'hull' ? '' : 'none';
+  $('wrapEdgeOffset').style.display = on && style === 'offset' ? '' : 'none';
+  $('wrapEdgeHullWidth').style.display = on && style.includes('hull') ? '' : 'none';
+}
+
+/**
+ * 把 `?edges=` 的值落到面板 + 图层，方便直接甩链接复现某种画法。
+ * 支持 `1` / `line` / `offset` / `hull` / `gpu`，以及 `line+hull`、`gpu+line` 这种叠加。
+ */
+function applyEdgesOption(raw) {
+  if (!raw) return;
+  const parts = raw === '1' || raw === 'true' ? ['line'] : raw.split('+');
+  const allowed = parts.filter((p) => ['line', 'offset', 'hull', 'gpu'].includes(p));
+  if (allowed.length === 0) return;
+
+  $('optEdges').checked = true;
+  // 下拉只表达单值 / line+hull 两种组合，其余组合（如 gpu+line）仅作用到图层
+  const preset = allowed.includes('line') && allowed.includes('hull') ? 'line+hull' : allowed[0];
+  const select = $('optEdgeStyle');
+  if ([...select.options].some((o) => o.value === preset)) select.value = preset;
+
+  layer.setEdges(allowed.length > 1 ? allowed : allowed[0]);
+  syncEdgeSubPanels();
+}
+
+$('optEdges').addEventListener('change', (e) => {
+  layer.setEdges(e.target.checked ? currentEdgeOption() : false);
+  syncEdgeSubPanels();
+});
+
+$('optEdgeStyle').addEventListener('change', () => {
+  // 换画法会拆旧装饰再重建，只在棱线开着时才有意义
+  if ($('optEdges').checked) layer.setEdges(currentEdgeOption());
+  syncEdgeSubPanels();
+});
+
+$('optForceCpuEdges').addEventListener('change', (e) =>
+  layer.setStyle({ forceCpuEdges: e.target.checked })
+);
+
+$('optEdgeOffset').addEventListener('input', (e) => {
+  const v = Number(e.target.value) / 100;
+  $('edgeOffsetVal').textContent = `${v.toFixed(2)}m`;
+  layer.setStyle({ edgeOffset: v });
+});
+
+$('optEdgeHullWidth').addEventListener('input', (e) => {
+  const v = Number(e.target.value) / 10;
+  $('edgeHullWidthVal').textContent = `${v.toFixed(1)}m`;
+  layer.setStyle({ edgeHullWidth: v });
 });
 
 $('optEdgeThreshold').addEventListener('input', (e) => {
@@ -1783,6 +1842,9 @@ map.on('load', async () => {
   // ?ortho=local 只把模型换正交；?ortho=global 接管整个 MapLibre（=1 等同 local）
   const orthoParam = new URLSearchParams(window.location.search).get('ortho');
   if (orthoParam) applyOrthoMode(orthoParam === 'global' ? 'global' : 'local');
+
+  // ?edges=gpu|line|offset|hull|line+hull 直接打开某种棱线画法（调试 / 分享用）
+  applyEdgesOption(new URLSearchParams(window.location.search).get('edges'));
 
   // ?mvt=<TileJSON|模板> 指定矢量源
   const mvtParam = new URLSearchParams(window.location.search).get('mvt');
