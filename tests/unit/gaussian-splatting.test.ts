@@ -107,18 +107,25 @@ test('多骨架子瓦：4 块骨架各自指向下一级，子引用互不重复
   ]);
 });
 
-test('泼溅瓦片要能建成 three 对象：无索引包的骨架按 Points 出图，不是「无可用几何」', async () => {
+test('泼溅瓦片要能建成 three 对象：无索引包的骨架按高斯四边形出图，不是「无可用几何」', async () => {
   // 这些瓦片一个索引包都没有 —— 顶点就是点。补不出「顶点即点」的伪包的话，
   // GeometryBuilder 会一块几何都不产出，最后落到 skipped: ['tile 无可用几何']。
+  // 补上 gsScale / gsRotation 的解码之后，这类数据走实例化四边形（真泼溅），
+  // 不再是 THREE.Points —— 但这条断言的本意没变：**必须产出几何**。
   const tile = await parse(CHILD_TILE);
   const res = await buildTileObjects(tile);
 
-  const points: THREE.Points[] = [];
-  res.group.traverse((o) => o instanceof THREE.Points && points.push(o));
-  expect(points.length).toBe(4);
+  const splats: THREE.Mesh[] = [];
+  res.group.traverse((o) => {
+    if ((o as THREE.Mesh).userData?.isGaussianSplat) splats.push(o as THREE.Mesh);
+  });
+  expect(splats.length).toBe(4);
   expect(res.stats.skipped.length).toBe(0);
   expect(res.stats.meshes).toBe(4);
-  expect(points.reduce((s, p) => s + (p.geometry.getAttribute('position')?.count ?? 0), 0)).toBe(9448);
-  // 点渲染必须有顶点色可用（PointsMaterial 读内置 color 槽）
-  for (const p of points) expect(p.geometry.getAttribute('color')).toBeTruthy();
+
+  const total = splats.reduce(
+    (s, m) => s + ((m.geometry as THREE.InstancedBufferGeometry).instanceCount ?? 0),
+    0
+  );
+  expect(total).toBe(9448);
 });

@@ -13,6 +13,7 @@ import { BinaryReader } from './BinaryReader.js';
 import { parseDracoGeometry } from './Draco.js';
 import { parseMeshOptGeometry } from './MeshOpt.js';
 import { isS3M1Buffer, parseS3M1 } from './S3M1Parser.js';
+import type { DegradationKind } from './degradations.js';
 import type {
   AttrDType,
   BoundingBox,
@@ -663,6 +664,22 @@ export async function parseS3MB(arrayBuffer: ArrayBuffer, options: ParseOptions 
     extensions = s ? JSON.parse(s) : undefined;
   }
 
+  // 3DGS：泼溅参数（gsScale / gsRotation）的量化格式已经标定（见 core/GaussianSplat.ts），
+  // 正常数据会被渲染成各向异性的高斯片，**这不再是降级**。
+  // 只有「数据声称自己是 3DGS、但骨架里根本没有这两条流」时才退回点渲染 ——
+  // 那种情况没有任何东西可以补，只能如实上报，而不是画一堆点让人猜。
+  const degradations: DegradationKind[] = [];
+  const gs = (extensions as { GaussianSplatting?: { isGaussianSplatting?: boolean } } | undefined)
+    ?.GaussianSplatting;
+  if (gs?.isGaussianSplatting) {
+    const hasSplatStreams = Object.values(geoPackage).some((e) =>
+      e.vertexPackage.vertexAttributes.some(
+        (a) => a.semantic === 'gsScale' || a.semantic === 'gsRotation'
+      )
+    );
+    if (!hasSplatStreams) degradations.push('gaussian-splatting-points');
+  }
+
   return {
     version,
     compressedType,
@@ -673,6 +690,7 @@ export async function parseS3MB(arrayBuffer: ArrayBuffer, options: ParseOptions 
     materials,
     pickInfo,
     extensions,
+    ...(degradations.length > 0 ? { degradations } : {}),
     bytesRead: t.offset,
     bytesTotal: t.view.byteLength,
   };

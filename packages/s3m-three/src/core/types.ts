@@ -4,6 +4,7 @@
  * 这里只放「跨模块共享」的结构定义。模块内部的私有类型各自就近声明。
  */
 import type { Color } from 'three';
+import type { DegradationKind } from './degradations.js';
 
 /* ------------------------------------------------------------------ 数学 */
 
@@ -200,6 +201,14 @@ export interface ParsedTile {
   materials: unknown;
   pickInfo: unknown;
   extensions?: unknown;
+  /**
+   * 解析成功、但渲染能力不完整的项（机器可读）。
+   *
+   * 空 / 不传 = 这份数据的每一项能力都实现了。目前只会由 3DGS 数据填上
+   * `'gaussian-splatting-points'` —— 那种数据能加载、能看出轮廓，但画不出泼溅。
+   * 处置策略见 `core/degradations.ts` 与 `S3MTilesetOptions.unsupported`。
+   */
+  degradations?: DegradationKind[];
   /** 实际消费的字节数，应与 bytesTotal 相等 */
   bytesRead: number;
   bytesTotal: number;
@@ -230,6 +239,20 @@ export interface Stats {
   textures: number;
   /** 显存里驻留的几何数（renderer.info.memory.geometries） */
   geometries: number;
+  /**
+   * 泼溅瓦片里高斯最长轴的中位长度（米），用来估「屏幕上一个高斯多大」。
+   * 非泼溅数据为 undefined；顶点统计接口也会带上这个可选字段。
+   */
+  splatSigma?: number;
+  /** 泼溅瓦片里的高斯实例数；非泼溅数据为 undefined */
+  splatCount?: number;
+  /**
+   * 当前场景里出现过的降级项（去重）。空数组 = 所有数据的能力都完整实现了。
+   *
+   * 这是给 UI 用的：状态栏 / 诊断面板可以直接读它，不必去翻 console。
+   * 语义与 `ParsedTile.degradations` 一致，只是从「单块瓦片」聚到「整个场景」。
+   */
+  degradations: DegradationKind[];
 }
 
 /* ------------------------------------------------------------------ 单体属性 */
@@ -291,6 +314,15 @@ export interface StyleUniforms {
   uTexMix?: { value: number };
   /** 基础漫反射底色增益 / 直通自发光微调（0~1，默认 0.0） */
   uAmbientGain?: { value: number };
+  /**
+   * 金属度覆盖（0~1，**负数 = 不覆盖**，保持材质自身的值）。
+   *
+   * PBR 材质才有意义：注入在 `metalnessmap_fragment` 之后直接改写 metalnessFactor，
+   * 不重建材质也就不会重编译 program。lambert 光照模型没有这个 chunk，会被忽略。
+   */
+  uMetalness?: { value: number };
+  /** 粗糙度覆盖（0~1，负数 = 不覆盖）。同上，只有 pbr 生效。 */
+  uRoughness?: { value: number };
   /** 双纹理交叉淡化插值因子（0~1，0 = 状态 A，1 = 状态 B） */
   uBatchMix?: { value: number };
   /** 图层整体透明度（共享 uniform，透明度动画靠它做到 O(1)） */
