@@ -142,18 +142,29 @@ git add demo docs                # 产物一起提交，否则线上还是旧页
 
 `demo/assets/` 在 `.gitignore` 里（hash 文件名，由构建生成），只提交 `demo/index.html` 等入口。
 
-### 5.2 npm 发布 —— **打 tag 就是发布**（`.github/workflows/publish.yml`）
+### 5.2 npm 发布 —— **一条命令**（`.github/workflows/publish.yml`）
 
-这是最容易搞错的一步：**不需要在本地跑 `npm publish`，push 一个 tag 上去，CI 就会发。**
+**不需要在本地跑 `npm publish`，push 一个 tag 上去，CI 就会发。**
 
 ```bash
-# ① 改版本（两个包的 x/y 必须一致，用脚本改，别手改）
-NODE_OPTIONS= bun run release patch        # 或 minor / major / --align
-# ② 打 tag（脚本结尾会把这两行原样打出来）
-git tag s3m-three@0.4.15
-git tag s3m-maplibre@0.4.15
-# ③ push tag（GitHub 走代理，见下）：两个连着推，不要等 npm 出现新版本
+node tools/release.mjs patch --push        # 或 minor / major
 ```
+
+它按顺序做完六件事，**任何一步失败就停住，不会留下半个发布**：
+
+1. `bun run build` —— 重建 `demo/` 与 `docs/`（Pages 用的是提交进仓库的产物）
+2. `bun run typecheck`
+3. `bun test ./tests/unit`
+4. `git add -A` + commit `chore: release x.y.z / x.y.z`
+5. `git tag s3m-three@x.y.z` + `git tag s3m-maplibre@x.y.z`
+6. `git push origin main` + `git push origin <两个 tag>`
+
+前三步必须在打 tag 之前跑完：tag 推出去才触发 CI，那时才发现测试挂了就只能删 tag 重打
+（npm 上已经发出去的版本还收不回来）。
+
+想自己控制某一步就拆开跑：`node tools/release.mjs patch`（只改版本）→ 手动 build / commit →
+`git tag` 两个 → `git push origin main` → `git push origin <tag1> <tag2>`。
+`--dry-run` 可以只看版本会变成多少。
 
 tag → 包的映射：
 
@@ -184,21 +195,15 @@ CI 里的硬性校验（触发失败会直接中止，不会发出半个包）�
 - `publish.yml` 的认证走 `secrets.NPM_TOKEN` + OIDC provenance（`npm publish --access public --provenance`），**本地不需要、也不应该做 `npm login`**。
 - `push main` 只触发 CI + Pages，**不发 npm**。发 npm 的唯一入口是 push tag。
 
-push（本机必须走代理，否则 GitHub 超时；凭据要用系统 Git 自带的 GCM，PortableGit 的读不到 Windows 凭据管理器）：
+push 就是普通 `git push`：代理已经写在全局 git config 里（`http.proxy=http://127.0.0.1:10809`），
+凭据走系统 Git 自带的 GCM。**不要**再手加
+`-c credential.helper=!...PortableGit/.../git-credential-manager.exe` —— 那个路径在本机不存在，
+加上反而会让凭据失效（报 `No such file or directory`，只是恰好还有别的凭据兜住了）。
+
+换机器 / 换端口才需要临时指定代理：
 
 ```bash
-"/c/Program Files/Git/cmd/git.exe" \
-  -c 'credential.helper=!"C:/Program Files/Git/mingw64/bin/git-credential-manager.exe"' \
-  -c http.proxy=http://127.0.0.1:10809 \
-  -c https.proxy=http://127.0.0.1:10809 \
-  push origin main
-
-# tag 单独推
-"/c/Program Files/Git/cmd/git.exe" \
-  -c 'credential.helper=!"C:/Program Files/Git/mingw64/bin/git-credential-manager.exe"' \
-  -c http.proxy=http://127.0.0.1:10809 \
-  -c https.proxy=http://127.0.0.1:10809 \
-  push origin s3m-three@0.4.15 s3m-maplibre@0.4.15
+git -c http.proxy=http://127.0.0.1:<port> -c https.proxy=http://127.0.0.1:<port> push origin main
 ```
 
 ### 5.3 版本规则：x / y 共享，z 独立
@@ -223,6 +228,7 @@ node tools/release.mjs patch           # 两包各 +1
 node tools/release.mjs patch --only maplibre    # 只动图层
 node tools/release.mjs patch --align   # 先把历史漂移收拢，再递增（0.3.14/0.4.14 → 0.4.15/0.4.15）
 node tools/release.mjs minor           # 两包一起 0.5.0
+node tools/release.mjs patch --push    # 一条命令发版（改版本 + 构建 + 测试 + commit + tag + push）
 ```
 
 脚本做的事：改两个 `package.json` → `bun install` 同步 `bun.lock` → 检查目标 tag 没被占用 → 打印 tag 与 push 命令。**它不改文件之外的任何东西：不建 tag、不提交、不推送**（`--commit` 只提交，仍然不 push）。
@@ -239,12 +245,12 @@ node tools/release.mjs minor           # 两包一起 0.5.0
 
 - [ ] 代码功能完成，`typecheck` 通过，`bun test ./tests/unit` 全绿
 - [ ] 三处文档同步（见第 7 节）
-- [ ] `bun run build` 重建，`demo/` + `docs/` 的产物改动已 `git add`
-- [ ] `bun run release patch`（或 `minor` / `major`；脚本会同步 `bun.lock`）—— 不要手改版本
-- [ ] `bun run release:check` 通过（x/y 已同步）
-- [ ] commit + push `main`
-- [ ] 打 tag：`s3m-three@x.y.z` 与 `s3m-maplibre@x.y.z` 两个连着推，**不要等 npm 出现新版本**
+- [ ] `node tools/release.mjs patch --push`（或 `minor` / `major`）—— 一条命令搞定
+      版本 + 构建产物 + commit + tag + push，不要手改版本、不要手写 push 命令
 - [ ] 去 Actions 看 `Publish to npm` 两个 job 都绿
+
+> `--push` 内部会跑 build / typecheck / 单测，所以清单前两条只要在**动手前**确认过就行；
+> 它任何一步失败都会停住，不会留下「tag 已推、包没发」的中间态。
 
 发布后再改代码 = 要么另发一个补丁版本，要么 `git tag -f` 重推（npm 一旦发出去就不能覆盖，`-f` 只对**还没发成功**的 tag 有意义）。所以 tag 尽量等代码稳定、文档补齐后再打。
 
@@ -282,6 +288,6 @@ node tools/release.mjs minor           # 两包一起 0.5.0
 | `replace('#include <…>')` 静默失效 | three 改了 chunk 名，材质照样渲染但注入没生效 |
 | 正交模式下底图与模型差一个楼高/相机距 | 只有 S3M 层正交，MapLibre 仍是透视；要全对齐得用 `enableMapLibreOrtho`（beta） |
 | `bun` / `pnpm` 毫无输出地失败 | 本机 `NODE_OPTIONS` 注入，加 `NODE_OPTIONS=` 前缀 |
-| push 超时 / 要用户名密码 | 没走 `127.0.0.1:10809` 代理，或用了 PortableGit 的 GCM |
+| push 超时 / 要用户名密码 | 全局 `git config http.proxy` 丢了（正常是 `127.0.0.1:10809`）；临时用 `git -c http.proxy=... push`。**不要**手加 `-c credential.helper=!...PortableGit/...`，那个路径不存在 |
 | 发布 CI 报「标签与版本不一致」 | tag 版本 ≠ `package.json` version |
 | CI 报「两个包的 x/y 不同步」 | 手改了版本或漏了 `bun install`：跑 `node tools/release.mjs --align` 或 `patch --align` |

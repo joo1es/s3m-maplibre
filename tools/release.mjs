@@ -12,15 +12,19 @@
  *   node tools/release.mjs patch --only maplibre
  *   node tools/release.mjs minor|major     # x/y 共享位，两包必须一起进
  *
+ *   一条命令发版（推荐）：
+ *   node tools/release.mjs patch --push
+ *
  * 选项：
+ *   --push      改版本后一路做完：build → typecheck → 单测 → commit → tag → push main → push tag
  *   --dry-run   只打印结果，不写文件
  *   --no-lock   不跑 bun install（bun.lock 里的 workspace 版本会不同步，通常别用）
  *   --commit    改完顺手提交一个 `chore: release ...`，**不会 push**
  *   --force     体检发现问题也继续（tag 已被占用仍然拒绝）
  *
- * 这个脚本只改版本、不发布。发布是 push tag 触发 .github/workflows/publish.yml ——
- * 那条流水线会跑测试，但 tag 一旦推出去 CI 才报错就晚了（只能删 tag 重打），
- * 所以打 tag 前自己先 `bun test ./tests/unit`。
+ * 发布由 push tag 触发 .github/workflows/publish.yml（构建 + 测试 + npm publish）。
+ * `--push` 会在打 tag **之前**把 build / typecheck / 单测跑完 —— tag 一旦推出去，
+ * CI 才发现挂了就只能删 tag 重打。
  */
 import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
@@ -146,12 +150,76 @@ function syncLockfile() {
   }
 }
 
+/** 跑一条命令，实时输出（build / typecheck / test 这类要看进度的用它） */
+function runLive(cmd, args, label) {
+  console.log(C.bold(`\n${label}`));
+  try {
+    execFileSync(cmd, args, {
+      cwd: ROOT,
+      stdio: 'inherit',
+      // 本机 shell 注入了 NODE_OPTIONS=--use-system-ca，会让 bun 静默失败
+      env: { ...process.env, NODE_OPTIONS: '' },
+    });
+  } catch {
+    die(`${label} 失败 —— 已中止，没有提交也没有打 tag`);
+  }
+}
+
+/** 跑一条 git 命令，输出收起来，失败时才打印 */
+function gitRun(args, label) {
+  try {
+    return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', stdio: 'pipe' }).trim();
+  } catch (err) {
+    const out = `${err?.stdout ?? ''}${err?.stderr ?? ''}`.trim();
+    if (out) console.error(C.dim(out));
+    die(`${label || `git ${args[0]}`} 失败`);
+  }
+}
+
+/**
+ * 一条命令发版：build → typecheck → 单测 → commit → tag → push main → push tag。
+ *
+ * 顺序是有讲究的：前三步必须在**打 tag 之前**跑完。tag 推出去才会触发 CI，
+ * 那时才发现测试挂了，就只能删 tag 重打（npm 上已经发出去的版本还收不回来）。
+ */
+function publish(next) {
+  if (dryRun) die('--push 不能和 --dry-run 一起用');
+
+  runLive('bun', ['run', 'build'], '1/6 重建 demo/ 与 docs/');
+  runLive('bun', ['run', 'typecheck'], '2/6 typecheck');
+  runLive('bun', ['test', './tests/unit'], '3/6 单测');
+
+  const text = `chore: release ${next.three} / ${next.maplibre}`;
+  console.log(C.bold('\n4/6 提交'));
+  gitRun(['add', '-A'], 'git add');
+  const dirty = gitRun(['status', '--porcelain']);
+  if (dirty) {
+    gitRun(['commit', '-q', '-m', text], 'git commit');
+    console.log(C.green(`  ✓ ${text}`));
+  } else {
+    console.log(C.dim('  工作区本来就干净，跳过提交'));
+  }
+
+  console.log(C.bold('\n5/6 打 tag'));
+  const tags = tagNames(next);
+  for (const tag of tags) {
+    gitRun(['tag', tag], `git tag ${tag}`);
+    console.log(C.green(`  ✓ ${tag}`));
+  }
+
+  console.log(C.bold('\n6/6 推送'));
+  gitRun(['push', 'origin', 'main'], 'git push main');
+  console.log(C.green('  ✓ main'));
+  // 两个 tag 一次推：npm 元数据缓存约 10 分钟才刷新，等「npm 上出现新版本」是白等
+  gitRun(['push', 'origin', ...tags], 'git push tags');
+  console.log(C.green(`  ✓ ${tags.join(' , ')}`));
+
+  console.log(C.green('\n✓ 已推送，发布流水线开始跑'));
+  console.log(C.dim('  去 Actions 看 Publish to npm 的两个 job，绿了就是发完了（别去看 registry，缓存要等）'));
+}
+
 function nextSteps(next) {
   const [tagThree, tagMaplibre] = tagNames(next);
-  const proxy =
-    `"/c/Program Files/Git/cmd/git.exe" ` +
-    `-c 'credential.helper=!"C:/Program Files/Git/mingw64/bin/git-credential-manager.exe"' ` +
-    `-c http.proxy=http://127.0.0.1:10809 -c https.proxy=http://127.0.0.1:10809 push origin`;
 
   console.log(C.bold('\n接下来'));
   console.log(`  1. NODE_OPTIONS= bun run build      ${C.dim('重建 demo/ 与 docs/，产物要一起提交')}`);
@@ -159,11 +227,9 @@ function nextSteps(next) {
   console.log(`     ${C.yellow('publish.yml 也会跑测试，但 tag 推出去才报错就晚了 —— 本地先跑')}`);
   console.log(`  3. git add -A && git commit -m "chore: release ${next.three} / ${next.maplibre}"`);
   console.log(`  4. git tag ${tagThree} && git tag ${tagMaplibre}`);
-  console.log(`  5. 先推内核，再推图层；两个连着推，${C.yellow('不要等 npm 出现新版本')}`);
-  console.log(`     ${C.dim('npm 缓存约 10 分钟才刷新，轮询 registry 只会白等；看 Actions 的 job 状态为准')}`);
-  console.log(C.dim(`     ${proxy} main`));
-  console.log(C.dim(`     ${proxy} ${tagThree}`));
-  console.log(C.dim(`     ${proxy} ${tagMaplibre}`));
+  console.log(`  5. git push origin main && git push origin ${tagThree} ${tagMaplibre}`);
+  console.log(C.dim('     两个 tag 连着推，不要等 npm 出现新版本'));
+  console.log(C.bold(`\n或者直接一条命令：`) + C.dim(` node tools/release.mjs ${kind || 'patch'} --push`));
 }
 
 // ---------------------------------------------------------------- main
@@ -228,6 +294,12 @@ apply(next, { dryRun });
 if (!dryRun) {
   assertTagsFree(next);
   syncLockfile();
+}
+
+// 一条命令发版：提交、打 tag、推送都由它接管
+if (flags.has('--push')) {
+  publish(next);
+  process.exit(0);
 }
 
 if (!dryRun) {
