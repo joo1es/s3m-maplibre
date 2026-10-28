@@ -7,6 +7,9 @@
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
+import { planDegradations } from '../core/degradations.js';
+import { splatLodDecision } from '../core/SplatLod.js';
+import type { UnsupportedPolicy } from '../core/degradations.js';
 import { authFetch, type AuthenticateFn } from '../core/AuthFetch.js';
 import { getSharedS3MWorker, S3MWorkerClient, WorkerDeadError } from '../worker/S3MWorkerClient.js';
 import {
@@ -219,6 +222,14 @@ export interface TileNode {
   parentUrl?: string;
   /** 当前帧是否满足细化条件 */
   needRefine?: boolean;
+  /**
+   * 该瓦片高斯的最长轴中位长度（米）。非泼溅瓦片为 undefined。
+   * 有值时细化判据改走 core/SplatLod.ts —— 点云的各层 σ 恒定，
+   * 包围球像素误差那套判据对它无效（见该文件头部）。
+   */
+  splatSigma?: number;
+  /** 该瓦片的高斯实例数（泼溅瓦片才有） */
+  splatCount?: number;
   /** 该瓦片引用的纹理 key 清单，用于引用计数与显存释放 */
   textureKeys?: string[];
   /** 瓦片构建产生的统计信息，用于淘汰时准确扣减 stats */
@@ -233,6 +244,8 @@ export type BuildTileFn = (
     uniforms: StyleUniforms | null;
     /** Worker 侧已完成的纯数据几何组装（经典 .s3mb 路径），构建器直接包装成 three 对象 */
     assembled?: TileGeometryData;
+    /** 深度偏移配置（透传给 buildTileObjects），见 BuildTileOptions.polygonOffset */
+    polygonOffset?: { factor: number; units: number };
   }
 ) => Promise<{ group: Group; stats: Partial<Stats> }>;
 
@@ -243,6 +256,8 @@ export interface S3MTilesetOptions {
   /** 原始图像/子图集缓存上限（LRU），默认 128 */
   maxImageCache?: number;
   buildTile?: BuildTileFn | null;
+  /** 三角面材质深度偏移（共面摩尔纹 / 重合面归属），透传给 buildTileObjects */
+  polygonOffset?: { factor: number; units: number };
   /**
    * 是否用 Web Worker 解析经典 `.s3mb` 瓦片（默认开）。
    *
@@ -287,6 +302,17 @@ export interface S3MTilesetOptions {
    * 子图集）发出前过一遍，可改写 URL（加 `?token=`）或附加请求头。见 `AuthenticateFn`。
    */
   authenticate?: AuthenticateFn;
+  /**
+   * 遇到「解析得了但画不出该有的样子」的数据时怎么办。**默认 `'warn'`**。
+   *
+   * 目前只有一类：3DGS 数据按点渲染（`gsScale` / `gsRotation` 的量化格式未标定）。
+   *   'warn'   —— 首次遇到告警一次，照常出图。旧版没有这个开关，但也不告警，
+   *               所以这里的差异只有多一条日志，不传参时的渲染路径逐字未变。
+   *   'throw'  —— 直接拒绝这类瓦片（标 `permanent`，不重试）。给「宁可不显示，
+   *               也不要显示一个看不出是错的画面」的场景。
+   *   'silent' —— 只记录到 `stats.degradations`，由 UI 自己决定怎么提示。
+   */
+  unsupported?: UnsupportedPolicy;
 }
 
 export class S3MTileset {
@@ -341,6 +367,7 @@ export class S3MTileset {
     programs: 0,
     textures: 0,
     geometries: 0,
+    degradations: [],
   };
 
   maxConcurrent: number;
@@ -368,6 +395,8 @@ export class S3MTileset {
   private readonly _maxRetries: number;
   /** 鉴权适配函数；undefined = 不做任何改写（行为与旧版一致） */
   readonly authenticate: AuthenticateFn | undefined;
+  /** 能力降级的处置策略，默认 'warn'，见 `S3MTilesetOptions.unsupported` */
+  private readonly _unsupported: UnsupportedPolicy;
   /** 失败重试计数与下次可用时间，退避期间 _enqueue 会直接跳过 */
   private readonly _retryCount = new Map<string, number>();
   private readonly _retryAt = new Map<string, number>();
@@ -382,6 +411,7 @@ export class S3MTileset {
   /** 本数据集是 S3M 1.x（SuperMapCache，.s3m）：子瓦地址规则与 3.x 不同 */
   private isS3MV1 = false;
   private _buildTile: BuildTileFn | null;
+  private readonly _polygonOffset: { factor: number; units: number } | undefined;
   private readonly _uniforms: StyleUniforms | null;
   /** 经典 .s3mb 的 Worker 解析客户端；undefined = 尚未尝试创建，null = 不可用/已降级 */
   private _workerClient: S3MWorkerClient | null | undefined;  private readonly _useWorker: boolean;
@@ -397,9 +427,11 @@ export class S3MTileset {
     this._onProgress = options.onProgress ?? (() => {});
     this._maxRetries = Math.max(0, options.maxRetries ?? 2);
     this.authenticate = options.authenticate;
+    this._unsupported = options.unsupported ?? 'warn';
 
     // 渲染层可注入：Node 环境下不需要 three，也能跑 URL / 解析链路
     this._buildTile = options.buildTile ?? null;
+    this._polygonOffset = options.polygonOffset;
     // 着色器共享 uniform，由 S3MLayer 持有并传进来
     this._uniforms = options.uniforms ?? null;
     this._useWorker = options.useWorker !== false;
@@ -1039,6 +1071,23 @@ export class S3MTileset {
     return;
   }
 
+  /**
+   * 处置一块瓦片的降级项。
+   *
+   * 位置很讲究：必须在 `build` 之前。`'throw'` 策略下要在浪费一次几何组装
+   * （几十万面的解交错 + 合批）之前就拒绝，否则「拒绝」本身也成了开销。
+   *
+   * 抛出的错带 `permanent`，由 `_load` 的 catch 识别 → 不重试、直接进 failed。
+   */
+  private _noteDegradations(tile: ParsedTile): void {
+    const incoming = tile.degradations;
+    if (!incoming?.length) return;
+    const plan = planDegradations(incoming, this.stats.degradations, this._unsupported);
+    this.stats.degradations = plan.known;
+    for (const msg of plan.messages) console.warn(msg);
+    if (plan.error) throw plan.error;
+  }
+
   private async _load(url: string): Promise<void> {
     if (this.nodes.has(url) || this.pending.has(url) || this.failed.has(url)) return;
     this.pending.add(url);
@@ -1088,11 +1137,15 @@ export class S3MTileset {
         await this._upgradeAtlasLod(tile, baseUrl);
       }
 
+      // 解析成功但能力不完整的（目前只有 3DGS），在花力气建几何之前先决定处置
+      this._noteDegradations(tile);
+
       const build = await this._builder();
       const buildRes = await build(tile, {
         textureCache: this.textureCache,
         uniforms: this._uniforms,
         assembled,
+        polygonOffset: this._polygonOffset,
       });
       const { group, stats } = buildRes;
       const texKeys = (buildRes as any).textureKeys ?? (group.userData?.textureKeys as string[] | undefined) ?? Object.keys(tile.textures ?? {});
@@ -1130,6 +1183,8 @@ export class S3MTileset {
         childUrls,
         parentUrl: this._parentOf.get(url),
         state: 'ready',
+        ...(stats.splatSigma ? { splatSigma: stats.splatSigma } : {}),
+        ...(stats.splatCount ? { splatCount: stats.splatCount } : {}),
         stats: {
           meshes: stats.meshes ?? 0,
           vertices: stats.vertices ?? 0,
@@ -1242,7 +1297,29 @@ export class S3MTileset {
       const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
       // 加入 8% 迟滞区间（Hysteresis Band），防止相机在 LOD 临界距离处发生父子瓦片逐帧来回横跳闪烁
       const hFactor = node.needRefine ? (byDistance ? 1.08 : 0.92) : 1.0;
-      const needRefine = childUrls.length > 0 && (byDistance ? metric < threshold * hFactor : metric > threshold * hFactor);
+
+      // 泼溅 / 点云瓦片走另一套判据：每层 σ 是同一个物理量、只有点数在涨，包围球
+      // 像素误差对它没有含义 —— 按上面那套算，metric 在任何距离都远大于阈值，等于
+      // 「永远细化到叶子」。
+      // 判据换成**屏幕上的高斯尺寸**（3σ 超过 SPLAT_REFINE_PX 就细化），见 core/SplatLod.ts。
+      // 别用覆盖率：主体那块根瓦片 32 万高斯、σ=13.5cm，覆盖率一上来就是 51，
+      // 当场停止细化，最后只画了总量 2.3% 的高斯 —— 柱子就是这么被糊掉的。
+      const splat =
+        node.splatSigma && node.sphere
+          ? splatLodDecision({
+              splats: node.splatCount ?? node.stats?.vertices ?? 0,
+              radius: node.sphere.radius,
+              distance: dist,
+              sigma: node.splatSigma,
+              screenHeight,
+              hasChild: childUrls.length > 0,
+            })
+          : null;
+
+      const needRefine = splat
+        ? splat.needRefine
+        : childUrls.length > 0 &&
+          (byDistance ? metric < threshold * hFactor : metric > threshold * hFactor);
       node.needRefine = needRefine;
 
       const dbgSeen = ((globalThis as { __S3M_LOD_SEEN?: Set<string> }).__S3M_LOD_SEEN ??= new Set<string>());

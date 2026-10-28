@@ -32,6 +32,12 @@ export interface DecodedTextureData {
    */
   blocks?: Uint8Array;
   blockFormat?: 'dxt1' | 'dxt5';
+  /**
+   * 数据自带的 DXT 内联 mip 链（S3M 纹理的 data 常是 level0 + 完整链，`tex.level`
+   * 记录层数）。官方 iClient3D 把整条链逐层上传，远处采样高层级平均成纯色。
+   * 与 blocks 同时存在；渲染层用它构造多层 CompressedTexture。
+   */
+  mipmaps?: { data: Uint8Array; width: number; height: number }[];
   /** CRN 转码失败时的原始错误（渲染层负责打 warn） */
   error?: string;
 }
@@ -195,6 +201,33 @@ export function expectedDxtByteLength(width: number, height: number, format: 'dx
   return bw * bh * (format === 'dxt1' ? 8 : 16);
 }
 
+/**
+ * 切 DXT 内联 mip 链：`data` = level0 + 逐层减半直到 1×1，每层 ceil(w/4)*ceil(h/4)*blockBytes。
+ * 切不出与总字节数严丝合缝的链（不是链 / 格式对不上）返回 null，调用方回退。
+ */
+export function sliceDxtMipChain(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  blockBytes: number
+): { data: Uint8Array; width: number; height: number }[] | null {
+  const levels: { data: Uint8Array; width: number; height: number }[] = [];
+  let w = width;
+  let h = height;
+  let off = 0;
+  for (;;) {
+    const bytes = Math.ceil(w / 4) * Math.ceil(h / 4) * blockBytes;
+    if (off + bytes > data.byteLength) return null;
+    levels.push({ data: data.subarray(off, off + bytes), width: w, height: h });
+    off += bytes;
+    if (w === 1 && h === 1) break;
+    w = Math.max(1, w >> 1);
+    h = Math.max(1, h >> 1);
+  }
+  if (off !== data.byteLength) return null;
+  return levels;
+}
+
 /** 主线程 / Worker 共用的解码入口。不抛错：失败与不支持都体现在返回值里 */
 export async function decodeTextureData(
   tex: S3MTexture,
@@ -229,6 +262,7 @@ async function decodeTextureDataRaw(
   /** 块数据字节数与 4×4 对齐公式一致才允许直传，否则回退解码 */
   const compressible = (data: Uint8Array, w: number, h: number, format: 'dxt1' | 'dxt5'): boolean =>
     data.byteLength === expectedDxtByteLength(w, h, format);
+
 
   if (kind === 'crn') {
     try {
@@ -279,17 +313,35 @@ async function decodeTextureDataRaw(
   if (kind === 'dxt1' || kind === 'dxt3' || kind === 'dxt4' || kind === 'dxt5') {
     const pf = dxtPixelFormatOf(kind);
     // dxt3/dxt4 少见，不进直传白名单；块长与 4×4 对齐公式不符的也回退解码
-    if (canCompress && (kind === 'dxt1' || kind === 'dxt5') && compressible(tex.data, tex.width, tex.height, kind)) {
-      return {
-        kind: `${kind}(c)`,
-        width: tex.width,
-        height: tex.height,
-        rgba: null,
-        bitmap: null,
-        hasAlpha: kind === 'dxt5',
-        blocks: tex.data,
-        blockFormat: kind,
-      };
+    if (canCompress && (kind === 'dxt1' || kind === 'dxt5')) {
+      const level0Bytes = expectedDxtByteLength(tex.width, tex.height, kind);
+      if (tex.data.byteLength === level0Bytes && compressible(tex.data, tex.width, tex.height, kind)) {
+        return {
+          kind: `${kind}(c)`,
+          width: tex.width,
+          height: tex.height,
+          rgba: null,
+          bitmap: null,
+          hasAlpha: kind === 'dxt5',
+          blocks: tex.data,
+          blockFormat: kind,
+        };
+      }
+      // 带内联 mip 链：整条切出来逐层上传（官方同款）。切不齐（字节不吻合）再回退解码
+      const chain = sliceDxtMipChain(tex.data, tex.width, tex.height, kind === 'dxt1' ? 8 : 16);
+      if (chain && chain.length > 1) {
+        return {
+          kind: `${kind}(chain)`,
+          width: tex.width,
+          height: tex.height,
+          rgba: null,
+          bitmap: null,
+          hasAlpha: kind === 'dxt5',
+          blocks: tex.data,
+          blockFormat: kind,
+          mipmaps: chain,
+        };
+      }
     }
     const decoded = decodeDXT({ ...tex, pixelFormat: pf });
     return { kind, width: tex.width, height: tex.height, rgba: decoded.rgba, bitmap: null, hasAlpha: decoded.hasAlpha };

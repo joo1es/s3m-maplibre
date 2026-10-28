@@ -11,6 +11,7 @@ import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import type { Anchor } from '../core/types.js';
+import type { UnsupportedPolicy } from '../core/degradations.js';
 import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 
 export type DatasetAlignment = 'origin' | 'bottom' | 'top' | 'center';
@@ -38,6 +39,8 @@ export interface S3MDatasetOptions {
   heightOffset?: number;
   /** 是否用 Web Worker 解析经典 .s3mb 瓦片（默认开，崩溃自动降级主线程），见 S3MTilesetOptions.useWorker */
   useWorker?: boolean;
+  /** 三角面材质深度偏移（共面摩尔纹 / 重合面归属），见 BuildTileOptions.polygonOffset */
+  polygonOffset?: { factor: number; units: number };
   /**
    * 是否对该数据集生成几何棱线（CPU 端 EdgesGeometry）。
    * - 不填：跟随全局 `style.edges`
@@ -49,6 +52,11 @@ export interface S3MDatasetOptions {
    * 适合多数据集走不同网关 / 不同 token 的场景。见 `AuthenticateFn`。
    */
   authenticate?: AuthenticateFn;
+  /**
+   * 本数据集遇到「解析得了但画不出该有的样子」时怎么办（默认 `'warn'`）。
+   * 目前只有 3DGS：按点渲染，做不出泼溅。见 `S3MTilesetOptions.unsupported`。
+   */
+  unsupported?: UnsupportedPolicy;
 }
 
 export interface S3MDatasetEntry {
@@ -211,8 +219,10 @@ export class DatasetManager {
       maxImageCache: ds.maxImageCache ?? maxImageCache,
       lodRangeScale: ds.lodRangeScale ?? defaultLodRangeScale,
       buildTile: buildTile ?? null,
+      polygonOffset: ds.polygonOffset,
       useWorker: ds.useWorker,
       authenticate: ds.authenticate ?? authenticate,
+      unsupported: ds.unsupported,
       uniforms: uniforms,
       onTile: (node) => {
         callbacks.onTile(node, entry);

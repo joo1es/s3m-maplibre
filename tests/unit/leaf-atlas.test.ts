@@ -159,6 +159,31 @@ describe('parseTexblockSegments：三种外层格式', () => {
     expect(segs[1]![0]!.id).toBe('s2');
   });
 
+  test('存储态条目（zip == unzip，无 zlib 包装）必须按原样读（3D-CBD-2 Tex_0_000 实测）', async () => {
+    // CBD 的 texblock pack 里，部分条目 payload 未压缩：zip == unzip，
+    // 内容直接就是图像记录。无条件 inflate 会把整包判成「无法识别的外层格式」。
+    const storedEntry = (name: string, record: Buffer): Buffer => {
+      const nameBuf = Buffer.from(name, 'utf8');
+      const head = Buffer.alloc(4 + nameBuf.length + 4 + 4);
+      let p = 0;
+      head.writeUInt32LE(nameBuf.length, p); p += 4;
+      nameBuf.copy(head, p); p += nameBuf.length;
+      head.writeUInt32LE(record.length, p); p += 4;
+      head.writeUInt32LE(record.length, p); // zip == unzip → 存储态
+      return Buffer.concat([head, record]);
+    };
+    const bytes = dynPackBytes([
+      containerBytes([entryBytes('14_-1.texblock', recBytes(14, 4, 4, 13, DXT5_RED_BLUE))]),
+      containerBytes([storedEntry('15_-1.texblock', recBytes(26, 4, 4, 13, DXT5_RED_BLUE))]),
+    ]);
+    const segs = await parseTexblockSegments(toArrayBuffer(bytes), { inflate: zlibInflate });
+    expect(segs.length).toBe(2);
+    expect(segs[0]![0]!.id).toBe('14_-1.texblock');
+    expect(segs[1]![0]!.id).toBe('15_-1.texblock');
+    expect(segs[1]![0]!.compressType).toBe(26);
+    expect(segs[1]![0]!.data.length).toBe(16);
+  });
+
   test('守卫：count≤256 的普通容器不得被误判成动态 pack（算术必须严丝合缝）', async () => {
     // 2 条目的容器 count=2 ≤256：若 dyn 判定贪婪，lens[0] = nameLen 会把名字字节当长度
     const bytes = containerBytes([

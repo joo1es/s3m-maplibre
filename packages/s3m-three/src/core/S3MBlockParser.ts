@@ -73,6 +73,8 @@ import { parseGroupNodeEntries, parseSkeletonEntries, parsePickInfoEntries } fro
 import { atlasAlphaMask, shrinkRectToOpaque } from './AtlasAlpha.js';
 import { packAtlases, decodeAtlasImage } from './AtlasPack.js';
 import type { PackedAtlases } from './AtlasPack.js';
+import { transcodeCRN } from './CRNDecode.js';
+import { resolveTextureKind, PixelFormat, TextureCompress } from './TextureFormat.js';
 
 /** 图集子区域，以及它绑定的几何顶点区间 */
 export interface S3MSubTextureBinding {
@@ -487,13 +489,35 @@ export async function parseTexblockSegments(
 ): Promise<S3MBlockAtlasImage[][]> {
   const inflate = options.inflate ?? defaultInflate;
   const bytes = new Uint8Array(arrayBuffer);
-  const dyn = await tryDynPack(bytes, inflate);
-  if (dyn) return dyn;
-  const stat = await tryStaticPack(bytes, inflate);
-  if (stat) return stat;
-  const container = await readContainerEntries(bytes, inflate);
-  if (container) return [container];
-  throw new Error('[s3m] .texblock 无法识别的外层格式（动态 pack / 静态 pack / 容器均不成立）');
+  let segments: S3MBlockAtlasImage[][] | null = await tryDynPack(bytes, inflate);
+  if (!segments) segments = await tryStaticPack(bytes, inflate);
+  if (!segments) {
+    const container = await readContainerEntries(bytes, inflate);
+    if (container) segments = [container];
+  }
+  if (!segments) {
+    throw new Error('[s3m] .texblock 无法识别的外层格式（动态 pack / 静态 pack / 容器均不成立）');
+  }
+  // 3D-CBD-2 的 texblock 图像是 CRN 压缩（ct=26/27，'Hx' 魔数）。leaf 组合管线
+  // （composeLeafAtlas → decodeAtlasImage）只认 DXT / 已解 RGBA，这里统一在解析层
+  // 转码成 DXT：与主纹理解码的 crn->dxt 路径同一份 crunch wasm。
+  // 转码失败的记录原样保留（下游按缺失精灵处理并计数，不静默吞）。
+  for (const seg of segments) {
+    for (const rec of seg) {
+      if (resolveTextureKind(rec.compressType, rec.pixelFormat) !== 'crn') continue;
+      try {
+        const crn = await transcodeCRN(rec.data);
+        rec.data = crn.data;
+        rec.width = crn.width;
+        rec.height = crn.height;
+        rec.compressType = crn.dxtFormat === 1 ? TextureCompress.DXT1_RGBA : 14; // 14 = DXT5（见 TextureFormat 实测注释）
+        rec.pixelFormat = crn.dxtFormat === 1 ? PixelFormat.DXT1 : PixelFormat.DXT5;
+      } catch {
+        // 保留原记录，交给下游缺失统计
+      }
+    }
+  }
+  return segments;
 }
 
 /** 解压后的裸图像记录区：`ct|w|h|pf|size|data` 可多条连排，尾部允许有无关字节 */
@@ -510,6 +534,27 @@ function readImageRecords(raw: Uint8Array, id: string): S3MBlockAtlasImage[] {
     out.push({ id, width, height, compressType, pixelFormat, data: t.bytesCopy(size) });
   }
   return out;
+}
+
+/**
+ * 条目负载解压。`zip == unzip` 是**存储态**（未压缩，内容直接就是图像记录区）：
+ * 3D-CBD-2 的 Tex_0_000.texblock 实测存在这种条目，无条件 inflate 会把整包
+ * 判成「无法识别的外层格式」。zlib 流必有 ~11 字节头尾开销，zip == unzip
+ * 不可能是有效 zlib，此判定安全。
+ */
+async function inflateEntryPayload(
+  payload: Uint8Array,
+  unzipSize: number,
+  zipSize: number,
+  inflate: InflateFn
+): Promise<Uint8Array | null> {
+  if (zipSize === unzipSize) return payload;
+  try {
+    const raw = await inflate(payload);
+    return raw.length === unzipSize ? raw : null;
+  } catch {
+    return null;
+  }
 }
 
 /** 读 `count | 条目 × count` 容器（尾部允许有无关字节）。结构不成立返回 null。 */
@@ -529,8 +574,8 @@ async function readContainerEntries(bytes: Uint8Array, inflate: InflateFn): Prom
       const unzipSize = r.u32();
       const zipSize = r.u32();
       if (zipSize > r.remaining) return null;
-      const raw = await inflate(r.bytesCopy(zipSize));
-      if (raw.length !== unzipSize) return null;
+      const raw = await inflateEntryPayload(r.bytesCopy(zipSize), unzipSize, zipSize, inflate);
+      if (!raw || raw.length !== unzipSize) return null;
       out.push(...readImageRecords(raw, name));
     }
     return out.length ? out : null;
@@ -552,8 +597,8 @@ async function readSingleEntry(bytes: Uint8Array, inflate: InflateFn): Promise<S
     const unzipSize = r.u32();
     const zipSize = r.u32();
     if (zipSize !== r.remaining) return null;
-    const raw = await inflate(r.bytesCopy(zipSize));
-    if (raw.length !== unzipSize) return null;
+    const raw = await inflateEntryPayload(r.bytesCopy(zipSize), unzipSize, zipSize, inflate);
+    if (!raw || raw.length !== unzipSize) return null;
     const recs = readImageRecords(raw, name);
     return recs.length ? recs : null;
   } catch {

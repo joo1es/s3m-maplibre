@@ -207,6 +207,17 @@ export interface S3MStyle {
    * 绕过光照夹角直接补偿表面暗部底色，让 TOP_SIDE / 自定义等模式下的背光阴影面保持通透、不至于过黑。
    */
   ambientGain?: number;
+  /**
+   * 金属度（0~1）。不传 = 保持数据/材质自身的值（实测 S3M 数据恒为 0）。
+   *
+   * 只对 pbr 光照模型有效（`materialQuality: 'lambert'` 时忽略）。
+   * ⚠️ 金属度越高，漫反射越少、几乎全靠环境反射成像：场景没有 `scene.environment`
+   * 时会明显发黑（只剩两盏平行光的高光点）。要用先把环境贴图挂上
+   * （`viewer.setEnvironment(url)` / `layer.setEnvironment(url)`）。
+   */
+  metalness?: number;
+  /** 粗糙度（0~1）。不传 = 保持数据自身的值（S3M 的 shininess 映射，常见 0.95） */
+  roughness?: number;
   /** 半透明时是否保持深度写入（默认 true，保持写入可彻底遮挡背面与内部棱线，避免背面透出） */
   depthWrite?: boolean;
   /**
@@ -283,6 +294,26 @@ export function getMaterialQuality(): MaterialQuality {
   return materialQuality;
 }
 
+/**
+ * 颜色管线：
+ * - `'linear'`（默认）：纹理 sRGB 解码 → 线性 PBR 光照 → linear→sRGB 输出，three 的标准姿势；
+ * - `'direct'`：官方 iClient3D 的做法 —— 字节值不解码、sRGB 数值空间直乘 Lambert
+ *   （0.8·NdotL + 0.7）、输出前抵消 renderer 的 OETF。与 `setSrgbTextureDecode(false)`
+ *   配套使用，`lightingPreset: 'supermap'` 会同时打开两者。
+ *
+ * 与 materialQuality 同一套全局约定：只影响之后创建的材质，已加载瓦片要重载才换。
+ */
+export type ColorPipeline = 'linear' | 'direct';
+let colorPipeline: ColorPipeline = 'linear';
+
+export function setColorPipeline(p: ColorPipeline): void {
+  colorPipeline = p === 'direct' ? 'direct' : 'linear';
+}
+
+export function getColorPipeline(): ColorPipeline {
+  return colorPipeline;
+}
+
 export type StyledMaterial = (THREE.MeshStandardMaterial | THREE.MeshLambertMaterial) & {
   userData: {
     uSelBatch: { value: number };
@@ -315,6 +346,8 @@ DUMMY_BATCH_TEX.needsUpdate = true;
 export function createSharedUniforms(): StyleUniforms {
   return {
     uMode: { value: STYLE.TEXTURE },
+    /** 主光世界方向（direct 管线的官方 Lambert 用；headlamp/fixed 都随 _updateLights 更新） */
+    uSunDirection: { value: new THREE.Vector3(0.5, 0.5, 0.7071).normalize() },
     uColorA: { value: new THREE.Color('#dfe6ee') },
     uColorB: { value: new THREE.Color('#1d4ed8') },
     uColorC: { value: new THREE.Color('#fbbf24') },
@@ -350,6 +383,10 @@ export function createSharedUniforms(): StyleUniforms {
     uTexMix: { value: 0 },
     /** 基础底色增益 / 暗部补偿（0~1，默认 0.0） */
     uAmbientGain: { value: 0 },
+    /** 金属度覆盖（<0 = 不覆盖，用材质自身的值） */
+    uMetalness: { value: -1 },
+    /** 粗糙度覆盖（<0 = 不覆盖，用材质自身的值） */
+    uRoughness: { value: -1 },
     /** 双纹理交叉淡化插值系数（0 = 纯 uBatchTex, 1 = 纯 uBatchTex2） */
     uBatchMix: { value: 0 },
     /** GPU 路径数据采样纹理 */
@@ -385,7 +422,8 @@ export function createSharedUniforms(): StyleUniforms {
 }
 const VERT_PARS = /* glsl */ `
   attribute float aBatchId;
-  attribute vec3 aColor;
+  // vec4：alpha 是「材质不透明、顶点半透明」这类数据的唯一透明度来源（官方 baseColorWithAlpha = vColor）
+  attribute vec4 aColor;
   #ifdef S3M_ATLAS
     attribute vec4 aAtlasRect;
     #ifdef S3M_ATLAS_SEC
@@ -400,6 +438,15 @@ const VERT_PARS = /* glsl */ `
   #ifdef USE_INSTANCING
     attribute float aInstanceBatchId;
   #endif
+  // uv 第三分量：官方 aTextureCoordMatrix，决定该顶点采不采样纹理 / 用图集哪一块。
+  // 解码必须在**顶点着色器**做：z 的量级是 65536~327680，片元里若落到 mediump（fp16
+  // 上限 65504）会直接溢出成 inf，官方也是在 VS 解完再用 varying 传。
+  #ifdef S3M_TEXCOORD_Z
+    attribute float aTexCoordZ;
+    varying vec4 vTexMatrix;          // x=xTran  y=yTran  z=scale  w=log2(scale*texWidth)
+    varying float vTexCoordTransform; // 原始 z，-90000 以下表示不采样
+    uniform vec2 uAtlasDim;           // 与片元共用：纹理像素尺寸
+  #endif
   uniform float uSelBatch;
   uniform float uSelWhole;
   uniform float uSelElevation;
@@ -413,7 +460,7 @@ const VERT_PARS = /* glsl */ `
   uniform float uPathTime;
   uniform int uPathTexActive;
   varying float vBatchId;
-  varying vec3 vVertColor;
+  varying vec4 vVertColor;
   varying float vWorldZ;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
@@ -443,29 +490,37 @@ const VERT_PARS = /* glsl */ `
 
   vec4 s3mSampleBatchRow0( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
     vec4 vA = texture2D( texA, uv );
-    if ( mixVal <= 0.0001 ) return vA;
-    vec4 vB = texture2D( texB, uv );
-    vec4 res = mix( vA, vB, mixVal );
-    if ( vA.r < 0.0 && vB.r >= 0.0 ) {
-      res.rgb = vB.rgb;
-    } else if ( vA.r >= 0.0 && vB.r < 0.0 ) {
-      res.rgb = vA.rgb;
-    }
-    if ( vA.a < -0.5 || vB.a < -0.5 ) {
-      res.a = ( mixVal >= 0.5 ) ? vB.a : vA.a;
+    vec4 res;
+    if ( mixVal <= 0.0001 ) {
+      res = vA;
+    } else {
+      vec4 vB = texture2D( texB, uv );
+      res = mix( vA, vB, mixVal );
+      if ( vA.r < 0.0 && vB.r >= 0.0 ) {
+        res.rgb = vB.rgb;
+      } else if ( vA.r >= 0.0 && vB.r < 0.0 ) {
+        res.rgb = vA.rgb;
+      }
+      if ( vA.a < -0.5 || vB.a < -0.5 ) {
+        res.a = ( mixVal >= 0.5 ) ? vB.a : vA.a;
+      }
     }
     return res;
   }
 
   vec4 s3mSampleBatchRow1( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
     vec4 vA = texture2D( texA, uv );
-    if ( mixVal <= 0.0001 ) return vA;
-    vec4 vB = texture2D( texB, uv );
-    vec4 res = mix( vA, vB, mixVal );
-    if ( vA.a == 0.0 && vB.a > 0.0 ) {
-      res.a = mix( 1.0, vB.a, mixVal );
-    } else if ( vA.a > 0.0 && vB.a == 0.0 ) {
-      res.a = mix( vA.a, 1.0, mixVal );
+    vec4 res;
+    if ( mixVal <= 0.0001 ) {
+      res = vA;
+    } else {
+      vec4 vB = texture2D( texB, uv );
+      res = mix( vA, vB, mixVal );
+      if ( vA.a == 0.0 && vB.a > 0.0 ) {
+        res.a = mix( 1.0, vB.a, mixVal );
+      } else if ( vA.a > 0.0 && vB.a == 0.0 ) {
+        res.a = mix( vA.a, 1.0, mixVal );
+      }
     }
     return res;
   }
@@ -569,6 +624,31 @@ const VERT_WORLD = /* glsl */ `
   vWorldPos = s3mWorld.xyz;
   vBatchId = s3mBatchRaw();
   vVertColor = aColor;
+  #ifdef S3M_TEXCOORD_Z
+    // 官方 S3MTilesVS.js:192-198（getTextureMatrixFromZValue）+ bundle getTextureColor
+    // 的三档哨兵，档位编码在 vTexMatrix.z 的符号上：
+    //   -2 → 白（z < -99900 档：官方 texCoordZ < -99900 返回 vec4(1.0)，平涂顶点色面）
+    //   -1 → 平铺（-99900 ≤ z < -9000：uv 原样采样）
+    //   >0 → 图集子区域公式
+    vTexCoordTransform = aTexCoordZ;
+    vTexMatrix = vec4( 0.0, 0.0, 1.0, 0.0 );
+    if ( vTexCoordTransform < -99900.0 ) {
+      vTexMatrix.z = -2.0;
+    } else if ( vTexCoordTransform < -9000.0 ) {
+      vTexMatrix.z = -1.0;
+    } else {
+      float s3mNz = floor( vTexCoordTransform );
+      if ( s3mNz > 0.0 ) {
+        float nDel8 = floor( s3mNz / 256.0 );
+        float nDel16 = floor( nDel8 / 256.0 );
+        float nDel20 = floor( nDel16 / 16.0 );
+        vTexMatrix.x = nDel8 - nDel16 * 256.0;
+        vTexMatrix.y = s3mNz - nDel8 * 256.0;
+        vTexMatrix.z = 1.0 / pow( 2.0, nDel16 - nDel20 * 16.0 );
+      }
+    }
+    vTexMatrix.w = vTexMatrix.z > 0.0 ? log2( uAtlasDim.x * vTexMatrix.z ) : 0.0;
+  #endif
 
   #ifdef S3M_ATLAS
     vAtlasRect = aAtlasRect;
@@ -590,31 +670,85 @@ const VERT_WORLD = /* glsl */ `
 `;
 
 const FRAG_PARS = /* glsl */ `
+  // 纹理像素尺寸：图集分支用它把 rect 换算成像素宽，uv-z 分支用它算 uv 周期。
+  // 两个分支都需要，所以无条件声明（值恒为 map 的实际像素尺寸）。
+  uniform vec2 uAtlasDim;
+
+  /**
+   * 官方 CalculateMipLevel（vec2 版），逐字照抄 iClient3D 12.1.1。
+   * 用**未 fract** 的 uv 求屏幕空间导数 —— 先 fract 再求导会在平铺接缝处炸出
+   * 一个巨大导数，GPU 直接把整块砖采成最糊的 mip，表现为每块砖边缘一条暗线。
+   */
+  void s3mMipLevel( vec2 uv, vec2 texSize, float maxMip, out float mip ) {
+    vec2 dx = dFdx( uv * texSize.x );
+    vec2 dy = dFdy( uv * texSize.y );
+    float dotX = dot( dx, dx );
+    float dotY = dot( dy, dy );
+    float dMax = max( dotX, dotY );
+    float dMin = min( dotX, dotY );
+    float off = clamp( ( dMax - dMin ) / max( dMax + dMin, 1e-8 ), 0.0, 1.0 );
+    float d = dMax * ( 1.0 - off ) + dMin * off;
+    mip = clamp( 0.5 * log2( max( d, 1e-8 ) ), 0.0, maxMip - 1.62 );
+  }
+
+  #ifdef S3M_TEXCOORD_Z
+    // 矩阵在顶点着色器解好（vTexMatrix），这里只做 mip 收缩 + 采样。
+    varying vec4 vTexMatrix;
+
+    /**
+     * 官方 S3MTilesFS.js 的 getTextureColor → getTexColorForS3M → calculateTexCoord
+     * 逐行移植，数学等价物见 core/TexCoordZ.ts（单测钉住两边一致）：
+     *
+     *   vTexMatrix.z < 0        → 不采样，返回白（官方 if ( vTexMatrix.z < 0.0 )）
+     *   fTile = scale * texWidth
+     *   inner = 2^mip / fTile;  f = clamp( fract(uv), inner, 1 - inner )
+     *   out   = ( f + T ) * scale
+     *
+     * ★ 采样必须用**显式 LOD**（官方 textureLod / texture2DLodEXT）。
+     *   交给硬件自动求导时，导数从 (fract(uv)+T)*scale 上取，而 fract 每个周期
+     *   都有一次跳变，接缝像素的导数会炸掉 → GPU 采到最糊的 mip，画面上每隔一个
+     *   周期就出现一条暗带 / 摩尔纹。近处周期密，这些带子最明显。
+     */
+    vec4 s3mTexCoordZUnit( vec2 uv, vec4 m, sampler2D tex, float texWidth ) {
+      // 官方 bundle getTextureColor 三档语义（逐行核对 SuperMap3D.js）：
+      //   texCoordZ < -99900 → vec4(1.0) 纯白，不采样（平涂顶点色面，如 SMID 3464）
+      //   texCoordZ < -9000  → uv 原样平铺（自动 mip 平均成贴图色）
+      //   其余               → 图集子区域公式
+      // 之前误读成「-99999 也平铺」，3464 的米制 uv 就把整张纹理平铺上百次 = 「uv 整图」。
+      // 单出口结构：ANGLE 把返回值翻译成 out 参数，函数内提前 return
+      // 会让 D3D 编译器报 X4000「use of potentially uninitialized variable」。
+      vec4 s3mResult;
+      if ( m.z < -1.5 ) {
+        s3mResult = vec4( 1.0 );
+      } else if ( m.z < 0.0 ) {
+        s3mResult = texture2D( tex, uv );
+      } else {
+        float fTile = max( m.z * texWidth, 1.0 );
+        float mip = 0.0;
+        s3mMipLevel( uv, vec2( fTile ), m.w, mip );
+
+        vec2 f = fract( uv );
+        float inner = pow( 2.0, mip ) / fTile;
+        f = clamp( f, vec2( inner ), vec2( 1.0 - inner ) );
+        vec2 c = ( f + m.xy ) * m.z;
+
+        #if __VERSION__ >= 300
+          s3mResult = textureLod( tex, c, mip );
+        #else
+          s3mResult = texture2D( tex, c );
+        #endif
+      }
+      return s3mResult;
+    }
+  #endif
   #ifdef S3M_ATLAS
     varying vec4 vAtlasRect;
-    uniform vec2 uAtlasDim;
     #ifdef S3M_ATLAS_SEC
       uniform sampler2D uSecMap;
       uniform vec2 uAtlasDim1;
       varying vec2 vSecUv;
       varying vec4 vSecRect;
     #endif
-    /**
-     * 官方 CalculateMipLevel（vec2 版），逐字照抄 iClient3D 12.1.1。
-     * 用**未 fract** 的 uv 求屏幕空间导数 —— 先 fract 再求导会在平铺接缝处炸出
-     * 一个巨大导数，GPU 直接把整块砖采成最糊的 mip，表现为每块砖边缘一条暗线。
-     */
-    void s3mMipLevel( vec2 uv, vec2 texSize, float maxMip, out float mip ) {
-      vec2 dx = dFdx( uv * texSize.x );
-      vec2 dy = dFdy( uv * texSize.y );
-      float dotX = dot( dx, dx );
-      float dotY = dot( dy, dy );
-      float dMax = max( dotX, dotY );
-      float dMin = min( dotX, dotY );
-      float off = clamp( ( dMax - dMin ) / max( dMax + dMin, 1e-8 ), 0.0, 1.0 );
-      float d = dMax * ( 1.0 - off ) + dMin * off;
-      mip = clamp( 0.5 * log2( max( d, 1e-8 ) ), 0.0, maxMip - 1.62 );
-    }
 
     /**
      * 按指定 mip 档采样子区域（官方 czm_getTexColorForS3M 的内层循环体）。
@@ -646,17 +780,22 @@ const FRAG_PARS = /* glsl */ `
      * 因为内联金字塔只有 2 的整数次幂，中间档必须靠混合。
      */
     vec4 s3mAtlasUnit( vec2 uv, vec4 rect, vec2 atlasDim, sampler2D tex ) {
-      // 退化矩形 = 官方 batchId < 0：该纹理单元不参与合成
-      if ( rect.z <= 0.0 || rect.w <= 0.0 ) return vec4( 1.0 );
-      vec2 dimPx = vec2( rect.z * atlasDim.x, rect.w * atlasDim.y );
-      vec2 texSize = vec2( dimPx.x * ( 2.0 / 3.0 ), dimPx.y );
-      float maxMip = log2( max( min( texSize.x, texSize.y ), 1.0 ) );
-      vec2 scale = texSize / atlasDim;
-      float mip = 0.0;
-      s3mMipLevel( uv, texSize, maxMip, mip );
-      vec4 hi = s3mAtlasLod( uv, rect.xy, scale, texSize, tex, ceil( mip ) );
-      vec4 lo = s3mAtlasLod( uv, rect.xy, scale, texSize, tex, floor( mip ) );
-      return hi * 0.5 + lo * 0.5;
+      // 退化矩形 = 官方 batchId < 0：该纹理单元不参与合成（单出口，同 X4000 规避）
+      vec4 s3mResult;
+      if ( rect.z <= 0.0 || rect.w <= 0.0 ) {
+        s3mResult = vec4( 1.0 );
+      } else {
+        vec2 dimPx = vec2( rect.z * atlasDim.x, rect.w * atlasDim.y );
+        vec2 texSize = vec2( dimPx.x * ( 2.0 / 3.0 ), dimPx.y );
+        float maxMip = log2( max( min( texSize.x, texSize.y ), 1.0 ) );
+        vec2 scale = texSize / atlasDim;
+        float mip = 0.0;
+        s3mMipLevel( uv, texSize, maxMip, mip );
+        vec4 hi = s3mAtlasLod( uv, rect.xy, scale, texSize, tex, ceil( mip ) );
+        vec4 lo = s3mAtlasLod( uv, rect.xy, scale, texSize, tex, floor( mip ) );
+        s3mResult = hi * 0.5 + lo * 0.5;
+      }
+      return s3mResult;
     }
   #endif
   uniform int uMode;
@@ -687,11 +826,13 @@ const FRAG_PARS = /* glsl */ `
   uniform float uRoofThreshold;
   uniform float uTexMix;
   uniform float uAmbientGain;
+  uniform float uMetalness;
+  uniform float uRoughness;
   uniform float uOpacity;
   uniform float uTileFade;
   uniform float uFade;
   varying float vBatchId;
-  varying vec3 vVertColor;
+  varying vec4 vVertColor;
   varying float vWorldZ;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
@@ -700,29 +841,37 @@ const FRAG_PARS = /* glsl */ `
 
   vec4 s3mSampleBatchRow0( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
     vec4 vA = texture2D( texA, uv );
-    if ( mixVal <= 0.0001 ) return vA;
-    vec4 vB = texture2D( texB, uv );
-    vec4 res = mix( vA, vB, mixVal );
-    if ( vA.r < 0.0 && vB.r >= 0.0 ) {
-      res.rgb = vB.rgb;
-    } else if ( vA.r >= 0.0 && vB.r < 0.0 ) {
-      res.rgb = vA.rgb;
-    }
-    if ( vA.a < -0.5 || vB.a < -0.5 ) {
-      res.a = ( mixVal >= 0.5 ) ? vB.a : vA.a;
+    vec4 res;
+    if ( mixVal <= 0.0001 ) {
+      res = vA;
+    } else {
+      vec4 vB = texture2D( texB, uv );
+      res = mix( vA, vB, mixVal );
+      if ( vA.r < 0.0 && vB.r >= 0.0 ) {
+        res.rgb = vB.rgb;
+      } else if ( vA.r >= 0.0 && vB.r < 0.0 ) {
+        res.rgb = vA.rgb;
+      }
+      if ( vA.a < -0.5 || vB.a < -0.5 ) {
+        res.a = ( mixVal >= 0.5 ) ? vB.a : vA.a;
+      }
     }
     return res;
   }
 
   vec4 s3mSampleBatchRow1( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
     vec4 vA = texture2D( texA, uv );
-    if ( mixVal <= 0.0001 ) return vA;
-    vec4 vB = texture2D( texB, uv );
-    vec4 res = mix( vA, vB, mixVal );
-    if ( vA.a == 0.0 && vB.a > 0.0 ) {
-      res.a = mix( 1.0, vB.a, mixVal );
-    } else if ( vA.a > 0.0 && vB.a == 0.0 ) {
-      res.a = mix( vA.a, 1.0, mixVal );
+    vec4 res;
+    if ( mixVal <= 0.0001 ) {
+      res = vA;
+    } else {
+      vec4 vB = texture2D( texB, uv );
+      res = mix( vA, vB, mixVal );
+      if ( vA.a == 0.0 && vB.a > 0.0 ) {
+        res.a = mix( 1.0, vB.a, mixVal );
+      } else if ( vA.a > 0.0 && vB.a == 0.0 ) {
+        res.a = mix( vA.a, 1.0, mixVal );
+      }
     }
     return res;
   }
@@ -762,6 +911,10 @@ const FRAG_COLOR = /* glsl */ `
   vec3 s3mBase = diffuseColor.rgb;   // 已含 diffuse × map
   // 图层整体透明度（共享 uniform）+ 单瓦片淡入系数（逐材质），逐帧改都不产生重编译
   diffuseColor.a *= uOpacity * uTileFade;
+  // 顶点色 alpha：官方 outColor = baseColorWithAlpha * uDiffuseColor，alpha 走的就是这条路。
+  // 实测 3D-BIMbuilding-2 / SMID 4421 的材质无纹理、diffuse.a = 1，透明度只存在于
+  // 顶点色 alpha（u8 63/255 ≈ 0.247）。不乘进来，这一片就是实心色。
+  diffuseColor.a *= vVertColor.a;
   // 所有按单体取值（配色 / 状态纹理 / 选中判定）都走取整后的 id，避免插值噪声
   float s3mBid = s3mBatchId();
 
@@ -773,7 +926,7 @@ const FRAG_COLOR = /* glsl */ `
     diffuseColor.rgb = uColorA;
   } else if ( uMode == 1 ) {
     // 原色：贴图 × 顶点色
-    diffuseColor.rgb = s3mBase * vVertColor;
+    diffuseColor.rgb = s3mBase * vVertColor.rgb;
   } else if ( uMode == 2 ) {
     diffuseColor.rgb = uColorA;
   } else if ( uMode == 3 ) {
@@ -808,7 +961,7 @@ const FRAG_COLOR = /* glsl */ `
 
   // 叠加在原色贴图上：保留窗框、玻璃幕墙、材质纹理与顶点色
   if ( uMode != 1 && uTexMix > 0.001 ) {
-    vec3 origTex = s3mBase * vVertColor;
+    vec3 origTex = s3mBase * vVertColor.rgb;
     vec3 overlay = origTex * diffuseColor.rgb * 1.35;
     diffuseColor.rgb = mix( diffuseColor.rgb, overlay, uTexMix );
   }
@@ -870,6 +1023,36 @@ const FRAG_COLOR = /* glsl */ `
   diffuseColor.rgb *= uFade;
 `;
 
+/**
+ * direct 管线（lightingPreset: 'supermap' 完整版）的着色器片段。
+ *
+ * 官方整条管线（S3MTilesFS.js）：贴图字节值不解码 → sRGB 数值空间直乘
+ * Lambert（Sun 0.8 / Ambient 0.7，无高光无 tonemap）→ 直出。
+ * 我们保留 three 的 sRGB 输出 OETF（不动共享 renderer，底图不受影响），
+ * 在片元末尾把颜色先压回 linear，OETF 再把它还原成官方直乘的原始数值。
+ */
+const FRAG_DIRECT_PARS = /* glsl */ `
+  #ifdef S3M_DIRECT_COLOR
+    uniform vec3 uSunDirection;
+
+    // 精确 sRGB EOTF 逆（与 renderer 输出端的 OETF 互逆），不是 pow 2.2 近似
+    vec3 s3mSRGBToLinear( vec3 c ) {
+      return mix( c / 12.92, pow( ( c + 0.055 ) / 1.055, vec3( 2.4 ) ), step( vec3( 0.04045 ), c ) );
+    }
+  #endif
+`;
+
+const FRAG_DIRECT_MAIN = /* glsl */ `
+  #ifdef S3M_DIRECT_COLOR
+    // 官方 S3MTilesFS.js:255-263：uDiffuseColor.rgb * (SunLightColor * NdotL + AmbientLightColor)
+    // Sun=0.8、Ambient=0.7；uAmbientColor 数据里恒为 (1,1,1)，并入常数
+    float s3mNL = max( dot( s3mNorm, normalize( uSunDirection ) ), 0.0 );
+    vec3 s3mDirectOut = diffuseColor.rgb * ( 0.8 * s3mNL + vec3( 0.7 ) );
+    s3mDirectOut = s3mSRGBToLinear( max( s3mDirectOut, vec3( 0.0 ) ) );
+    outgoingLight = s3mDirectOut;
+  #endif
+`;
+
 const FRAG_EMISSIVE = /* glsl */ `
   float s3mSelE = max( step( 0.0, uSelBatch ) * step( abs( s3mBatchId() - uSelBatch ), 0.5 ), uSelWhole );
   // glowOnly 模式下表面不自发光，只保留描边边框；其他模式下适度发光
@@ -909,6 +1092,17 @@ export interface StyledMaterialOptions {
   alphaTest?: number;
   /** 贴图为 S3MBLOCK 图集：几何需带 aAtlasRect，平铺改由片元按子区域做 */
   atlas?: boolean;
+  /**
+   * 几何带 uv 第三分量（`aTexCoordZ`，来自文件里的 `custom0`）。
+   *
+   * 官方 iClient3D 用它决定采样方式：`z < -9000` 时 uv 原样平铺整图（非白）
+   * `vec4(1.0)`（纯色），否则把 uv 按 `czm_getTextureMatrixFromZValue` 解出的
+   * 平移/缩放送进图集子区域。BIM / OSGB 转出来的数据大量依赖它——忽略就会把
+   * 本该纯色的墙面贴上整张材质图并高频重复。
+   *
+   * 不传 = 与改动前完全一致（走 three 原生的 `texture2D( map, vMapUv )`）。
+   */
+  texCoordZ?: boolean;
   /** 图集材质的第二套纹理（官方 BakeTex，光照烘焙），与 base 相乘 */
   secMap?: THREE.Texture | null;
 }
@@ -936,6 +1130,24 @@ const FRAG_NORMAL = /* glsl */ `
     #endif
     normal = s3mFlatN;
   }
+`;
+
+/**
+ * 金属度 / 粗糙度覆盖。
+ *
+ * 注入点必须是 `#include <metalnessmap_fragment>` 之后 —— 两个 chunk 各自
+ * `float roughnessFactor = roughness;` / `float metalnessFactor = metalness;`，
+ * 之前引用会「变量未声明」，之后就落在 `lights_physical_fragment` 之前，
+ * 改完立刻参与 GGX 计算。
+ *
+ * 用共享 uniform 而不是改 `material.metalness`：材质是一 mesh 一份，逐 mesh 改是
+ * O(meshes)；uniform 改一次全场景生效，也能走样式动画插值。
+ *
+ * 注意：`lambert` 光照模型里没有这两个 include，注入是 no-op，金属度自然无效。
+ */
+const FRAG_SURFACE = /* glsl */ `
+  if ( uMetalness >= 0.0 ) metalnessFactor = clamp( uMetalness, 0.0, 1.0 );
+  if ( uRoughness >= 0.0 ) roughnessFactor = clamp( uRoughness, 0.04, 1.0 );
 `;
 
 export function createStyledMaterial(opts: StyledMaterialOptions): StyledMaterial {
@@ -984,9 +1196,16 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
 
   // 图集材质：只有几何确实带了 aAtlasRect 才开这个宏，否则缺属性会采到 (0,0) 的默认值
   const atlas = !!opts.atlas && !!opts.map;
+  // uv 第三分量：同样要求几何真的带 aTexCoordZ，且没有贴图时没有意义。
+  // atlas 优先——S3MBLOCK 图集的 aAtlasRect 已经表达了子区域，两者不会同时出现。
+  const texCoordZ = !atlas && !!opts.texCoordZ && !!opts.map;
   const secMap = atlas ? (opts.secMap ?? null) : null;
   if (atlas) mat.defines = { ...(mat.defines as Record<string, string>), S3M_ATLAS: '' };
+  if (texCoordZ) mat.defines = { ...(mat.defines as Record<string, string>), S3M_TEXCOORD_Z: '' };
   if (secMap) mat.defines = { ...mat.defines, S3M_ATLAS_SEC: '' };
+  // supermap 完整版：官方 sRGB 直乘管线（配合 setSrgbTextureDecode(false)）
+  const direct = colorPipeline === 'direct';
+  if (direct) mat.defines = { ...mat.defines, S3M_DIRECT_COLOR: '' };
   // 官方 uTextureDim = (base宽, base高, bake宽, bake高)，取实际绑定纹理的像素尺寸
   const uAtlasDim = { value: new THREE.Vector2(opts.map?.image?.width || 1, opts.map?.image?.height || 1) };
   const uAtlasDim1 = { value: new THREE.Vector2(secMap?.image?.width || 1, secMap?.image?.height || 1) };
@@ -1002,6 +1221,8 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       uBatchTexActive,
       uTileFade,
       uSecMap: { value: secMap },
+      // direct 管线需要主光方向；没接共享 uniforms 时（单测/独立构建）给个默认值保证能编译
+      ...(direct ? { uSunDirection: uniforms?.uSunDirection ?? { value: new THREE.Vector3(0.5, 0.5, 0.7071).normalize() } } : {}),
       uAtlasDim,
       uAtlasDim1,
     });
@@ -1013,9 +1234,17 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       .replace('#include <worldpos_vertex>', VERT_WORLD);
 
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', `#include <common>\n${FRAG_PARS}`)
+      .replace('#include <common>', `#include <common>\n${FRAG_PARS}${direct ? FRAG_DIRECT_PARS : ''}`)
       .replace('#include <color_fragment>', `#include <color_fragment>\n${FRAG_COLOR}`)
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>\n${FRAG_EMISSIVE}`);
+    if (direct) {
+      // s3mNorm（FRAG_COLOR 里定义）之后、three 组装 outgoingLight 之前整体接管：
+      // PBR 的 specular / 环境项全被丢弃 —— 官方模型里 totalSpecularLight 恒为 0
+      shader.fragmentShader = shader.fragmentShader.replace(
+        '#include <opaque_fragment>',
+        `${FRAG_DIRECT_MAIN}\n#include <opaque_fragment>`
+      );
+    }
 
     if (atlas) {
       // onBeforeCompile 收到的还是未展开的 `#include <map_fragment>`，不是 include 里的
@@ -1030,6 +1259,16 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
         '#include <map_fragment>',
         `${atlasMapFragment}${secMap ? `\n${FRAG_BAKE}` : ''}`
       );
+    } else if (texCoordZ) {
+      // 普通 S3M + uv 第三分量：逐顶点决定「用不用贴图 / 用哪块子区域」。
+      // 官方就是这个分支让 BIM 的墙体保持纯色（custom0 = -99999 的顶点直接返回白），
+      // 而我们过去一律整张平铺，才会出现「一个面重复铺满整张 uv 贴片」。
+      const texCoordZFragment = /* glsl */ `
+        #ifdef USE_MAP
+          diffuseColor *= s3mTexCoordZUnit( vMapUv, vTexMatrix, map, uAtlasDim.x );
+        #endif
+      `;
+      shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', texCoordZFragment);
     } else if (secMap) {
       shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', `#include <map_fragment>\n${FRAG_BAKE}`);
     }
@@ -1039,12 +1278,19 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
       '#include <normal_fragment_begin>',
       `#include <normal_fragment_begin>\n${FRAG_NORMAL}`
     );
+
+    // 金属度 / 粗糙度覆盖：紧跟在 metalnessmap_fragment 之后
+    // （lambert 模板里没有这个 include，replace 会静默 no-op，符合预期）
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <metalnessmap_fragment>',
+      `#include <metalnessmap_fragment>\n${FRAG_SURFACE}`
+    );
   };
 
   // 不同材质共用同一段注入代码，必须让 three 认为它们的 program 可复用；
   // 但图集 / 烘焙两套宏会改注入结果，必须进 cacheKey，否则会复用错 program。
   mat.customProgramCacheKey = () =>
-    `s3m-styled${atlas ? '-atlas' : ''}${secMap ? '-bake' : ''}`;
+    `s3m-styled${atlas ? '-atlas' : ''}${texCoordZ ? '-texz' : ''}${secMap ? '-bake' : ''}${direct ? '-direct' : ''}`;
 
   mat.userData.uSelBatch = uSelBatch;
   mat.userData.uSelWhole = uSelWhole;
@@ -1067,6 +1313,30 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   mat.userData.s3mOpts = opts;
   mat.userData.isStyled = true;
   return mat;
+}
+
+/**
+ * 恢复材质的「基础」混合状态（淡入结束 / 清除单体淡化 / 全局透明度滑回 1 时调用）。
+ *
+ * 材质的最终透明 = **自身语义透明**（alphaMode blend / 顶点色 alpha < 1 / 水面，
+ * 创建时算好记在 `userData.s3mOpts.transparent`）|| 图层全局半透明。
+ *
+ * 以前各处恢复逻辑只看图层透明度（`transparent && !layerTransparent → false`），
+ * 会把自身就是透明的材质（如 3D-BIMbuilding-2 的 SMID 4421）误关成不透明——
+ * 症状是「刚进场景没透明度，切换材质质感重建后又有了」。
+ *
+ * depthWrite 跟随：自身 blend 材质保持创建时的 false；临时透明（淡入 / 全局淡出）
+ * 则尊重调用方的 keepDepthWrite（默认 true，保持深度写入防漏背面）。
+ */
+export function restoreBaseBlendState(
+  mat: THREE.Material,
+  layerTransparent: boolean,
+  keepDepthWrite = true
+): void {
+  const opts = (mat as StyledMaterial).userData?.s3mOpts as StyledMaterialOptions | undefined;
+  const baseTransparent = opts?.transparent === true;
+  mat.transparent = baseTransparent || layerTransparent;
+  mat.depthWrite = baseTransparent ? false : mat.transparent ? keepDepthWrite : true;
 }
 
 /* ------------------------------------------------------------------ 选中描边 */

@@ -32,6 +32,16 @@ export function setMaxAnisotropy(n: number, cap = Infinity): void {
 }
 
 /**
+ * 单独调各向异性上限（只影响之后创建的纹理）。
+ * supermap 预设会设成 1 —— 官方 iClient3D 不开各向异性，斜视角直接采高 mip
+ * 平均成纯色；我们默认拉满（Infinity）是为了倾斜摄影立面清晰度，代价是
+ * 米制平铺纹理的远处高频纹（点阵/砖缝）被硬保下来，怎么调光照都"不像官方"。
+ */
+export function setAnisotropyCap(cap: number): void {
+  anisotropyCap = Number.isFinite(cap) && cap > 0 ? Math.max(1, cap) : Infinity;
+}
+
+/**
  * 纹理长边像素上限（默认 Infinity = 不限制）。
  * 只作用于非图集的 RGBA / WebP 产物，见 `core/TextureDecode.ts` 的 `maxSize`。
  */
@@ -86,6 +96,24 @@ async function decodeTexture(
   return decodeTextureData(tex, { compressed, maxSize });
 }
 
+/**
+ * 纹理是否做 sRGB→linear 解码。
+ *
+ * 默认 true（three 线性 PBR 管线的正确姿势）。`lightingPreset: 'supermap'` 会关掉它：
+ * 官方 iClient3D 把贴图字节值**不解码**直接进 shader、在 sRGB 数值空间做 Lambert 直乘，
+ * 要逐像素对齐就得让字节值原样进来（输出端由 StyleMaterial 的 S3M_DIRECT_COLOR 抵消）。
+ */
+let srgbTextureDecode = true;
+
+/** 切换纹理解码（只影响之后创建的纹理，已上传 GPU 的不受影响） */
+export function setSrgbTextureDecode(v: boolean): void {
+  srgbTextureDecode = v;
+}
+
+export function getSrgbTextureDecode(): boolean {
+  return srgbTextureDecode;
+}
+
 function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
@@ -94,7 +122,7 @@ function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
   tex.generateMipmaps = true;
   // 各向异性过滤对斜视角立面清晰度的提升比提高分辨率更直接
   tex.anisotropy = anisotropyCap === Infinity ? maxAnisotropy : Math.min(maxAnisotropy, anisotropyCap);
-  if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
+  if (srgb && srgbTextureDecode) tex.colorSpace = THREE.SRGBColorSpace;
   tex.flipY = false;
   tex.needsUpdate = true;
   return tex;
@@ -145,12 +173,16 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
     texture = new THREE.Texture(data.bitmap);
   } else if (data.blocks && data.blockFormat) {
     // DXT 块直传：GPU 硬件解压，省 4~8 倍上传带宽与显存。压缩纹理不能 generateMipmaps
-    // （WebGL 限制），远处靠 LinearFilter 兜底；s3mHasAlpha 走 alphaTest 的 DXT1 1bit
-    // alpha 历史上没开过，DXT5 的 hasAlpha 由 decodeTextureData 判定
+    // （WebGL 限制）——所以**数据自带的内联 mip 链**（官方 iClient3D 逐层上传的那条）
+    // 必须切出来一起传，否则远处只有 level0 可采，高频纹/点阵全保留，永远"糊"不出
+    // 官方那种平均色；s3mHasAlpha 走 alphaTest 的 DXT1 1bit alpha 历史上没开过，
+    // DXT5 的 hasAlpha 由 decodeTextureData 判定
     const format =
       data.blockFormat === 'dxt1' ? THREE.RGB_S3TC_DXT1_Format : THREE.RGBA_S3TC_DXT5_Format;
     texture = new THREE.CompressedTexture(
-      [{ data: data.blocks, width: data.width, height: data.height }],
+      data.mipmaps && data.mipmaps.length > 1
+        ? data.mipmaps.map((m) => ({ data: m.data, width: m.width, height: m.height }))
+        : [{ data: data.blocks, width: data.width, height: data.height }],
       data.width,
       data.height,
       format,
@@ -165,7 +197,9 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
   const configured = isAtlas ? configureAtlas(texture) : configure(texture);
   if (data.blocks) {
     configured.generateMipmaps = false;
-    configured.minFilter = THREE.LinearFilter;
+    // 带链 → 三线性取链上高层级（官方同款平均效果）；纯 level0 才退回 Linear 兜底
+    configured.minFilter =
+      data.mipmaps && data.mipmaps.length > 1 ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
   }
   // flipY 为真即 S3MBLOCK 图集（见 core/types.ts），必须无 mip
   return { texture: configured, decoded: data.kind };

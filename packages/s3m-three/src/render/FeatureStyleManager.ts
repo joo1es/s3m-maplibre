@@ -20,6 +20,7 @@ import {
 } from '../core/FeatureInfo.js';
 import type { AttributeQuery, AttributeQueryOptions, AttributeRow } from '../core/AttributeQuery.js';
 import type { StyledMaterial } from './StyleMaterial.js';
+import { restoreBaseBlendState } from './StyleMaterial.js';
 
 export interface GPUPathOptions {
   /** 绑定的路径索引 ID（0, 1, 2...） */
@@ -1011,8 +1012,9 @@ export class FeatureStyleManager {
       if (mat.userData.uBatchTexActive) {
         mat.userData.uBatchTexActive.value = 0;
       }
-      // 单体淡化清除后，把材质 transparent 还原成全局透明度语义
-      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
+      // 单体淡化清除后，把材质 transparent 还原成「自身语义 || 全局透明度」
+      // （只看全局透明度会把 alphaMode blend / 顶点 alpha 材质误关成不透明）
+      if (mat.transparent && !this._isLayerTransparent()) restoreBaseBlendState(mat, false);
       return;
     }
 
@@ -1020,7 +1022,7 @@ export class FeatureStyleManager {
       if (mat.userData.uBatchTexActive) {
         mat.userData.uBatchTexActive.value = 0;
       }
-      if (mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
+      if (mat.transparent && !this._isLayerTransparent()) restoreBaseBlendState(mat, false);
       return;
     }
 
@@ -1052,9 +1054,9 @@ export class FeatureStyleManager {
       this.featureStyles
     );
 
-    // 有淡化单体时整块材质要开混合才有透明效果；清除后还原为全局透明度语义
+    // 有淡化单体时整块材质要开混合才有透明效果；清除后还原为「自身语义 || 全局透明度」
     if (hasFade && !mat.transparent) mat.transparent = true;
-    else if (!hasFade && mat.transparent && !this._isLayerTransparent()) mat.transparent = false;
+    else if (!hasFade && mat.transparent && !this._isLayerTransparent()) restoreBaseBlendState(mat, false);
 
     if (conflicts > 0 && !this._batchConflictWarned) {
       this._batchConflictWarned = true;

@@ -24,8 +24,12 @@ import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import { authFetch, type AuthenticateFn } from '../core/AuthFetch.js';
-import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
-import { getMaterialQuality, setMaterialQuality } from './StyleMaterial.js';
+import { sortSplatMesh } from './SplatSorter.js';
+import { splatCenterBounds } from './SplatMaterial.js';
+import { setSplatViewport } from './GeometryBuilder.js';
+import { setMaxAnisotropy, setAnisotropyCap, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap, setSrgbTextureDecode } from './TextureFactory.js';
+import { getMaterialQuality, setMaterialQuality, setColorPipeline } from './StyleMaterial.js';
+import { resolveLightingPreset, type LightingPreset } from './lightingPreset.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
@@ -37,6 +41,7 @@ import {
   createOutlineMaterial,
   resolveEdgeModes,
   sameEdgeModes,
+  restoreBaseBlendState,
 } from './StyleMaterial.js';
 import type {
   OutlineMaterial,
@@ -51,6 +56,7 @@ import type {
   MaterialQuality,
 } from './StyleMaterial.js';
 import { applyPointCloudStyle, isOwnedPointCloudMaterial } from './PointCloudMaterial.js';
+import type { DegradationKind, UnsupportedPolicy } from '../core/degradations.js';
 import { Picker } from './Picker.js';
 import { GpuEdgePass } from './GpuEdgePass.js';
 import { Animator } from '../anim/Animator.js';
@@ -209,8 +215,21 @@ export interface LightOptions {
 }
 
 export interface S3MViewerOptions {
+  /**
+   * 光照预设：
+   * - `'default'`（默认）：现有 PBR 打光，亮部线性总量 ≈ 2.55；
+   * - `'supermap'`：对齐 iClient3D 观感（暗部 0.46 / 亮部 2.44），远处不发灰、饱和度更高。
+   *   只改光源，不动材质与色调映射；`light` 里的显式字段仍然优先生效。
+   */
+  lightingPreset?: LightingPreset;
   /** 光照参数配置（强度、颜色、朝向模式、太阳方位角/仰角等） */
   light?: LightOptions;
+  /**
+   * 三角面材质深度偏移（共面摩尔纹 / 重合面归属的人工定序）。
+   * 例：factor -1 / units -2 把配置材质的片元深度略微拉近。
+   * 这是 mesh 粒度开关，见 BuildTileOptions.polygonOffset 的说明。
+   */
+  polygonOffset?: { factor: number; units: number };
   /**
    * 色调映射模式（默认 THREE.NoToneMapping，避免 ACESFilmic 压暗中暗部及导致底图与建筑色彩失真；
    * 可传入 THREE.ACESFilmicToneMapping、THREE.LinearToneMapping、THREE.ReinhardToneMapping 等）
@@ -232,6 +251,11 @@ export interface S3MViewerOptions {
   maxTiles?: number;
   /** 每个数据集并发请求数 */
   maxConcurrent?: number;
+  /**
+   * 图层级默认的降级处置策略（默认 `'warn'`），数据集可用 `unsupported` 单独覆盖。
+   * 见 `S3MTilesetOptions.unsupported`。
+   */
+  unsupported?: UnsupportedPolicy;
   /** 是否用 Web Worker 解析经典 .s3mb 瓦片（默认开，崩溃自动降级主线程），见 S3MTilesetOptions.useWorker */
   useWorker?: boolean;
   /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
@@ -395,6 +419,8 @@ const STYLE_SCALAR_KEYS = [
   'texMix',
   'roofThreshold',
   'ambientGain',
+  'metalness',
+  'roughness',
   'edgeWidth',
   'edgeOpacity',
   'edgeOffset',
@@ -534,6 +560,9 @@ export class S3MViewer {
   private readonly _nativeEdgeLines = new Set<THREE.LineSegments>();
   /** 点云对象集合：透明度动画时只刷它们，避免每帧遍历全部 pickables */
   private readonly _pointClouds = new Set<THREE.Points>();
+  /** 泼溅排序状态：相机不动且没有新瓦片时，排序结果可以直接复用 */
+  private readonly _lastSplatSortView = new THREE.Matrix4();
+  private _splatsSorted = false;
   /** 当前材质是否处于 transparent 状态，用来避免逐帧重复切换 program */
   private _opacityTransparent = false;
 
@@ -560,6 +589,8 @@ export class S3MViewer {
   private _hemiLight!: THREE.HemisphereLight;
   private _keyLight!: THREE.DirectionalLight;
   private _fillLight!: THREE.DirectionalLight;
+  /** 环境贴图的 PMREM 渲染目标（setEnvironment 建的，unmount 时释放） */
+  private _envRT: THREE.WebGLRenderTarget | null = null;
   private readonly _lightOptions: Required<Omit<LightOptions, 'mainIntensity' | 'mainColor'>> = {
     ambientIntensity: 0.4,
     ambientColor: 0xffffff,
@@ -583,6 +614,8 @@ export class S3MViewer {
   /** 鉴权适配（全局默认），构造时注入 */
   private readonly _authenticate: AuthenticateFn | undefined;
   private _lodRangeScale = 1.0;
+  /** 图层级降级策略，数据集可覆盖，见 `S3MViewerOptions.unsupported` */
+  private readonly _unsupported: UnsupportedPolicy;
   /** LOD 判定屏幕高度的 DPR 上限。Infinity = 不截断（默认，行为同旧版） */
   private _lodPixelRatioCap = Infinity;
 
@@ -599,9 +632,14 @@ export class S3MViewer {
     this.options = options;
     this.pickable = options.pickable !== false;
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
+    this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
     setMaterialQuality(options.materialQuality ?? 'pbr');
+    if (options.lightingPreset && options.lightingPreset !== 'default') {
+      Object.assign(this._lightOptions, resolveLightingPreset(options.lightingPreset));
+      this._applyColorPipeline(options.lightingPreset);
+    }
     if (options.light) {
       Object.assign(this._lightOptions, options.light);
     }
@@ -780,6 +818,8 @@ export class S3MViewer {
     this.groundManager.dispose();
     this.picker?.dispose();
     this.picker = null;
+    this._envRT?.dispose();
+    this._envRT = null;
     this.outlineMaterial.dispose();
     this._gpuEdge?.dispose();
     this._gpuEdge = null;
@@ -841,6 +881,34 @@ export class S3MViewer {
       this._fillLight.intensity = this._lightOptions.fillLightIntensity;
       this._fillLight.color.set(this._lightOptions.fillLightColor as any);
     }
+  }
+
+  /**
+   * 运行时切换光照预设：覆盖四个强度，颜色/朝向保持不变。
+   * 之后再调 `setLight({...})` 仍然可以逐项微调。
+   */
+  /**
+   * supermap 完整版 = 光照强度 + 颜色管线一起切：
+   * direct 管线下纹理不做 sRGB 解码、片元按官方常数 Lambert 直乘（见 lightingPreset.ts）。
+   * 两个都是模块级全局态，只影响之后创建的材质 / 纹理 —— 已加载瓦片要重载才换。
+   */
+  private _applyColorPipeline(preset: LightingPreset): void {
+    const direct = preset === 'supermap';
+    setColorPipeline(direct ? 'direct' : 'linear');
+    setSrgbTextureDecode(!direct);
+    // 官方不开各向异性：远处直接采高 mip 平均成纯色（"灰色滤镜"的一部分）。
+    // 我们默认 Infinity（倾斜摄影立面清晰度优先），supermap 模式必须收回。
+    setAnisotropyCap(direct ? 1 : Infinity);
+  }
+
+  setLightingPreset(preset: LightingPreset): void {
+    Object.assign(this._lightOptions, resolveLightingPreset(preset));
+    this._applyColorPipeline(preset);
+    this.options.lightingPreset = preset;
+    this._applyLightOptions();
+    this._updateLights();
+    this._needsRepaint = true;
+    this.triggerRepaint();
   }
 
   /**
@@ -909,22 +977,31 @@ export class S3MViewer {
     };
     place(this._keyLight, this._lightOptions.azimuth, this._lightOptions.altitude);
     place(this._fillLight, this._lightOptions.azimuth + 65, Math.max(10, this._lightOptions.altitude - 20));
+    // direct 管线的官方 Lambert 用主光方向（共享 uniform，所有材质同步生效）
+    if (this.uniforms?.uSunDirection && this._keyLight) {
+      (this.uniforms.uSunDirection.value as THREE.Vector3).copy(this._keyLight.position).normalize();
+    }
   }
 
   /* ---------------------------------------------------------------- 数据集 */
 
   private _normalizeDatasets(options: S3MViewerOptions): S3MDatasetOptions[] {
-    if (Array.isArray(options.datasets)) return options.datasets.filter((d) => !!d?.configUrl);
+    if (Array.isArray(options.datasets))
+      return options.datasets
+        .filter((d) => !!d?.configUrl)
+        .map((d) => ({ ...d, polygonOffset: d.polygonOffset ?? options.polygonOffset }));
     if (options.configUrl)
-      return [{ id: 'default', name: '默认数据集', configUrl: options.configUrl, useWorker: options.useWorker }];
+      return [{ id: 'default', name: '默认数据集', configUrl: options.configUrl, useWorker: options.useWorker, polygonOffset: options.polygonOffset }];
     return [];
   }
 
   /** 追加一个数据集。图层 addLayer 之前调用会抛错。 */
   async addDataset(ds: S3MDatasetOptions): Promise<S3MDatasetEntry> {
     if (!this.scene) throw new Error('[s3m] 图层尚未 addLayer，不能添加数据集');
+    // 图层级默认值：数据集自己指定了就用自己的，见 `S3MViewerOptions.unsupported`
+    const merged: S3MDatasetOptions = { ...ds, unsupported: ds.unsupported ?? this._unsupported };
     const entry = await this._datasetManager.addDataset(
-      ds,
+      merged,
       this.scene,
       this.geo,
       this.uniforms,
@@ -1851,6 +1928,8 @@ export class S3MViewer {
       const mesh = child as THREE.Mesh;
       if (!mesh.isMesh && !isPoints) continue;
       if (isPoints) this._pointClouds.add(child as THREE.Points);
+      // 新瓦片里的泼溅实例还没按当前视角排过，下一帧要重排
+      if (isPoints) this._splatsSorted = false;
       const ud = mesh.userData as MeshUserData;
       ud.pickId = this._allocPickId();
       ud.datasetId = entry.id;
@@ -1882,9 +1961,11 @@ export class S3MViewer {
         if (mat) {
           const o = clampOpacity(this.style.opacity);
           // 不写 mat.opacity：全局透明度走共享 uOpacity，材质自身 opacity 保留模型自带 alpha
-          mat.transparent = o < 0.999;
+          // 混合开关不能写成 `o < 0.999` 一刀切：材质自身可能是 blend / 顶点 alpha
+          // 透明（s3mOpts.transparent，如 SMID 4421），注册时就被这句踩掉，
+          // 表现为「刚进去没透明度，切换材质质感重建后才恢复」。
           const keepDepth = this.style.depthWrite !== false;
-          mat.depthWrite = mat.transparent ? keepDepth : (this.style.depthWrite !== false);
+          restoreBaseBlendState(mat, o < 0.999, keepDepth);
           // shading 走共享 uniform（uFlatShading），不写 mat.flatShading / needsUpdate——
           // transparent / depthWrite 也不是 program 决定项，整套样式继承零重编译
           if (mat.userData.uFlatShading) {
@@ -1940,9 +2021,10 @@ export class S3MViewer {
         (mesh.userData as MeshUserData).tileFadeKey = undefined;
         this.animator.unregister(key);
         // 淡入期间强制开了 transparent + depthWrite，结束时不能自己拍板关掉——
-        // 图层可能本来就半透明、单体也可能还有淡化。交给淡化流程重新裁决一次。
+        // 先恢复「材质自身语义 || 图层透明度」的基础状态（材质可能是 blend /
+        // 顶点 alpha 透明，如 SMID 4421），再让单体淡化流程有需要时重新打开。
+        restoreBaseBlendState(mat, this._opacityTransparent, this.style.depthWrite !== false);
         this._featureStyleManager.applyOverridesToMesh(mesh);
-        mat.depthWrite = this.style.depthWrite !== false;
         this._requestRepaint();
       },
     });
@@ -2146,6 +2228,52 @@ export class S3MViewer {
     return { ...this._styleTarget, modeLabel: STYLE_LABELS[this._styleTarget.mode] };
   }
 
+  /**
+   * 挂 / 摘环境贴图。
+   *
+   * 金属度（`setStyle({ metalness })`）**必须**有环境图才看得出质感：
+   * PBR 的金属几乎没有漫反射，画面全靠 `scene.environment` 里的环境反射，
+   * 没有它时 metalness 一高就整片发黑，只剩两盏平行灯打成的小高光点。
+   *
+   * @param source 等距柱状图（.hdr / .jpg / .png，2:1）地址，或已加载的 `THREE.Texture`；
+   *               `null` = 关掉环境图
+   * @param intensity 环境光强度（`scene.environmentIntensity`，默认 1）
+   *
+   * 传入 URL 时纹理由内部加载并转成 PMREM（预滤波 mipmap）；传 Texture 时不会接管它的生命周期。
+   */
+  async setEnvironment(
+    source: string | THREE.Texture | null,
+    intensity = 1
+  ): Promise<void> {
+    if (!this.renderer || !this.scene) return;
+    this.scene.environmentIntensity = Math.max(0, intensity);
+
+    if (source == null) {
+      this.scene.environment = null;
+      this._envRT?.dispose();
+      this._envRT = null;
+      this._requestRepaint();
+      return;
+    }
+
+    const fromUrl = typeof source === 'string';
+    const tex = fromUrl ? await new THREE.TextureLoader().loadAsync(source) : source;
+    // PMREM 只认等距柱状图；普通贴图也按 2:1 全景处理
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+
+    const pmrem = new THREE.PMREMGenerator(this.renderer);
+    pmrem.compileEquirectangularShader();
+    const rt = pmrem.fromEquirectangular(tex);
+    pmrem.dispose();
+    if (fromUrl) tex.dispose();
+
+    this.scene.environment = rt.texture;
+    // 上一张（同一个 viewer 反复换）要释放，否则显存里会一直堆
+    this._envRT?.dispose();
+    this._envRT = rt;
+    this._requestRepaint();
+  }
+
   /** 把某个样式键的取值转成动画通道能吃的形状（标量 or 线性 RGB 三元组） */
   private _animTargetOf(key: string, patch: Partial<S3MStyle>): number | number[] {
     const value = (patch as Record<string, unknown>)[key];
@@ -2327,6 +2455,9 @@ export class S3MViewer {
     if (u.uAmbientGain && s.ambientGain != null) {
       u.uAmbientGain.value = s.ambientGain;
     }
+    // 金属度 / 粗糙度：负值 = 不覆盖，保持材质（数据）自身的值
+    if (u.uMetalness) u.uMetalness.value = s.metalness ?? -1;
+    if (u.uRoughness) u.uRoughness.value = s.roughness ?? -1;
     if (u.uOpacity && s.opacity != null) {
       u.uOpacity.value = clampOpacity(s.opacity);
     }
@@ -2368,8 +2499,9 @@ export class S3MViewer {
         // 有单体淡化 / 正在淡入的材质，transparent 由各自的流程管，这里不要抢
         if (m.userData.uBatchTexActive?.value) continue;
         if ((m.userData.uTileFade?.value ?? 1) < 1) continue;
-        m.transparent = transparent;
-        m.depthWrite = transparent ? keepDepth : true;
+        // 材质自身可能是 blend / 顶点 alpha 透明（s3mOpts.transparent），
+        // 关全局混合时不能把它一刀切成不透明
+        restoreBaseBlendState(m, transparent, keepDepth);
       }
     }
 
@@ -3059,6 +3191,9 @@ export class S3MViewer {
     ray?: THREE.Ray
   ): PickResult | null {
     const ud = ref.mesh.userData as MeshUserData;
+    // 泼溅走独立分支：它既没有 instanceMatrix，也没有 geoRef.pickInfo 里的单体表，
+    // 走下面那段会在 `_instanceFeature()` 拿到 null 直接返回 —— 表现是「点得中但拿不到结果」。
+    if (ud.isGaussianSplat) return this._buildSplatPickResult(hit, ref, exactPoint, ray);
     let smid: number | null = null;
     let batchId = hit.batchId;
     let instanceIndex = hit.instanceIndex;
@@ -3203,6 +3338,85 @@ export class S3MViewer {
       altitude,
       ...attributes,
       mesh: ref.mesh,
+    };
+  }
+
+  /**
+   * 泼溅的拾取结果。
+   *
+   * 整块泼溅瓦片当一个单体（没有单体级 smid 可报），命中点由 `splatRaycast` 给出 ——
+   * 它按每个高斯的 3σ 球求交，比拾取那一趟为了命中率摊开的 4px 方块准得多。
+   * 包围盒必须由 `iCenter` 算：geometry 的 position 只是 [-1,1]² 的四边形角点。
+   */
+  private _buildSplatPickResult(
+    hit: { objectId: number; batchId: number; instanceIndex?: number },
+    ref: PickableRef,
+    exactPoint?: THREE.Vector3,
+    ray?: THREE.Ray
+  ): PickResult | null {
+    const anchor = this.sceneAnchor;
+    if (!anchor) return null;
+    const mesh = ref.mesh;
+
+    let hitPoint = exactPoint ?? null;
+    if (!hitPoint && ray) hitPoint = this._intersectMeshAtRay(mesh, ray);
+
+    const local = splatCenterBounds(mesh.geometry);
+    const box: SegmentBox | null = local
+      ? {
+          minX: local.minX,
+          minY: local.minY,
+          minZ: local.minZ,
+          maxX: local.maxX,
+          maxY: local.maxY,
+          maxZ: local.maxZ,
+          count: local.count,
+          triangles: 0,
+        }
+      : null;
+
+    const attributes = buildAttributes({
+      smid: null,
+      box,
+      triangles: 0,
+      floorHeight: this.style.floorHeight,
+    });
+
+    const s = anchor.meterInMercator;
+    let point: [number, number, number] | null = null;
+    let lngLat: [number, number] | null = null;
+    let altitude: number | null = null;
+    let centerLngLat: [number, number] | null = null;
+
+    if (hitPoint) {
+      point = [hitPoint.x, hitPoint.y, hitPoint.z];
+      lngLat = this._lngLatFromWorld(hitPoint.x * s + anchor.x, -hitPoint.y * s + anchor.y);
+      altitude = hitPoint.z + (anchor.altitude ?? 0);
+      // 泼溅命中的就是一个高斯，没有「单体中心」可言，用命中点当中心
+      centerLngLat = lngLat;
+    } else if (box) {
+      const v = new THREE.Vector3(
+        (box.minX + box.maxX) / 2,
+        (box.minY + box.maxY) / 2,
+        (box.minZ + box.maxZ) / 2
+      ).applyMatrix4(mesh.matrixWorld);
+      centerLngLat = this._lngLatFromWorld(v.x * s + anchor.x, -v.y * s + anchor.y);
+      altitude = v.z + (anchor.altitude ?? 0);
+    }
+
+    return {
+      datasetId: ref.datasetId,
+      datasetName: this.datasets.get(ref.datasetId)?.name ?? ref.datasetId,
+      objectId: hit.objectId,
+      batchId: -1,
+      instanceIndex: undefined,
+      skeletonName: ref.skeletonName,
+      centerLngLat,
+      point,
+      lngLat,
+      altitude,
+      ...attributes,
+      mesh,
     };
   }
 
@@ -3907,6 +4121,23 @@ export class S3MViewer {
   }
 
   /**
+   * 泼溅实例按视深 back-to-front 重排：alpha 混合是顺序相关的，
+   * 乱序混合就是满屏彩色噪点。相机没动且没有新瓦片时整个跳过；
+   * 单个瓦片顺序本来就对时 sortSplatMesh 内部也会跳过重写。
+   */
+  private _sortSplats(): void {
+    const cam = this.camera;
+    if (!cam) return;
+    if (this._splatsSorted && this._lastSplatSortView.equals(cam.matrixWorldInverse)) return;
+    for (const pc of this._pointClouds) {
+      if (!(pc.userData as { isGaussianSplat?: boolean }).isGaussianSplat) continue;
+      sortSplatMesh(pc as unknown as THREE.Mesh, cam.matrixWorldInverse);
+    }
+    this._lastSplatSortView.copy(cam.matrixWorldInverse);
+    this._splatsSorted = true;
+  }
+
+  /**
    * 渲染一帧。所有宿主相关量都由调用方喂进来，viewer 不碰任何地图 API：
    *
    * @param mvp        宿主本帧的 world→clip 矩阵（列主序 16 元素）
@@ -3997,12 +4228,15 @@ export class S3MViewer {
 
     // 等宽棱线按设备像素撑开，分辨率每帧同步一次
     this._updateLineResolution(canvas);
+    // 泼溅的最小像素半径 / 抗锯齿低通同样要把 ndc 换算成像素
+    setSplatViewport(canvas.width, canvas.height);
 
     this.renderer.setViewport(0, 0, canvas.width, canvas.height);
     this.renderer.resetState();
     // 完全透明时什么都不画：透明物体照样写深度，画了会在底图上挖出一个洞。
     // 这里跳过的是「本层的绘制」，宿主自己的清屏 / 底图照旧。
     if ((this.uniforms.uOpacity?.value ?? 1) > OPACITY_EPS) {
+      this._sortSplats();
       this.renderer.render(this.scene, this.camera);
       // GPU 描边必须画在主场景之后：它的全屏 quad 参与宿主深度测试，
       // 依赖本帧已经写好的深度（被地形挡住的地方不该描边）
@@ -4053,7 +4287,9 @@ export class S3MViewer {
       programs: 0,
       textures: 0,
       geometries: 0,
+      degradations: [],
     };
+    let degradations: DegradationKind[] | null = null;
     for (const entry of this.datasets.values()) {
       const s = entry.tileset?.stats;
       if (!s) continue;
@@ -4063,7 +4299,15 @@ export class S3MViewer {
       total.meshes += s.meshes;
       total.vertices += s.vertices;
       total.triangles += s.triangles;
+      // 降级项跨数据集去重：同一类只报一次给 UI
+      if (s.degradations?.length) {
+        degradations ??= [];
+        for (const d of s.degradations) {
+          if (!degradations.includes(d)) degradations.push(d);
+        }
+      }
     }
+    if (degradations) total.degradations = degradations;
     // GPU 侧预算观测：draw call / program / 显存驻留。没有渲染器（未 mount /
     // 纯解析场景）时保持 0，不抛错。
     const info = this.renderer?.info;

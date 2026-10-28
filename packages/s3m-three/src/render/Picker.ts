@@ -15,6 +15,7 @@
  * 的代价（移动端尤其明显）就没了。
  */
 import * as THREE from 'three';
+import { createSplatPickMaterial } from './SplatMaterial.js';
 
 const PICK_VERT = /* glsl */ `
   attribute float aBatchId;
@@ -175,6 +176,8 @@ export interface PickHit {
 interface PickUserData {
   pickId?: number;
   pickMaterial?: THREE.Material;
+  /** 高斯泼溅实例网格：拾取要走专用材质，见 SplatMaterial.createSplatPickMaterial */
+  isGaussianSplat?: boolean;
   [key: string]: unknown;
 }
 
@@ -299,13 +302,26 @@ export class Picker {
       if (!mesh.isMesh && !isPointsObject(mesh)) return;
       const ud = mesh.userData as PickUserData;
       if (ud.pickId === undefined) return;
-      if (!ud.pickMaterial) ud.pickMaterial = createPickMaterial(ud.pickId);
-      if ((mesh as THREE.InstancedMesh).isInstancedMesh) instancedPickIds.add(ud.pickId);
-
-      // 把当前的「单体状态纹理」抄给拾取材质：抬高 / 平移 / 姿态 / GPU 路径都是逐单体
-      // 写在里面的，抄的是同一个纹理与同一批 uniform 对象，主材质那边更新后这里自动跟着变。
+      // 泼溅走自己的拾取材质：通用拾取着色器只读 position，不知道 iCenter，
+      // 交给它每个高斯都会塌在原点，点哪儿都没反应。见 SplatMaterial 里那段注释。
+      const isSplat = ud.isGaussianSplat === true;
+      if (!ud.pickMaterial) {
+        ud.pickMaterial = isSplat ? createSplatPickMaterial(ud.pickId) : createPickMaterial(ud.pickId);
+      }
+      // 泼溅**不登记为实例化单体**：它的实例号在 geoRef.pickInfo 里查不到（没有
+      // instanceMatrix 那套单体表），报成 instanceIndex 只会让上层 `_instanceFeature`
+      // 返回 null 把结果丢掉。泼溅整块瓦片当一个单体，命中点交给 splatRaycast。
+      if (!isSplat && (mesh as THREE.InstancedMesh).isInstancedMesh) instancedPickIds.add(ud.pickId);
       const prev = mesh.material;
       const pm = ud.pickMaterial as THREE.ShaderMaterial;
+      // 泼溅没有单体状态纹理 / GPU 路径那一套 uniform，直接跳过抄写
+      if (isSplat) {
+        swapped.push([mesh, prev]);
+        mesh.material = pm;
+        return;
+      }
+      // 把当前的「单体状态纹理」抄给拾取材质：抬高 / 平移 / 姿态 / GPU 路径都是逐单体
+      // 写在里面的，抄的是同一个纹理与同一批 uniform 对象，主材质那边更新后这里自动跟着变。
       const src = (Array.isArray(prev) ? prev[0] : prev) as THREE.Material & {
         userData?: Record<string, THREE.IUniform>;
         uniforms?: Record<string, THREE.IUniform>;

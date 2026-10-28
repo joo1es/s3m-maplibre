@@ -228,8 +228,14 @@ map.on('movestart', (e) => {
   if (e.originalEvent) userMovedCamera = true;
 });
 
+// ?poffset=1 拉近 / ?poffset=-1 推远：跨单体共面重复面的摩尔纹调试（面板里也能切）
+const poffsetParam = new URLSearchParams(window.location.search).get('poffset');
+const layerPolygonOffset =
+  poffsetParam === '1' ? { factor: -1, units: -2 } : poffsetParam === '-1' ? { factor: 1, units: 2 } : undefined;
+
 const layer = new S3MLayer({
   id: 's3m',
+  polygonOffset: layerPolygonOffset,
   // 预算要能装下「近处所有可见瓦片」。这个数据集光是根瓦片就有 79 块，
   // 预算给 64 时每帧都在淘汰-重下-再淘汰，子瓦片永远挤不进显示，纹理就永远停在
   // 最粗一级的雪碧图（一栋楼只剩十几像素、再被 uv 平铺几十遍）。
@@ -320,6 +326,23 @@ async function resolveUrlToDatasets(rawUrl) {
 
   // 3. iServer REST realspace 服务的兼容探测
   const cleanUrl = url.replace(/\/+$/, '');
+
+  // 直接给了某个数据集的 config：`.../datas/<名>/config`。
+  // 必须在下面的 datas.json 探测之前认出来 —— iServer 的 config **不带后缀**，
+  // 落到探测逻辑里会拼成 `config.json` 并返回 406（当前资源不支持请求体中的媒体类型）。
+  const cfgMatch = /\/datas\/([^\/\?#]+)\/config$/i.exec(cleanUrl);
+  if (cfgMatch) {
+    const dsName = cfgMatch[1];
+    return [
+      {
+        id: dsName,
+        name: dsName,
+        configUrl: cleanUrl,
+        checked: true,
+        color: '#2563eb',
+      },
+    ];
+  }
 
   // 若指向具体数据集，例如 .../datas/cheng
   const subDsMatch = /\/datas\/([^\/\?#]+)$/i.exec(cleanUrl);
@@ -1210,6 +1233,27 @@ $('optOccludeBack').addEventListener('change', (e) => {
 
 /* ---------------------------------------------------------------- 光照调节 */
 
+if ($('optLightPreset')) {
+  $('optLightPreset').addEventListener('change', (e) => {
+    layer.setLightingPreset(e.target.value);
+    syncLightSliders();
+  });
+}
+/**
+ * 切预设后，主光 / 环境光滑块要跟着走 —— 不跟着走的话界面显示 0.90 / 0.80，
+ * 实际渲染却是 1.95 / 0.12，之后再拖一次滑块才"跳"回来，很容易误判。
+ */
+function syncLightSliders() {
+  const l = layer.getLight();
+  const set = (id, valId, v) => {
+    const el = $(id);
+    if (el) el.value = String(Math.round(v * 100));
+    const b = $(valId);
+    if (b) b.textContent = v.toFixed(2);
+  };
+  set('optLightMain', 'lightMainVal', l.keyLightIntensity ?? 1);
+  set('optLightAmbient', 'lightAmbientVal', l.ambientIntensity ?? 0.4);
+}
 if ($('optLightMode')) {
   $('optLightMode').addEventListener('change', (e) => {
     layer.setLight({ mode: e.target.value });
@@ -1253,6 +1297,104 @@ if ($('optLightAmbientColor')) {
     layer.setLight({ ambientColor: e.target.value });
   });
 }
+/* ---------------------------------------------------------------- 金属质感 */
+
+/**
+ * 内置环境贴图：现场画一张 2:1 的天空渐变（canvas → dataURL），不依赖外部 HDR。
+ *
+ * 金属度靠的是环境反射：只有平行光时 metalness 一高就整片发黑，只剩两个高光点，
+ * 所以 demo 里用一张离线可生成的等距柱状图当 environment，顶部天空、地平线亮带、
+ * 底部地面，再加一个明确的太阳亮点，金属表面能看出方向感。
+ */
+function skyEnvDataUrl() {
+  const w = 512;
+  const h = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const g = canvas.getContext('2d');
+
+  const sky = g.createLinearGradient(0, 0, 0, h);
+  sky.addColorStop(0, '#0d1524');
+  sky.addColorStop(0.32, '#3b6ea5');
+  sky.addColorStop(0.48, '#9fc4e8');
+  sky.addColorStop(0.52, '#e8eef5');
+  sky.addColorStop(0.56, '#7d8894');
+  sky.addColorStop(1, '#232830');
+  g.fillStyle = sky;
+  g.fillRect(0, 0, w, h);
+
+  // 太阳：金属上的高光条就是它反射出来的
+  const sun = g.createRadialGradient(w * 0.62, h * 0.26, 0, w * 0.62, h * 0.26, 40);
+  sun.addColorStop(0, 'rgba(255,255,255,1)');
+  sun.addColorStop(0.25, 'rgba(255,247,222,0.9)');
+  sun.addColorStop(1, 'rgba(255,240,200,0)');
+  g.fillStyle = sun;
+  g.fillRect(0, 0, w, h);
+
+  return canvas.toDataURL('image/png');
+}
+
+if ($('optPbrSurface')) {
+  const wrap = $('wrapPbrSurface');
+  const envToggle = $('optEnv');
+  const metalInput = $('optMetalness');
+  const roughInput = $('optRoughness');
+  const metalVal = $('metalnessVal');
+  const roughVal = $('roughnessVal');
+
+  const applyMetalness = (v) => {
+    metalVal.textContent = v.toFixed(2);
+    layer.setStyle({ metalness: v });
+  };
+  const enableEnv = () => {
+    envToggle.checked = true;
+    layer.setEnvironment(skyEnvDataUrl(), 1);
+  };
+
+  $('optPbrSurface').addEventListener('change', (e) => {
+    wrap.style.display = e.target.checked ? '' : 'none';
+    if (e.target.checked) return;
+    // 收起面板 = 回到数据自身的口径（metalness 0 / roughness 由 shininess 映射）
+    metalInput.value = '0';
+    roughInput.value = '95';
+    metalVal.textContent = '0.00';
+    roughVal.textContent = '0.95';
+    envToggle.checked = false;
+    layer.setStyle({ metalness: undefined, roughness: undefined });
+    layer.setEnvironment(null);
+  });
+
+  envToggle.addEventListener('change', (e) => {
+    if (e.target.checked) {
+      enableEnv();
+      // 环境图就位但金属度还是 0 的话什么变化都看不到，顺手给个默认值
+      if (Number(metalInput.value) === 0) {
+        metalInput.value = '85';
+        applyMetalness(0.85);
+      }
+    } else {
+      // 没有 environment 时金属度 > 0 只会发黑，一起退回 0
+      layer.setEnvironment(null);
+      metalInput.value = '0';
+      applyMetalness(0);
+    }
+  });
+
+  metalInput.addEventListener('input', (e) => {
+    const v = Number(e.target.value) / 100;
+    applyMetalness(v);
+    // 第一次上金属度就自动挂环境图，否则用户只会看到「变黑了」
+    if (v > 0 && !envToggle.checked) enableEnv();
+  });
+
+  roughInput.addEventListener('input', (e) => {
+    const v = Math.max(0.04, Number(e.target.value) / 100);
+    roughVal.textContent = v.toFixed(2);
+    layer.setStyle({ roughness: v });
+  });
+}
+
 /* ---------------------------------------------------------------- 过滤与单体定制 */
 
 let hiddenSmids = new Set();
@@ -1848,6 +1990,14 @@ map.on('load', async () => {
   // ?edges=gpu|line|offset|hull|line+hull 直接打开某种棱线画法（调试 / 分享用）
   applyEdgesOption(new URLSearchParams(window.location.search).get('edges'));
 
+  // ?lighting=supermap 切官方观感光照预设（与面板「光照预设」等价，方便分享链接复现）
+  const lightingParam = new URLSearchParams(window.location.search).get('lighting');
+  if (lightingParam) {
+    layer.setLightingPreset(lightingParam);
+    if ($('optLightPreset')) $('optLightPreset').value = lightingParam;
+    syncLightSliders();
+  }
+
   // ?mvt=<TileJSON|模板> 指定矢量源
   const mvtParam = new URLSearchParams(window.location.search).get('mvt');
   if (mvtParam && $('optVectorUrl')) $('optVectorUrl').value = mvtParam;
@@ -1856,6 +2006,20 @@ map.on('load', async () => {
   if (new URLSearchParams(window.location.search).get('vector') === '1') {
     if ($('optVector')) $('optVector').checked = true;
     setVectorBasemap(true);
+  }
+
+  // ?poffset=1 启用深度偏移（-1,-2），?poffset=-1 推远（1,2）——共面摩尔纹调试用
+  if ($('optPolygonOffset')) {
+    const sel = $('optPolygonOffset');
+    if (layerPolygonOffset) sel.value = layerPolygonOffset.factor < 0 ? 'near' : 'far';
+    sel.addEventListener('change', (e) => {
+      // polygonOffset 是构建期材质属性，切了要重载瓦片；写进 URL 刷新生效
+      const v = e.target.value;
+      const u = new URL(window.location.href);
+      if (v === 'off') u.searchParams.delete('poffset');
+      else u.searchParams.set('poffset', v === 'near' ? '1' : '-1');
+      window.location.href = u.toString();
+    });
   }
 
   // 从 URL query ?url= 获取，若无则使用默认的 CCTV CBD 模型

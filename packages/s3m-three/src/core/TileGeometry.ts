@@ -106,8 +106,16 @@ export function deinterleave(attr: VertexAttribute): PlainAttribute {
 }
 
 /** 把 u8 顶点色转成 float vec3，供着色器直接相乘（原 toColorAttribute） */
+/**
+ * 顶点色解成 RGBA。
+ *
+ * **必须带 alpha**：BIM 数据里"材质不透明、靠顶点色 alpha 表达半透明"是常见做法。
+ * 实测 `3D-BIMbuilding-2` 的 SMID 4421（`WhiteMaterial_1`，无纹理、`diffuse.a=1`）
+ * 顶点色是 u8 `(0,128,192,63)`，alpha = 0.247 —— 之前只取 RGB，这一片就变成实心青色。
+ * 官方片元里 `baseColorWithAlpha = vColor` 是 vec4，走的就是这条路。
+ */
 function colorData(attr: VertexAttribute | null, vertexCount: number): Float32Array {
-  const out = new Float32Array(vertexCount * 3);
+  const out = new Float32Array(vertexCount * 4);
   if (!attr) {
     out.fill(1);
     return out;
@@ -115,11 +123,14 @@ function colorData(attr: VertexAttribute | null, vertexCount: number): Float32Ar
   const src = attr.data;
   const comp = attr.components ?? 4;
   const scale = attr.dtype === 'u8' ? 1 / 255 : 1;
+  // 只有 RGB 的旧数据补 alpha = 1，避免留下 0（那会整片全透明）
+  const hasAlpha = comp >= 4;
   for (let i = 0; i < vertexCount; i++) {
     const o = i * comp;
-    out[i * 3] = (src[o] ?? 255) * scale;
-    out[i * 3 + 1] = (src[o + 1] ?? 255) * scale;
-    out[i * 3 + 2] = (src[o + 2] ?? 255) * scale;
+    out[i * 4] = (src[o] ?? 255) * scale;
+    out[i * 4 + 1] = (src[o + 1] ?? 255) * scale;
+    out[i * 4 + 2] = (src[o + 2] ?? 255) * scale;
+    out[i * 4 + 3] = hasAlpha ? (src[o + 3] ?? 255) * scale : 1;
   }
   return out;
 }
@@ -232,6 +243,11 @@ export interface PrimitiveAttributes {
   aAtlasRect?: PlainAttribute;
   aAtlasRect1?: PlainAttribute;
   aSecUv?: PlainAttribute;
+  /**
+   * uv 第三分量（文件里的 `custom0`，官方 `aTextureCoordMatrix`）。
+   * 只有存在该流时才产生；解码语义见 core/TexCoordZ.ts。
+   */
+  aTexCoordZ?: PlainAttribute;
 }
 
 export interface PrimitiveData {
@@ -258,6 +274,8 @@ export interface TileGeometryStats {
   edgeLines: number;
   /** 合批前独立网格数（batching 生效时 > meshes） */
   originalMeshes?: number;
+  /** 被剔除的「同单体共面重复」三角形数（数据自重叠，见 dropCoincidentTriangles） */
+  deduped?: number;
   skipped: string[];
 }
 
@@ -355,6 +373,7 @@ function mergeCandidates(candidates: Candidate[]): PrimitiveData {
   let hasUv = false;
   let hasUv1 = false;
   let hasAtlas = false;
+  let hasTexZ = false;
 
   for (const c of candidates) {
     totalVertices += c.vertexCount;
@@ -363,17 +382,19 @@ function mergeCandidates(candidates: Candidate[]): PrimitiveData {
     if (c.attrs.uv) hasUv = true;
     if (c.attrs.uv1) hasUv1 = true;
     if (c.attrs.aAtlasRect) hasAtlas = true;
+    if (c.attrs.aTexCoordZ) hasTexZ = true;
   }
 
   const mergedPos: PlainAttribute = { array: new Float32Array(totalVertices * 3), components: 3, normalized: false };
   const mergedNorm = hasNormal ? { array: new Float32Array(totalVertices * 3), components: 3, normalized: false } : null;
   const mergedUv = hasUv ? { array: new Float32Array(totalVertices * 2), components: 2, normalized: false } : null;
   const mergedUv1 = hasUv1 ? { array: new Float32Array(totalVertices * 2), components: 2, normalized: false } : null;
-  const mergedColor: PlainAttribute = { array: new Float32Array(totalVertices * 3), components: 3, normalized: false };
+  const mergedColor: PlainAttribute = { array: new Float32Array(totalVertices * 4), components: 4, normalized: false };
   const mergedBatchId: PlainAttribute = { array: new Float32Array(totalVertices), components: 1, normalized: false };
   const mergedRect0 = hasAtlas ? { array: new Float32Array(totalVertices * 4), components: 4, normalized: false } : null;
   const mergedRect1 = hasAtlas ? { array: new Float32Array(totalVertices * 4), components: 4, normalized: false } : null;
   const mergedSecUv = hasAtlas ? { array: new Float32Array(totalVertices * 2), components: 2, normalized: false } : null;
+  const mergedTexZ = hasTexZ ? { array: new Float32Array(totalVertices), components: 1, normalized: false } : null;
   const mergedIndices = (totalVertices > 65535 ? new Uint32Array(totalIndices) : new Uint16Array(totalIndices)) as Uint16Array | Uint32Array;
 
   const tmp = [0, 0, 0];
@@ -389,6 +410,8 @@ function mergeCandidates(candidates: Candidate[]): PrimitiveData {
     const normArr = attrs.normal?.array;
     const uvArr = attrs.uv?.array;
     const uv1Arr = attrs.uv1?.array;
+    const tzArr = attrs.aTexCoordZ?.array;
+    const tzOut = mergedTexZ?.array as Float32Array | undefined;
     const colArr = attrs.aColor.array;
     const bArr = attrs.aBatchId.array;
     const posOut = mergedPos.array as Float32Array;
@@ -433,15 +456,19 @@ function mergeCandidates(candidates: Candidate[]): PrimitiveData {
         uv1Out[dst * 2] = uv1Arr[i * 2];
         uv1Out[dst * 2 + 1] = uv1Arr[i * 2 + 1];
       }
-      // aColor
+      // aTexCoordZ（uv 第三分量）：缺这条流的候选补 0 = 单位变换
+      if (tzOut) tzOut[dst] = tzArr ? tzArr[i]! : 0;
+      // aColor（RGBA：alpha 是 4421 这类「材质不透明、顶点半透明」的唯一来源）
       if (colArr) {
-        colOut[dst * 3] = colArr[i * 3];
-        colOut[dst * 3 + 1] = colArr[i * 3 + 1];
-        colOut[dst * 3 + 2] = colArr[i * 3 + 2];
+        colOut[dst * 4] = colArr[i * 4];
+        colOut[dst * 4 + 1] = colArr[i * 4 + 1];
+        colOut[dst * 4 + 2] = colArr[i * 4 + 2];
+        colOut[dst * 4 + 3] = colArr[i * 4 + 3] ?? 1;
       } else {
-        colOut[dst * 3] = 1;
-        colOut[dst * 3 + 1] = 1;
-        colOut[dst * 3 + 2] = 1;
+        colOut[dst * 4] = 1;
+        colOut[dst * 4 + 1] = 1;
+        colOut[dst * 4 + 2] = 1;
+        colOut[dst * 4 + 3] = 1;
       }
       // aBatchId
       bOut[dst] = bArr ? bArr[i] : -1;
@@ -501,6 +528,7 @@ function mergeCandidates(candidates: Candidate[]): PrimitiveData {
       aAtlasRect: mergedRect0 ?? undefined,
       aAtlasRect1: mergedRect1 ?? undefined,
       aSecUv: mergedSecUv ?? undefined,
+      aTexCoordZ: mergedTexZ ?? undefined,
     },
     index: mergedIndices,
     bounds,
@@ -529,7 +557,7 @@ function assembleSkeleton(name: string, geo: GeoPackageEntry, tile: ParsedTile, 
   const vertexCount = vp.verticesCount || 0;
   const attrs: PrimitiveAttributes = {
     position: deinterleave(positionAttr),
-    aColor: { array: new Float32Array(0), components: 3, normalized: false },
+    aColor: { array: new Float32Array(0), components: 4, normalized: false },
     aBatchId: { array: new Float32Array(0), components: 1, normalized: false },
   };
   let colorAttr: VertexAttribute | null = null;
@@ -537,6 +565,7 @@ function assembleSkeleton(name: string, geo: GeoPackageEntry, tile: ParsedTile, 
   let normalData: PlainAttribute | null = null;
   let uvData: PlainAttribute | null = null;
   let uv1Data: PlainAttribute | null = null;
+  let texCoordZData: PlainAttribute | null = null;
 
   for (const attr of vp.vertexAttributes) {
     if (attr.divisor !== undefined) continue; // 实例属性不进顶点流
@@ -546,15 +575,22 @@ function assembleSkeleton(name: string, geo: GeoPackageEntry, tile: ParsedTile, 
     else if (attr.semantic === 'normal') normalData = deinterleave(attr);
     else if (attr.semantic === 'uv') uvData = deinterleave(attr);
     else if (attr.semantic === 'uv2') uv1Data = deinterleave(attr);
+    // custom0 = uv 的第三分量，官方 aTextureCoordMatrix：决定「这张贴图用不用、
+    // 用图集的哪个子区域、按 2 的几次幂缩放」。BIM/OSGB 转出来的数据依赖它，
+    // 丢掉就会把本该纯色的墙面贴上整张材质图。语义见 core/TexCoordZ.ts。
+    else if (attr.semantic === 'custom0' && (attr.components ?? 1) >= 1) {
+      texCoordZData = deinterleave(attr);
+    }
   }
 
-  attrs.aColor = { array: colorData(colorAttr, vertexCount), components: 3, normalized: false };
+  attrs.aColor = { array: colorData(colorAttr, vertexCount), components: 4, normalized: false };
   attrs.aBatchId = batchAttr
     ? { array: deinterleave(batchAttr).array, components: 1, normalized: false }
     : { array: new Float32Array(vertexCount).fill(-1), components: 1, normalized: false };
   if (normalData) attrs.normal = normalData;
   if (uvData) attrs.uv = uvData;
   if (uv1Data) attrs.uv1 = uv1Data;
+  if (texCoordZData) attrs.aTexCoordZ = texCoordZData;
 
   // S3MBLOCK 图集：逐顶点带子区域矩形；烘焙图用第二套 UV（aSecUv）
   const rects = tile.atlasRects?.[name];
@@ -622,6 +658,77 @@ function primitiveOf(
     index,
     bounds: computeBounds(attrs.position.array, vertexCount),
   };
+}
+
+/**
+ * 丢弃「同单体、同位置、同绕向」的重复三角形。
+ *
+ * 为什么需要：OSGB 转出来的 S3M 里确实存在**模型自重叠**。实测
+ * `3D-BIMbuilding-2` 的 `Tile_-85071_248749_0000` 中 geo E2F8F0 有 7156 个三角形，
+ * 其中 2276 个与前面某个三角形的三个顶点坐标完全相同（4 位小数，0.1 mm 内），
+ * `Tile_-85071_248750_0000` 的 geo 386340 是 58/156 —— 文件级统计，不是我们合批造出来的。
+ *
+ * 两个共面三角形各自光栅化时深度值只差最后几位，深度缓冲分不出谁在前，
+ * 屏幕上就是一片斜向摩尔纹（用户说的「模型重叠的斜线」）；若两份材质不同，
+ * 还会随绘制顺序闪成另一种颜色。
+ *
+ * 只丢**同 batchId** 的重复：跨单体的重叠是数据本身两个单体压在一起，
+ * 丢掉任何一个都会让那个 SMID 变得不可见 / 不可拾取，只能留给业务层处理。
+ *
+ * @param quantum 顶点坐标量化步长（米）。1 mm 足以合并「同一条边」的重复，
+ *                又不会误伤真正相邻的两个面。
+ */
+export function dropCoincidentTriangles(
+  index: Uint16Array | Uint32Array,
+  positions: ArrayLike<number>,
+  batchIds: ArrayLike<number> | null,
+  quantum = 1e-3
+): { index: Uint16Array | Uint32Array; dropped: number } {
+  const triCount = Math.floor(index.length / 3);
+  if (triCount === 0) return { index, dropped: 0 };
+
+  const inv = 1 / quantum;
+  const keyOf = (v: number): string =>
+    `${Math.round(positions[v * 3] * inv)},${Math.round(positions[v * 3 + 1] * inv)},${Math.round(positions[v * 3 + 2] * inv)}`;
+
+  const seen = new Set<string>();
+  const out = new (index instanceof Uint32Array ? Uint32Array : Uint16Array)(index.length);
+  let w = 0;
+  let dropped = 0;
+  for (let t = 0; t < triCount; t++) {
+    const a = index[t * 3];
+    const b = index[t * 3 + 1];
+    const c = index[t * 3 + 2];
+    const ka = keyOf(a);
+    const kb = keyOf(b);
+    const kc = keyOf(c);
+    // 把字典序最小的顶点转到首位，**保持绕向**：
+    // 绕向相同的两份才是「同一个面画了两遍」；正反两份是有意做的双面片，
+    // 它们共面且绕向相反，深度相等时后者覆盖前者、着色一致，不会出摩尔纹。
+    let k1 = ka;
+    let k2 = kb;
+    let k3 = kc;
+    if (kb <= ka && kb <= kc) {
+      k1 = kb;
+      k2 = kc;
+      k3 = ka;
+    } else if (kc <= ka && kc <= kb) {
+      k1 = kc;
+      k2 = ka;
+      k3 = kb;
+    }
+    const key = k1 + k2 + k3 + (batchIds ? `#${batchIds[a]}` : '');
+    if (seen.has(key)) {
+      dropped++;
+      continue;
+    }
+    seen.add(key);
+    out[w++] = a;
+    out[w++] = b;
+    out[w++] = c;
+  }
+  if (dropped === 0) return { index, dropped: 0 };
+  return { index: out.slice(0, w) as Uint16Array | Uint32Array, dropped };
 }
 
 /**
@@ -738,6 +845,23 @@ export function assembleTileGeometry(tile: ParsedTile, options: AssembleOptions 
       } else {
         emit(mergeCandidates(list));
       }
+    }
+  }
+
+  // 数据自重叠：同单体、同位置、同绕向的重复三角形会互相压深度，出斜向摩尔纹。
+  // 只在**单 geo** 的 primitive 上做：合批产物里多个 geo 的 batchId 各自从 0 起，
+  // 混在一起会把「不同单体恰好共面」误判成同一条。
+  for (const p of primitives) {
+    if (p.primitiveType !== 4 || !p.index) continue;
+    if (p.geoNames.length > 1) continue;
+    const positions = p.attributes.position?.array;
+    if (!positions) continue;
+    const batchIds = p.attributes.aBatchId?.array ?? null;
+    const { index, dropped } = dropCoincidentTriangles(p.index, positions, batchIds);
+    if (dropped > 0) {
+      p.index = index;
+      p.indexCount = index.length;
+      stats.deduped = (stats.deduped ?? 0) + dropped;
     }
   }
 

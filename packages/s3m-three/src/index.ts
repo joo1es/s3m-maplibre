@@ -14,6 +14,8 @@ export { parseS3MB, S3MFormatError, S3M_VERSION, VertexTag, VertexTagV3 } from '
 export { parseS3M1, isS3M1Buffer } from './core/S3M1Parser.js';
 export type { ParseOptions, InflateFn } from './core/S3MBParser.js';
 export { BinaryReader } from './core/BinaryReader.js';
+export { planDegradations } from './core/degradations.js';
+export type { DegradationKind, UnsupportedPolicy, DegradationPlan } from './core/degradations.js';
 export { resolveFeature, measureSegments, buildAttributes, DEFAULT_FLOOR_HEIGHT } from './core/FeatureInfo.js';
 export { AttributeQuery } from './core/AttributeQuery.js';
 export type {
@@ -110,10 +112,15 @@ export type {
   PathFollowOptions,
 } from './render/S3MViewer.js';
 
+export { LIGHT_PRESETS, DEFAULT_LIGHT_PRESET, SUPERMAP_LIGHT_PRESET, resolveLightingPreset } from './render/lightingPreset.js';
+export type { LightingPreset, PresetLightIntensities } from './render/lightingPreset.js';
+
 export { buildTileObjects } from './render/GeometryBuilder.js';
 export type { BuildTileOptions, BuildTileResult, TileBuildStats } from './render/GeometryBuilder.js';
 
-export { createTexture, PixelFormat, setMaxAnisotropy, setMaxTextureSize } from './render/TextureFactory.js';
+export { createTexture, PixelFormat, setMaxAnisotropy, setMaxTextureSize, setSrgbTextureDecode } from './render/TextureFactory.js';
+export { setColorPipeline, getColorPipeline } from './render/StyleMaterial.js';
+export type { ColorPipeline } from './render/StyleMaterial.js';
 export type { DecodedTexture } from './render/TextureFactory.js';
 
 export { resolveTextureKind, dxtPixelFormatOf, TextureCompress } from './core/TextureFormat.js';

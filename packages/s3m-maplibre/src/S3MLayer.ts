@@ -41,6 +41,7 @@ import type {
   BatchAudit,
   GroundMode,
   LightOptions,
+  LightingPreset,
   TransitionOptions,
   Path,
   PathFollowOptions,
@@ -474,6 +475,11 @@ export class S3MLayer extends HostRenderer {
 
   /* ---------------------------------------------------------------- 样式 */
 
+  /** 切换光照预设：'default' 保持现状，'supermap' 对齐 iClient3D 观感 */
+  setLightingPreset(preset: LightingPreset): void {
+    this.viewer.setLightingPreset(preset);
+  }
+
   /** 动态设置光照配置（强度、颜色、朝向模式、太阳方位角/仰角等） */
   setLight(options: Partial<LightOptions>): void {
     this.viewer.setLight(options);
@@ -519,6 +525,22 @@ export class S3MLayer extends HostRenderer {
 
   getStyle(): S3MStyle & { modeLabel: string } {
     return this.viewer.getStyle();
+  }
+
+  /**
+   * 挂 / 摘环境贴图。
+   *
+   * `setStyle({ metalness })` 想有金属质感必须先有环境图：PBR 的金属几乎没有漫反射，
+   * 场景没有 `environment` 时金属度一高就整片发黑。
+   *
+   * @param source 等距柱状图（2:1 的 .hdr / .jpg / .png）地址或已加载的 three 纹理，`null` = 关闭
+   * @param intensity 环境光强度，默认 1
+   */
+  setEnvironment(
+    source: Parameters<S3MViewer['setEnvironment']>[0],
+    intensity = 1
+  ): Promise<void> {
+    return this.viewer.setEnvironment(source, intensity);
   }
 
   /**

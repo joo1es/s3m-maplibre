@@ -297,6 +297,23 @@ interface LightOptions {
 
 调用 `setLight` 会即时更新场景光源并自动触发重新绘制（`triggerRepaint()`）。
 
+### 金属度 / 粗糙度与环境贴图
+
+```ts
+viewer.setStyle({ metalness: 0.85, roughness: 0.25 });
+await viewer.setEnvironment('/env/city_2k.hdr', 1.0); // 等距柱状图（2:1），null = 关闭
+```
+
+- `metalness` / `roughness` 走共享 uniform（`uMetalness` / `uRoughness`），注入在
+  `metalnessmap_fragment` 之后改写 `metalnessFactor` / `roughnessFactor`：不重建材质、
+  不重编译 program，可以进 `setStyle` 的过渡通道逐帧插值。
+- **不传 = 不覆盖**（内部用 `-1` 当哨兵），保持数据自身的口径：`metalness` 恒 0，
+  `roughness` 由 S3M 的 `shininess` 映射（常见 0.95）。
+- 只有 `materialQuality: 'pbr'`（默认）支持；`'lambert'` 模板里没有这两个 chunk，注入是 no-op。
+- ⚠️ 金属几乎没有漫反射，**没有环境贴图时 `metalness` 一高就整片发黑**，只剩平行光的
+  高光点。先 `setEnvironment()` 挂一张等距柱状图（内部会转成 PMREM 预滤波），
+  强度由 `scene.environmentIntensity` 控制。
+
 ### 单体样式与状态
 
 ```ts
@@ -396,8 +413,43 @@ getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范�
 interface Stats {
   tiles: number; loading: number; failed: number;
   meshes: number; vertices: number; triangles: number; datasets: number;
+  /** GPU 侧观测，没有渲染器（未 mount / 纯解析）时恒为 0 */
+  drawCalls: number; programs: number; textures: number; geometries: number;
+  /** 场景里出现过的降级项（跨数据集去重）。空数组 = 所有数据的能力都完整实现了 */
+  degradations: DegradationKind[];
 }
 ```
+
+### 降级上报（degradations）
+
+**「解析不了」应该抛错，「解析得了但画不出该有的样子」必须显式说出来。** 后者最容易被写成静默降级 —— 用户看到一个能跑但不对的画面，会去怀疑数据、怀疑网络、怀疑显卡，很难怀疑到「这个分支还没做完」。
+
+目前只有一类：
+
+| kind | 数据 | 现状 |
+|:---|:---|:---|
+| `gaussian-splatting-points` | 3DGS（`dataType = "3DGaussianSplatting"`） | **按 Points 渲染**。`gsScale` / `gsRotation` 的量化格式未标定，画不出 EWA splatting，详见 [FORMAT-NOTES 第九节](./FORMAT-NOTES.md#九未标定字段d-级) |
+
+三层可见，任选自己需要的：
+
+1. **`ParsedTile.degradations`** —— 单块瓦片，解析期打标。只有真的命中才写字段，非 3DGS 数据的 `ParsedTile` 形状与旧版逐字一致。
+2. **`stats.degradations`** —— 整个场景，跨数据集去重。状态栏 / 诊断面板直接读它，不必翻 console。
+3. **`console.warn`** —— 首次遇到告警一次。同一类只报一次：一个 3DGS 服务一上来几十块瓦片都是同一个原因，不去重会把真正有用的日志冲掉。
+
+处置策略 `unsupported`（默认 `'warn'`），图层级和数据集级都能配，数据集优先：
+
+```ts
+new S3MLayer({ /* ... */, unsupported: 'warn' })          // 图层级默认
+viewer.addDataset({ /* ... */, unsupported: 'throw' })    // 数据集级覆盖
+```
+
+| 值 | 行为 | 适用 |
+|:---|:---|:---|
+| `'warn'`（默认） | 首次告警一次，照常出图 | 大多数情况。**不传参时的渲染路径与旧版逐字未变**，只是多一条日志 |
+| `'throw'` | 拒绝这类瓦片，标 `permanent` 不重试（不会在重试里空转） | 宁可不出图，也不要出一张看不出是错的图 |
+| `'silent'` | 只进 `stats.degradations`，不告警 | 已经自己接管提示的 UI |
+
+纯函数 `planDegradations(incoming, known, policy)` 也导出了，需要自定义聚合（比如按数据集分行显示）时可以直接用。
 
 ### 投影
 
@@ -444,6 +496,8 @@ interface S3MStyle {
   edgeHullWidth?: number; // 背面外扩轮廓厚度（米，默认 0.9），仅 edges 含 'hull'
   forceCpuEdges?: boolean; // 忽略数据自带的棱线包，一律 CPU 现算（默认 false）
   roofThreshold?: number; // 顶面法线判定阈值，默认 0.65
+  metalness?: number;   // 金属度 0~1，不传 = 保持数据自身（0）。pbr 才有意义，见「金属度 / 粗糙度与环境贴图」
+  roughness?: number;   // 粗糙度 0~1，不传 = 保持数据自身（shininess 映射，常见 0.95）
   fadeIn?: number;      // 新瓦片淡入时长（毫秒，默认 0 = 关闭）
 }
 ```
@@ -844,7 +898,7 @@ setMode(mode: StyleMode, opts?: { duration?: number; dim?: number }): Promise<vo
 |---|---|---|
 | `style.opacity` | 1 | 共享 `uOpacity`；混合开关只在跨 `0.999` 时切一次 |
 | `style.colorA` / `colorB` / `colorC` / `selectColor` / `edgeColor` | 3 | 线性空间 RGB |
-| `style.texMix` / `floorHeight` / `selectOpacity` / `selectEmissive` / `selectElevation` / `dimFactor` / `roofThreshold` / `ambientGain` / `edgeWidth` / `edgeOpacity` / `edgeOffset` / `edgeHullWidth` / `outlineWidth` | 1 | 直接写 uniform / 字段 |
+| `style.texMix` / `floorHeight` / `selectOpacity` / `selectEmissive` / `selectElevation` / `dimFactor` / `roofThreshold` / `ambientGain` / `metalness` / `roughness` / `edgeWidth` / `edgeOpacity` / `edgeOffset` / `edgeHullWidth` / `outlineWidth` | 1 | 直接写 uniform / 字段 |
 | `style.edgeFade` | 1 | 棱线淡入乘子，`setEdges` 内部使用 |
 | `style.fade` | 1 | 整体压暗乘子，`setMode` 内部使用 |
 

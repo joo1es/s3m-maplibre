@@ -25,6 +25,14 @@ export default function StyleSection() {
       <section>
         <h2>质感与高程</h2>
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+          <span style="color:#94a3b8; font-size:11.5px;">深度偏移</span>
+          <select id="optPolygonOffset" class="form-select" title="给三角面材质加 polygonOffset：解决跨单体完全共面的重复面（如 BIMbuilding 的 SMID 5136）在深度分辨率边缘出的斜向摩尔纹。mesh 粒度，改动后需重新加载">
+            <option value="off" selected>关（默认）</option>
+            <option value="near">拉近 (-1, -2)</option>
+            <option value="far">推远 (1, 2)</option>
+          </select>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
           <span style="color:#94a3b8; font-size:11.5px;">垂直对齐</span>
           <select id="optAlign" class="form-select">
             <option value="origin" selected>
@@ -80,6 +88,13 @@ export default function StyleSection() {
       <section>
         <h2>光照调节 (Lighting)</h2>
         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+          <span style="color:#94a3b8; font-size:11.5px;">光照预设</span>
+          <select id="optLightPreset" class="form-select" title="supermap：对齐 iClient3D 的观感（暗部压暗、亮部更饱和）。只改光源强度，不动材质与色调映射">
+            <option value="default" selected>默认 (PBR)</option>
+            <option value="supermap">supermap（对齐官方）</option>
+          </select>
+        </div>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
           <span style="color:#94a3b8; font-size:11.5px;">光照模式</span>
           <select id="optLightMode" class="form-select">
             <option value="headlamp" selected>头灯跟随 (Headlamp)</option>
@@ -118,6 +133,27 @@ export default function StyleSection() {
               <input type="color" id="optLightAmbientColor" value="#ffffff" style="width:20px; height:20px; padding:0; border:none; border-radius:4px; cursor:pointer;" />
             </label>
           </div>
+        </div>
+        <label
+          class="chk"
+          title="金属度 / 粗糙度走 PBR 材质的共享 uniform（不改材质、不重编译着色器）。金属几乎没有漫反射，没有环境反射时会发黑——先勾上下面那一项"
+        >
+          <input type="checkbox" id="optPbrSurface" /> 金属质感（Metalness / Roughness）
+        </label>
+        <div id="wrapPbrSurface" style="display:none">
+          <label class="rng" title="0 = 非金属（默认）。越高漫反射越少，金属感越强，同时越依赖环境反射">
+            <span>金属度</span>
+            <input type="range" id="optMetalness" min="0" max="100" step="1" value="0" />
+            <b id="metalnessVal">0.00</b>
+          </label>
+          <label class="rng" title="越小越接近镜面（下限 0.04），越大越哑光。S3M 数据自身的值由 shininess 映射，常见 0.95">
+            <span>粗糙度</span>
+            <input type="range" id="optRoughness" min="4" max="100" step="1" value="95" />
+            <b id="roughnessVal">0.95</b>
+          </label>
+          <label class="chk" title="内置天空渐变当环境反射（离线生成，不拉外部 HDR）。关掉时金属度会退回 0，否则整片会发黑">
+            <input type="checkbox" id="optEnv" /> 环境反射（天空渐变）
+          </label>
         </div>
       </section>
 
