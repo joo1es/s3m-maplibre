@@ -125,14 +125,14 @@ describe('实例化单体（comModel 样例）', () => {
     const layer = new S3MLayer({});
     // 按生产路径注册（TileNode 装载时做的就是这三步），只塞 _smidMeshes 的话
     // setFilter 的全量脏标记走 _pickables 会漏掉这个网格
-    mesh.userData.pickId = layer.viewer._allocPickId();
-    layer.viewer._pickables.set(mesh.userData.pickId, {
+    mesh.userData.pickId = (layer.viewer as any)._allocPickId();
+    (layer.viewer as any)._pickables.set(mesh.userData.pickId, {
       datasetId: 'test',
       mesh,
       tile: null,
       skeletonName: 'test',
     } as never);
-    layer.viewer._indexMeshSmids(mesh);
+    (layer.viewer as any)._indexMeshSmids(mesh);
 
     layer.setFeatureStyle(smid, { color: '#ff0000', elevation: 12 });
     layer.flushOverrides();
@@ -188,7 +188,7 @@ describe('实例化单体（comModel 样例）', () => {
     const mesh = instancedMeshes.find((m) => m.userData.geoRef === geo);
     const layer = new S3MLayer({});
 
-    const box = layer.viewer._instanceBox(mesh, entry.instanceIds[0]);
+    const box = (layer.viewer as any)._instanceBox(mesh, entry.instanceIds[0]);
     expect(box).toBeTruthy();
     expect(box!.maxX).toBeGreaterThan(box!.minX);
     expect(box!.maxZ).toBeGreaterThan(box!.minZ); // 不能退化成点

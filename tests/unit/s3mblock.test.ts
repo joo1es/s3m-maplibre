@@ -353,8 +353,8 @@ describe('S3MBLOCK 高清图集重拼（解拼图 → 换图 → 重拼）', () 
     // 拼图整体变宽了，归一化 rect 必须随之改变（第二张图集的 x 会被推到更右边）
     const packedW = tile.texturePackage[ids[0]!]!.width;
     expect(packedW).toBeGreaterThan(0);
-    const geo = Object.keys(tile.atlasRects)[0]!;
-    const r = tile.atlasRects[geo]!.uv!;
+    const geo = Object.keys(tile.atlasRects!)[0]!;
+    const r = tile.atlasRects![geo]!.uv!;
     expect(r.length).toBeGreaterThan(0);
     for (let i = 0; i < r.length; i += 4) {
       expect(r[i + 2]!).toBeGreaterThan(0);

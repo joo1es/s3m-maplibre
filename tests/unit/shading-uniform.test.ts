@@ -16,7 +16,7 @@ import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
 import { createSharedUniforms, createStyledMaterial } from '../../packages/s3m-three/src/render/StyleMaterial';
 
 function makeViewer(): S3MViewer {
-  return new S3MViewer({ canvas: null as never, container: null as never });
+  return new S3MViewer({ canvas: null as never, container: null as never } as ConstructorParameters<typeof S3MViewer>[0]);
 }
 
 function registerMesh(viewer: S3MViewer, smid: number): THREE.Mesh {
@@ -50,7 +50,7 @@ describe('shading = uFlatShading 共享 uniform', () => {
     const mat = createStyledMaterial({ uniforms });
     expect(mat.flatShading).toBe(false);
     expect(mat.userData.uFlatShading).toBe(uniforms.uFlatShading); // 挂共享引用，改一次全场景生效
-    expect(uniforms.uFlatShading.value).toBe(1); // 默认平面着色，语义与旧版一致
+    expect(uniforms.uFlatShading!.value).toBe(1); // 默认平面着色，语义与旧版一致
   });
 
   test('onBeforeCompile 注入 uFlatShading uniform 与导数法线分支', () => {

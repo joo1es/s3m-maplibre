@@ -36,7 +36,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
       expect(tex.format).toBe(THREE.RGBAFormat);
       expect(tex.type).toBe(THREE.FloatType);
 
-      const data = tex.image.data as Float32Array;
+      const data = tex.image.data as unknown as Float32Array;
       // 起点 (0, 0, 0)
       expect(data[0]).toBeCloseTo(0, 3);
       expect(data[1]).toBeCloseTo(0, 3);
@@ -65,7 +65,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
 
       const id = manager.registerPath(circlePts);
       const tex = manager.getTexture();
-      const data = tex.image.data as Float32Array;
+      const data = tex.image.data as unknown as Float32Array;
 
       // 验证相邻采样点的切线角差绝对值 < PI，绝不产生跨越断崖
       for (let i = 1; i < SAMPLES_PER_PATH; i++) {
@@ -149,7 +149,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
       expect(tex).toBeTruthy();
       expect(tex.image.height).toBe(6);
 
-      const data = tex.image.data as Float32Array;
+      const data = tex.image.data as unknown as Float32Array;
       const w = tex.image.width;
 
       // Row 5: (w * 5 + 0) * 4
@@ -190,7 +190,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
       fsm.applyOverridesToMesh(mesh);
 
       const tex = mat.userData.uBatchTex.value as THREE.DataTexture;
-      const data = tex.image.data as Float32Array;
+      const data = tex.image.data as unknown as Float32Array;
       const r5 = (tex.image.width * 5 + 0) * 4;
       expect(data[r5 + 0]).toBe(2); // pathId = 2
       // clamp (2) + noAutoHeading (+3) = 5
@@ -223,7 +223,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
       fsm.applyOverridesToMesh(mesh);
 
       const tex = mat.userData.uBatchTex.value as THREE.DataTexture;
-      const data = tex.image.data as Float32Array;
+      const data = tex.image.data as unknown as Float32Array;
       const r5 = (tex.image.width * 5 + 0) * 4;
       expect(data[r5 + 1]).toBe(0); // speed 变为 0
       expect(data[r5 + 2]).toBeCloseTo(0.8, 4); // phase = 0.8
@@ -316,7 +316,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
         removeEventListener: () => {},
       } as any;
 
-      const v = new S3MViewer({ canvas, container: null as any });
+      const v = new S3MViewer({ canvas, container: null as any } as ConstructorParameters<typeof S3MViewer>[0]);
       expect(v.gpuPathManager).toBeTruthy();
 
       // 1. 注册 GPU 巡检路线
@@ -333,7 +333,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
       // 2. 模拟瓦片网格与单体
       const geom = new THREE.BufferGeometry();
       geom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(18), 3));
-      const mat = createStyledMaterial(v.uniforms);
+      const mat = createStyledMaterial(v.uniforms as unknown as Parameters<typeof createStyledMaterial>[0]);
       const mesh = new THREE.Mesh(geom, mat);
       mesh.userData = {
         pickId: 0,
@@ -350,7 +350,7 @@ describe('GPU 路径动画 (GPU Path Animation)', () => {
 
       const batchTex = mat.userData.uBatchTex.value as THREE.DataTexture;
       expect(batchTex.image.height).toBe(6);
-      const data = batchTex.image.data as Float32Array;
+      const data = batchTex.image.data as unknown as Float32Array;
       const w = batchTex.image.width;
 
       // 701 校验

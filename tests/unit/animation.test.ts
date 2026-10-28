@@ -394,21 +394,21 @@ describe('5. 图层透明度走共享 uniform', () => {
     const v = makeViewer();
     v.setStyle({ opacity: 0.2 }, { duration: 100 });
 
-    expect(v.uniforms.uOpacity.value).toBe(1);
+    expect(v.uniforms.uOpacity!.value).toBe(1);
     expect(v.getStyle().opacity).toBeCloseTo(0.2, 6);
 
     stepTo(v, 50);
-    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.6, 5);
+    expect(v.uniforms.uOpacity!.value).toBeCloseTo(0.6, 5);
 
     stepTo(v, 100);
-    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.2, 5);
+    expect(v.uniforms.uOpacity!.value).toBeCloseTo(0.2, 5);
     expect(v.animator.isActive('style.opacity')).toBe(false);
   });
 
   test('无过渡时立即生效（向后兼容）', () => {
     const v = makeViewer();
     v.setStyle({ opacity: 0.4 });
-    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.4, 6);
+    expect(v.uniforms.uOpacity!.value).toBeCloseTo(0.4, 6);
     expect(v.animator.activeCount).toBe(0);
   });
 
@@ -418,7 +418,7 @@ describe('5. 图层透明度走共享 uniform', () => {
     const mat = mesh.material as THREE.MeshStandardMaterial;
 
     v.setOpacity(0.5);
-    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.5, 6);
+    expect(v.uniforms.uOpacity!.value).toBeCloseTo(0.5, 6);
     // 材质自身的 opacity 保留模型自带 alpha，全局透明度由 uniform 叠乘
     expect(mat.opacity).toBe(1);
     // 但混合开关必须打开，否则 uniform 写了也不生效
@@ -454,13 +454,13 @@ describe('5. 图层透明度走共享 uniform', () => {
     v.removeFeatureStyle(801);
     v.flushOverrides();
     expect(mat.transparent).toBe(true);
-    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.5, 6);
+    expect(v.uniforms.uOpacity!.value).toBeCloseTo(0.5, 6);
   });
 
   test('构造函数传入初始 style.opacity 时，uOpacity 正确初始化生效（非滞留 1.0）', () => {
     const v = makeViewer({ style: { opacity: 0.35 } } as any);
     expect(v.getStyle().opacity).toBe(0.35);
-    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.35, 6);
+    expect(v.uniforms.uOpacity!.value).toBeCloseTo(0.35, 6);
     expect((v as any)._opacityTransparent).toBe(true);
     // 棱线不透明度也必须包含图层不透明度因子
     expect(v.edgeMaterial.uniforms.uOpacity.value).toBeCloseTo(0.6 * 0.35, 5);
@@ -518,15 +518,15 @@ describe('7. 棱线淡入', () => {
     const v = makeViewer();
     registerMesh(v, 701);
 
-    expect(v.uniforms.uEdgeFade.value).toBe(1);
+    expect(v.uniforms.uEdgeFade!.value).toBe(1);
     v.setEdges(true, { duration: 100 });
-    expect(v.uniforms.uEdgeFade.value).toBe(0);
+    expect(v.uniforms.uEdgeFade!.value).toBe(0);
 
     stepTo(v, 50);
-    expect(v.uniforms.uEdgeFade.value).toBeCloseTo(0.5, 5);
+    expect(v.uniforms.uEdgeFade!.value).toBeCloseTo(0.5, 5);
 
     stepTo(v, 100);
-    expect(v.uniforms.uEdgeFade.value).toBeCloseTo(1, 5);
+    expect(v.uniforms.uEdgeFade!.value).toBeCloseTo(1, 5);
   });
 
   test('setEdges(false, duration) 淡完才释放几何', () => {
@@ -540,7 +540,7 @@ describe('7. 棱线淡入', () => {
     stepTo(v, 50);
     // 还没淡完，几何仍在
     expect((mesh.userData as { edges?: unknown }).edges).toBeTruthy();
-    expect(v.uniforms.uEdgeFade.value).toBeCloseTo(0.5, 5);
+    expect(v.uniforms.uEdgeFade!.value).toBeCloseTo(0.5, 5);
 
     stepTo(v, 100);
     expect((mesh.userData as { edges?: unknown }).edges).toBeFalsy();
@@ -550,10 +550,10 @@ describe('7. 棱线淡入', () => {
     const v = makeViewer();
     const mesh = registerMesh(v, 703);
     v.setEdges(true);
-    expect(v.uniforms.uEdgeFade.value).toBe(1);
+    expect(v.uniforms.uEdgeFade!.value).toBe(1);
     v.setEdges(false);
     expect((mesh.userData as { edges?: unknown }).edges).toBeFalsy();
-    expect(v.uniforms.uEdgeFade.value).toBe(1);
+    expect(v.uniforms.uEdgeFade!.value).toBe(1);
   });
 });
 
@@ -733,16 +733,16 @@ describe('9. 单体样式过渡（颜色 / 抬高 / 透明度）', () => {
 describe('10. 着色模式 fade-through', () => {
   test('setMode 压暗 → 换模式 → 亮回来', async () => {
     const v = makeViewer();
-    expect(v.uniforms.uFade.value).toBe(1);
+    expect(v.uniforms.uFade!.value).toBe(1);
 
     const done = v.setMode(3, { duration: 100, dim: 0.4 });
 
     stepTo(v, 100); // 压暗结束
-    expect(v.uniforms.uFade.value).toBeCloseTo(0.4, 4);
+    expect(v.uniforms.uFade!.value).toBeCloseTo(0.4, 4);
     expect(v.getStyle().mode).toBe(3);
 
     stepTo(v, 200); // 亮回来
-    expect(v.uniforms.uFade.value).toBeCloseTo(1, 4);
+    expect(v.uniforms.uFade!.value).toBeCloseTo(1, 4);
     await done;
   });
 
@@ -750,7 +750,7 @@ describe('10. 着色模式 fade-through', () => {
     const v = makeViewer();
     await v.setMode(2, { duration: 0 });
     expect(v.getStyle().mode).toBe(2);
-    expect(v.uniforms.uFade.value).toBe(1);
+    expect(v.uniforms.uFade!.value).toBe(1);
     expect(v.animator.activeCount).toBe(0);
   });
 

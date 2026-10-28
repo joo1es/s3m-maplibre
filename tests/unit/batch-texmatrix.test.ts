@@ -7,6 +7,7 @@
 import { describe, expect, test } from 'bun:test';
 import * as THREE from 'three';
 import { buildTileObjects } from '../../packages/s3m-three/src/render/GeometryBuilder';
+import type { ParsedTile } from '../../packages/s3m-three/src/core/types';
 
 const f32 = (arr: number[]) => new Uint8Array(new Float32Array(arr).buffer);
 
@@ -65,9 +66,9 @@ describe('纹理变换矩阵（texmodmatrix）与寻址模式（addressmode）',
   };
 
   const build = async () => {
-    const res = await buildTileObjects(fakeTile);
+    const res = await buildTileObjects(fakeTile as unknown as ParsedTile);
     expect(res.stats.meshes).toBe(1);
-    return res.objects[0].material;
+    return (res.objects[0] as THREE.Mesh).material as THREE.MeshStandardMaterial;
   };
 
   test('texmodmatrix 写成 map.matrix（列主序，缩放 2 / 平移 0.2,0.5）', async () => {
@@ -75,7 +76,7 @@ describe('纹理变换矩阵（texmodmatrix）与寻址模式（addressmode）',
     expect(mat.map).toBeTruthy();
     // elements：列主序 [n00, n10, n20, n01, n11, n21, n02, n12, n22]
     // 对应仿射 [ 2,0,0.2 / 0,2,0.5 / 0,0,1 ]
-    const el = mat.map.matrix.elements;
+    const el = mat.map!.matrix.elements;
     expect(el[0]).toBe(2);
     expect(el[4]).toBe(2);
     expect(el[6]).toBe(0.2);
@@ -84,13 +85,13 @@ describe('纹理变换矩阵（texmodmatrix）与寻址模式（addressmode）',
 
   test('有 texmodmatrix 时关闭 matrixAutoUpdate（否则每帧被重算覆盖）', async () => {
     const mat = await build();
-    expect(mat.map.matrixAutoUpdate).toBe(false);
+    expect(mat.map!.matrixAutoUpdate).toBe(false);
   });
 
   test('addressmode 映射到 wrapS / wrapT', async () => {
     const mat = await build();
-    expect(mat.map.wrapS).toBe(THREE.RepeatWrapping); // u=0
-    expect(mat.map.wrapT).toBe(THREE.ClampToEdgeWrapping); // v=1
+    expect(mat.map!.wrapS).toBe(THREE.RepeatWrapping); // u=0
+    expect(mat.map!.wrapT).toBe(THREE.ClampToEdgeWrapping); // v=1
   });
 });
 
@@ -157,12 +158,12 @@ describe('瓦片同材质网格合批（Geometry Batching）', () => {
   };
 
   test('开启合批：3 个碎片合并成 1 个 Mesh，DrawCall 降低 66%', async () => {
-    const res = await buildTileObjects(fakePhotogrammetryTile, { batching: true });
+    const res = await buildTileObjects(fakePhotogrammetryTile as unknown as ParsedTile, { batching: true });
     expect(res.stats.meshes).toBe(1);
     expect(res.stats.originalMeshes).toBe(3);
     expect(res.stats.triangles).toBe(3);
 
-    const mesh = res.objects[0];
+    const mesh = res.objects[0] as THREE.Mesh;
     expect(mesh.userData.isBatched).toBe(true);
     expect(mesh.userData.batchedCount).toBe(3);
     expect(mesh.geometry.attributes.position.count).toBe(9);
@@ -170,8 +171,8 @@ describe('瓦片同材质网格合批（Geometry Batching）', () => {
   });
 
   test('各子网格的局部变换被烘焙进顶点位置', async () => {
-    const res = await buildTileObjects(fakePhotogrammetryTile, { batching: true });
-    const pos = res.objects[0].geometry.attributes.position.array;
+    const res = await buildTileObjects(fakePhotogrammetryTile as unknown as ParsedTile, { batching: true });
+    const pos = (res.objects[0] as THREE.Mesh).geometry.attributes.position.array;
     // chunk0: (0,0,0)
     expect([pos[0], pos[1], pos[2]]).toEqual([0, 0, 0]);
     // chunk1: 平移 (10,0,0)
@@ -181,7 +182,7 @@ describe('瓦片同材质网格合批（Geometry Batching）', () => {
   });
 
   test('关闭合批：平滑回退到 3 个独立 Mesh', async () => {
-    const res = await buildTileObjects(fakePhotogrammetryTile, { batching: false });
+    const res = await buildTileObjects(fakePhotogrammetryTile as unknown as ParsedTile, { batching: false });
     expect(res.stats.meshes).toBe(3);
   });
 });

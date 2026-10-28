@@ -77,9 +77,9 @@ describe('2. 全局棱线：逐网格材质 + 共享外观', () => {
     // 材质必须独立（要绑各自的 batch 纹理）
     expect(edges.material).not.toBe(v.edgeMaterial);
     // 外观必须是同一批对象：改一次全局，所有棱线生效
-    expect(edges.material.uniforms.uColor).toBe(v.edgeMaterial.uniforms.uColor);
-    expect(edges.material.uniforms.uOpacity).toBe(v.edgeMaterial.uniforms.uOpacity);
-    expect(edges.material.uniforms.uWidth).toBe(v.edgeMaterial.uniforms.uWidth);
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uColor).toBe(v.edgeMaterial.uniforms.uColor);
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uOpacity).toBe(v.edgeMaterial.uniforms.uOpacity);
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uWidth).toBe(v.edgeMaterial.uniforms.uWidth);
   });
 
   test('改全局棱线颜色，逐网格材质同步生效', () => {
@@ -90,7 +90,7 @@ describe('2. 全局棱线：逐网格材质 + 共享外观', () => {
 
     v.setStyle({ edgeColor: '#ff0000' });
     const edges = edgesOf(mesh);
-    expect(edges.material.uniforms.uColor.value.getHexString()).toBe('ff0000');
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uColor.value.getHexString()).toBe('ff0000');
   });
 
   test('棱线的单体状态 uniform 直接复用主材质的对象，自动跟随', () => {
@@ -103,8 +103,8 @@ describe('2. 全局棱线：逐网格材质 + 共享外观', () => {
       userData: { uBatchTex: { value: unknown }; uBatchTexActive: { value: number } };
     };
     const edges = edgesOf(mesh);
-    expect(edges.material.uniforms.uBatchTex).toBe(styled.userData.uBatchTex);
-    expect(edges.material.uniforms.uBatchTexActive).toBe(styled.userData.uBatchTexActive);
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uBatchTex).toBe(styled.userData.uBatchTex);
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uBatchTexActive).toBe(styled.userData.uBatchTexActive);
   });
 
   test('移动单体：状态纹理写进平移量，棱线采样同一份纹理', () => {
@@ -127,7 +127,7 @@ describe('2. 全局棱线：逐网格材质 + 共享外观', () => {
     expect(data[4 + 0]).toBeCloseTo(50, 4);
     // 棱线材质采的就是同一个纹理对象，所以它自然会跟着移动
     const edges = edgesOf(mesh);
-    expect(edges.material.uniforms.uBatchTex.value).toBe(styled.userData.uBatchTex.value);
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uBatchTex.value).toBe(styled.userData.uBatchTex.value);
   });
 
   test('_ensureEdges 回填的 aBatchId 与 pickInfo 一致', () => {
@@ -154,7 +154,7 @@ describe('2. 全局棱线：逐网格材质 + 共享外观', () => {
     const styled = mesh.material as unknown as { userData: { uBatchTexActive: { value: number } } };
     expect(styled.userData.uBatchTexActive.value).toBe(1);
     const edges = edgesOf(mesh);
-    expect(edges.material.uniforms.uBatchTexActive.value).toBe(1);
+    expect((edges.material as THREE.ShaderMaterial).uniforms.uBatchTexActive.value).toBe(1);
   });
 });
 
@@ -195,12 +195,12 @@ describe('3. 选中棱线跟随', () => {
     v.select(pick(v, mesh, 202, 0));
 
     const sel = (v as unknown as { _selectionEdgeMeshes: THREE.Mesh[] })._selectionEdgeMeshes[0];
-    expect(sel.material.uniforms.uColor).toBe(v.selectionEdgeMaterial.uniforms.uColor);
+    expect((sel.material as THREE.ShaderMaterial).uniforms.uColor).toBe(v.selectionEdgeMaterial.uniforms.uColor);
 
     const styled = mesh.material as unknown as {
       userData: { uBatchTex: { value: unknown } };
     };
-    expect(sel.material.uniforms.uBatchTex).toBe(styled.userData.uBatchTex);
+    expect((sel.material as THREE.ShaderMaterial).uniforms.uBatchTex).toBe(styled.userData.uBatchTex);
   });
 
   test('选中后平移单体，选中棱线采样同一份状态纹理', () => {
@@ -220,7 +220,7 @@ describe('3. 选中棱线跟随', () => {
 
     const data = styled.userData.uBatchTex.value.image.data;
     expect(data[4 + 0]).toBeCloseTo(30, 4);
-    expect(sel.material.uniforms.uBatchTex.value).toBe(styled.userData.uBatchTex.value);
+    expect((sel.material as THREE.ShaderMaterial).uniforms.uBatchTex.value).toBe(styled.userData.uBatchTex.value);
   });
 
   test('选中棱线只加全局 selectElevation，单体自身拔高由状态纹理带出（不双重拔高）', () => {
@@ -231,6 +231,6 @@ describe('3. 选中棱线跟随', () => {
     v.setStyle({ selectElevation: 30 });
 
     const sel = (v as unknown as { _selectionEdgeMeshes: THREE.Mesh[] })._selectionEdgeMeshes[0];
-    expect(sel.material.uniforms.uElevation.value).toBe(30);
+    expect((sel.material as THREE.ShaderMaterial).uniforms.uElevation.value).toBe(30);
   });
 });

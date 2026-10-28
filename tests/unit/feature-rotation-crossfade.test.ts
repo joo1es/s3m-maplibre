@@ -102,7 +102,7 @@ describe('P2. 单体姿态旋转 (5 行状态纹理与 3x3 矩阵)', () => {
     expect(tex).toBeTruthy();
     expect(tex.image.height).toBe(6);
 
-    const data = tex.image.data as Float32Array;
+    const data = tex.image.data as unknown as Float32Array;
     const w = tex.image.width;
 
     // Row 2: [R00, R01, R02, pivot.x]
@@ -175,7 +175,7 @@ describe('P1. GPU 双纹理交叉淡化 (crossFadeStyles)', () => {
   test('StyleMaterial 与 uniforms 包含 uBatchMix 与 uBatchTex2', () => {
     const shared = createSharedUniforms();
     expect(shared.uBatchMix).toBeTruthy();
-    expect(shared.uBatchMix.value).toBe(0);
+    expect(shared.uBatchMix!.value).toBe(0);
 
     const mat = createStyledMaterial({ uniforms: shared });
     expect(mat.userData.uBatchTex).toBeTruthy();
@@ -192,7 +192,7 @@ describe('P1. GPU 双纹理交叉淡化 (crossFadeStyles)', () => {
     // 交叉淡化到绿色
     v.crossFadeStyles({ 501: { color: '#00ff00' } });
 
-    expect(v.uniforms.uBatchMix.value).toBe(0);
+    expect(v.uniforms.uBatchMix!.value).toBe(0);
     const cur = v.getFeatureStyle(501);
     expect(cur?.color).toBe('#00ff00');
   });
@@ -217,14 +217,14 @@ describe('P1. GPU 双纹理交叉淡化 (crossFadeStyles)', () => {
 
     // 推进到一半 100ms
     stepTo(v, 100);
-    expect(v.uniforms.uBatchMix.value).toBeCloseTo(0.5, 2);
+    expect(v.uniforms.uBatchMix!.value).toBeCloseTo(0.5, 2);
     expect(completed).toBe(false);
 
     // 推进结束 200ms
     stepTo(v, 200);
     expect(completed).toBe(true);
     // 结束后 uBatchMix 复位为 0
-    expect(v.uniforms.uBatchMix.value).toBe(0);
+    expect(v.uniforms.uBatchMix!.value).toBe(0);
     // featureStyles 已更新为目标状态
     expect(v.getFeatureStyle(601)?.color).toBe('#0000ff');
   });
@@ -273,7 +273,7 @@ describe('P1. GPU 双纹理交叉淡化 (crossFadeStyles)', () => {
     const tex = edgeMat.uniforms.uBatchTex.value as THREE.DataTexture;
     expect(tex.image.height).toBe(6);
 
-    const data = tex.image.data as Float32Array;
+    const data = tex.image.data as unknown as Float32Array;
     const w = tex.image.width;
 
     // Row 1 平移验证

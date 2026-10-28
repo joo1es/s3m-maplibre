@@ -92,13 +92,10 @@ describe('S3MWorkerClient 端到端（Bun Worker 直跑 TS）', () => {
       const geodes = Object.values(main.geoPackage);
       const wkGeodes = Object.values(viaWorker.geoPackage);
       for (let i = 0; i < geodes.length; i++) {
-        const packages = geodes[i]!.vertexPackages ?? [];
-        const wkPackages = wkGeodes[i]!.vertexPackages ?? [];
-        expect(wkPackages.length).toBe(packages.length);
-        for (let j = 0; j < packages.length; j++) {
-          expect(wkPackages[j]!.verticesCount).toBe(packages[j]!.verticesCount);
-          expect(wkPackages[j]!.vertexAttributes.length).toBe(packages[j]!.vertexAttributes.length);
-        }
+        const pkg = geodes[i]!.vertexPackage;
+        const wkPkg = wkGeodes[i]!.vertexPackage;
+        expect(wkPkg.verticesCount).toBe(pkg.verticesCount);
+        expect(wkPkg.vertexAttributes.length).toBe(pkg.vertexAttributes.length);
       }
     } finally {
       client.dispose();
@@ -233,7 +230,7 @@ describe('S3MWorkerClient 端到端（Bun Worker 直跑 TS）', () => {
     expect(compressed.blocks).toBeTruthy(); // 块数据原样透传
     expect(compressed.rgba).toBeNull();
     expect(compressed.kind.endsWith('(c)')).toBe(true);
-    expect(['dxt1', 'dxt5']).toContain(compressed.blockFormat);
+    expect(['dxt1', 'dxt5']).toContain(compressed.blockFormat!);
     if (compressed.blockFormat === 'dxt1') {
       expect(compressed.blocks!.length).toBe(compressed.width * compressed.height * 0.5);
     }

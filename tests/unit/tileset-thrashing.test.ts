@@ -26,6 +26,7 @@ function createMockTileNode(url: string, triangles = 1000, meshes = 1, vertices 
     sphere: { center: { x: 0, y: 0, z: 0 }, radius: 100 },
     rangeValue: 100,
     rangeMode: 1,
+    childUrl: null,
     childUrls: [],
     state: 'ready',
     stats: { meshes, vertices, triangles },
@@ -45,15 +46,15 @@ describe('瓦片淘汰统计与防循环加载 (Tileset Thrashing Prevention)', 
     // 模拟注册
     ts.nodes.set(node1.url, node1);
     ts.stats.tiles++;
-    ts.stats.meshes += node1.stats.meshes;
-    ts.stats.vertices += node1.stats.vertices;
-    ts.stats.triangles += node1.stats.triangles;
+    ts.stats.meshes += node1.stats!.meshes;
+    ts.stats.vertices += node1.stats!.vertices;
+    ts.stats.triangles += node1.stats!.triangles;
 
     ts.nodes.set(node2.url, node2);
     ts.stats.tiles++;
-    ts.stats.meshes += node2.stats.meshes;
-    ts.stats.vertices += node2.stats.vertices;
-    ts.stats.triangles += node2.stats.triangles;
+    ts.stats.meshes += node2.stats!.meshes;
+    ts.stats.vertices += node2.stats!.vertices;
+    ts.stats.triangles += node2.stats!.triangles;
 
     expect(ts.stats.tiles).toBe(2);
     expect(ts.stats.meshes).toBe(5);

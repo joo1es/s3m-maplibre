@@ -11,7 +11,7 @@ import { describe, expect, test } from 'bun:test';
 import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
 
 function makeViewer(): S3MViewer {
-  return new S3MViewer({ canvas: null as never, container: null as never });
+  return new S3MViewer({ canvas: null as never, container: null as never } as ConstructorParameters<typeof S3MViewer>[0]);
 }
 
 describe('renderer.info 进 Stats', () => {

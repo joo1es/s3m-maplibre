@@ -268,14 +268,14 @@ describe('7. fov 单位（v5 起 transform.fov 是「度」）', () => {
       fovInRadians: FOV,
       cameraToCenterDistance: DISTANCE,
     }) as never;
-    expect(layer._frameFov({ fov: 0.9 })).toBe(0.9);
+    expect((layer as any)._frameFov({ fov: 0.9 })).toBe(0.9);
 
     // 入参没有 → 退回 fovInRadians，而不是把「度」当弧度
-    expect(layer._frameFov({})).toBe(FOV);
+    expect((layer as any)._frameFov({})).toBe(FOV);
 
     // 只有 v5 的 transform.fov（度）时 → 落到默认弧度，绝不能把 36.87 当弧度
     layer.map = mkMap({ fov: 36.87, cameraToCenterDistance: DISTANCE }) as never;
-    expect(layer._frameFov({})).toBe(0.6435011087932844);
+    expect((layer as any)._frameFov({})).toBe(0.6435011087932844);
   });
 });
 
@@ -331,7 +331,7 @@ describe('8. 接线：真实类上的行为', () => {
       fov: FOV,
     };
 
-    const wired = layer._applyOrtho(input as never, new THREE.Matrix4().fromArray(mainMatrix.elements));
+    const wired = (layer as any)._applyOrtho(input as never, new THREE.Matrix4().fromArray(mainMatrix.elements));
     expect(wired).toBeTruthy();
 
     const expectedMvp = expectedOrtho()
@@ -345,8 +345,8 @@ describe('8. 接线：真实类上的行为', () => {
     const origWarn = console.warn;
     console.warn = (m: string) => warnings.push(m);
     try {
-      expect(layer._applyOrtho([...mainMatrix.elements] as never, new THREE.Matrix4())).toBeNull();
-      expect(layer._applyOrtho([...mainMatrix.elements] as never, new THREE.Matrix4())).toBeNull();
+      expect((layer as any)._applyOrtho([...mainMatrix.elements] as never, new THREE.Matrix4())).toBeNull();
+      expect((layer as any)._applyOrtho([...mainMatrix.elements] as never, new THREE.Matrix4())).toBeNull();
     } finally {
       console.warn = origWarn;
     }

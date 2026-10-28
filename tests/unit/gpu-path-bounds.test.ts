@@ -18,7 +18,7 @@ import { createStyledMaterial } from '../../packages/s3m-three/src/render/StyleM
 /* ------------------------------------------------------------------ 工具 */
 
 function makeViewer(): S3MViewer {
-  const v = new S3MViewer({ canvas: null as never, container: null as never });
+  const v = new S3MViewer({ canvas: null as never, container: null as never } as ConstructorParameters<typeof S3MViewer>[0]);
   // 造一个能算出经纬度的锚点（1 米 = 1 墨卡托单位，换算可逆）
   v.sceneAnchor = { x: 0, y: 0, z: 0, meterInMercator: 1 };
   return v;
@@ -53,7 +53,7 @@ describe('1. 拾取材质能拿到路径 uniform', () => {
       userData: Record<string, { value: unknown }>;
     };
 
-    expect(mat.userData.uPathTex?.value).toBe(v.uniforms.uPathTex.value);
+    expect(mat.userData.uPathTex?.value).toBe(v.uniforms.uPathTex!.value);
     expect(mat.userData.uPathTexActive).toBe(v.uniforms.uPathTexActive);
     expect(mat.userData.uPathCount).toBe(v.uniforms.uPathCount);
     expect(mat.userData.uPathTime).toBe(v.uniforms.uPathTime);
@@ -69,21 +69,21 @@ describe('1. 拾取材质能拿到路径 uniform', () => {
   test('绑定 GPU 路径后 uPathTexActive 置 1，路径库清空后回落', () => {
     const v = makeViewer();
     registerMesh(v, 701);
-    expect(v.uniforms.uPathTexActive.value).toBe(0);
+    expect(v.uniforms.uPathTexActive!.value).toBe(0);
 
     const pathId = v.registerGPUPath([0, 0, 0, 100, 0, 0]);
     v.bindGPUPath(701, pathId, { speed: 0.1 });
-    expect(v.uniforms.uPathTexActive.value).toBe(1);
-    expect(v.uniforms.uPathCount.value).toBeGreaterThanOrEqual(1);
+    expect(v.uniforms.uPathTexActive!.value).toBe(1);
+    expect(v.uniforms.uPathCount!.value).toBeGreaterThanOrEqual(1);
 
     // 解绑只摘掉单体的 pathId（row5 归零），路径库还在，所以纹理仍处于激活态
     v.unbindGPUPath(701);
     expect(v.getFeatureStyle(701)?.gpuPath).toBeUndefined();
-    expect(v.uniforms.uPathTexActive.value).toBe(1);
+    expect(v.uniforms.uPathTexActive!.value).toBe(1);
 
     // 路径库清空才真正关掉分支
     v.unregisterGPUPath(pathId);
-    expect(v.uniforms.uPathTexActive.value).toBe(0);
+    expect(v.uniforms.uPathTexActive!.value).toBe(0);
     v.dispose();
   });
 });

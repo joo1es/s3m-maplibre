@@ -122,7 +122,7 @@ test('OSGB XML 把 FileType 带出来，供上层提前判定这是 1.x 缓存',
 test('S3M 1.x（.s3m / SuperMapCache）瓦片能真解码：几何、纹理、LOD 球全部对上', async () => {
   // 真实根瓦片：supermapol 3D-suofeiya_church / datas/Config/Tile_+002_+001/Tile_+002_+001.s3m
   const b = readFileSync(join(import.meta.dir, '../fixtures/osgb/root.s3m'));
-  const tile = await parseS3MB(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength), {
+  const tile = await parseS3MB(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer, {
     inflate: (x) => inflateSync(x),
   });
 
@@ -171,7 +171,7 @@ test('S3M 1.x 缓冲被截断/伪造时报能定位的错，不是 RangeError �
   const buf = Buffer.concat([Buffer.from([0x73, 0x33, 0x6d, 0x00]), body]);
   let err: unknown;
   try {
-    await parseS3MB(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+    await parseS3MB(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer);
   } catch (e) {
     err = e;
   }
@@ -188,7 +188,7 @@ test('S3M 2.x / 3.x 的正常头不会被 1.x 识别误伤', async () => {
   const ab = new Uint8Array([0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x00, 0x00]).buffer;
   let err: unknown;
   try {
-    await parseS3MB(ab);
+    await parseS3MB(ab as ArrayBuffer);
   } catch (e) {
     err = e;
   }

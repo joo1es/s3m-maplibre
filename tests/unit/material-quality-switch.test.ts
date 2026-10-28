@@ -14,7 +14,7 @@ import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
 import { createStyledMaterial, getMaterialQuality } from '../../packages/s3m-three/src/render/StyleMaterial';
 
 function makeViewer(): S3MViewer {
-  return new S3MViewer({ canvas: null as never, container: null as never });
+  return new S3MViewer({ canvas: null as never, container: null as never } as ConstructorParameters<typeof S3MViewer>[0]);
 }
 
 function registerMesh(viewer: S3MViewer, smid: number): THREE.Mesh {

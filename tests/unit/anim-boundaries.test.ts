@@ -15,7 +15,7 @@ import { createStyledMaterial } from '../../packages/s3m-three/src/render/StyleM
 
 function makeViewer(opts: Record<string, unknown> = {}): S3MViewer {
   let t = 0;
-  const v = new S3MViewer({ canvas: null as never, container: null as never, ...opts });
+  const v = new S3MViewer({ canvas: null as never, container: null as never, ...opts } as ConstructorParameters<typeof S3MViewer>[0]);
   v.sceneAnchor = { x: 0, y: 0, z: 0, meterInMercator: 1 };
   // 假时钟：动画按绝对时间推进，用真实 performance.now() 断言不了中间值
   (v.animator as unknown as { _now: () => number })._now = () => t;
@@ -80,16 +80,16 @@ describe('1. 全局透明度允许到 0', () => {
     const v = makeViewer();
     v.setOpacity(0);
     expect(v.getStyle().opacity).toBe(0);
-    expect(v.uniforms.uOpacity.value).toBe(0);
+    expect(v.uniforms.uOpacity!.value).toBe(0);
     v.dispose();
   });
 
   test('越界值按 [0, 1] 钳制', () => {
     const v = makeViewer();
     v.setOpacity(1.8);
-    expect(v.uniforms.uOpacity.value).toBe(1);
+    expect(v.uniforms.uOpacity!.value).toBe(1);
     v.setOpacity(-3);
-    expect(v.uniforms.uOpacity.value).toBe(0);
+    expect(v.uniforms.uOpacity!.value).toBe(0);
     v.dispose();
   });
 
@@ -99,9 +99,9 @@ describe('1. 全局透明度允许到 0', () => {
     v.setOpacity(0, { duration: 100, easing: 'linear' });
 
     stepTo(v, 50);
-    expect(v.uniforms.uOpacity.value).toBeCloseTo(0.5, 2);
+    expect(v.uniforms.uOpacity!.value).toBeCloseTo(0.5, 2);
     stepTo(v, 100);
-    expect(v.uniforms.uOpacity.value).toBe(0);
+    expect(v.uniforms.uOpacity!.value).toBe(0);
     v.dispose();
   });
 

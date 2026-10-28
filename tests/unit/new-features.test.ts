@@ -53,7 +53,7 @@ describe('2. 单体 xy/z 平移（状态纹理第 2 行）', () => {
     mesh.userData = { pickId: 0, geoRef: { pickInfo: { 101: { batchId: 0 } } } };
 
     layer.setFeatureStyle(101, { color: '#ff0000', translation: [5, 10, 15] });
-    layer.viewer._applyOverridesToMesh(mesh);
+    (layer.viewer as any)._applyOverridesToMesh(mesh);
 
     const tex = mat.userData.uBatchTex.value;
     expect(tex).toBeTruthy();
@@ -78,7 +78,7 @@ describe('2.5 单体独立透明度（状态纹理第 2 行 alpha）', () => {
   const mkStyledMesh = (layer: S3MLayer, smid: number) => {
     const geom = new THREE.BoxGeometry(10, 10, 10);
     geom.setAttribute('aBatchId', new THREE.BufferAttribute(new Float32Array(geom.attributes.position.count), 1));
-    const mesh = new THREE.Mesh(geom, createStyledMaterial(layer.uniforms));
+    const mesh = new THREE.Mesh(geom, createStyledMaterial(layer.uniforms as unknown as Parameters<typeof createStyledMaterial>[0]));
     mesh.userData = { pickId: 0, geoRef: { pickInfo: { [smid]: { batchId: 0 } } } };
     return mesh;
   };
@@ -88,7 +88,7 @@ describe('2.5 单体独立透明度（状态纹理第 2 行 alpha）', () => {
     const mesh = mkStyledMesh(layer, 101);
 
     layer.setFeatureStyle(101, { opacity: 0.4 });
-    layer.viewer._applyOverridesToMesh(mesh);
+    (layer.viewer as any)._applyOverridesToMesh(mesh);
 
     const mat = mesh.material as unknown as {
       transparent: boolean;
@@ -107,7 +107,7 @@ describe('2.5 单体独立透明度（状态纹理第 2 行 alpha）', () => {
 
     // 清除后：uBatchTexActive 归零（渲染不再采样状态纹理）、transparent 还原（全局 opacity=1）
     layer.removeFeatureStyle(101);
-    layer.viewer._applyOverridesToMesh(mesh);
+    (layer.viewer as any)._applyOverridesToMesh(mesh);
     expect(mat.userData.uBatchTexActive.value).toBe(0);
     expect(mat.transparent).toBe(false);
   });
@@ -117,7 +117,7 @@ describe('2.5 单体独立透明度（状态纹理第 2 行 alpha）', () => {
     const mesh = mkStyledMesh(layer, 102);
 
     layer.setFeatureStyle(102, { opacity: 0 });
-    layer.viewer._applyOverridesToMesh(mesh);
+    (layer.viewer as any)._applyOverridesToMesh(mesh);
 
     const mat = mesh.material as unknown as {
       userData: { uBatchTex: { value: { image: { data: Float32Array; width: number } } } };
@@ -138,7 +138,7 @@ describe('3. getFeatureBounds & flyToFeature', () => {
     const mesh = new THREE.Mesh(geom);
     mesh.updateMatrixWorld(true);
     mesh.userData = { pickId: 1, geoRef: { pickInfo: { 202: { batchId: 0 } } } };
-    layer.viewer._pickables.set(1, { mesh, datasetId: 'test', skeletonName: 'box' } as never);
+    (layer.viewer as any)._pickables.set(1, { mesh, datasetId: 'test', skeletonName: 'box' } as never);
 
     const bounds = layer.getFeatureBounds(202);
     expect(bounds).toBeTruthy();
@@ -165,10 +165,10 @@ describe('4. pickPosition 与精确求交', () => {
     const layer = mkLayer({ configUrl: 'http://example.com/config.json' });
     layer.sceneAnchor = { x: 0.5, y: 0.5, z: 0.0, meterInMercator: 1e-6, altitude: 50 } as never;
     layer.viewer.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
-    layer.camera.position.set(0, 0, 100);
-    layer.camera.lookAt(0, 0, 0);
-    layer.camera.updateMatrixWorld(true);
-    layer.camera.updateProjectionMatrix();
+    (layer.camera as THREE.PerspectiveCamera).position.set(0, 0, 100);
+    (layer.camera as THREE.PerspectiveCamera).lookAt(0, 0, 0);
+    (layer.camera as THREE.PerspectiveCamera).updateMatrixWorld(true);
+    (layer.camera as THREE.PerspectiveCamera).updateProjectionMatrix();
 
     // viewer 在 mount 时缓存画布；测试直接注入
     layer.viewer.canvas = { clientWidth: 800, clientHeight: 600, width: 800, height: 600 } as never;
@@ -188,10 +188,10 @@ describe('5. drillPick 穿透拾取', () => {
     const layer = mkLayer({ configUrl: 'http://example.com/config.json' });
     layer.sceneAnchor = { x: 0.5, y: 0.5, z: 0.0, meterInMercator: 1e-6, altitude: 0 } as never;
     layer.viewer.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
-    layer.camera.position.set(0, 0, 200);
-    layer.camera.lookAt(0, 0, 0);
-    layer.camera.updateMatrixWorld(true);
-    layer.camera.updateProjectionMatrix();
+    (layer.camera as THREE.PerspectiveCamera).position.set(0, 0, 200);
+    (layer.camera as THREE.PerspectiveCamera).lookAt(0, 0, 0);
+    (layer.camera as THREE.PerspectiveCamera).updateMatrixWorld(true);
+    (layer.camera as THREE.PerspectiveCamera).updateProjectionMatrix();
     layer.viewer.canvas = { clientWidth: 800, clientHeight: 600, width: 800, height: 600 } as never;
 
     // 沿 z 轴放置前后两个面（前层 z=50，后层 z=10）
@@ -206,14 +206,14 @@ describe('5. drillPick 穿透拾取', () => {
     };
     const front = plane(50, 10, 301);
     const back = plane(10, 11, 302);
-    layer.viewer._pickables.set(10, { mesh: front, datasetId: 'test', skeletonName: 'front' } as never);
-    layer.viewer._pickables.set(11, { mesh: back, datasetId: 'test', skeletonName: 'back' } as never);
+    (layer.viewer as any)._pickables.set(10, { mesh: front, datasetId: 'test', skeletonName: 'front' } as never);
+    (layer.viewer as any)._pickables.set(11, { mesh: back, datasetId: 'test', skeletonName: 'back' } as never);
 
     const hits = layer.drillPick(400, 300);
     expect(hits.length).toBe(2);
     expect(hits[0].smid).toBe(301);
     expect(hits[1].smid).toBe(302);
-    expect(hits[0].point[2]).toBeGreaterThan(hits[1].point[2]); // 按深度排序
+    expect(hits[0].point![2]).toBeGreaterThan(hits[1].point![2]); // 按深度排序
   });
 });
 
@@ -246,7 +246,7 @@ describe('6. CRS / worldCoordinateHelper 适配', () => {
 
     const layer = mkLayer();
     layer.map = mockMap as never;
-    mockMap.on('projectiontransition', layer._onProjectionChange);
+    mockMap.on('projectiontransition', (layer as any)._onProjectionChange);
 
     layer.datasets.set('customDs', {
       id: 'customDs',
@@ -265,7 +265,7 @@ describe('6. CRS / worldCoordinateHelper 适配', () => {
     expect(layer.sceneAnchor!.z).toBe(100 / 50000);
 
     // 坐标反查经纬度
-    expect(layer.viewer._lngLatFromWorld(0.5, 0.5)).toEqual([105, 35]);
+    expect((layer.viewer as any)._lngLatFromWorld(0.5, 0.5)).toEqual([105, 35]);
 
     // 投影切换动态响应
     customCRS.metersPerWorldUnit = () => 20000;
@@ -281,11 +281,11 @@ describe('7. 多 Mesh 共享同一 SMID 时联动选中（CBD 场景）', () => 
     const mkMesh = (pos: number[]) => {
       const g = new THREE.BufferGeometry();
       g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
-      const m = new THREE.Mesh(g, createStyledMaterial(layer.uniforms));
+      const m = new THREE.Mesh(g, createStyledMaterial(layer.uniforms as unknown as Parameters<typeof createStyledMaterial>[0]));
       m.userData = {
         geoRef: { pickInfo: { 20: { batchId: 0, segments: [{ vertexOffset: 0, vertexCount: 3 }] } } },
       };
-      layer.viewer._indexMeshSmids(m);
+      (layer.viewer as any)._indexMeshSmids(m);
       return m;
     };
     const m1 = mkMesh([0, 0, 0, 1, 0, 0, 0, 1, 0]);
@@ -296,12 +296,12 @@ describe('7. 多 Mesh 共享同一 SMID 时联动选中（CBD 场景）', () => 
     // 虽然只点了 m1，但共享 SMID 20 的两块网格都要高亮
     expect(m1.material.userData.uSelBatch.value).toBe(0);
     expect(m2.material.userData.uSelBatch.value).toBe(0);
-    expect(layer.viewer._selectedMeshes.length).toBe(2);
+    expect((layer.viewer as any)._selectedMeshes.length).toBe(2);
 
     layer.select(null);
     expect(m1.material.userData.uSelBatch.value).toBe(-1);
     expect(m2.material.userData.uSelBatch.value).toBe(-1);
-    expect(layer.viewer._selectedMeshes.length).toBe(0);
+    expect((layer.viewer as any)._selectedMeshes.length).toBe(0);
   });
 });
 

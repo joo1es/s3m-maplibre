@@ -41,7 +41,7 @@ afterEach(() => {
 
 /** 永不 resolve 的 fetch：避免用例真的发请求 */
 const stallFetch = () => {
-  globalThis.fetch = () => new Promise(() => {});
+  globalThis.fetch = (() => new Promise<void>(() => {})) as unknown as typeof fetch;
 };
 
 const f32 = (arr: number[]) => new Uint8Array(new Float32Array(arr).buffer);
@@ -122,14 +122,14 @@ describe('2. 预算满时不停止加载，但绝不踢「正在显示且没人�
     ts.nodes.set('recent', mkNode('recent', null, 9, 50) as never);
 
     stallFetch();
-    ts._enqueue('http://example.com/new.s3mb');
+    (ts as any)._enqueue('http://example.com/new.s3mb');
 
     // 旧策略在这里就会为了塞新瓦片删掉 lastSeen 最旧的「old」—— 而它正在显示、
     // 位置没有任何子瓦接手，删掉立刻是一个洞，下一帧还得回补 → 反复就是闪烁。
     expect(removed).toEqual([]);
     expect(ts.nodes.has('old')).toBe(true);
     // 新瓦片照常进入加载队列，预算不再靠「先删后加」来腾地方
-    expect(ts.pending.size + ts._queue.length).toBeGreaterThan(0);
+    expect(ts.pending.size + (ts as any)._queue.length).toBeGreaterThan(0);
   });
 
   test('子瓦接手显示后，父瓦才是安全候选（由 _trimBudget 裁掉）', () => {
@@ -143,7 +143,7 @@ describe('2. 预算满时不停止加载，但绝不踢「正在显示且没人�
     parent.group.visible = false;
     child.group.visible = true;
 
-    ts._trimBudget();
+    (ts as any)._trimBudget();
     expect(removed).toEqual(['p']);
     expect(ts.nodes.has('c')).toBe(true); // 正在显示的绝不动
   });
@@ -161,21 +161,21 @@ describe('3. 瓦片失败退避重试，超次数才进 failed', () => {
       throw new Error('network down');
     }) as never;
 
-    await ts._load('http://example.com/t.s3mb');
+    await (ts as any)._load('http://example.com/t.s3mb');
     expect(ts.failed.size).toBe(0); // 第一次失败不应直接进 failed
     expect(calls).toBe(1);
 
     // 退避期内再入队应被拒绝
-    ts._enqueue('http://example.com/t.s3mb');
+    (ts as any)._enqueue('http://example.com/t.s3mb');
     expect(calls).toBe(1);
 
     // 退避结束后还能再试
     fakeNow += 10000;
-    await ts._load('http://example.com/t.s3mb');
+    await (ts as any)._load('http://example.com/t.s3mb');
     expect(calls).toBe(2);
 
     fakeNow += 10000;
-    await ts._load('http://example.com/t.s3mb');
+    await (ts as any)._load('http://example.com/t.s3mb');
     expect(calls).toBe(3);
     expect(ts.failed.has('http://example.com/t.s3mb')).toBe(true); // 超次数后才永久标记
 
@@ -187,12 +187,12 @@ describe('3. 瓦片失败退避重试，超次数才进 failed', () => {
 describe('4. 拾取 ID 回收复用（2 字节上限）', () => {
   test('释放的 ID 会被下一个网格复用，不会无限增长', () => {
     const layer = new S3MLayer({ configUrl: 'http://example.com/a.scp' });
-    const a = layer.viewer._allocPickId();
-    const b = layer.viewer._allocPickId();
+    const a = (layer.viewer as any)._allocPickId();
+    const b = (layer.viewer as any)._allocPickId();
     expect([a, b]).toEqual([0, 1]);
 
-    layer.viewer._releasePickId(a);
-    expect(layer.viewer._allocPickId()).toBe(a);
+    (layer.viewer as any)._releasePickId(a);
+    expect((layer.viewer as any)._allocPickId()).toBe(a);
   });
 });
 
@@ -223,12 +223,12 @@ describe('5. 批量改单体样式只重写一次状态纹理', () => {
     const layer = new S3MLayer({});
     const smids = Array.from({ length: 300 }, (_, i) => i + 1);
     const mesh = makeMesh(smids);
-    layer.viewer._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' } as never);
-    layer.viewer._indexMeshSmids(mesh);
+    (layer.viewer as any)._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' } as never);
+    (layer.viewer as any)._indexMeshSmids(mesh);
 
     let calls = 0;
-    const original = layer.viewer._applyOverridesToMesh.bind(layer.viewer);
-    layer.viewer._applyOverridesToMesh = (m: any) => {
+    const original = (layer.viewer as any)._applyOverridesToMesh.bind(layer.viewer);
+    (layer.viewer as any)._applyOverridesToMesh = (m: any) => {
       calls++;
       original(m);
     };
@@ -245,8 +245,8 @@ describe('5. 批量改单体样式只重写一次状态纹理', () => {
 
     // 只改其中一个单体时，不该碰不含它的网格
     const other = makeMesh([9001, 9002]);
-    layer.viewer._pickables.set(2, { datasetId: 'd', mesh: other, tile: {}, skeletonName: '' } as never);
-    layer.viewer._indexMeshSmids(other);
+    (layer.viewer as any)._pickables.set(2, { datasetId: 'd', mesh: other, tile: {}, skeletonName: '' } as never);
+    (layer.viewer as any)._indexMeshSmids(other);
     calls = 0;
     layer.setFeatureStyle(9001, { color: '#00ff00' });
     await new Promise((r) => setTimeout(r, 0));
@@ -267,23 +267,23 @@ describe('6. uHeightMin / uHeightMax 增量维护', () => {
     const a = boxAt(0, 10);
     const b = boxAt(5, 80);
     const c = boxAt(-2, 30);
-    for (const m of [a, b, c]) layer.viewer._addMeshHeight(m);
+    for (const m of [a, b, c]) (layer.viewer as any)._addMeshHeight(m);
 
     const near = (x: number, y: number) => Math.abs(x - y) < 1e-6;
     expect(near(layer.uniforms.uHeightMin.value, -2)).toBe(true);
     expect(near(layer.uniforms.uHeightMax.value, 80)).toBe(true);
 
     // 淘汰非边界网格：不动全局值
-    layer.viewer._removeMeshHeight(a);
+    (layer.viewer as any)._removeMeshHeight(a);
     expect(near(layer.uniforms.uHeightMin.value, -2)).toBe(true);
     expect(near(layer.uniforms.uHeightMax.value, 80)).toBe(true);
 
     // 淘汰顶到边界的网格：必须回退到次大值，不能留着 80
-    layer.viewer._removeMeshHeight(b);
+    (layer.viewer as any)._removeMeshHeight(b);
     expect(near(layer.uniforms.uHeightMax.value, 30)).toBe(true);
 
     // 清空后回到兜底范围
-    layer.viewer._removeMeshHeight(c);
+    (layer.viewer as any)._removeMeshHeight(c);
     expect([layer.uniforms.uHeightMin.value, layer.uniforms.uHeightMax.value]).toEqual([0, 100]);
   });
 });
@@ -353,8 +353,8 @@ describe('8. 多个 SMID 共用 batchId 时不互相覆盖', () => {
       pickInfo: { 1: { batchId: 0 }, 2: { batchId: 0 }, 3: { batchId: 1 } },
       entities: [],
     };
-    layer.viewer._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' } as never);
-    layer.viewer._indexMeshSmids(mesh);
+    (layer.viewer as any)._pickables.set(1, { datasetId: 'd', mesh, tile: {}, skeletonName: '' } as never);
+    (layer.viewer as any)._indexMeshSmids(mesh);
 
     const data = () => mesh.material.userData.uBatchTex.value.image.data;
 
@@ -425,7 +425,7 @@ describe('10. 淘汰选择：只裁「已交棒的父瓦」；脏数据（childT
     tsA.nodes.set('parent', parent);
     tsA.nodes.set('child', child);
 
-    tsA._trimBudget();
+    (tsA as any)._trimBudget();
     expect(removedA).toEqual(['parent']); // 裁掉没人依赖的父瓦
     expect(tsA.nodes.has('child')).toBe(true); // 正在显示的叶子保留
 
@@ -434,7 +434,7 @@ describe('10. 淘汰选择：只裁「已交棒的父瓦」；脏数据（childT
     const tsB = makeSet(removedB);
     tsB.nodes.set('self', mkNode('self', 'self', 1, 900) as never);
     tsB.nodes.set('other', mkNode('other', 'other', 5, 500) as never);
-    tsB._trimBudget();
+    (tsB as any)._trimBudget();
     expect(removedB.length).toBe(1); // 至少能裁一块，不会卡死
   });
 
@@ -444,9 +444,9 @@ describe('10. 淘汰选择：只裁「已交棒的父瓦」；脏数据（childT
     stallFetch();
     ts.nodes.set('a', mkNode('a', null, 1, 900) as never);
     ts.nodes.set('b', mkNode('b', null, 5, 500) as never);
-    ts._enqueue('http://example.com/new2.s3mb');
+    (ts as any)._enqueue('http://example.com/new2.s3mb');
     expect(removed).toEqual([]);
-    expect(ts.pending.size + ts._queue.length).toBe(1); // 新瓦片正常进队列
+    expect(ts.pending.size + (ts as any)._queue.length).toBe(1); // 新瓦片正常进队列
   });
 });
 

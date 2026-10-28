@@ -100,7 +100,7 @@ test('bumpVersions：输入本身已漂移时拒绝执行，要求先 align', ()
 });
 
 test('bumpVersions：非法 kind / 非法版本号直接抛错', () => {
-  expect(() => bumpVersions(ALIGNED, 'huge')).toThrow();
+  expect(() => bumpVersions(ALIGNED, 'huge' as 'patch')).toThrow();
   expect(() => bumpVersions({ three: '0.4', maplibre: '0.4.15' }, 'patch')).toThrow();
 });
 
