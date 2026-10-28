@@ -96,7 +96,7 @@ map.on('load', () => map.addLayer(layer));
 - **样式系统**（`S3MStyle` 全字段、着色模式、`shading` / 光照细节）
 - **动画内核**（完整的通道表、曲线库、`Animator` / `Path` / GPU 路径实现细节，见 [s3m-three 动画与过渡](../s3m-three/docs/API.md#动画与过渡)）
 - **核心概念**（坐标链路、锚点、瓦片与 LOD、单体化与 batch 粒度）
-- **按业务字段着色 / 过滤 / 抬高**（`colorByField` / `filterByField` / `elevateByField` / `AttributeQuery`）
+- **按业务字段着色 / 过滤 / 抬高**（`colorByField` / `filterByField` / `elevateByField` / `AttributeQuery`）—— 可选的内置 iServer 便利版，业务对应关系本应在外部自己实现
 - **底层 API**（`parseS3MB` / MeshOpt / `S3MTileset` / 单体属性工具）
 - **性能调优**与解析 / 几何 / 纹理类的**已知限制**
 
@@ -131,7 +131,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。手机上 1024 即可，显存降到 1/4；图集与 DXT 直传不受影响 |
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限，1024² RGBA 约 4MB / 条。低端设备 32~48，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型，`lambert` 片元约省一半。模块级全局，只影响之后创建的材质 |
-| `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 字段着色章节](../s3m-three/docs/API.md#按业务字段着色) |
+| `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 业务字段章节](../s3m-three/docs/API.md#业务字段锚点在库内对应关系在外部) |
 | `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
 | `nearPlaneScale` | `number` | `1` | 近裁剪面缩放系数（`0 < scale < 1`，1 = 不改）。MapLibre 的 near 是硬编码的 `canvasHeight/50`，zoom 16.5 时约合 13 米，相机贴近模型会把楼面整片裁掉；缩放后 fov / far 不变，见[近裁剪面](#近裁剪面贴脸看时不消失) |
 | `onStats` | `(s: Stats) => void` | — | 统计更新 |
@@ -238,7 +238,7 @@ flyToFeature(smid: number, options?: Record<string, unknown>): boolean
 
 ### 单体样式与字段
 
-以下方法均为委托 `viewer`，语义与参数见 [s3m-three 对应章节](../s3m-three/docs/API.md#按业务字段着色)：
+以下方法均为委托 `viewer`，语义与参数见 [s3m-three 业务字段章节](../s3m-three/docs/API.md#业务字段锚点在库内对应关系在外部)：
 
 ```ts
 setFeatureStyle(smid: number, style: FeatureStyle): void

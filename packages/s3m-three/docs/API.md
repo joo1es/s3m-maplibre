@@ -13,7 +13,7 @@
 - [样式（S3MStyle）](#样式s3mstyle)
 - [拾取与属性](#拾取与属性)
 - [投影](#投影)
-- [按业务字段着色](#按业务字段着色)
+- [业务字段：锚点在库内，对应关系在外部](#业务字段锚点在库内对应关系在外部)
 - [动画与过渡](#动画与过渡)
 - [纯 three.js 使用](#纯-threejs-使用)
 - [底层 API](#底层-api)
@@ -176,7 +176,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限。一条 = 一张已解码的瓦片纹理，1024² RGBA 约 4MB，128 条即约 512MB 显存；低端设备 32~48。LRU，降下来下次淘汰时释放 |
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型。`lambert` 用 `MeshLambertMaterial` 替换 PBR，去掉 GGX 与环境球谐，片元约省一半；白模 / 纯色 / 按高度着色几乎无差。模块级全局，只影响之后创建的材质 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
-| `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，配了才能 `colorByField()`，见[按业务字段着色](#按业务字段着色) |
+| `attributes` | `AttributeQueryOptions` | — | 可选的 iServer 数据服务配置，配了才能用 `colorByField()` 等便利方法；不配就自己取数 + `setFeaturesStyle()`，见[业务字段](#业务字段锚点在库内对应关系在外部) |
 | `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
 | `getBearing` | `() => number` | — | 地图朝向（弧度），让灯光跟着视角走；不传则灯光方向固定 |
 | `onStats` | `(s: Stats) => void` | — | 统计更新 |
@@ -334,7 +334,7 @@ getFilter(): S3MFilter | null
 clearFilter(): void
 ```
 
-详见[按业务字段着色](#按业务字段着色)。
+详见[业务字段](#业务字段锚点在库内对应关系在外部)。
 
 ### 3D 物理地表与基坑
 
@@ -536,7 +536,7 @@ interface PickResult {
 }
 ```
 
-> **注意**：`height` / `floors` / `bboxArea` 这些是**从几何算出来的**，不是业务属性表。OSGB 转 S3M 的数据通常不带属性表，`smid` 是与 iServer 侧数据对齐的唯一标识，业务字段需要你自己按 `smid` 去外部关联。
+> **注意**：`height` / `floors` / `bboxArea` 这些是**从几何算出来的**，不是业务属性表。OSGB 转 S3M 的数据通常不带属性表，`smid` 是与 iServer 侧数据对齐的唯一标识，业务字段需要你自己按 `smid` 去外部关联 —— 库不内置这个对应关系，见[业务字段](#业务字段锚点在库内对应关系在外部)。
 
 需要接业务属性时，用 `onPick` 拿到 `smid` 后自行查询：
 
@@ -572,9 +572,31 @@ V = P⁻¹ × MVP
 
 ---
 
-## 按业务字段着色
+## 业务字段：锚点在库内，对应关系在外部
 
-S3M 瓦片里**只有单体 ID**（SMID）和顶点区间，没有任何业务字段；业务属性在 iServer 的**数据服务**里（`data-xxx/rest/data`），和三维服务（`3D-xxx/rest/realspace`）是两个服务。所以按字段着色是「三维 + 数据」的跨服务查询，需要单独配一个数据源。
+S3M 瓦片里**只有单体 ID（SMID）和顶点区间，没有任何业务字段**。所以"哪个字段代表这栋楼、这栋楼在业务系统里是谁"这件事，库不替你做——鉴权、主子表、多数据源、字段命名每家都不一样，一旦内置就得跟着业务改。
+
+库只提供三个锚点：
+
+| 能力 | API |
+|---|---|
+| 拿到单体 ID | `onPick` 回调里的 `feature.smid` |
+| 单个 / 批量落样式 | `setFeatureStyle(smid, style)` / `setFeaturesStyle(smids, style)` |
+| 批量上色 | `setThematicColors(Map<smid, color>)` |
+
+推荐写法是**外部取数 → 自己算 → 落样式**：
+
+```ts
+const smids = viewer.getLoadedSmids();                       // 当前加载进来的单体
+const rows = await myOwnApi(smids);                          // 你自己的后端、自己的鉴权
+const colors = new Map<number, string>();
+for (const [smid, row] of rows) colors.set(smid, pickColor(row.用途));
+viewer.setThematicColors(colors);                            // 一次写纹理，不重建几何
+```
+
+### 内置的 iServer 便利版（可选）
+
+如果业务属性**刚好**发布在同一个 iServer 的**数据服务**里（`data-xxx/rest/data`，和三维服务 `3D-xxx/rest/realspace` 是两个服务），且单体 ID 列就是 `SmID`、没有额外鉴权，可以直接用内置的三个方法，省掉自己写查询：
 
 ```ts
 const viewer = new S3MViewer({
@@ -586,29 +608,25 @@ const viewer = new S3MViewer({
   },
 });
 
-// 分类字段：同一取值同色
-const result = await viewer.colorByField({ field: 'KEYID', type: 'category' });
-
-// 数值字段：连续色带 / 按阈值分级
-await viewer.colorByField({ field: 'SmMaxZ', type: 'ramp' });
-await viewer.colorByField({ field: 'SmMaxZ', type: 'breaks', breaks: [10, 30, 60] });
-
-result.legend;    // [{ label, color, count }]  直接拿去画图例
-result.matched;   // 真正上了色的单体数
+await viewer.colorByField({ field: 'SmMaxZ', type: 'ramp' });   // 数值列：连续色带
+await viewer.colorByField({ field: 'KEYID', type: 'category' }); // 字符串列：同值同色
+await viewer.filterByField({ field: '用途', values: ['住宅'] });  // 只显示命中
+await viewer.elevateByField({ field: 'SmMaxZ', scale: 0.5 });    // 按字段抬高
 ```
 
-几个要点：
+它的能力边界很明确，超出就别硬套，自己写：
 
-- **默认范围是「当前已加载的单体」**（`getLoadedSmids()`），不是整个数据集。实测每条要素的响应约 5KB（模型数据集每条都挂着 `geometry.model`，见下面的「为什么这么重」），全量几千栋会变成几十 MB，所以只查加载进来的那部分，按 200 个一批分片；
-- 查询结果按 SMID 缓存**整行**（`AttributeQuery`），换字段只是重算颜色、重写一张一维纹理，不重建几何、不重编译着色器，也不再发一次请求；
+- **只认 iServer 数据服务**，换后端没有口子；
+- **键固定是 `SmID`**（可用 `idField` 改名，但语义仍是"属性表里有一列等于 smid"）；
+- 三个方法**各自查各自的**，共享的只是 `AttributeQuery` 内部那份整行缓存；
+- 默认范围是**当前已加载的单体**（`getLoadedSmids()`），不是整个数据集。实测每条要素约 5KB（模型数据集每条都挂着 `geometry.model`），全量几千栋会变成几十 MB，所以按 200 个一批分片；
+- 查询结果按 SMID 缓存**整行**，换字段只重算颜色、重写一维纹理，不重建几何、不重编译着色器，也不再发请求；
 - 手动 `setFeatureStyle()` 的颜色优先级高于专题色；
-- `transform` 用来归并取值：`KEYID` / `ENTITYID` 这种基本一栋一个值的字段直接上分类色，着出来就是「随机色」，要么改用 `ramp` / `breaks`，要么用 `transform` 把编码截到能分组的层级，比如 `(v) => v.slice(0, 6)`;
-- `breaks` 不给就用色带档数等分；`colors` 不给就用内置 12 色板。
+- `transform` 用来归并取值：`KEYID` / `ENTITYID` 这种基本一栋一个值的字段直接上分类色会变成"随机色"，要么改用 `ramp` / `breaks`，要么用 `transform` 把编码截到能分组的层级。
 
-不想接数据服务时，也可以：
+不接数据服务也能自己算颜色（比如按几何派生量：高度 / 面积 / 楼层）：
 
 ```ts
-// 自己算好颜色（比如按几何派生量：高度 / 面积 / 楼层）
 viewer.setThematicColors(new Map([[423, '#ef4444'], [424, '#22c55e']]));
 viewer.clearThematic();
 ```
