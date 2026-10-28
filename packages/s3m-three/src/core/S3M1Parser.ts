@@ -6,7 +6,7 @@
  *
  * 结构（root / L16 / L17 / L18 四块真实瓦片交叉标定，链尾全部精确闭合）：
  * ```
- * byte[4] 's3m\0'  +  zlib
+ * byte[4] 's3m' + 版本字节（0 = 老导出，1 = iServer 2025 起）+ zlib
  *   解压后：
  *   uint32 xmlSize; byte[] XML; <补齐 4 字节对齐>
  *   uint32 geoSize;  几何流
@@ -15,8 +15,9 @@
  *
  * 几何流： uint32 meshCount，然后每块网格
  *   uint32 geoName; uint32 7; uint32 772; uint32 V; uint32 0
- *   V × 16B  顶点 (x, y, z, w)，实测 w 恒等于 z
- *   uint32[6] 数组头 [0,0,0,kind=1,count=V,flag=2]
+ *   V × 16B  顶点 (x, y, z, w)，实测 w 恒等于 z        ← 版本 0
+ *   V × 12B  顶点 (x, y, z)                            ← 版本 1（部分数据）
+ *   uint32[6] 数组头 [0,0,0,kind=1,count=V,flag=2]     ← 版本 0
  *   V × 8B   UV (u, v)
  *   uint32[3] 索引头 [1, indexCount, 0x00040100]
  *   indexCount × uint16                     // indexCount 恒为 3 的倍数，值域最大 V-1
@@ -28,6 +29,35 @@
  *   byte[size]                              // 实测 format=14、0.5B/px，即 DXT1
  * ```
  *
+ * **版本 0 与版本 1 的几何流布局不同**（2026-10-28 用 SuperMap Online 的
+ * `3D-tishuju`（体数据）与 `3D-Histogram`（柱状图）两组真实瓦片标定）：
+ * - 版本 0：顶点恒 vec4(16B)，顶点块之后一定是上面那套 UV 头。
+ * - 版本 1：顶点有 vec3(12B) / vec4(16B) 两种；顶点块之后是若干「属性块」，
+ *   块头里带 count=V，但块数（3~4）与行宽逐网格不同，UV / 法线 / 颜色的顺序
+ *   没有稳定规律可循（同一文件里 4 个网格的记录长度都不一样）。
+ *   所以版本 1 只取顶点与索引，中间那一段属性块整段跳过 —— 实测这两类数据的
+ *   材质都没有纹理（texSize 只有 count=0），跳过不影响画面。
+ *   索引段带固定标记 `[1, indexCount, 0x00040100]`，跳过就靠它定位。
+ *
+ *   版本 1 的顶点还可能是**归一化模板**（柱状图：x/z 落在 [-0.5,0.5]、y 落在 [0,1]，
+ *   即一根菱形截面柱），真实位置与尺寸只写在记录尾的 `[1][8][minx…maxz]` 量化盒里。
+ *   不展开的话所有柱子都叠在原点 1 米见方 —— 画面上等于「什么都没加载出来」。
+ *   展开后每块网格的包围盒与 XML 的 BoundingSphere 完全重合（4/4，误差 0.00m）。
+ *
+ *   ★ 柱状图真正的几何是**实例化**的（对应规范里 VertexDataPackage 的 InstanceInfo /
+ *   InstanceObject）：瓦片里只有一份「单位盒模板」，每根柱是一条 20 float 记录：
+ *     [0..11] 3×4 行主序仿射矩阵（缩放≈45 / 平移=柱底中心）
+ *     [12..15] RGBA —— 官方截图里黄/绿/红的来源
+ *     [16..19] 预留（值与权重之类，本库暂不用）
+ *   实测一块 250×50m 的瓦片里 11 条记录、缩放 45×45×38~44，柱间距 50m，与官方渲染一致。
+ *   实例数组紧贴记录尾的量化盒（[1][8]+6 float），从盒往前按 80 字节回溯就能整段取到；
+ *   块头到实例数组之间还夹着长度不定的零区，所以**不能**正向扫固定偏移。
+ *
+ *   ★ S3M 1.x 容器**没有 pickInfo 段**，而拾取链路（Picker → _instanceFeature）全靠
+ *   pickInfo.instanceIds 把实例序号翻译成 SMID，缺了它就是「看得见、点不中」。
+ *   所以实例化网格会合成一份：控制位 = 实例序号，SMID = geoName × 1e6 + 序号。
+ *   非实例化网格不需要（拾取退化成「整块网格」，本来就能选中）。
+ *
  * 几何里**没有法线数组**，交给 GeometryBuilder 在绑定索引后 computeVertexNormals()。
  */
 import { BinaryReader } from './BinaryReader.js';
@@ -37,22 +67,35 @@ import type {
   IndexPackage,
   PageLOD,
   ParsedTile,
+  PickEntry,
   S3MTexture,
   VertexAttribute,
   VertexPackage,
 } from './types.js';
 
-/** S3M 1.x 魔数：ASCII "s3m" + 结尾 0 */
+/**
+ * S3M 1.x 魔数：ASCII "s3m" + 1 字节版本号。
+ *
+ * 第 4 字节**不是常量 0**：老导出写 0x00，iServer 2025 写 0x01。原先逐字比对
+ * `s3m\0`，版本 1 的瓦片就落到 2.x/3.x 分支，4 字节魔数被当 float32 版本号
+ * （≈1.4e-38），紧跟的 zlib 头被当压缩长度，最终抛
+ * `RangeError: Invalid typed array length: 1424349816` —— 完全看不出根因。
+ * 版本 2 起结构可能再变，宁可让它在 2.x 分支明确报错，也不要猜着解。
+ */
 const S3M_V1_MAGIC = 0x006d3373;
+const S3M_V1_MAGIC_MASK = 0x00ffffff;
+const S3M_V1_MAX_VERSION = 1;
 
 export interface ParseS3M1Options {
   inflate?: (bytes: Uint8Array) => Uint8Array | Promise<Uint8Array>;
 }
 
-/** 是不是 S3M 1.x 容器 */
+/** 是不是 S3M 1.x 容器（版本字节 0 或 1） */
 export function isS3M1Buffer(buffer: ArrayBuffer): boolean {
   if (buffer.byteLength < 8) return false;
-  return new DataView(buffer, 0, 8).getUint32(0, true) === S3M_V1_MAGIC;
+  const v = new DataView(buffer, 0, 8).getUint32(0, true);
+  if ((v & S3M_V1_MAGIC_MASK) !== S3M_V1_MAGIC) return false;
+  return v >>> 24 <= S3M_V1_MAX_VERSION;
 }
 
 async function defaultInflate(bytes: Uint8Array): Promise<Uint8Array> {
@@ -184,12 +227,177 @@ interface MeshRecord {
   indexCount: number;
   indices: Uint16Array;
   materialId: string;
+  /** 实例矩阵（每实例 16 float：3×4 行主序 + RGBA），没有实例化时为 undefined */
+  instances?: Float32Array;
 }
 
-function readGeometry(br: BinaryReader, geoSize: number): MeshRecord[] {
+/** 索引头的第 3 个 dword，全版本固定 */
+const INDEX_HEADER_MARK = 0x00040100;
+
+/**
+ * v1 里每个实例记录固定 20 个 float（80 字节）：
+ *   [0..11]  3×4 行主序仿射矩阵（第 4 行隐式 0,0,0,1）
+ *   [12..15] RGBA —— 实测就是柱子的配色，官方截图里那些黄/绿/红
+ *   [16..19] 预留（值/权重之类，本库暂时不用）
+ * 取前 16 个交给 GeometryBuilder，正好对上它认的 stride=16（矩阵 + 颜色）。
+ */
+const V1_INSTANCE_FLOATS = 20;
+const V1_INSTANCE_BYTES = V1_INSTANCE_FLOATS * 4;
+
+/**
+ * 合成 SMID 时给每个 geoName 留的实例位宽。
+ *
+ * geoName 是 uint32 哈希，乘 1e6 后最大约 4.29e15，仍在 Number 安全整数范围内
+ * （9.007e15），所以「geoName × 1e6 + 实例序号」可以当作全局唯一键。
+ * S3M 1.x 容器不带单体化信息，SMID 只能这样合成——它只用于本库内部的拾取/描边，
+ * 和 iServer 侧的 SMID 没有对应关系。
+ */
+const S3M1_SMID_STRIDE = 1_000_000;
+
+/**
+ * 解析实例化数组。
+ *
+ * 地块级数据（柱状图）不是「一堆柱子的顶点」，而是**一份模板几何 + N 个变换矩阵**：
+ * 顶点是单位盒（x/z ∈ [-0.5,0.5]、y ∈ [0,1]），真实位置/尺寸/颜色全在实例矩阵里。
+ * 块内布局（实测 5 个网格交叉验证，N 全是整数）：
+ *   [V][2] 块头 | V×8 字节（恒 0） | [1][20] 头 | N×80 实例 | [1][8] + 6 float 量化盒
+ */
+function readInstances(
+  view: DataView,
+  from: number,
+  to: number
+): { count: number; floats: Float32Array } | null {
+  // 实例数组紧贴量化盒（[1][8] + 6 float）。从它往前按 80 字节回溯，
+  // 一旦遇到不像矩阵的记录就停 —— 块头到实例数组之间还夹着长度不定的零区，
+  // 正向扫「[1][20] 头」只在单实例的网格上成立（多实例的网格压根没这个头）。
+  let aabb = -1;
+  for (let p = to - 12; p >= from; p -= 4) {
+    if (view.getUint32(p, true) === 1 && view.getUint32(p + 4, true) === 8) {
+      aabb = p;
+      break;
+    }
+  }
+  if (aabb < 0) return null;
+
+  const ok = (o: number): boolean => {
+    const m00 = view.getFloat32(o, true);
+    const m11 = view.getFloat32(o + 20, true);
+    const m22 = view.getFloat32(o + 40, true);
+    const tx = view.getFloat32(o + 12, true);
+    const ty = view.getFloat32(o + 28, true);
+    const tz = view.getFloat32(o + 44, true);
+    if (![m00, m11, m22, tx, ty, tz].every(Number.isFinite)) return false;
+    if (Math.abs(tx) > 1e7 || Math.abs(ty) > 1e7 || Math.abs(tz) > 1e7) return false;
+    // 缩放不能全是 0：零填充区被这条挡掉
+    if (m00 === 0 && m11 === 0 && m22 === 0) return false;
+    for (let k = 12; k < 16; k++) {
+      const c = view.getFloat32(o + k * 4, true);
+      if (!Number.isFinite(c) || Math.abs(c) > 1e3) return false;
+    }
+    return true;
+  };
+
+  let start = aabb;
+  while (start - V1_INSTANCE_BYTES >= from && ok(start - V1_INSTANCE_BYTES)) {
+    start -= V1_INSTANCE_BYTES;
+  }
+  const count = (aabb - start) / V1_INSTANCE_BYTES;
+  if (count <= 0 || count > 1_000_000) return null;
+
+  const out = new Float32Array(count * 16);
+  for (let i = 0; i < count; i++) {
+    const o = start + i * V1_INSTANCE_BYTES;
+    for (let k = 0; k < 16; k++) out[i * 16 + k] = view.getFloat32(o + k * 4, true);
+  }
+  return { count, floats: out };
+}
+
+/**
+ * 从 `from` 起找索引头 `[1, indexCount, 0x00040100]`，返回相对偏移，找不到返回 -1。
+ *
+ * 只在「顶点块之后那段不是版本 0 的 UV 头」时用得到：版本 1 的属性块布局没有
+ * 稳定规律，与其猜行宽，不如直接跳到结构最稳定的索引段。
+ */
+function findIndexHeader(view: DataView, from: number): number {
+  const limit = view.byteLength - 12;
+  for (let p = from; p <= limit; p += 4) {
+    if (view.getUint32(p, true) !== 1) continue;
+    const count = view.getUint32(p + 4, true);
+    if (count === 0 || count % 3 !== 0) continue;
+    if (view.getUint32(p + 8, true) !== INDEX_HEADER_MARK) continue;
+    return p;
+  }
+  return -1;
+}
+
+/**
+ * 从 `to - 12` 往前找量化盒 `[1][8][minx,miny,minz,maxx,maxy,maxz]`，返回 6 个 float。
+ *
+ * 版本 1 的柱状图（`3D-Histogram`）把顶点压进单位盒（x/z 落在 [-0.5,0.5]、y 落在 [0,1]，
+ * 就是「一根菱形截面的柱」的模板），真实位置与尺寸只存在记录尾部这个盒里。不反量化的
+ * 话所有柱子都叠在原点、边长 1 米，看起来就是「什么都加载不出来」。
+ *
+ * 反过来从索引头往前扫：同一个记录里可能还有别的 `[1][8]`（实测 mesh1 就有一个诱饵），
+ * 越靠后越可能是真正的那个。盒本身要求每轴 min < max，这是排除诱饵的硬条件。
+ */
+function findQuantBox(view: DataView, from: number, to: number): Float32Array | null {
+  for (let p = to - 12; p >= from; p -= 4) {
+    if (view.getUint32(p, true) !== 1 || view.getUint32(p + 4, true) !== 8) continue;
+    if (p + 32 > view.byteLength) continue;
+    const f = new Float32Array(6);
+    let ok = true;
+    for (let i = 0; i < 6; i++) {
+      const v = view.getFloat32(p + 8 + i * 4, true);
+      if (!Number.isFinite(v) || Math.abs(v) > 1e7) {
+        ok = false;
+        break;
+      }
+      f[i] = v;
+    }
+    if (!ok) continue;
+    if (!(f[0]! < f[3]! && f[1]! < f[4]! && f[2]! < f[5]!)) continue;
+    return f;
+  }
+  return null;
+}
+
+/**
+ * 顶点落在 [-1, 1] 里就认为它是「归一化模板」，按盒逐轴拉伸回去。
+ *
+ * 逐轴用自己的包围盒做映射（而不是假设 [0,1] 或 [-0.5,0.5]）：实测柱状图 x、z 是
+ * [-0.5,0.5]、y 是 [0,1]，硬编码任一约定都会把柱子摆错。
+ */
+function applyQuantBox(position: Float32Array, box: Float32Array): boolean {
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < position.length; i += 3) {
+    for (let a = 0; a < 3; a++) {
+      const v = position[i + a]!;
+      if (v < min[a]!) min[a] = v;
+      if (v > max[a]!) max[a] = v;
+    }
+  }
+  for (let a = 0; a < 3; a++) {
+    if (!(Math.abs(min[a]!) <= 1.001 && Math.abs(max[a]!) <= 1.001)) return false;
+  }
+  for (let a = 0; a < 3; a++) {
+    const span = max[a]! - min[a]!;
+    const scale = (box[a + 3]! - box[a]!) / (span > 1e-6 ? span : 1);
+    const base = box[a]! - (span > 1e-6 ? min[a]! * scale : (box[a + 3]! - box[a]!) / 2);
+    for (let i = a; i < position.length; i += 3) position[i] = base + position[i]! * scale;
+  }
+  return true;
+}
+
+function readGeometry(
+  br: BinaryReader,
+  geoSize: number
+): { meshes: MeshRecord[]; skippedAttrs: number; quantized: number } {
   const meshCount = br.u32();
   if (meshCount > 4096) throw new Error(`[s3m] S3M 1.x 网格数异常：${meshCount}`);
   const out: MeshRecord[] = [];
+  let skippedAttrs = 0;
+  let quantized = 0;
 
   for (let m = 0; m < meshCount; m++) {
     const geoName = String(br.u32());
@@ -201,30 +409,66 @@ function readGeometry(br: BinaryReader, geoSize: number): MeshRecord[] {
       throw new Error(`[s3m] S3M 1.x 顶点数异常：网格 ${geoName} V=${V}（字段 7=${seven} 772=${seven72}）`);
     }
 
-    // 顶点 (x, y, z, w)；w 实测恒等于 z
+    // 顶点：版本 0 是 vec4(x,y,z,w)，w 实测恒等于 z；版本 1 有一半数据是 vec3。
+    // 先认版本 0 的 UV 头（不传参时走的还是这条老路，判据一字未改），认不出才用
+    // 「顶点块之后那块的头 dword 等于 V」去定行宽。
+    const posStart = br.offset;
+    const u32At = (off: number): number =>
+      off + 4 <= br.view.byteLength ? br.view.getUint32(off, true) : -1;
+    const v0UvAt16 =
+      u32At(posStart + V * 16 + 12) === 1 && u32At(posStart + V * 16 + 16) === V;
+    const stride: 12 | 16 = v0UvAt16
+      ? 16
+      : u32At(posStart + V * 16) === V
+        ? 16
+        : 12;
     const position = new Float32Array(V * 3);
     for (let i = 0; i < V; i++) {
       const x = br.f32();
       const y = br.f32();
       const z = br.f32();
-      br.f32(); // w == z
+      if (stride === 16) br.f32(); // w
       position[i * 3] = x;
       position[i * 3 + 1] = y;
       position[i * 3 + 2] = z;
     }
 
-    // UV 数组头 [0,0,0,kind=1,count=V,flag=2]
-    br.u32(); br.u32(); br.u32();
-    const uvKind = br.u32();
-    const uvCount = br.u32();
-    br.u32(); // flag
-    if (uvKind !== 1 || uvCount !== V) {
-      throw new Error(`[s3m] S3M 1.x UV 头不符：网格 ${geoName} kind=${uvKind} count=${uvCount} 期望 1/${V}`);
-    }
     const uv = new Float32Array(V * 2);
-    for (let i = 0; i < V; i++) {
-      uv[i * 2] = br.f32();
-      uv[i * 2 + 1] = br.f32();
+    let instances: Float32Array | undefined;
+    if (v0UvAt16) {
+      // 版本 0：UV 数组头 [0,0,0,kind=1,count=V,flag=2]
+      br.u32(); br.u32(); br.u32();
+      const uvKind = br.u32();
+      const uvCount = br.u32();
+      br.u32(); // flag
+      if (uvKind !== 1 || uvCount !== V) {
+        throw new Error(`[s3m] S3M 1.x UV 头不符：网格 ${geoName} kind=${uvKind} count=${uvCount} 期望 1/${V}`);
+      }
+      for (let i = 0; i < V; i++) {
+        uv[i * 2] = br.f32();
+        uv[i * 2 + 1] = br.f32();
+      }
+    } else {
+      // 版本 1：顶点块之后是若干属性块（UV / 法线 / 颜色混排，行宽逐网格不同），
+      // 整段跳过，靠索引头的固定标记落位。这两类数据没有纹理，跳过不影响画面。
+      const at = findIndexHeader(br.view, br.offset);
+      if (at < 0) {
+        throw new Error(`[s3m] S3M 1.x 属性段无法定位索引头：网格 ${geoName}（偏移 ${br.offset}/${geoSize}）`);
+      }
+      if (at !== br.offset) {
+        skippedAttrs++;
+        // 优先认实例化：柱状图是真·实例化的（一份模板 + N 个变换矩阵），
+        // 顶点本来就该保持单位盒，靠矩阵摆位/缩放/上色。
+        const inst = readInstances(br.view, br.offset, at);
+        if (inst) {
+          instances = inst.floats;
+        } else {
+          // 没有实例矩阵时，顶点是归一化模板，用记录尾的量化盒展开兜底
+          const box = findQuantBox(br.view, br.offset, at);
+          if (box) quantized += applyQuantBox(position, box) ? 1 : 0;
+        }
+        br.offset = at;
+      }
     }
 
     // 索引头 [1, indexCount, 0x00040100]
@@ -244,9 +488,18 @@ function readGeometry(br: BinaryReader, geoSize: number): MeshRecord[] {
     if (one !== 1) {
       throw new Error(`[s3m] S3M 1.x 记录尾标记异常：网格 ${geoName} 期望 1 实得 ${one}`);
     }
-    out.push({ geoName, vertexCount: V, position, uv, indexCount, indices, materialId });
+    out.push({
+      geoName,
+      vertexCount: V,
+      position,
+      uv,
+      indexCount,
+      indices,
+      materialId,
+      ...(instances ? { instances } : {}),
+    });
   }
-  return out;
+  return { meshes: out, skippedAttrs, quantized };
 }
 
 /**
@@ -308,6 +561,10 @@ function readTextures(br: BinaryReader, texSize: number): Record<string, S3MText
 
 /* ------------------------------------------------------------------ 入口 */
 
+/** 版本 1 布局的提示只打一次：几百块瓦片各喊一句会把控制台刷爆 */
+let warnedV1Attrs = false;
+let warnedQuantBox = false;
+
 export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Options = {}): Promise<ParsedTile> {
   const inflate = options.inflate ?? defaultInflate;
   const r = new BinaryReader(arrayBuffer);
@@ -326,7 +583,23 @@ export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Opti
 
   const geoSize = br.u32();
   const geoStart = br.offset;
-  const meshes = readGeometry(new BinaryReader(br.buffer, br.base + geoStart, geoSize), geoSize);
+  const { meshes, skippedAttrs, quantized } = readGeometry(
+    new BinaryReader(br.buffer, br.base + geoStart, geoSize),
+    geoSize
+  );
+  if (quantized && !warnedQuantBox) {
+    warnedQuantBox = true;
+    console.warn(
+      `[s3m] S3M 1.x（版本 1 布局）：顶点是归一化模板，已按记录尾的量化盒展开到真实尺寸/位置（本进程只提示一次）。`
+    );
+  }
+  if (skippedAttrs && !warnedV1Attrs) {
+    warnedV1Attrs = true;
+    console.warn(
+      `[s3m] S3M 1.x（版本 1 布局）：UV/法线/颜色属性块已跳过，几何与索引正常。` +
+        `若该数据集带纹理，贴图会取到同一像素（本进程只提示一次）。`
+    );
+  }
   br.offset = geoStart + geoSize;
 
   const smallSize = br.u32();
@@ -365,6 +638,34 @@ export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Opti
       instanceMode: 0,
       instanceIndex: -1,
     };
+    let pickInfo: Record<number, PickEntry> | undefined;
+    if (mesh.instances && mesh.instances.length >= 16) {
+      // stride 16 = 3×4 行主序矩阵 + RGBA，正是 GeometryBuilder 认的布局：
+      // 它会 setMatrixAt(i) 并拿 [12..14] 当实例颜色（柱状图的黄/绿/红就来自这里）
+      const count = mesh.instances.length / 16;
+      vp.instanceCount = count;
+      vp.instanceMode = 16;
+      vp.instanceIndex = 0;
+      vp.instanceBuffer = new Uint8Array(
+        mesh.instances.buffer,
+        mesh.instances.byteOffset,
+        mesh.instances.byteLength
+      );
+      // S3M 1.x 容器里**没有 pickInfo 段**，而拾取链路（Picker → _instanceFeature）
+      // 完全靠 pickInfo.instanceIds 把「实例序号」翻译成 SMID；缺了它就一路返回 null，
+      // 表现就是「模型能看见、但怎么点都选不中」。这里按实例合成一份：
+      //   控制位 = 实例序号（写进 aInstanceBatchId，状态纹理按它索引）
+      //   SMID   = geoName × 1e6 + 实例序号（哈希值本身 32 位，跨瓦片不重复）
+      const ids = new Float32Array(count);
+      const instPick: Record<number, PickEntry> = {};
+      const smidBase = Number(mesh.geoName) * S3M1_SMID_STRIDE;
+      for (let i = 0; i < count; i++) {
+        ids[i] = i;
+        instPick[smidBase + i] = { batchId: i, instanceIds: [i] };
+      }
+      vp.instanceBatchIds = ids;
+      pickInfo = instPick;
+    }
     const pack: IndexPackage = {
       indexCount: mesh.indexCount,
       indexType: 0, // 0 = UNSIGNED_SHORT
@@ -373,7 +674,12 @@ export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Opti
       indices: new Uint8Array(mesh.indices.buffer, mesh.indices.byteOffset, mesh.indices.byteLength),
       passNames: [mesh.materialId],
     };
-    geoPackage[name] = { name, vertexPackage: vp, indexPackages: [pack] };
+    geoPackage[name] = {
+      name,
+      vertexPackage: vp,
+      indexPackages: [pack],
+      ...(pickInfo ? { pickInfo } : {}),
+    };
   }
 
   // pageLods 与网格必须按 GeoName 绑定，不能按出现顺序：
