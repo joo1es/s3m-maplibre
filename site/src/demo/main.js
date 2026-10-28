@@ -1188,6 +1188,8 @@ $('optFadeIn').addEventListener('input', (e) => {
   layer.setStyle({ fadeIn: v });
 });
 $('optFlat').addEventListener('change', (e) => layer.setStyle({ shading: e.target.checked ? 'flat' : 'smooth' }));
+// 材质模型运行时切换：原位重建材质（不重拉瓦片），切换后「着色程序」数会 +1 档
+$('optQuality').addEventListener('change', (e) => layer.setMaterialQuality(e.target.value));
 
 $('optBlendTex').addEventListener('change', (e) => {
   const on = e.target.checked;
@@ -1865,6 +1867,14 @@ map.on('load', async () => {
 
 const statsTimer = setInterval(() => {
   $('stFps').textContent = layer.fps || '—';
+  // GPU 侧观测（renderer.info）：切换平面/平滑着色时「着色程序」不涨 = 零重编译
+  const s = layer.stats;
+  if (s) {
+    $('stDraws').textContent = s.drawCalls;
+    $('stPrograms').textContent = s.programs;
+    $('stTex').textContent = s.textures;
+    $('stGeo').textContent = s.geometries;
+  }
   if (currentDatasets.length > 0) updateLegend();
 }, 600);
 

@@ -222,6 +222,14 @@ export interface Stats {
   vertices: number;
   triangles: number;
   datasets: number;
+  /** 上一帧 draw call 数（renderer.info.render.calls，无渲染器时为 0） */
+  drawCalls: number;
+  /** 已编译着色程序数（renderer.info.programs.length） */
+  programs: number;
+  /** 显存里驻留的纹理数（renderer.info.memory.textures） */
+  textures: number;
+  /** 显存里驻留的几何数（renderer.info.memory.geometries） */
+  geometries: number;
 }
 
 /* ------------------------------------------------------------------ 单体属性 */

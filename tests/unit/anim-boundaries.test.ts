@@ -2,7 +2,7 @@
  * 单元测试：动画 API 的两条「能力边界」被消掉之后的行为
  *
  *   1. 全局透明度可以真的到 0（不再钳在 0.05），到 0 时整层不画
- *   2. `shading` 的另一种变体会被预热，首次切换不再现场编译
+ *   2. `shading` 由共享 uniform 驱动，切换零重编译；预热只把当前唯一 program 编一次
  *
  * 两条都不依赖 WebGL：渲染器用桩替身，只验证「有没有调用 / 调了什么」。
  */
@@ -135,25 +135,26 @@ describe('1. 全局透明度允许到 0', () => {
 
 /* ------------------------------------------------------------------ 2. shading 预热 */
 
-describe('2. shading 变体预热', () => {
-  test('预热会编译另一种变体，然后把材质恢复原状', async () => {
+describe('2. shading 由 uniform 驱动（零重编译）', () => {
+  test('默认平面着色：uFlatShading = 1，flatShading 恒为 false（program 稳定）', async () => {
     const v = makeViewer();
     const mesh = registerMesh(v, 802);
     const mat = mesh.material as THREE.MeshStandardMaterial;
-    expect(mat.flatShading).toBe(true); // 默认平面着色
+    expect(mat.userData.uFlatShading.value).toBe(1); // 默认平面着色，语义不变
+    expect(mat.flatShading).toBe(false); // 不再用 define，program 不随 shading 变
 
-    const seen: boolean[] = [];
+    let compiles = 0;
     (v as unknown as { renderer: unknown }).renderer = {
       compileAsync: async () => {
-        // 编译时材质应当已经被翻到「另一种变体」
-        seen.push(mat.flatShading);
+        compiles++;
       },
     };
     (v as unknown as { camera: THREE.Camera }).camera = new THREE.PerspectiveCamera();
 
     await v.prewarmShading();
-    expect(seen).toEqual([false]); // 预热的是 smooth
-    expect(mat.flatShading).toBe(true); // 用完恢复
+    expect(compiles).toBe(1); // 唯一 program 预热一次
+    expect(mat.userData.uFlatShading.value).toBe(1); // 材质未被翻转
+    expect((v as unknown as { _shadingPrewarmed: boolean })._shadingPrewarmed).toBe(true);
     v.dispose();
   });
 
@@ -177,22 +178,37 @@ describe('2. shading 变体预热', () => {
     v.dispose();
   });
 
-  test('shading 已经是 smooth 时预热的是 flat', async () => {
+  test('setStyle smooth 只翻 uniform，flatShading 与 program 不动', async () => {
     const v = makeViewer();
     v.setStyle({ shading: 'smooth' });
     const mesh = registerMesh(v, 804);
     const mat = mesh.material as THREE.MeshStandardMaterial;
 
-    const seen: boolean[] = [];
+    // smooth 已生效：uniform = 0；材质属性保持 false，program 不变
+    expect(mat.userData.uFlatShading.value).toBe(0);
+    expect(mat.flatShading).toBe(false);
+
+    // 预热不翻转任何状态（新机制下没有「另一种变体」）
+    let compiles = 0;
     (v as unknown as { renderer: unknown }).renderer = {
       compileAsync: async () => {
-        seen.push(mat.flatShading);
+        compiles++;
       },
     };
     (v as unknown as { camera: THREE.Camera }).camera = new THREE.PerspectiveCamera();
-
     await v.prewarmShading();
-    expect(seen).toEqual([true]);
+    expect(compiles).toBe(1);
+    expect(mat.userData.uFlatShading.value).toBe(0);
+    v.dispose();
+  });
+
+  test('customProgramCacheKey 不随 shading 变化（flat/smooth 不再撞 key 也不再分叉）', () => {
+    const v = makeViewer();
+    const mesh = registerMesh(v, 807);
+    const mat = mesh.material as THREE.MeshStandardMaterial;
+    const before = mat.customProgramCacheKey?.();
+    v.setStyle({ shading: 'smooth' });
+    expect(mat.customProgramCacheKey?.()).toBe(before);
     v.dispose();
   });
 

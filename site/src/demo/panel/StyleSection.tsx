@@ -35,6 +35,17 @@ export default function StyleSection() {
             <option value="center">中心对齐 (Center)</option>
           </select>
         </div>
+        <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px;">
+          <span style="color:#94a3b8; font-size:11.5px;">材质模型</span>
+          <select
+            id="optQuality"
+            class="form-select"
+            title="运行时切换材质模型：原位重建材质，不重拉瓦片。Lambert 光照更便宜，低端设备 / 白模场景更流畅"
+          >
+            <option value="pbr" selected>PBR（物理光照，默认）</option>
+            <option value="lambert">Lambert（低开销）</option>
+          </select>
+        </div>
         <label class="rng">
           <span>高程调整</span>
           <input type="range" id="optHeightOffset" min="-50" max="50" step="0.5" value="0" />
@@ -50,7 +61,10 @@ export default function StyleSection() {
           <input type="range" id="optFadeIn" min="0" max="1200" step="100" value="0" />
           <b id="fadeInVal">关闭</b>
         </label>
-        <label class="chk">
+        <label
+          class="chk"
+          title="切换平面/平滑着色：走共享 uniform，不重编译着色器——看底部「着色程序」数保持不变"
+        >
           <input type="checkbox" id="optFlat" checked /> 平面着色（白模更干净）
         </label>
         <label class="chk">

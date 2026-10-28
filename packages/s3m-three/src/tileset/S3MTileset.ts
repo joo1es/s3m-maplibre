@@ -321,7 +321,21 @@ export class S3MTileset {
   readonly atlasUpgraded = new Set<string>();
   /** 拿到高清版但判定不通过 → 原因。用于排查「为什么这块还是糊的」 */
   readonly atlasUpgradeSkipped = new Map<string, string>();
-  readonly stats: Stats = { tiles: 0, loading: 0, failed: 0, meshes: 0, vertices: 0, triangles: 0, datasets: 1 };
+  // drawCalls / programs / textures / geometries 是 viewer 级 GPU 观测，
+  // 瓦片侧不产生，恒为 0；聚合时由 S3MViewer.stats 用 renderer.info 覆盖
+  readonly stats: Stats = {
+    tiles: 0,
+    loading: 0,
+    failed: 0,
+    meshes: 0,
+    vertices: 0,
+    triangles: 0,
+    datasets: 1,
+    drawCalls: 0,
+    programs: 0,
+    textures: 0,
+    geometries: 0,
+  };
 
   maxConcurrent: number;
   maxTiles: number;

@@ -620,6 +620,19 @@ export class S3MLayer {
     return this.viewer.getToneMapping();
   }
 
+  /**
+   * 运行时切换材质质感（`'pbr'` | `'lambert'`）：原位重建现有 styled 材质，
+   * 不重拉瓦片、不重建几何。lambert 开销更低，低端设备 / 白模场景适用。
+   */
+  setMaterialQuality(q: 'pbr' | 'lambert'): void {
+    this.viewer.setMaterialQuality(q);
+  }
+
+  /** 当前材质质感档位 */
+  get materialQuality(): 'pbr' | 'lambert' {
+    return this.viewer.materialQuality;
+  }
+
   /** 动态设置图层整体透明度 (0.0 ~ 1.0)，可带过渡 */
   setOpacity(opacity: number, transition?: TransitionOptions): void {
     this.viewer.setOpacity(opacity, transition);

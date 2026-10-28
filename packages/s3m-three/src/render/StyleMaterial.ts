@@ -375,6 +375,12 @@ export function createSharedUniforms(): StyleUniforms {
      * （压暗 → 换模式 → 亮回来），比硬切自然得多。
      */
     uFade: { value: 1 },
+    /**
+     * 平面 / 平滑着色开关：0 = 平滑（插值法线），1 = 平面（屏幕导数法线）。
+     * 走 uniform 而不是 three 的 `flatShading` define，所以切换 shading 不会触发
+     * 着色器重编译（旧实现靠 prewarm 把卡顿藏起来，现在连卡顿都没有）。
+     */
+    uFlatShading: { value: 1 },
   };
 }
 const VERT_PARS = /* glsl */ `
@@ -411,6 +417,8 @@ const VERT_PARS = /* glsl */ `
   varying float vWorldZ;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
+  // 视图空间位置：平面着色用它算屏幕导数法线，符号与 three 的 vViewPosition 一致
+  varying vec3 vS3MViewPos;
 
   // 跨 chunk 共享的顶点姿态变量（在 beginnormal_vertex 建立，begin_vertex / worldpos 使用）
   vec3 s3mCustomOffset;
@@ -576,6 +584,9 @@ const VERT_WORLD = /* glsl */ `
     mat3 s3mNormMat = mat3( modelMatrix );
   #endif
   vWorldNormal = normalize( s3mNormMat * ( s3mRot * normal ) );
+  // 视图空间位置直接拷 three 的 vViewPosition（此处已在 project_vertex 之后，
+  // 含实例化 / 形变的最终值）：平面着色的导数法线与 FLAT_SHADED 分支逐点一致
+  vS3MViewPos = vViewPosition;
 `;
 
 const FRAG_PARS = /* glsl */ `
@@ -684,6 +695,8 @@ const FRAG_PARS = /* glsl */ `
   varying float vWorldZ;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
+  varying vec3 vS3MViewPos;
+  uniform float uFlatShading;
 
   vec4 s3mSampleBatchRow0( sampler2D texA, sampler2D texB, vec2 uv, float mixVal ) {
     vec4 vA = texture2D( texA, uv );
@@ -885,6 +898,12 @@ export interface StyledMaterialOptions {
   transparent?: boolean;
   opacity?: number;
   roughness?: number;
+  /**
+   * @deprecated 旧版用 three 的 `flatShading` define 表达，切换必重编译；现在
+   * shading 走共享 uniform `uFlatShading`（见 `createSharedUniforms`），运行期
+   * 二选一。此参数仅作为 uniform 的**初始值**被兼容（false = smooth），
+   * 运行期切换请走 viewer 的 `setStyle({ shading })`。
+   */
   flatShading?: boolean;
   /** >0 时开启 alphaTest：镂空贴图（S3MBLOCK 图集）的透明片元直接丢弃，避免渲染成黑面 */
   alphaTest?: number;
@@ -898,6 +917,27 @@ export interface StyledMaterialOptions {
  * 创建一个带样式的 PBR 材质。
  * 每个 Mesh 独享一个材质实例，但 uniform 对象是全局共享的。
  */
+/**
+ * 片元法线覆盖：平面着色时用屏幕导数算真实几何法线。
+ *
+ * 注入在 `<normal_fragment_begin>` 之后——此时 three 已按平滑路径算好 `normal`
+ * （来自插值 vNormal）；uFlatShading > 0.5 时用视图空间位置的导数叉积覆盖它，
+ * 数学上与 three 的 FLAT_SHADED 分支逐点一致（vS3MViewPos 符号对齐 vViewPosition）。
+ * 因为是运行期分支而非编译期 define，切 shading 不再触发重编译。
+ */
+const FRAG_NORMAL = /* glsl */ `
+  if ( uFlatShading > 0.5 ) {
+    vec3 s3mFlatN = normalize( cross( dFdx( vS3MViewPos ), dFdy( vS3MViewPos ) ) );
+    #ifdef USE_DOUBLE_SIDED
+      s3mFlatN = s3mFlatN * ( float( gl_FrontFacing ) * 2.0 - 1.0 );
+    #endif
+    #ifdef USE_FLIP_SIDED
+      s3mFlatN = - s3mFlatN;
+    #endif
+    normal = s3mFlatN;
+  }
+`;
+
 export function createStyledMaterial(opts: StyledMaterialOptions): StyledMaterial {
   const uniforms = opts.uniforms;
   // 两种光照模型共用的参数。注入的 chunk 只动 diffuseColor / normal / transformed，
@@ -909,9 +949,10 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
     transparent: !!opts.transparent,
     opacity: opts.opacity ?? 1,
     depthWrite: opts.transparent ? false : true,
-    // 白模 / OSGB 的法线多是共享顶点平均出来的，平滑插值会让墙面出现斑驳，
-    // 默认走平面着色（片元里用导数算法线），墙面才干净。
-    flatShading: opts.flatShading !== false,
+    // 白模 / OSGB 的法线多是共享顶点平均出来的，平滑插值会让墙面出现斑驳。
+    // 平面 / 平滑不再走 three 的 flatShading define（那是编译期变体，切换必重编译），
+    // 改由共享 uniform uFlatShading 在片元里二选一：材质恒为平滑，program 因此稳定。
+    flatShading: false,
     // 顶点色、贴图全部在自定义 chunk 里处理，不让 three 插手
     vertexColors: false,
     alphaTest: opts.alphaTest ?? 0,
@@ -930,6 +971,10 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   const uSelBatch = { value: -1 };
   // 没有单体化信息的几何（batchId = -1）只能整块选中
   const uSelWhole = { value: 0 };
+  // shading 开关：跟随共享 uniforms（改一次全场景生效）；测试里可能不传
+  // uniforms，这里兜底一份独立对象，与旧代码容忍 uniforms === undefined 的口径一致。
+  // 兼容旧参数：显式传 flatShading: false（旧语义 = smooth）映射为初始值 0
+  const uFlatShading = uniforms?.uFlatShading ?? { value: opts.flatShading === false ? 0 : 1 };
   const uBatchTex = { value: DUMMY_BATCH_TEX };
   const uBatchTex2 = { value: DUMMY_BATCH_TEX };
   const uBatchTexWidth = { value: 1.0 };
@@ -950,6 +995,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
     Object.assign(shader.uniforms, uniforms, {
       uSelBatch,
       uSelWhole,
+      uFlatShading,
       uBatchTex,
       uBatchTex2,
       uBatchTexWidth,
@@ -987,6 +1033,12 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
     } else if (secMap) {
       shader.fragmentShader = shader.fragmentShader.replace('#include <map_fragment>', `#include <map_fragment>\n${FRAG_BAKE}`);
     }
+
+    // 平面 / 平滑着色：运行期分支（见 FRAG_NORMAL），不再依赖 flatShading define
+    shader.fragmentShader = shader.fragmentShader.replace(
+      '#include <normal_fragment_begin>',
+      `#include <normal_fragment_begin>\n${FRAG_NORMAL}`
+    );
   };
 
   // 不同材质共用同一段注入代码，必须让 three 认为它们的 program 可复用；
@@ -1009,6 +1061,10 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   mat.userData.uBatchTexWidth = uBatchTexWidth;
   mat.userData.uBatchTexActive = uBatchTexActive;
   mat.userData.uTileFade = uTileFade;
+  // 平面 / 平滑着色开关：S3MViewer._applyShading 翻它，不触发重编译
+  mat.userData.uFlatShading = uFlatShading;
+  // 记录创建参数：materialQuality 运行时切换时按原参数重建材质（换类不换外观）
+  mat.userData.s3mOpts = opts;
   mat.userData.isStyled = true;
   return mat;
 }

@@ -24,7 +24,7 @@ import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
-import { setMaterialQuality } from './StyleMaterial.js';
+import { getMaterialQuality, setMaterialQuality } from './StyleMaterial.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
@@ -32,6 +32,7 @@ import {
   SELECT_MODE,
   DEFAULT_STYLE,
   createSharedUniforms,
+  createStyledMaterial,
   createOutlineMaterial,
   resolveEdgeModes,
   sameEdgeModes,
@@ -40,11 +41,13 @@ import type {
   OutlineMaterial,
   OutlineStyleUniforms,
   StyledMaterial,
+  StyledMaterialOptions,
   StyleMode,
   SelectMode,
   S3MStyle,
   EdgeModes,
   EdgesOption,
+  MaterialQuality,
 } from './StyleMaterial.js';
 import { applyPointCloudStyle, isOwnedPointCloudMaterial } from './PointCloudMaterial.js';
 import { Picker } from './Picker.js';
@@ -1864,8 +1867,11 @@ export class S3MViewer {
           mat.transparent = o < 0.999;
           const keepDepth = this.style.depthWrite !== false;
           mat.depthWrite = mat.transparent ? keepDepth : (this.style.depthWrite !== false);
-          mat.flatShading = this.style.shading !== 'smooth';
-          mat.needsUpdate = true;
+          // shading 走共享 uniform（uFlatShading），不写 mat.flatShading / needsUpdate——
+          // transparent / depthWrite 也不是 program 决定项，整套样式继承零重编译
+          if (mat.userData.uFlatShading) {
+            mat.userData.uFlatShading.value = this.style.shading !== 'smooth' ? 1 : 0;
+          }
           this._featureStyleManager.applyOverridesToMesh(mesh);
           this._startTileFade(mesh, mat);
         }
@@ -2369,26 +2375,74 @@ export class S3MViewer {
 
   /** 平面/平滑着色：FLAT_SHADED 是编译期宏，改它必须重编译 */
   private _applyShading(): void {
-    const flat = this.style.shading !== 'smooth';
+    // shading 现在是共享 uniform（uFlatShading）驱动的运行期分支，不再是
+    // flatShading define：翻一个 float 就完成切换，零重编译、零卡顿。
+    const target = this.style.shading !== 'smooth' ? 1 : 0;
     for (const p of this._pickables.values()) {
       const m = styledMaterialOf(p.mesh);
-      if (!m || m.flatShading === flat) continue;
-      m.flatShading = flat;
-      m.needsUpdate = true;
+      const u = m?.userData.uFlatShading;
+      if (!u || u.value === target) continue;
+      u.value = target;
     }
     this._requestRepaint();
   }
 
   /**
-   * 预热另一种 `shading` 变体，让首次切换不再同步编译着色器。
+   * 运行时切换材质质感（`'pbr'` | `'lambert'`）。
    *
-   * 做法是「把材质翻到另一种变体 → 编译 → 翻回来」：three 的 program 缓存按
-   * cacheKey（含 flatShading / defines）分桶，编译一次就留在缓存里，之后
-   * `_applyShading()` 切过去只是取缓存。
+   * 档位是模块级设置（影响之后新建的材质）；已加载瓦片的材质在这里**原位重建**：
+   * 不重拉瓦片、不重建几何，按创建时记录的参数（`userData.s3mOpts`）换一个
+   * 新材质实例，并保留逐材质状态（选中编号、瓦片淡入、批量状态纹理）。
+   * 切换后 program 需要重新编译一次（lambert / pbr 是不同着色器），这是唯一开销。
+   */
+  setMaterialQuality(q: MaterialQuality): void {
+    setMaterialQuality(q);
+    this._rebuildStyledMaterials();
+    this._requestRepaint();
+  }
+
+  /** 当前材质质感档位 */
+  get materialQuality(): MaterialQuality {
+    return getMaterialQuality();
+  }
+
+  /** 按创建参数原位重建所有 styled 材质（materialQuality 切换用） */
+  private _rebuildStyledMaterials(): void {
+    // 逐材质 own uniform 的状态要在重建时搬过去，否则选中高亮 / 瓦片淡入会闪没
+    const PRESERVED = [
+      'uSelBatch',
+      'uSelWhole',
+      'uBatchTex',
+      'uBatchTex2',
+      'uBatchTexWidth',
+      'uBatchTexActive',
+      'uTileFade',
+    ] as const;
+    for (const p of this._pickables.values()) {
+      const mesh = p.mesh;
+      const raw = mesh.material;
+      if (Array.isArray(raw)) continue; // styled 材质恒为单材质；数组材质（点云等）不归这里管
+      const old = raw as StyledMaterial | undefined;
+      if (!old?.userData?.isStyled || !old.userData?.s3mOpts) continue;
+      const opts = old.userData.s3mOpts as StyledMaterialOptions;
+      const fresh = createStyledMaterial({ ...opts, uniforms: this.uniforms });
+      for (const key of PRESERVED) {
+        const src = old.userData[key] as { value: unknown } | undefined;
+        const dst = fresh.userData[key] as { value: unknown } | undefined;
+        if (src && dst) dst.value = src.value;
+      }
+      mesh.material = fresh;
+      old.dispose();
+    }
+  }
+
+  /**
+   * 预热着色 program，避免首帧同步编译。
    *
-   * 翻转期间材质是「错误变体」，所以用 `_prewarming` 让 renderFrame 跳过渲染——
-   * 少画一两帧看不出来，把平滑的楼画成平面的就很明显。
-   * 优先用 `compileAsync`（KHR_parallel_shader_compile），没有就退回同步 `compile`。
+   * shading 改为 `uFlatShading` 共享 uniform 驱动后（见 `_applyShading`），
+   * flat / smooth 共用同一个 program，不再存在「另一种变体」，也不需要
+   * 「翻变体 → 编译 → 翻回来」的那套流程与 `_prewarming` 跳帧。这里只把当前
+   * 唯一的 program 编一次（优先 `compileAsync`，KHR_parallel_shader_compile）。
    */
   async prewarmShading(): Promise<void> {
     if (this._shadingPrewarmed || this._prewarming) return;
@@ -2397,23 +2451,17 @@ export class S3MViewer {
     const camera = this.camera;
     if (!r || !scene || !camera) return;
 
-    const mats: StyledMaterial[] = [];
-    const seen = new Set<THREE.Material>();
+    // 场上还没有材质就没必要预热：program 会在首个材质出现时编译
+    let hasMaterial = false;
     for (const p of this._pickables.values()) {
-      const m = styledMaterialOf(p.mesh);
-      if (!m || seen.has(m)) continue;
-      seen.add(m);
-      mats.push(m);
+      if (styledMaterialOf(p.mesh)) {
+        hasMaterial = true;
+        break;
+      }
     }
-    if (mats.length === 0) return;
+    if (!hasMaterial) return;
 
     this._shadingPrewarmed = true;
-    this._prewarming = true;
-    // 当前是 smooth（flatShading = false）就预热 flat，反之预热 smooth
-    const target = this.style.shading === 'smooth';
-    const saved = mats.map((m) => m.flatShading);
-    for (const m of mats) m.flatShading = target;
-
     try {
       const anyR = r as unknown as {
         compileAsync?: (s: THREE.Object3D, c: THREE.Camera) => Promise<unknown>;
@@ -2421,15 +2469,9 @@ export class S3MViewer {
       if (typeof anyR.compileAsync === 'function') await anyR.compileAsync(scene, camera);
       else r.compile(scene, camera);
     } catch {
-      // 预热失败不影响主流程：最坏情况退回「首次切换时编译一次」
-    } finally {
-      for (let i = 0; i < mats.length; i++) {
-        mats[i].flatShading = saved[i];
-        mats[i].needsUpdate = true;
-      }
-      this._prewarming = false;
-      this._requestRepaint();
+      // 预热失败不影响主流程：最坏情况退回「首次渲染时编译一次」
     }
+    this._requestRepaint();
   }
 
   /**
@@ -3989,6 +4031,10 @@ export class S3MViewer {
       vertices: 0,
       triangles: 0,
       datasets: this.datasets.size,
+      drawCalls: 0,
+      programs: 0,
+      textures: 0,
+      geometries: 0,
     };
     for (const entry of this.datasets.values()) {
       const s = entry.tileset?.stats;
@@ -3999,6 +4045,15 @@ export class S3MViewer {
       total.meshes += s.meshes;
       total.vertices += s.vertices;
       total.triangles += s.triangles;
+    }
+    // GPU 侧预算观测：draw call / program / 显存驻留。没有渲染器（未 mount /
+    // 纯解析场景）时保持 0，不抛错。
+    const info = this.renderer?.info;
+    if (info) {
+      total.drawCalls = info.render.calls;
+      total.programs = info.programs?.length ?? 0;
+      total.textures = info.memory.textures;
+      total.geometries = info.memory.geometries;
     }
     return total;
   }
