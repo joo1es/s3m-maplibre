@@ -87,7 +87,7 @@ NODE_OPTIONS= bun test ./tests/unit/xxx.test.ts   # 单个文件，写测试时�
 NODE_OPTIONS= bun test                   # 含 e2e，需要网络
 ```
 
-**交付标准**：`typecheck` 通过 + `bun test ./tests/unit` 全绿（当前基线 363 pass / 0 fail）。有一条红就不算完成，也不要在报告里说「基本通过」。
+**交付标准**：`typecheck` 通过 + `bun test ./tests/unit` 全绿（当前基线 449 pass / 0 fail —— 这个数字只会涨，别拿它当断言，以本地实跑为准）。有一条红就不算完成，也不要在报告里说「基本通过」。
 
 样例数据是可选的：`tests/helpers/sample.ts` 会去 `../s3m-spec/S3M_SDK/S3M_JS/data/` 找官方 `.s3mb`，找不到就 skip 整组解析断言。CI 里设了 `S3M_REQUIRE_SAMPLES=1`，样例没拉下来直接判失败——因为静默 skip 比失败更危险。
 
