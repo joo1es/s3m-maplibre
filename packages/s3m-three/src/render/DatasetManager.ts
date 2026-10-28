@@ -9,6 +9,7 @@
  */
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
+import type { AuthenticateFn } from '../core/AuthFetch.js';
 import type { Anchor } from '../core/types.js';
 import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 
@@ -43,6 +44,11 @@ export interface S3MDatasetOptions {
    * - true / false：强制开 / 关（例如地形、绿地、道路只显示材质、不描边）
    */
   enableEdges?: boolean;
+  /**
+   * 本数据集专属的鉴权适配函数（不填则用图层级的 `authenticate`）。
+   * 适合多数据集走不同网关 / 不同 token 的场景。见 `AuthenticateFn`。
+   */
+  authenticate?: AuthenticateFn;
 }
 
 export interface S3MDatasetEntry {
@@ -170,7 +176,8 @@ export class DatasetManager {
     maxConcurrent: number,
     callbacks: DatasetManagerCallbacks,
     maxTriangles: number = Infinity,
-    maxImageCache: number = 128
+    maxImageCache: number = 128,
+    authenticate?: AuthenticateFn
   ): Promise<S3MDatasetEntry> {
     const existing = this.datasets.get(ds.id);
     if (existing) return existing;
@@ -205,6 +212,7 @@ export class DatasetManager {
       lodRangeScale: ds.lodRangeScale ?? defaultLodRangeScale,
       buildTile: buildTile ?? null,
       useWorker: ds.useWorker,
+      authenticate: ds.authenticate ?? authenticate,
       uniforms: uniforms,
       onTile: (node) => {
         callbacks.onTile(node, entry);

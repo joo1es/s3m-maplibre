@@ -59,6 +59,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 实例化几何 | ✅ | `instanceMode` 16 / 17 |
 | 正交投影 | ✅ | 可选开关（`projection: 'orthographic'`），默认透视；需 MapLibre ≥ 5，正交时底图 / 地形 / marker 需 App 退出，见[正交投影](#正交投影) |
 | 可调光照 | ✅ | `setLight()` / `getLight()` 支持动态调整环境光与主平行光的颜色、强度、方位角与高度角，支持 `headlamp`（跟随视角）与 `fixed`（太阳固定世界方位）模式 |
+| 服务鉴权 | ✅ | `authenticate` 钩子：内核发出的全部请求（配置 / 瓦片 / 子图集 / 棱线缓存 / 属性查询）统一改写 URL（加 `?token=`）或附加请求头，支持异步换 token，见[服务鉴权](#服务鉴权authenticate) |
 | 显存与多图层优化 | ✅ | 全局瓦片预算 `totalMaxTiles` 动态分配、纹理引用计数淘汰自动释放 GPU 显存、递归深度释放几何/材质/点云/线框，防止长时间漫游或多图层堆叠爆显存 |
 | 瓦片同材质合批 | ✅ | 倾斜摄影大瓦片自动合批，大幅降低 DrawCall |
 | 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
@@ -490,6 +491,26 @@ V = P⁻¹ × MVP           （反推视图矩阵，不猜、不自建相机）
 实现上有个坑：视场角必须用 render() 入参里的 `fov`（弧度）——MapLibre v5 起 `transform.fov` 改成了「度」，当弧度用会让 `tan(fov/2)` 差出 20% 以上（LOD 屏幕误差和正交半高都会错）。
 
 **边界（产品决策，不是技术限制）**：正交只覆盖本层。底图瓦片、地形、DOM Marker / 弹窗仍走 MapLibre 自己的透视投影，和正交层差 ≈ 楼高 / 相机距——城市尺度（楼高 100m、相机距 1km）俯视时屋顶线就能差出 ~90px（1080p），带俯仰角时连地面一起撕开（近端可差上千像素）。要用正交，App 需要自行把这些层退出；demo 里的勾选框就是这么干的（勾选即隐藏 `bg` / `osm` 两层）。
+
+### 服务鉴权（authenticate）
+
+S3M 服务挂在带鉴权的网关后面时（要求 URL 带 `?token=`、或请求头带 `Authorization` / `X-Token`），用 `authenticate` 钩子统一处理。内核主线程发出的**全部**请求——数据集配置 scp、瓦片 `.s3mb` / `.s3mblock`、子图集 `.texblock`、棱线缓存、iServer 属性查询——发出前都过一遍这个钩子：
+
+```js
+const layer = new S3MLayer({
+  configUrl: 'https://gw.example.com/data/a.scp',
+  authenticate: (url, kind) => ({
+    url: `${url}${url.includes('?') ? '&' : '?'}token=${getToken()}`,
+    headers: { 'X-Token': getToken() },
+  }),
+});
+```
+
+- 返回 `string`：只改写 URL（最简形式）；返回 `{ url, headers }`：改 URL 并加请求头；返回 `Promise` 也行（比如先向认证服务换新 token）。
+- `kind` 标明请求类别：`'config'`（配置 scp）| `'tile'`（瓦片）| `'texblock'`（子图集）| `'creases'`（棱线缓存）| `'attributes'`（属性查询），可按类别走不同网关。
+- 鉴权只作用于**发到网络上的请求**，不参与瓦片缓存键——token 轮换不会导致同一块瓦片重复加载；失败重试时每次重新过钩子，刷新后的 token 天然带上。
+- 多数据集走不同网关时，给单个数据集传 `authenticate` 覆盖全局：`layer.addDataset({ id, configUrl, authenticate })`；属性查询同理（`attributes.authenticate`）。
+- **不传 = 行为与旧版完全一致**，一个字节都不多发。
 
 ---
 

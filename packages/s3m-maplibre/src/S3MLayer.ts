@@ -3,18 +3,23 @@
  *
  * 这个文件只做「宿主协议 ↔ s3m-three 渲染内核」的翻译，不含任何渲染逻辑：
  *
- *   onAdd(map, gl)      → 建 GeoAdapter、viewer.mount(canvas, gl)、挂地图事件
- *   render(gl, arg)     → 从 MapLibre 每帧输入里取出 world→clip 矩阵与相机位置，
- *                         喂给 viewer.renderFrame()，按返回值决定是否继续 triggerRepaint
+ *   onAdd(map, gl)      → 建 GeoAdapter、经 HostRenderer.mountViewer 挂载内核、挂地图事件
+ *   render(gl, arg)     → 从 MapLibre 每帧输入里抽出 world→clip 矩阵与相机位置
+ *                         （近平面缩放 / 正交混合是 MapLibre 专属拼接），
+ *                         交给 HostRenderer.driveFrame 喂内核并按需续帧
  *   click / projectiontransition → 转成 viewer 的拾取与锚点重算
  *
- * 渲染、样式、拾取、选中、棱线、单体状态全部在 s3m-three 的 S3MViewer 里，
+ * 宿主无关的部分（持有 S3MViewer、投影模式、近平面缩放、requestRepaint / getBearing
+ * 钩子接线、生命周期 mount / unmount）全部在 s3m-three 的 HostRenderer 基类里；
+ * 渲染、样式、拾取、选中、棱线、单体状态在 S3MViewer 里。
+ * 接入其他地图（ArcGIS / Cesium…）时继承 HostRenderer，只补各家专属胶水。
  * 纯 three 宿主（不接地图）请直接用 S3MViewer。
  *
  * 兼容性：图层只依赖 `MapLike` 这组鸭子类型接口，MapLibre GL JS v4/v5 与
  * Mapbox GL JS v2/v3 都可以直接 `map.addLayer(layer)`，不引入任一方的类型依赖。
  */
-import { S3MViewer } from 's3m-three';
+import { HostRenderer } from 's3m-three';
+import type { S3MViewer } from 's3m-three';
 import type {
   S3MViewerOptions,
   S3MStyle,
@@ -98,23 +103,9 @@ export interface S3MLayerOptions extends S3MViewerOptions {
   nearPlaneScale?: number;
 }
 
-/** 近裁剪缩放系数的合法化：非数字 / <=0 / >=1 一律视为「不改」 */
-function normalizeNearPlaneScale(v: number | undefined): number {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return 1;
-  return v > 0 && v < 1 ? v : 1;
-}
-
-export class S3MLayer {
-  readonly id: string;
+export class S3MLayer extends HostRenderer {
   readonly type = 'custom' as const;
   readonly renderingMode = '3d' as const;
-
-  readonly options: S3MLayerOptions;
-  readonly pickable: boolean;
-  onStats: (stats: Stats) => void;
-  onReady: (entry: S3MDatasetEntry) => void;
-  onPick: (result: PickResult | null) => void;
-  onError: (error: unknown) => void;
 
   /** 宿主地图。赋值时自动同步 viewer 的地理坐标适配器（0.2.x 允许直接赋值的兼容行为） */
   private _map: MapLike | null = null;
@@ -126,48 +117,6 @@ export class S3MLayer {
   set map(map: MapLike | null) {
     this._map = map;
     this.viewer.geo = map ? createMapLibreGeoAdapter(map) : null;
-  }
-
-  /** 底层渲染内核（s3m-three）。直接暴露，方便高级用法绕过图层自己喂帧 */
-  readonly viewer: S3MViewer;
-
-  /** 当前近裁剪面缩放系数（1 = 不改，用 MapLibre 的 canvasHeight/50） */
-  get nearPlaneScale(): number {
-    return this._nearPlaneScale;
-  }
-
-  /**
-   * 动态调整近裁剪面缩放（0 < scale < 1）。传 1 / 0 / 非法值 = 恢复 MapLibre 原始 near。
-   *
-   * 解决「相机推进到楼体十几米以内，楼面整片消失」：MapLibre 的 near 是
-   * `canvasHeight / 50`，zoom 16.5 时约合 13 米。缩放后 fov 与 far 完全不变，
-   * 画面逐点重合，只有近处不再被裁。代价见 `nearPlaneScale` 选项说明（深度精度）。
-   */
-  setNearPlaneScale(scale: number): void {
-    this._nearPlaneScale = normalizeNearPlaneScale(scale);
-    this.map?.triggerRepaint?.();
-  }
-
-  /** 正交不可用只告警一次 */
-  private _orthoWarned = false;
-  private _projection: ProjectionMode = 'perspective';
-  /** 近裁剪面缩放系数，1 = 不改（默认） */
-  private _nearPlaneScale = 1;
-  /** 正交插值参数：0 = 纯透视，1 = 纯正交，过渡期间由 animator 平滑推进 */
-  private _projectionT = 0;
-
-  private _ensureProjectionChannel(): void {
-    if (this.viewer.animator.has('projection.t')) return;
-    this.viewer.animator.register('projection.t', {
-      dim: 1,
-      read: (out) => {
-        out[0] = this._projectionT;
-      },
-      write: (v) => {
-        this._projectionT = v[0];
-        this.map?.triggerRepaint();
-      },
-    });
   }
 
   private readonly _onProjectionChange = (): void => {
@@ -224,49 +173,23 @@ export class S3MLayer {
     );
   }
 
+  /**
+   * 构造适配器。所有渲染内核选项与宿主开关（id / projection / nearPlaneScale）
+   * 都上抛给 `HostRenderer` 基类：基类会创建 `S3MViewer` 并把宿主能力钩子
+   * （requestRepaint / getBearing）注入内核，内核不碰任何地图 API。
+   */
   constructor(options: S3MLayerOptions = {}) {
-    this.id = options.id ?? 's3m';
-    this.options = options;
-    this.pickable = options.pickable !== false;
-    this._projection = options.projection === 'orthographic' ? 'orthographic' : 'perspective';
-    this._nearPlaneScale = normalizeNearPlaneScale(options.nearPlaneScale);
-    this._projectionT = this._projection === 'orthographic' ? 1 : 0;
-    this.onStats = options.onStats ?? (() => {});
-    this.onReady = options.onReady ?? (() => {});
-    this.onPick = options.onPick ?? (() => {});
-    this.onError = options.onError ?? ((e) => console.warn('[s3m]', e));
+    super(options);
+  }
 
-    this.viewer = new S3MViewer({
-      configUrl: options.configUrl,
-      datasets: options.datasets,
-      style: options.style,
-      ground: options.ground,
-      pickable: options.pickable,
-      maxTiles: options.maxTiles,
-      maxConcurrent: options.maxConcurrent,
-      useWorker: options.useWorker,
-      lodRangeScale: options.lodRangeScale,
-      lodPixelRatioCap: options.lodPixelRatioCap,
-      maxTriangles: options.maxTriangles,
-      maxImageCache: options.maxImageCache,
-      materialQuality: options.materialQuality,
-      anisotropyCap: options.anisotropyCap,
-      maxTextureSize: options.maxTextureSize,
-      buildTile: options.buildTile,
-      light: options.light,
-      toneMapping: options.toneMapping,
-      toneMappingExposure: options.toneMappingExposure,
-      totalMaxTiles: options.totalMaxTiles,
-      attributes: options.attributes,
-      prewarmShading: options.prewarmShading,
-      // 三个宿主能力全部走回调注入，viewer 不碰任何地图 API
-      onRequestRepaint: () => this.map?.triggerRepaint(),
-      getBearing: () => this.map?.getBearing?.() ?? 0,
-      onStats: (s) => this.onStats(s),
-      onReady: (e) => this.onReady(e),
-      onPick: (r) => this.onPick(r),
-      onError: (e) => this.onError(e),
-    });
+  /** 宿主能力钩子：请求下一帧重绘（MapLibre / Mapbox → triggerRepaint） */
+  protected requestRepaint(): void {
+    this.map?.triggerRepaint();
+  }
+
+  /** 宿主方位角（度）：MapLibre v5+ 跟随视角，灯光随之旋转 */
+  protected override getBearing(): number {
+    return this.map?.getBearing?.() ?? 0;
   }
 
   /* ---------------------------------------------------------------- 生命周期 */
@@ -276,13 +199,9 @@ export class S3MLayer {
     // 老版本回退标准墨卡托）同步进 viewer
     this.map = map;
 
-    if (this.viewer.renderer) {
-      // 上下文恢复路径：onAdd 被再次触发（map.addLayer），原地换新 renderer，
-      // 保留已加载的场景与瓦片，不重建、不重拉。
-      this.viewer.restoreContext(gl);
-    } else {
-      this.viewer.mount(map.getCanvas(), gl);
-    }
+    // mountViewer 内部处理「上下文恢复（已挂载则原地换新 renderer，保留瓦片）」
+    // 与「首次挂载」两条路径。
+    this.mountViewer(map.getCanvas(), gl);
 
     // 监听器只在首次挂载时绑定一次；上下文恢复重加图层时不重复绑定，
     // 否则 click / projectiontransition 等会被挂多次。
@@ -306,7 +225,7 @@ export class S3MLayer {
     }
     this._listenersAttached = false;
     this._contextLost = false;
-    this.viewer.unmount();
+    this.unmountViewer();
     this.viewer.geo = null;
     this.map = null;
   }
@@ -373,52 +292,6 @@ export class S3MLayer {
     return canvas.width / canvas.height;
   }
 
-  /**
-   * 切换投影模式，可带平滑过渡。
-   *
-   * 正交只影响本层：底图瓦片、地形、DOM Marker / 弹窗仍走 MapLibre 的透视
-   * 投影，和正交层差 ≈ 楼高 / 相机距（城市尺度几十到上百像素），App 需要
-   * 自行把这些层退出。拾取、选中描边、按单体着色/隐藏/抬高不受影响。
-   */
-  setProjection(mode: ProjectionMode, transition?: TransitionOptions): void {
-    const next = mode === 'orthographic' ? 'orthographic' : 'perspective';
-    const targetT = next === 'orthographic' ? 1 : 0;
-    const duration = transition?.duration ?? 0;
-    const wantAnim = duration > 0 || !!transition?.spring;
-
-    this._projection = next;
-    this._orthoWarned = false;
-
-    if (!wantAnim) {
-      if (this.viewer.animator.has('projection.t')) this.viewer.animator.cancel('projection.t');
-      this._projectionT = targetT;
-      this.map?.triggerRepaint();
-      return;
-    }
-
-    this._ensureProjectionChannel();
-    this.viewer.animator.to('projection.t', targetT, {
-      ...transition,
-      duration,
-      easing: transition?.easing ?? 'easeInOutCubic',
-      onComplete: () => {
-        this._projectionT = targetT;
-        this.map?.triggerRepaint();
-      },
-    });
-    this.map?.triggerRepaint();
-  }
-
-  /** 当前投影模式 */
-  get projection(): ProjectionMode {
-    return this._projection;
-  }
-
-  /** 当前正交插值比例（0 = 纯透视，1 = 纯正交） */
-  get projectionT(): number {
-    return this._projectionT;
-  }
-
   render(gl: WebGLRenderingContext | WebGL2RenderingContext, arg: unknown): void {
     const map = this.map;
     const anchor = this.viewer.sceneAnchor;
@@ -467,15 +340,16 @@ export class S3MLayer {
       /* 忽略 */
     }
 
-    const needsNextFrame = this.viewer.renderFrame({
+    // 矩阵拼接（近缩放 / 正交混合 / 相机 ENU 反推）是 MapLibre 专属，留在上面；
+    // 「喂内核 + 按需请求下一帧」是宿主无关逻辑，交给基类的 driveFrame——
+    // 内部 requestRepaint() 即本适配器的 map.triggerRepaint()。
+    // 动态着色 / 瓦片加载中 / 瓦片层级或可见性改变时内核会要求继续驱动。
+    this.driveFrame({
       mvp: mvpMat.elements,
       cameraEnu: camEnu,
       fovRad: this._frameFov(arg),
       canvasHeight: canvas.height,
     });
-
-    // 动态着色 / 瓦片加载中 / 瓦片层级或可见性改变，都需要继续驱动下一帧
-    if (needsNextFrame) map.triggerRepaint();
   }
 
   /* ---------------------------------------------------------------- 事件与拾取 */

@@ -23,6 +23,7 @@
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
+import { authFetch, type AuthenticateFn } from '../core/AuthFetch.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
 import { getMaterialQuality, setMaterialQuality } from './StyleMaterial.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
@@ -290,6 +291,13 @@ export interface S3MViewerOptions {
   onRequestRepaint?: () => void;
   /** 地图朝向（弧度），用于让灯光跟着视角走。不传则灯光方向固定 */
   getBearing?: () => number;
+  /**
+   * 鉴权适配函数（全局默认，数据集可用自己的 `authenticate` 覆盖）。
+   * 内核主线程发出的全部请求（配置 scp / 瓦片 / 子图集 / 棱线缓存 / 属性查询）
+   * 发出前都过一遍，可改写 URL（加 `?token=`）或附加请求头。
+   * 不传 = 行为与旧版完全一致。见 `AuthenticateFn`。
+   */
+  authenticate?: AuthenticateFn;
   onStats?: (stats: Stats) => void;
   onReady?: (entry: S3MDatasetEntry) => void;
   onPick?: (result: PickResult | null) => void;
@@ -572,6 +580,8 @@ export class S3MViewer {
   /** 宿主重画信号与地图朝向，构造时注入 */
   private _onRequestRepaint: () => void = () => {};
   private _getBearing: (() => number) | undefined;
+  /** 鉴权适配（全局默认），构造时注入 */
+  private readonly _authenticate: AuthenticateFn | undefined;
   private _lodRangeScale = 1.0;
   /** LOD 判定屏幕高度的 DPR 上限。Infinity = 不截断（默认，行为同旧版） */
   private _lodPixelRatioCap = Infinity;
@@ -600,6 +610,7 @@ export class S3MViewer {
     }
     this._onRequestRepaint = options.onRequestRepaint ?? (() => {});
     this._getBearing = options.getBearing;
+    this._authenticate = options.authenticate;
     this.onStats = options.onStats ?? (() => {});
     this.onReady = options.onReady ?? (() => {});
     this.onPick = options.onPick ?? (() => {});
@@ -670,7 +681,11 @@ export class S3MViewer {
 
     this._fps.last = performance.now();
     this._datasetQueue = this._normalizeDatasets(options);
-    if (options.attributes) this.attributeQuery = new AttributeQuery(options.attributes);
+    if (options.attributes)
+      this.attributeQuery = new AttributeQuery({
+        ...options.attributes,
+        authenticate: options.attributes.authenticate ?? this._authenticate,
+      });
   }
 
   /* ---------------------------------------------------------------- 生命周期 */
@@ -950,7 +965,8 @@ export class S3MViewer {
         },
       },
       this.options.maxTriangles ?? Infinity,
-      this.options.maxImageCache ?? 128
+      this.options.maxImageCache ?? 128,
+      this._authenticate
     );
     return entry;
   }
@@ -1616,7 +1632,9 @@ export class S3MViewer {
   /* ---------------------------------------------------------------- 按业务字段着色 */
 
   setAttributeSource(options: AttributeQueryOptions | null): void {
-    this.attributeQuery = options ? new AttributeQuery(options) : null;
+    this.attributeQuery = options
+      ? new AttributeQuery({ ...options, authenticate: options.authenticate ?? this._authenticate })
+      : null;
   }
 
   getLoadedSmids(): number[] {
@@ -2683,7 +2701,7 @@ export class S3MViewer {
    * @param url  棱线缓存地址（二进制 Float32 序列：x,y,z,x,y,z,… 成对成段）
    */
   async loadCreases(url: string): Promise<void> {
-    const resp = await fetch(url);
+    const resp = await authFetch(url, this._authenticate, 'creases');
     if (!resp.ok) throw new Error(`[s3m] 棱线缓存加载失败: ${resp.status} ${url}`);
     const buf = await resp.arrayBuffer();
     const arr = new Float32Array(buf);

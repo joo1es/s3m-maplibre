@@ -21,6 +21,8 @@ export type {
   AttributeField,
   AttributeRow,
 } from './core/AttributeQuery.js';
+export type { AuthRequestKind, AuthResolvedRequest, AuthenticateFn } from './core/AuthFetch.js';
+export { resolveAuthRequest, authFetch } from './core/AuthFetch.js';
 
 // —— 公共类型
 export type {
@@ -65,6 +67,8 @@ export type {
   S3MViewerOptions,
   PickResult,
 } from './render/S3MViewer.js';
+export { HostRenderer } from './render/HostRenderer.js';
+export type { HostRendererOptions, HostFrame } from './render/HostRenderer.js';
 export {
   DEFAULT_STYLE,
   STYLE,

@@ -7,6 +7,7 @@
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
+import { authFetch, type AuthenticateFn } from '../core/AuthFetch.js';
 import { getSharedS3MWorker, S3MWorkerClient, WorkerDeadError } from '../worker/S3MWorkerClient.js';
 import {
   composeLeafAtlas,
@@ -281,6 +282,11 @@ export interface S3MTilesetOptions {
    * 度量方式见 `_tmp/atlas/rule2.mts`。
    */
   atlasLod?: boolean;
+  /**
+   * 鉴权适配函数（默认不传 = 行为与旧版一致）。每个请求（配置 scp / 瓦片 /
+   * 子图集）发出前过一遍，可改写 URL（加 `?token=`）或附加请求头。见 `AuthenticateFn`。
+   */
+  authenticate?: AuthenticateFn;
 }
 
 export class S3MTileset {
@@ -360,6 +366,8 @@ export class S3MTileset {
   private readonly _onError: (error: unknown) => void;
   private readonly _onProgress: (stats: Stats) => void;
   private readonly _maxRetries: number;
+  /** 鉴权适配函数；undefined = 不做任何改写（行为与旧版一致） */
+  readonly authenticate: AuthenticateFn | undefined;
   /** 失败重试计数与下次可用时间，退避期间 _enqueue 会直接跳过 */
   private readonly _retryCount = new Map<string, number>();
   private readonly _retryAt = new Map<string, number>();
@@ -388,6 +396,7 @@ export class S3MTileset {
     this._onError = options.onError ?? ((e) => console.warn(e));
     this._onProgress = options.onProgress ?? (() => {});
     this._maxRetries = Math.max(0, options.maxRetries ?? 2);
+    this.authenticate = options.authenticate;
 
     // 渲染层可注入：Node 环境下不需要 three，也能跑 URL / 解析链路
     this._buildTile = options.buildTile ?? null;
@@ -409,7 +418,7 @@ export class S3MTileset {
 
   async init(): Promise<this> {
     this.configUrl = toAbsolute(this.configUrl);
-    const res = await fetch(this.configUrl);
+    const res = await authFetch(this.configUrl, this.authenticate, 'config');
     if (!res.ok) throw new Error(`配置读取失败 ${res.status} ${this.configUrl}`);
     const text = await res.text();
     const config = parseConfigText(text);
@@ -991,7 +1000,7 @@ export class S3MTileset {
     const u = resolveUrl(dirOf(baseUrl), `${names[0]}.texblock?extratiles=${names.join(';')}`);
     try {
       if (!u) throw new Error('无法拼出 URL');
-      const res = await fetch(u);
+      const res = await authFetch(u, this.authenticate, 'texblock');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const segments = await parseTexblockSegments(await res.arrayBuffer());
       if (segments.length !== names.length) {
@@ -1009,7 +1018,7 @@ export class S3MTileset {
     const u = resolveUrl(dirOf(baseUrl), `${stem}.texblock`);
     try {
       if (!u) throw new Error('无法拼出 URL');
-      const res = await fetch(u);
+      const res = await authFetch(u, this.authenticate, 'texblock');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const records = (await parseTexblockSegments(await res.arrayBuffer())).flat();
       this.putLeafRecords(stem, records);
@@ -1052,7 +1061,7 @@ export class S3MTileset {
         groupNames = cachedSet.names;
         tile = cachedSet.tiles[groupIndex] ?? cachedSet.tiles[0]!;
       } else {
-        const res = await fetch(baseUrl);
+        const res = await authFetch(baseUrl, this.authenticate, 'tile');
         if (!res.ok) {
           throw new Error(`HTTP ${res.status} 加载瓦片失败: ${baseUrl}`);
         }

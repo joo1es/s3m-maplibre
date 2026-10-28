@@ -23,6 +23,8 @@
  * 这样换专题字段时全部命中缓存，不再发请求。
  */
 
+import { resolveAuthRequest, type AuthenticateFn } from './AuthFetch.js';
+
 const DEFAULT_ID_FIELD = 'SmID';
 const DEFAULT_CHUNK_SIZE = 200;
 /** 几何/索引字段取回来没用，还特别占带宽 */
@@ -44,6 +46,11 @@ export interface AttributeQueryOptions {
   format?: 'auto' | 'fastjson' | 'json';
   /** 便于测试时替换，默认用全局 fetch */
   fetchImpl?: typeof fetch;
+  /**
+   * 鉴权适配函数（不填则用图层级的 `authenticate`）。请求发出前过一遍，
+   * 可改写 URL（加 `?token=`）或附加请求头。见 `AuthenticateFn`。
+   */
+  authenticate?: AuthenticateFn;
 }
 
 export interface AttributeField {
@@ -93,6 +100,7 @@ export class AttributeQuery {
   private readonly _chunkSize: number;
   private readonly _formatOption: 'auto' | 'fastjson' | 'json';
   private readonly _fetch: typeof fetch;
+  private readonly _authenticate: AuthenticateFn | undefined;
   private readonly _cache = new Map<number, AttributeRow>();
   private _schema: AttributeField[] | null = null;
   private _resolvedFields: string[] | null = null;
@@ -113,11 +121,26 @@ export class AttributeQuery {
     this._chunkSize = Math.max(1, options.chunkSize ?? DEFAULT_CHUNK_SIZE);
     this._formatOption = options.format ?? 'auto';
     this._fetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    this._authenticate = options.authenticate;
   }
 
   /** 数据集的 REST 路径：.../datasources/name/{ds}/datasets/name/{name} */
   get datasetPath(): string {
     return `${this.dataServiceUrl}/datasources/name/${encodeURIComponent(this.datasourceName)}/datasets/name/${encodeURIComponent(this.datasetName)}`;
+  }
+
+  /**
+   * 带鉴权的请求：先过 `authenticate` 钩子改写 URL / 追加 header，再走本查询的
+   * 传输层（`fetchImpl` 或全局 fetch，自定义传输不被绕过）。未配置鉴权时与旧版
+   * 行为逐字一致（参数原样透传）。
+   */
+  private async _request(url: string, init?: RequestInit): Promise<Response> {
+    const resolved = await resolveAuthRequest(url, this._authenticate, 'attributes');
+    const hookHeaders = resolved.headers && Object.keys(resolved.headers).length > 0 ? resolved.headers : null;
+    if (!hookHeaders) return init === undefined ? this._fetch(resolved.url) : this._fetch(resolved.url, init);
+    // 钩子头在前，init 头在后：调用方显式给的头（如 Content-Type）不被覆盖
+    const headers = { ...hookHeaders, ...init?.headers } as Record<string, string>;
+    return this._fetch(resolved.url, { ...init, headers });
   }
 
   /** 累计的请求代价（不清零，用来观察整体开销） */
@@ -128,7 +151,7 @@ export class AttributeQuery {
   /** 字段表（顺手也用来判断「这个数据集到底有没有属性表」） */
   async loadSchema(): Promise<AttributeField[]> {
     if (this._schema) return this._schema;
-    const res = await this._fetch(`${this.datasetPath}/fields.json`);
+    const res = await this._request(`${this.datasetPath}/fields.json`);
     this._stats.requests++;
     if (!res.ok) throw new Error(`[s3m] 读取字段表失败 ${res.status}：${this.datasetPath}/fields.json`);
     const json = (await res.json()) as { fieldNames?: string[] };
@@ -197,7 +220,7 @@ export class AttributeQuery {
     if (this._format) return this._format;
     if (this._formatOption !== 'auto') return (this._format = this._formatOption);
     try {
-      const res = await this._fetch(`${this.datasetPath}/features.json?fromIndex=0&toIndex=1`);
+      const res = await this._request(`${this.datasetPath}/features.json?fromIndex=0&toIndex=1`);
       this._stats.requests++;
       const json = (await res.json()) as { geometryType?: string };
       const isModel = String(json.geometryType ?? '').toUpperCase().includes('MODEL');
@@ -249,7 +272,7 @@ export class AttributeQuery {
 
   private async _post(body: unknown, format: 'fastjson' | 'json'): Promise<string> {
     const t0 = performance.now();
-    const res = await this._fetch(`${this.dataServiceUrl}/featureResults.${format}?returnContent=true`, {
+    const res = await this._request(`${this.dataServiceUrl}/featureResults.${format}?returnContent=true`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
