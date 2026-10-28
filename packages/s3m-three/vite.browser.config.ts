@@ -1,7 +1,43 @@
 import { fileURLToPath } from 'node:url';
-import { defineConfig } from 'vite';
+import { createLogger, defineConfig, type Logger } from 'vite';
 
 const PKG = fileURLToPath(new URL('.', import.meta.url));
+
+/**
+ * 滤掉 rolldown:vite-resolve 对 node 内建模块的 externalize 信息打印。
+ * draco 的 emscripten 胶水里有 Node 分支 require('node:fs')，浏览器永远走不到；
+ * 产物已用 stubNodeBuiltins 指到空占位（bundle 里没有 shim），这条打印纯属噪音。
+ */
+function quietLogger(): Logger {
+  const logger = createLogger();
+  const filter = (msg: string): boolean => !msg.includes('has been externalized for browser compatibility');
+  const warn = logger.warn.bind(logger);
+  const warnOnce = logger.warnOnce.bind(logger);
+  logger.warn = (msg, options) => {
+    if (filter(msg)) warn(msg, options);
+  };
+  logger.warnOnce = (msg, options) => {
+    if (filter(msg)) warnOnce(msg, options);
+  };
+  return logger;
+}
+
+/**
+ * 把 emscripten vendor（draco / crunch）里的 Node 分支 require('node:fs')
+ * 指到浏览器空占位。enforce: 'pre' 必须放在 vite 顶层 plugins 里才生效——
+ * 放 rollupOptions.plugins 会被排到 vite 内部 resolve 插件之后，拦不住。
+ * 浏览器里这个分支永远不执行，占位只为不让 node:fs 的 shim 进产物。
+ */
+const stubNodeBuiltins = {
+  name: 'stub-node-builtins-for-browser',
+  enforce: 'pre' as const,
+  resolveId(source: string) {
+    if (source === 'node:fs') {
+      return fileURLToPath(new URL('./src/vendor/browser-node-stub.js', import.meta.url));
+    }
+    return null;
+  },
+};
 
 /**
  * 浏览器直引包（<script> 直接引入，不依赖打包器）。一次构出两个文件：
@@ -19,6 +55,9 @@ export default defineConfig(({ mode }) => {
 
   return {
     root: PKG,
+    customLogger: quietLogger(),
+    // 见 stubNodeBuiltins 注释：必须顶层 + enforce: 'pre' 才能赶在 vite-resolve 之前
+    plugins: [stubNodeBuiltins],
     build: {
       outDir: 'dist/browser',
       // ext-three 是第二轮构建，别把第一轮的产物清掉
@@ -42,6 +81,12 @@ export default defineConfig(({ mode }) => {
           // 入口同时有具名导出和 default，显式声明 named 才不会有混合导出警告
           exports: 'named',
           ...(externalThree ? { globals: { three: 'THREE' } } : {}),
+        },
+        // iife 没有 import.meta：把「new URL(worker, import.meta.url)」里的 import.meta
+        // 显式定义为空对象——与 rolldown 的隐式替换等价（worker 创建失败 → create()
+        // 返回 null → 降级主线程解析），但不再刷 [EMPTY_IMPORT_META] 告警。
+        transform: {
+          define: { 'import.meta': '({})' },
         },
       },
     },
