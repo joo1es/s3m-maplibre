@@ -106,20 +106,10 @@ jobs:
           npm run build
           npm run typecheck
 
-      # s3m-maplibre 发布时依赖会写成 ^x.y.z（prepublishOnly 替换 workspace:*），
-      # 内核不在 npm 上就会装不上，先挡一道
-      - name: Verify s3m-three dependency is on npm
-        if: steps.resolve.outputs.target == 's3m-maplibre'
-        run: |
-          DEP="$(node -p "require('./packages/s3m-maplibre/package.json').dependencies['s3m-three']")"
-          DEP="${DEP#workspace:}"
-          if npm view "s3m-three@$DEP" version >/dev/null 2>&1; then
-            echo "依赖已就绪：s3m-three@$DEP"
-          else
-            echo "::error::npm 上不存在 s3m-three@$DEP —— 请先打标签发布 s3m-three@$DEP（git tag s3m-three@$DEP && git push origin s3m-three@$DEP）"
-            exit 1
-          fi
-
+      # 不再校验「依赖是否已在 npm 上」：npm 元数据缓存约 10 分钟才刷新，
+      # 那个 npm view 会稳定误判刚发出去的内核，逼人 Re-run 一次。
+      # 两个 tag 连着推、各自独立发就行 —— s3m-maplibre 的依赖写成 ^x.y.z，
+      # 使用方装的时候内核必然已经在 npm 上了（两个包同批发布）。
       - name: Publish to npm
         run: npm publish --access public --provenance
         working-directory: packages/${{ steps.resolve.outputs.target }}
