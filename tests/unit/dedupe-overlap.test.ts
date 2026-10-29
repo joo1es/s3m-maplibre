@@ -72,6 +72,74 @@ describe('dropCoincidentTriangles', () => {
   });
 });
 
+/* ------------------------------------------------------------ 规模与引用语义 */
+
+describe('dropCoincidentTriangles 的规模与引用语义', () => {
+  const P = positions([
+    0, 0, 0, 1, 0, 0, 0, 1, 0, // 三角形 A
+    0, 0, 0, 1, 0, 0, 0, 1, 0, // 与 A 完全重合（同绕向）
+    2, 0, 0, 3, 0, 0, 2, 1, 0, // 另一处
+  ]);
+
+  /**
+   * 真实瓦片的量级（`3D-BIMbuilding-2` 单 geo 7156 三角形、2276 条重复）。
+   * 只有 2 个三角形的用例覆盖不到「绕向归一化在大量不同起点下是否一致」。
+   */
+  test('7156 三角形、1/3 重复：恰好丢掉重复的那些，剩下的顺序与绕向不变', () => {
+    const tris = 7156;
+    const verts = tris * 3;
+    const pos = new Float32Array(verts * 3);
+    const index = new Uint32Array(verts);
+    // 每 3 个三角形里有 1 个是前一个的副本（起点轮转，绕向不变）
+    for (let t = 0; t < tris; t++) {
+      const src = t - (t % 3);
+      const shift = t % 3;
+      for (let k = 0; k < 3; k++) {
+        const v = t * 3 + k;
+        const s = src * 3 + ((k + shift) % 3); // 副本换起点
+        index[v] = v;
+        pos[v * 3] = s * 0.37;
+        pos[v * 3 + 1] = s * 0.11;
+        pos[v * 3 + 2] = s * 0.53;
+      }
+    }
+    const { index: out, dropped } = dropCoincidentTriangles(index, pos, null);
+    // 2385 个完整组 × 每组丢 2 条；最后一组只剩 1 条，没有重复可丢
+    const groups = Math.floor(tris / 3);
+    expect(dropped).toBe(groups * 2);
+    expect(out.length).toBe((tris - dropped) * 3);
+    // 保留下来的第一条必须是原始的第一条（不是副本），顺序不能被打乱
+    expect(Array.from(out.subarray(0, 3))).toEqual([0, 1, 2]);
+  });
+
+  /**
+   * 没有重复时必须**原样返回入参引用**：这是零拷贝路径。
+   * 不锁住的话，将来有人改成"总是 copy 一份"，每个瓦片都会白付一次全量分配。
+   */
+  test('没有重复时返回同一个数组对象（零拷贝）', () => {
+    const index = idx([0, 1, 2, 6, 7, 8]);
+    const { index: out, dropped } = dropCoincidentTriangles(index, P, null);
+    expect(dropped).toBe(0);
+    expect(out).toBe(index);
+  });
+
+  /**
+   * 开关：默认开（保持现有渲染输出），显式 false 时一个循环都不跑、也不改统计。
+   * 数据本身有问题、又不想让去重介入时，业务层需要一个退路。
+   */
+  test('dedupeCoincident: false 时不做任何剔除（stats 里也不出现 deduped）', () => {
+    const { primitives, stats } = assembleTileGeometry(overlapTile(false), { dedupeCoincident: false });
+    expect(stats.deduped).toBeUndefined();
+    expect(primitives[0]!.indexCount).toBe(6); // 两条重合面都留着
+  });
+
+  test('不传开关时默认开启（行为与改动前一致）', () => {
+    const { primitives, stats } = assembleTileGeometry(overlapTile(false));
+    expect(stats.deduped).toBe(1);
+    expect(primitives[0]!.indexCount).toBe(3);
+  });
+});
+
 /* ------------------------------------------------------------ 组装层 */
 
 /** 6 个顶点、2 条完全重合的三角形，可带 batchId */

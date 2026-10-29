@@ -287,6 +287,16 @@ export interface TileGeometryData {
 export interface AssembleOptions {
   /** 是否对 primitiveType=4 的三角面做瓦片内同材质合批（默认 true） */
   batching?: boolean;
+  /**
+   * 是否剔除「同单体、同位置、同绕向」的共面重复三角形（默认 true）。
+   *
+   * 开：修掉数据自重叠造成的斜向摩尔纹（`3D-BIMbuilding-2` 实测单 geo 有 1/3 重复）。
+   * 关：完全不碰索引，一个循环都不跑 —— 数据本来没问题、又不想付这份 CPU 时用。
+   *
+   * 注意这份开销按三角形数线性增长（10 万三角形约 90 ms），在 Worker 里跑不占主线程；
+   * `useWorker: false` 或 Worker 崩溃降级时它落在主线程上。
+   */
+  dedupeCoincident?: boolean;
 }
 
 /* ------------------------------------------------------------------ 合批合并 */
@@ -851,17 +861,20 @@ export function assembleTileGeometry(tile: ParsedTile, options: AssembleOptions 
   // 数据自重叠：同单体、同位置、同绕向的重复三角形会互相压深度，出斜向摩尔纹。
   // 只在**单 geo** 的 primitive 上做：合批产物里多个 geo 的 batchId 各自从 0 起，
   // 混在一起会把「不同单体恰好共面」误判成同一条。
-  for (const p of primitives) {
-    if (p.primitiveType !== 4 || !p.index) continue;
-    if (p.geoNames.length > 1) continue;
-    const positions = p.attributes.position?.array;
-    if (!positions) continue;
-    const batchIds = p.attributes.aBatchId?.array ?? null;
-    const { index, dropped } = dropCoincidentTriangles(p.index, positions, batchIds);
-    if (dropped > 0) {
-      p.index = index;
-      p.indexCount = index.length;
-      stats.deduped = (stats.deduped ?? 0) + dropped;
+  // 默认开；显式关掉时连循环都不进（stats 里也不会出现 deduped）。
+  if (options.dedupeCoincident !== false) {
+    for (const p of primitives) {
+      if (p.primitiveType !== 4 || !p.index) continue;
+      if (p.geoNames.length > 1) continue;
+      const positions = p.attributes.position?.array;
+      if (!positions) continue;
+      const batchIds = p.attributes.aBatchId?.array ?? null;
+      const { index, dropped } = dropCoincidentTriangles(p.index, positions, batchIds);
+      if (dropped > 0) {
+        p.index = index;
+        p.indexCount = index.length;
+        stats.deduped = (stats.deduped ?? 0) + dropped;
+      }
     }
   }
 

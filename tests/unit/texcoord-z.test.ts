@@ -10,6 +10,7 @@
  *   2. 组装产物里带 / 不带 `aTexCoordZ` 的分流、合批搬运不丢这条属性。
  */
 import { describe, expect, test } from 'bun:test';
+import * as THREE from 'three';
 import {
   isTexCoordDisabled,
   isTexCoordWhite,
@@ -18,6 +19,7 @@ import {
   TEX_COORD_Z_WHITE_BELOW,
 } from '../../packages/s3m-three/src/core/TexCoordZ';
 import { assembleTileGeometry } from '../../packages/s3m-three/src/core/TileGeometry';
+import { createStyledMaterial } from '../../packages/s3m-three/src/render/StyleMaterial';
 import type { ParsedTile } from '../../packages/s3m-three/src/core/types';
 
 const f32 = (arr: number[]) => new Uint8Array(new Float32Array(arr).buffer);
@@ -123,5 +125,64 @@ describe('组装产物里的 aTexCoordZ', () => {
     const attr = primitives[0]!.attributes.aTexCoordZ!;
     expect(attr.array.length).toBe(6);
     expect(Array.from(attr.array as Float32Array)).toEqual([-99999, 65536, 65793, -99999, 65536, 65793]);
+  });
+});
+
+/* ------------------------------------------------------------ 材质注入 */
+
+/**
+ * `AGENTS.md` §3 第 4 条：涉及 shader 注入的，**必须断言 three 的模板里确实存在
+ * 被 `replace` 的那个 include 名**。`replace('#include <xxx>')` 在 three 改名后
+ * 会静默 no-op —— 材质照样渲染，只是这一整套 uv 语义静默失效，谁也不会发现。
+ *
+ * 上面那组测试只钉住了数学和属性搬运，管不到这里。
+ */
+describe('texCoordZ 的片元注入', () => {
+  const build = (texCoordZ: boolean) => {
+    const map = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+    map.needsUpdate = true;
+    const mat = createStyledMaterial({ map, texCoordZ } as never);
+    const shader = {
+      uniforms: {} as Record<string, unknown>,
+      vertexShader: THREE.ShaderLib.physical.vertexShader,
+      fragmentShader: THREE.ShaderLib.physical.fragmentShader,
+    };
+    (mat as unknown as { onBeforeCompile: (s: unknown, r: unknown) => void }).onBeforeCompile(shader, null);
+    return {
+      shader,
+      mat: mat as unknown as { defines: Record<string, string>; customProgramCacheKey: () => string },
+    };
+  };
+
+  test('three 模板里确实有 #include <map_fragment>（replace 的前提）', () => {
+    expect(THREE.ShaderLib.physical.fragmentShader).toContain('#include <map_fragment>');
+  });
+
+  test('texCoordZ: true → 注入采样函数、include 被吃掉、宏与缓存键都隔离', () => {
+    const { shader, mat } = build(true);
+    expect(mat.defines.S3M_TEXCOORD_Z).toBe('');
+    // 函数定义（FRAG_PARS）和调用点（map_fragment 位置）都得在，缺一个就是编译失败
+    expect(shader.fragmentShader).toContain('vec4 s3mTexCoordZUnit');
+    expect(shader.fragmentShader).toContain('s3mTexCoordZUnit( vMapUv, vTexMatrix, map, uAtlasDim.x )');
+    // 注入成功 = 原来的 include 不再存在；仍是 include 说明 replace 静默 no-op 了
+    expect(shader.fragmentShader).not.toContain('#include <map_fragment>');
+    // 顶点侧必须真的把 z 解成 varying（片元拿不到就是恒 0 = 公式档）
+    expect(shader.vertexShader).toContain('#ifdef S3M_TEXCOORD_Z');
+    expect(shader.vertexShader).toContain('vTexMatrix');
+    expect(mat.customProgramCacheKey()).toContain('-texz');
+  });
+
+  test('texCoordZ: false → 不注入，include 原样保留（默认路径一字节不变）', () => {
+    const { shader, mat } = build(false);
+    expect(mat.defines.S3M_TEXCOORD_Z).toBeUndefined();
+    expect(shader.fragmentShader).not.toContain('s3mTexCoordZUnit( vMapUv');
+    expect(shader.fragmentShader).toContain('#include <map_fragment>');
+    expect(mat.customProgramCacheKey()).not.toContain('-texz');
+  });
+
+  test('没有贴图时即使传了 texCoordZ 也不开宏（无意义的注入会让 program 白分裂一份）', () => {
+    const mat = createStyledMaterial({ texCoordZ: true } as never);
+    const defines = (mat as unknown as { defines: Record<string, string> }).defines;
+    expect(defines?.S3M_TEXCOORD_Z).toBeUndefined();
   });
 });

@@ -127,14 +127,33 @@ function buildSplatGeometry(
   // 真实包围球：拾取要先用它做「射线有没有碰到这一块」的快速排除。
   // createQuadGeometry 里给的是空球（渲染靠 frustumCulled = false，不看它），
   // 留成 Infinity 的话每点一次要把所有瓦片的每个高斯都算一遍。
-  const box = new THREE.Box3();
-  const p = new THREE.Vector3();
-  for (let i = 0; i < count; i++) {
-    box.expandByPoint(p.set(posAttr.array[i * 3]!, posAttr.array[i * 3 + 1]!, posAttr.array[i * 3 + 2]!));
-  }
+  //
+  // 包围盒和最长轴在同一遍里扫完：10 万点的瓦片，多一遍就是几毫秒。
+  const pos = posAttr.array;
+  let minX = Infinity, minY = Infinity, minZ = Infinity;
+  let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
   let maxAxis = 0;
   for (let i = 0; i < count; i++) {
-    maxAxis = Math.max(maxAxis, scales[i * 3]!, scales[i * 3 + 1]!, scales[i * 3 + 2]!);
+    const x = pos[i * 3]!;
+    const y = pos[i * 3 + 1]!;
+    const z = pos[i * 3 + 2]!;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    if (z < minZ) minZ = z;
+    if (z > maxZ) maxZ = z;
+    const sx = scales[i * 3]!;
+    const sy = scales[i * 3 + 1]!;
+    const sz = scales[i * 3 + 2]!;
+    if (sx > maxAxis) maxAxis = sx;
+    if (sy > maxAxis) maxAxis = sy;
+    if (sz > maxAxis) maxAxis = sz;
+  }
+  const box = new THREE.Box3();
+  if (count > 0) {
+    box.min.set(minX, minY, minZ);
+    box.max.set(maxX, maxY, maxZ);
   }
   const sphere = new THREE.Sphere(new THREE.Vector3(), 0);
   if (!box.isEmpty()) box.getBoundingSphere(sphere);
@@ -319,6 +338,13 @@ export interface BuildTileOptions {
    * 对倾斜摄影、大网格切片瓦片可减少 90%+ DrawCall，显著提高渲染帧率。
    */
   batching?: boolean;
+  /**
+   * 是否剔除同单体共面重复三角形（默认 true）。
+   *
+   * 见 `AssembleOptions.dedupeCoincident`。只在主线程现场组装时生效——
+   * 走 Worker 的路径在 Worker 里已经按默认值组装完了。
+   */
+  dedupeCoincident?: boolean;
   /**
    * Worker 侧已完成的纯数据几何组装（经典 .s3mb 路径由解析 Worker 顺带产出）。
    * 缺省时在主线程现场组装（core/TileGeometry 的同一份实现），两条路径产物一致。
@@ -526,7 +552,12 @@ export async function buildTileObjects(
 
   // 3) 纯数据几何组装：Worker 解析时已顺带产出就直接用，否则主线程现场组装
   //    （core/TileGeometry 的同一份实现，两条路径产物一致）
-  const assembled = options.assembled ?? assembleTileGeometry(tile, { batching: options.batching !== false });
+  const assembled =
+    options.assembled ??
+    assembleTileGeometry(tile, {
+      batching: options.batching !== false,
+      dedupeCoincident: options.dedupeCoincident,
+    });
   stats.vertices = assembled.stats.vertices;
   stats.edgeLines = assembled.stats.edgeLines;
   stats.instanced = assembled.stats.instanced;

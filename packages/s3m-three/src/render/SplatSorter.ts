@@ -15,6 +15,8 @@ const SORTED_ATTRS = ['iCenter', 'iScale', 'iQuat', 'iColor'] as const;
 
 const _view = new THREE.Matrix4();
 const _scratch = new WeakMap<THREE.BufferAttribute, THREE.TypedArray>();
+/** 排序下标缓冲：按 iCenter attribute 缓存，每帧重排不再分配 */
+const _orderCache = new WeakMap<THREE.BufferAttribute, Uint32Array>();
 
 /** @returns 是否真的重排了（false = 顺序本来就对，没动任何数据） */
 export function sortSplatMesh(mesh: THREE.Mesh, viewMatrix: THREE.Matrix4): boolean {
@@ -25,7 +27,12 @@ export function sortSplatMesh(mesh: THREE.Mesh, viewMatrix: THREE.Matrix4): bool
   if (count <= 1) return false;
 
   _view.multiplyMatrices(viewMatrix, mesh.matrixWorld);
-  const order = splatDepthOrder(center.array as Float32Array, count, _view);
+  let order = _orderCache.get(center);
+  if (!order || order.length < count) {
+    order = new Uint32Array(count);
+    _orderCache.set(center, order);
+  }
+  splatDepthOrder(center.array as Float32Array, count, _view, order);
 
   let sorted = true;
   for (let i = 0; i < count; i++) {

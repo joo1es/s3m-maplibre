@@ -23,6 +23,8 @@
     "test:watch": "bun test --watch",
     "test:coverage": "bun test --coverage",
     "test:e2e": "bun test ./tests/e2e",
+    "bench:render": "bun run tools/bench/render-hot-paths.ts",
+    "bench:render:check": "bun run tools/bench/render-hot-paths.ts --check",
     "test:meshopt": "bun run build:three && node tools/meshopt-check.mjs --preset shenyin",
     "test:oracle": "node tools/official-oracle.mjs",
     "release": "node tools/release.mjs",
