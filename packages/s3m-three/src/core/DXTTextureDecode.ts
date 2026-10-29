@@ -6,8 +6,9 @@
  *   1. 补齐类型；
  *   2. 修掉 `DecompressAlphaDxt3` 里把 `block` 误写成未定义全局 `bytes` 的笔误
  *      （DXT3 纹理此前会直接 ReferenceError）；
- *   3. 修掉 `DecompressImage565` 块行下标少减 1 的笔误（见下方函数内注释，
- *      format ≤ 11 的 DXT1 顶部块行曾整行变黑）。
+ *   3. 修掉 `DecompressImage565` 的两处 flipY 笔误（见下方函数内注释：
+ *      块行下标少减 1 让 format ≤ 11 的 DXT1 顶部块行整行变黑；块内 4 行
+ *      没倒着写，导致行序和 `DecompressImage` 主路径对不上）。
  */
 
 const kDxt1 = 1 << 0;
@@ -160,8 +161,11 @@ function DecompressImage565(rgb565: Uint16Array, width: number, height: number, 
   const blockHeight = height / 4;
   for (let blockY = 0; blockY < blockHeight; blockY++) {
     for (let blockX = 0; blockX < blockWidth; blockX++) {
-      // 与 DecompressImage 的 height - 1 - sy 同口径：倒着取流中块行做 flipY。
-      // 写成 blockHeight - blockY 会让 blockY=0 读到数组界外（Uint16Array 越界读
+      // flipY 分两级做，才和 DecompressImage 的 height - 1 - sy 真正同口径：
+      //   ① 块行倒着取（blockHeight - 1 - blockY）；
+      //   ② 块内 4 行也倒着写（下面 dstI 从块底行起、逐行 -= width）。
+      // 只做 ① 会变成「块带倒序、带内行正序」的错位图，和主路径对不上。
+      // 写成 blockHeight - blockY 则会让 blockY=0 读到数组界外（Uint16Array 越界读
       // 得 undefined，位运算后归 0），顶部块行解成全黑、其余块行整体错位一行。
       i = 4 * ((blockHeight - 1 - blockY) * blockWidth + blockX);
       c[0] = blocks[i];
@@ -177,23 +181,24 @@ function DecompressImage565(rgb565: Uint16Array, width: number, height: number, 
       c[2] = ((5 * r0 + 3 * r1) >> 3) | (((5 * g0 + 3 * g1) >> 3) & 0x7e0) | (((5 * b0 + 3 * b1) >> 3) & 0xf800);
       c[3] = ((5 * r1 + 3 * r0) >> 3) | (((5 * g1 + 3 * g0) >> 3) & 0x7e0) | (((5 * b1 + 3 * b0) >> 3) & 0xf800);
       m = blocks[i + 2];
-      dstI = blockY * 4 * width + blockX * 4;
+      // 块内第 0 行写到块底行，逐行往上走 —— 逐行 flipY
+      dstI = (blockY * 4 + 3) * width + blockX * 4;
       dst[dstI] = c[m & 0x3];
       dst[dstI + 1] = c[(m >> 2) & 0x3];
       dst[dstI + 2] = c[(m >> 4) & 0x3];
       dst[dstI + 3] = c[(m >> 6) & 0x3];
-      dstI += width;
+      dstI -= width;
       dst[dstI] = c[(m >> 8) & 0x3];
       dst[dstI + 1] = c[(m >> 10) & 0x3];
       dst[dstI + 2] = c[(m >> 12) & 0x3];
       dst[dstI + 3] = c[(m >> 14) & 0x3];
       m = blocks[i + 3];
-      dstI += width;
+      dstI -= width;
       dst[dstI] = c[m & 0x3];
       dst[dstI + 1] = c[(m >> 2) & 0x3];
       dst[dstI + 2] = c[(m >> 4) & 0x3];
       dst[dstI + 3] = c[(m >> 6) & 0x3];
-      dstI += width;
+      dstI -= width;
       dst[dstI] = c[(m >> 8) & 0x3];
       dst[dstI + 1] = c[(m >> 10) & 0x3];
       dst[dstI + 2] = c[(m >> 12) & 0x3];
