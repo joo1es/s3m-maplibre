@@ -151,5 +151,44 @@ describe('PointCloudMaterial', () => {
       expect(mat.version).toBeGreaterThan(v0);
       expect((points.userData as any).pcTransparent).toBe(false);
     });
+
+    it('depthWrite 分支：style.depthWrite=false 在半透明下关闭深度写入，不透明时强制为 true', () => {
+      const uniforms = createMockUniforms();
+
+      // 1. 默认情况（style.depthWrite 未显式设置）：点云即便半透明，depthWrite 依然保持 true
+      const ptsDefault = new THREE.Points();
+      applyPointCloudStyle(ptsDefault, { mode: STYLE.NONE, opacity: 0.5 }, uniforms);
+      const matDefault = ptsDefault.material as THREE.PointsMaterial;
+      expect(matDefault.transparent).toBe(true);
+      expect(matDefault.depthWrite).toBe(true);
+
+      // 2. 显式设置 style.depthWrite = false：半透明时关闭 depthWrite
+      const ptsNoDepth = new THREE.Points();
+      applyPointCloudStyle(ptsNoDepth, { mode: STYLE.NONE, opacity: 0.5, depthWrite: false }, uniforms);
+      const matNoDepth = ptsNoDepth.material as THREE.PointsMaterial;
+      expect(matNoDepth.transparent).toBe(true);
+      expect(matNoDepth.depthWrite).toBe(false);
+
+      // 3. solid 模式下的 depthWrite: false
+      const ptsSolid = new THREE.Points();
+      applyPointCloudStyle(ptsSolid, { mode: STYLE.SOLID, opacity: 0.8, depthWrite: false }, uniforms);
+      const matSolid = ptsSolid.material as THREE.PointsMaterial;
+      expect(matSolid.transparent).toBe(true);
+      expect(matSolid.depthWrite).toBe(false);
+
+      // 4. height 模式下的 depthWrite: false
+      const ptsHeight = new THREE.Points();
+      applyPointCloudStyle(ptsHeight, { mode: STYLE.HEIGHT, opacity: 0.6, depthWrite: false }, uniforms);
+      const matHeight = ptsHeight.material as THREE.ShaderMaterial;
+      expect(matHeight.transparent).toBe(true);
+      expect(matHeight.depthWrite).toBe(false);
+
+      // 5. 不透明（opacity: 1.0）时：即使 depthWrite: false，也会被强制保真为 true (transparent ? keepDepth : true)
+      const ptsOpaque = new THREE.Points();
+      applyPointCloudStyle(ptsOpaque, { mode: STYLE.SOLID, opacity: 1.0, depthWrite: false }, uniforms);
+      const matOpaque = ptsOpaque.material as THREE.PointsMaterial;
+      expect(matOpaque.transparent).toBe(false);
+      expect(matOpaque.depthWrite).toBe(true);
+    });
   });
 });

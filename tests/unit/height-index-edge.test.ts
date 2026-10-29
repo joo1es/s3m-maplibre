@@ -126,15 +126,36 @@ describe('HeightIndex', () => {
     expect(index.size).toBe(0);
   });
 
-  it('clear 重置高度索引和缓存', () => {
+  it('clear 重置高度索引和内部范围（注意：现状为 clear() 不调用 _push()，uniforms 保持旧值）', () => {
     const uniforms = createMockUniforms();
     const index = new HeightIndex(uniforms);
 
     index.add(makeMeshWithHeight(10, 20));
     expect(index.size).toBe(1);
+    expect(uniforms.uHeightMin.value).toBe(10);
+    expect(uniforms.uHeightMax.value).toBe(20);
 
     index.clear();
     expect(index.size).toBe(0);
     expect(index.range).toEqual({ min: Infinity, max: -Infinity });
+    // 现状记录：clear() 仅重置 _meshHeight 与 _min/_max，未显式调用 _push()，
+    // 因此 uniforms 的 uHeightMin/Max 保持上一次写入的旧值
+    expect(uniforms.uHeightMin.value).toBe(10);
+    expect(uniforms.uHeightMax.value).toBe(20);
+  });
+
+  it('单块扁平网格（minZ === maxZ）触发 _push() 的 max <= min 兜底逻辑，回退到 0 / 100', () => {
+    const uniforms = createMockUniforms();
+    const index = new HeightIndex(uniforms);
+
+    // 扁平网格：厚度为 0（如水平面或平面要素）
+    const flatMesh = makeMeshWithHeight(50, 50);
+    index.add(flatMesh);
+
+    expect(index.size).toBe(1);
+    expect(index.range).toEqual({ min: 50, max: 50 });
+    // 内部 _push() 检测到 max <= min，回退到兜底值 min=0, max=100
+    expect(uniforms.uHeightMin.value).toBe(0);
+    expect(uniforms.uHeightMax.value).toBe(100);
   });
 });

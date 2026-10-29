@@ -41,7 +41,7 @@ interface MeshUserData {
 }
 
 /** 拾取 ID 只有 2 个字节（RG 两个通道），65534 是安全上限 */
-const MAX_PICK_ID = 65534;
+export const MAX_PICK_ID = 65534;
 
 export interface PickHost {
   readonly picker: Picker | null;

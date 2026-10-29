@@ -149,4 +149,61 @@ describe('AttributeQuery 属性查询与缓存', () => {
 
     await expect(query.queryBySmids([999])).rejects.toThrow('属性查询失败：SQL filter 语法错误');
   });
+
+  it('chunkSize 分片查询：超过单片容量时切分多次请求并合并结果', async () => {
+    const chunkBodies: any[] = [];
+    const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = String(url);
+      if (urlStr.includes('fields.json')) {
+        return new Response(JSON.stringify({ fieldNames: ['SmID', 'Name'] }), { status: 200 });
+      }
+      if (urlStr.includes('features.json')) {
+        return new Response(JSON.stringify({ geometryType: 'POINT' }), { status: 200 });
+      }
+      if (urlStr.includes('featureResults.json')) {
+        const body = JSON.parse((init?.body as string) || '{}');
+        chunkBodies.push(body);
+        // 从 SQL filter 中解析出传入的 ID：例如 "SmID IN (10,20)"
+        const match = body.queryParameter?.attributeFilter?.match(/\(([^)]+)\)/);
+        const ids = match ? match[1].split(',').map((s: string) => Number(s.trim())) : [];
+        const features = ids.map((id: number) => ({
+          fieldNames: ['SmID', 'Name'],
+          fieldValues: [id, `Item_${id}`],
+        }));
+        return new Response(JSON.stringify({ features }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    };
+
+    // 配置 chunkSize: 2
+    const query = new AttributeQuery({
+      dataServiceUrl: 'http://test/rest/data',
+      datasetName: 'City:Items',
+      chunkSize: 2,
+      format: 'json',
+      fetchImpl: mockFetch as any,
+    });
+
+    // 查询 5 个 ID：[10, 20, 30, 40, 50]，按 chunkSize=2 应被切成 [10, 20], [30, 40], [50] 三个切片
+    const result = await query.queryBySmids([10, 20, 30, 40, 50]);
+
+    // 断言切片请求次数为 3
+    expect(chunkBodies.length).toBe(3);
+    expect(chunkBodies[0].queryParameter.attributeFilter).toBe('SmID IN (10,20)');
+    expect(chunkBodies[1].queryParameter.attributeFilter).toBe('SmID IN (30,40)');
+    expect(chunkBodies[2].queryParameter.attributeFilter).toBe('SmID IN (50)');
+
+    // 检查合并后的 5 条完整结果
+    expect(result.size).toBe(5);
+    for (const id of [10, 20, 30, 40, 50]) {
+      expect(result.get(id)).toEqual({ SmID: id, Name: `Item_${id}` });
+      expect(query.hasCached(id)).toBe(true);
+    }
+
+    // 再次查询这 5 个 ID，命中缓存，不再发出新的分片请求
+    const requestsBefore = query.stats.requests;
+    const cachedResult = await query.queryBySmids([20, 30, 50]);
+    expect(cachedResult.size).toBe(3);
+    expect(query.stats.requests).toBe(requestsBefore);
+  });
 });

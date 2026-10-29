@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import * as THREE from 'three';
-import { PickService, type PickHost } from '../../packages/s3m-three/src/render/viewer/PickService.js';
+import { MAX_PICK_ID, PickService, type PickHost } from '../../packages/s3m-three/src/render/viewer/PickService.js';
 
 function createMockHost(overrides: Partial<PickHost> = {}): PickHost {
   return {
@@ -44,18 +44,18 @@ describe('PickService', () => {
 
     it('超界时扫描空缺槽位，全部用尽时报错', () => {
       const service = new PickService(createMockHost());
-      // 模拟序号已触顶
-      (service as any)._pickSeq = 65535;
+      // 模拟序号已触顶（超过 MAX_PICK_ID）
+      (service as any)._pickSeq = MAX_PICK_ID + 1;
 
       // 槽位 0 未在 pickables 登记 -> 可以被回收扫描利用
       const freeId = service.allocPickId();
       expect(freeId).toBe(0);
 
       // 模拟所有槽位都登记在 pickables 中
-      for (let i = 0; i <= 65534; i++) {
+      for (let i = 0; i <= MAX_PICK_ID; i++) {
         service.pickables.set(i, { mesh: {} as THREE.Mesh, datasetId: 'd', batchId: 0 });
       }
-      expect(() => service.allocPickId()).toThrow('可拾取网格超过 65535 个');
+      expect(() => service.allocPickId()).toThrow(`可拾取网格超过 ${MAX_PICK_ID + 1} 个`);
     });
 
     it('clear 重置所有 ID 池与 pickables', () => {
@@ -139,7 +139,7 @@ describe('PickService', () => {
       expect(service.intersectMeshAtRay(mesh, missRay)).toBeNull();
     });
 
-    it('指定 instanceIndex 时只返回匹配该实例的结果', () => {
+    it('匹配指定 instance 时优先返回该实例，未匹配时退回最近命中点（当前兜底行为）', () => {
       const service = new PickService(createMockHost());
       const geom = new THREE.BoxGeometry(2, 2, 2);
       const im = new THREE.InstancedMesh(geom, new THREE.MeshBasicMaterial(), 2);
@@ -155,17 +155,19 @@ describe('PickService', () => {
 
       const rayTo0 = new THREE.Ray(new THREE.Vector3(0, 0, 10), new THREE.Vector3(0, 0, -1));
 
-      // 查询 instance 0 -> 匹配成功，返回 (0, 0, 1)（盒子的顶面 z=1）
+      // 1. 查询 instance 0 -> 精确命中匹配，返回 (0, 0, 1)（盒子的顶面 z=1）
       const hit0 = service.intersectMeshAtRay(im, rayTo0, 0);
       expect(hit0).not.toBeNull();
       expect(hit0!.x).toBeCloseTo(0);
       expect(hit0!.y).toBeCloseTo(0);
       expect(hit0!.z).toBeCloseTo(1);
 
-      // 查询未匹配的 instanceId 时退回最近的 hit[0].point 兜底
-      const hit1 = service.intersectMeshAtRay(im, rayTo0, 99);
-      expect(hit1).not.toBeNull();
-      expect(hit1!.x).toBeCloseTo(0);
+      // 2. 当前实现兜底行为记录：查询未匹配的 instanceId=99 时，代码会退回到 hits[0].point
+      // 注意：此断言钉住的是当前兜底行为（见 PickService.ts:121：match ? match.point : hits[0].point），
+      // 若将来重构为「未命中指定实例时返回 null」，此处断言需同步调整。
+      const fallbackHit = service.intersectMeshAtRay(im, rayTo0, 99);
+      expect(fallbackHit).not.toBeNull();
+      expect(fallbackHit!.x).toBeCloseTo(0);
     });
   });
 });

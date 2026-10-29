@@ -71,7 +71,7 @@ describe('FeatureInfo', () => {
   });
 
   describe('resolveFeature', () => {
-    it('geo 为空或 batchId < 0 时返回 null', () => {
+    it('geo 为空或 batchId < 0 时返回 { smid: null, segments: [] }', () => {
       expect(resolveFeature(undefined, 0)).toEqual({ smid: null, segments: [] });
       expect(resolveFeature({} as GeoPackageEntry, -1)).toEqual({ smid: null, segments: [] });
     });

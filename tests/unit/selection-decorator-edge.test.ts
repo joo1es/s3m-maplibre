@@ -7,7 +7,7 @@ import type { S3MStyle } from '../../packages/s3m-three/src/render/StyleMaterial
 function createMockHost(style: S3MStyle = {}): {
   host: SelectionHost;
   pcStyles: Array<{ pc: THREE.Points; selected?: boolean }>;
-  repaints: number;
+  readonly repaints: number;
 } {
   const pcStyles: Array<{ pc: THREE.Points; selected?: boolean }> = [];
   let repaints = 0;
@@ -61,12 +61,19 @@ function createMockHost(style: S3MStyle = {}): {
     createSelectionEdgeMaterial: () => ({ ...selectionEdgeMaterial }),
   };
 
-  return { host, pcStyles, repaints };
+  return {
+    host,
+    pcStyles,
+    get repaints() {
+      return repaints;
+    },
+  };
 }
 
 describe('SelectionDecorator 选中修饰与轮廓分支', () => {
-  it('点云对象的选中与取消选中', () => {
-    const { host, pcStyles } = createMockHost();
+  it('点云对象的选中与取消选中，并触发重绘', () => {
+    const mock = createMockHost();
+    const { host, pcStyles } = mock;
     const decorator = new SelectionDecorator(host);
 
     const pc = new THREE.Points(new THREE.BufferGeometry());
@@ -86,25 +93,29 @@ describe('SelectionDecorator 选中修饰与轮廓分支', () => {
       point: new THREE.Vector3(),
     };
 
-    // 选中点云
+    // 选中点云 -> 触发点云样式切换与宿主重绘
     decorator.select(pickResult);
     expect(pcStyles.length).toBe(1);
     expect(pcStyles[0]).toEqual({ pc, selected: true });
     expect(decorator.selectedMeshes).toContain(pc);
+    expect(mock.repaints).toBeGreaterThan(0);
+    const repaintsAfterSelect = mock.repaints;
 
-    // 取消选中（传 null）-> 触发点云恢复
+    // 取消选中（传 null）-> 触发点云恢复与再次重绘
     decorator.select(null);
     expect(pcStyles.length).toBe(2);
     expect(pcStyles[1]).toEqual({ pc, selected: false });
     expect(decorator.selectedMeshes.length).toBe(0);
+    expect(mock.repaints).toBeGreaterThan(repaintsAfterSelect);
   });
 
-  it('outlineStyle = "hull" 模式下生成外扩轮廓并挂载为子节点', () => {
-    const { host } = createMockHost({
+  it('outlineStyle = "hull" 模式下生成外扩轮廓并挂载为子节点，并触发重绘', () => {
+    const mock = createMockHost({
       outline: true,
       outlineStyle: 'hull',
       selectElevation: 10,
     });
+    const { host } = mock;
     const decorator = new SelectionDecorator(host);
 
     const geom = new THREE.BoxGeometry(2, 2, 2);
@@ -135,17 +146,21 @@ describe('SelectionDecorator 选中修饰与轮廓分支', () => {
     const outlineMesh = mesh.children[0] as THREE.Mesh;
     expect(outlineMesh.renderOrder).toBe(3);
     expect(outlineMesh.frustumCulled).toBe(false);
+    expect(mock.repaints).toBeGreaterThan(0);
+    const repaintsAfterSelect = mock.repaints;
 
-    // 取消选择时轮廓被移除
+    // 取消选择时轮廓被移除，并触发重绘
     decorator.select(null);
     expect(mesh.children.length).toBe(0);
+    expect(mock.repaints).toBeGreaterThan(repaintsAfterSelect);
   });
 
-  it('实例化 Mesh 选中时执行 applyInstanceTransform', () => {
-    const { host } = createMockHost({
+  it('实例化 Mesh 选中时执行 applyInstanceTransform 并触发重绘', () => {
+    const mock = createMockHost({
       outline: true,
       outlineStyle: 'hull',
     });
+    const { host } = mock;
     const decorator = new SelectionDecorator(host);
 
     const geom = new THREE.BoxGeometry(1, 1, 1);
@@ -171,6 +186,7 @@ describe('SelectionDecorator 选中修饰与轮廓分支', () => {
     expect(outline.position.x).toBeCloseTo(20);
     expect(outline.position.y).toBeCloseTo(30);
     expect(outline.position.z).toBeCloseTo(40);
+    expect(mock.repaints).toBeGreaterThan(0);
   });
 
   it('reset 重置内部所有数组和选择状态', () => {
