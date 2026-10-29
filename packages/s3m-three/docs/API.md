@@ -162,6 +162,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `pickable` | `boolean` | `true` | 是否响应拾取 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
 | `maxTriangles` | `number` | `Infinity` | 每个数据集**驻留三角形总数**的软上限（不限制）。`maxTiles` 数不了「一块精模几十万面」，这条按实际面数做刹车，走同一套 make-before-break 淘汰，不开洞 |
+| `maxMemory` | `number` | `Infinity` | 每个数据集**驻留显存/内存字节数**的软上限（不限制）。包含几何缓冲精确字节与纹理显存估计，超限走同一套 make-before-break 淘汰，不开洞 |
 | `totalMaxTiles` | `number` | — | 多数据集全局驻留瓦片总预算；开启后在可见数据集间动态均衡分配，防止叠加爆显存 |
 | `light` | `LightOptions` | — | 场景光照配置，可配环境光与主平行光的颜色、强度、模式与方位角/高度角 |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
@@ -397,6 +398,8 @@ setLodPixelRatioCap(cap: number): void        // Infinity = 不截断（默认�
 readonly lodPixelRatioCap: number
 setMaxTriangles(n: number, datasetId?: string): void   // Infinity = 不限制（默认）
 readonly maxTriangles: number
+setMaxMemory(bytes: number, datasetId?: string): void  // 显存字节上限，Infinity = 不限制（默认）
+readonly maxMemory: number
 setAnisotropyCap(cap: number): void           // Infinity = 取 GPU 最大值（默认）
 readonly anisotropyCap: number
 setMaxTextureSize(n: number): void            // Infinity = 不限制（默认）
@@ -1311,6 +1314,7 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 | `totalMaxTiles` | 多数据集全局瓦片总预算（如 `96` 或 `128`），自动在可见数据集间均衡分配配额，隐藏数据集时自动回收预算，防止多图层叠加爆显存 |
 | `maxTiles` | 单数据集瓦片驻留上限，默认 64。叠加多个数据集时建议配合 `totalMaxTiles` 或下调至 32~48 |
 | `maxTriangles` | 单数据集驻留面数软上限，默认不限制。`maxTiles` 只数瓦片个数，精模场景（一块几十万面）建议配 60 万~120 万 |
+| `maxMemory` | 单数据集驻留显存/内存软上限（字节），默认不限制。精确统计几何缓冲与纹理显存，超限按 make-before-break 自动主动回收 |
 | `lodPixelRatioCap` | LOD 判定用屏幕高度的 DPR 上限，默认不截断。见下方「移动端 / 差设备」 |
 | `anisotropyCap` | 各向异性过滤上限，默认取 GPU 最大值。移动端 4 / 8 通常肉眼无差 |
 | `maxTextureSize` | 纹理长边像素上限，默认不限制。手机上 1024 即可，显存降到 1/4 |

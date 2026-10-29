@@ -233,7 +233,7 @@ export interface TileNode {
   /** 该瓦片引用的纹理 key 清单，用于引用计数与显存释放 */
   textureKeys?: string[];
   /** 瓦片构建产生的统计信息，用于淘汰时准确扣减 stats */
-  stats?: { meshes: number; vertices: number; triangles: number };
+  stats?: { meshes: number; vertices: number; triangles: number; memory?: number };
 }
 
 /** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
@@ -288,6 +288,14 @@ export interface S3MTilesetOptions {
    */
   maxTriangles?: number;
   /**
+   * 本数据集**驻留显存/内存字节数**的软上限（默认不限制）。
+   * 包含几何顶点缓冲（精确字节）与纹理显存估计。超限时按同一套 make-before-break
+   * 主动淘汰非显示瓦片及其独占纹理。
+   *
+   * 不传 = 不限制（Infinity），行为与旧版完全一致。运行时可用 `setMaxMemory()` 调整。
+   */
+  maxMemory?: number;
+  /**
    * 是否请求 `.texblock` 子图集（S3MBLOCK 根图集的清晰版）。**默认关**。
    *
    * 不是没实现，而是「换图不换归一化 rect」这条规则只在部分链上成立：实测三对样本里
@@ -313,6 +321,54 @@ export interface S3MTilesetOptions {
    *   'silent' —— 只记录到 `stats.degradations`，由 UI 自己决定怎么提示。
    */
   unsupported?: UnsupportedPolicy;
+}
+
+/** 估算单个纹理占用的显存字节数 */
+export function estimateTextureBytes(tex: any): number {
+  if (!tex) return 0;
+  if (Array.isArray(tex.mipmaps) && tex.mipmaps.length > 0) {
+    let bytes = 0;
+    for (const m of tex.mipmaps) {
+      if (m?.data?.byteLength) bytes += m.data.byteLength;
+    }
+    if (bytes > 0) return bytes;
+  }
+  const img = tex.image;
+  if (!img) return 0;
+  if (img.data && typeof img.data.byteLength === 'number') {
+    return img.data.byteLength;
+  }
+  const w = img.width ?? 0;
+  const h = img.height ?? 0;
+  if (w > 0 && h > 0) {
+    const factor = tex.generateMipmaps ? 1.3333333333333333 : 1;
+    return Math.round(w * h * 4 * factor);
+  }
+  return 0;
+}
+
+/** 估算三维对象树中包含的几何缓冲字节数 */
+export function estimateObjectGeometryBytes(obj: any): number {
+  let bytes = 0;
+  if (!obj) return 0;
+  obj.traverse?.((child: any) => {
+    const geo = child.geometry;
+    if (geo) {
+      if (geo.attributes) {
+        for (const attr of Object.values(geo.attributes) as any[]) {
+          if (attr?.array?.byteLength) bytes += attr.array.byteLength;
+        }
+      }
+      if (geo.index?.array?.byteLength) {
+        bytes += geo.index.array.byteLength;
+      }
+    }
+    if (child.isInstancedMesh) {
+      if (child.instanceMatrix?.array?.byteLength) bytes += child.instanceMatrix.array.byteLength;
+      if (child.instanceColor?.array?.byteLength) bytes += child.instanceColor.array.byteLength;
+    }
+  });
+  return bytes;
 }
 
 export class S3MTileset {
@@ -377,6 +433,10 @@ export class S3MTileset {
    * 判据与旧版逐字一致，不会多算一次面数。
    */
   maxTriangles: number;
+  /**
+   * 驻留显存/内存字节数的软上限。`Infinity` = 不限制（默认）。
+   */
+  maxMemory: number;
   lodRangeScale: number;
 
   /** 数据集配置声明的高度范围（米），若配置未声明则返回 null */
@@ -439,6 +499,9 @@ export class S3MTileset {
     this.maxConcurrent = options.maxConcurrent ?? 4;
     this.maxTiles = options.maxTiles ?? 64;
     this.maxTriangles = options.maxTriangles ?? Infinity;
+    this.maxMemory = Number.isFinite(options.maxMemory) && (options.maxMemory as number) > 0
+      ? (options.maxMemory as number)
+      : Infinity;
     this.maxImageCache = options.maxImageCache ?? 128;
     // 硬上限 = 软上限 + 余量。淘汰只在「新瓦片已经落地并接管显示」之后做（make-before-break），
     // 所以中间态允许临时超出 maxTiles；硬上限只用来挡住失控的请求量，不用于挤掉正在显示的内容。
@@ -652,13 +715,48 @@ export class S3MTileset {
   }
 
   /**
+   * 运行时调整显存/内存字节预算。`Infinity` = 不限制（默认）。
+   * 收紧后不会立刻掉内容，要等下一次 `_trimBudget`（下一帧 update）才生效。
+   */
+  setMaxMemory(bytes: number): void {
+    this.maxMemory = Number.isFinite(bytes) && bytes > 0 ? bytes : Infinity;
+  }
+
+  /**
+   * 当前数据集驻留的显存与内存总字节数（几何缓冲精确大小 + 纹理显存估计）
+   */
+  residentMemory(): number {
+    return this._residentGeometryBytes() + this._residentTextureBytes();
+  }
+
+  private _residentGeometryBytes(): number {
+    let total = 0;
+    for (const node of this.nodes.values()) {
+      if (node.stats && typeof node.stats.memory === 'number') {
+        total += node.stats.memory;
+      } else if (node.group) {
+        total += estimateObjectGeometryBytes(node.group);
+      }
+    }
+    return total;
+  }
+
+  private _residentTextureBytes(): number {
+    let total = 0;
+    for (const tex of this.textureCache.values()) {
+      total += estimateTextureBytes(tex);
+    }
+    return total;
+  }
+
+  /**
    * 预算裁剪 —— 必须在可见性算完之后调用（make-before-break）：
    * 新瓦片已经落地、也已经决定由谁负责显示，这时候才把没人依赖的那块裁掉。
    * 只踢「当前不显示」或「位置已被可见子瓦接手」的瓦片；挑不出安全候选时允许
    * 暂时超出预算，等下一帧再裁 —— 宁可多占一会儿内存，也不在画面上开洞。
    *
-   * 两条预算并行：瓦片数（`maxTiles`）与三角形总数（`maxTriangles`，默认不限制）。
-   * `maxTriangles` 为 Infinity 时短路，行为与只有瓦片数预算时完全一致。
+   * 三条预算并行：瓦片数（`maxTiles`）、三角形总数（`maxTriangles`）与显存字节（`maxMemory`）。
+   * `maxTriangles` / `maxMemory` 为 Infinity 时短路，行为与只有瓦片数预算时完全一致。
    */
   private _trimBudget(): boolean {
     let removed = false;
@@ -667,9 +765,11 @@ export class S3MTileset {
     const overTiles = () => this.nodes.size + this.pending.size > this.maxTiles;
     const overTriangles = () =>
       Number.isFinite(this.maxTriangles) && this._residentTriangles() > this.maxTriangles;
-    // 面数预算生效时可能要连踢多块，迭代上限跟着驻留规模走；不生效时根本进不了循环
+    const overMemory = () =>
+      Number.isFinite(this.maxMemory) && this.residentMemory() > this.maxMemory;
+    // 预算生效时可能要连踢多块，迭代上限跟着驻留规模走；不生效时根本进不了循环
     const iterationCap = this.nodes.size + this.maxTiles + 16;
-    while ((overTiles() || overTriangles()) && guard++ <= iterationCap) {
+    while ((overTiles() || overTriangles() || overMemory()) && guard++ <= iterationCap) {
       if (!this._evictOne(this.nodes.size + this.pending.size > this.hardCap)) break;
       removed = true;
     }
@@ -1188,6 +1288,7 @@ export class S3MTileset {
           meshes: stats.meshes ?? 0,
           vertices: stats.vertices ?? 0,
           triangles: stats.triangles ?? 0,
+          memory: (stats as any).memory ?? estimateObjectGeometryBytes(group),
         },
       };
 

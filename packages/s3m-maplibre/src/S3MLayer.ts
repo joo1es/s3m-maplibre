@@ -936,6 +936,19 @@ export class S3MLayer extends HostRenderer {
     this.viewer.setMaxTriangles(n, datasetId);
   }
 
+  /** 当前每个数据集的驻留显存/内存字节预算。Infinity = 不限制 */
+  get maxMemory(): number {
+    return this.viewer.maxMemory;
+  }
+
+  /**
+   * 动态调整每个数据集驻留显存/内存字节总数的软上限（默认 Infinity = 不限制）。
+   * 瓦片几何与纹理显存超限时触发主动 make-before-break 淘汰。
+   */
+  setMaxMemory(bytes: number, datasetId?: string): void {
+    this.viewer.setMaxMemory(bytes, datasetId);
+  }
+
   /** 当前各向异性过滤上限。Infinity = 取 GPU 最大值 */
   get anisotropyCap(): number {
     return this.viewer.anisotropyCap;

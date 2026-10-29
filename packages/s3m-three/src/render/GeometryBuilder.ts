@@ -323,6 +323,7 @@ export interface TileBuildStats {
   /** 该瓦片的高斯实例数。泼溅瓦片才有值，LOD 判据用它算屏幕覆盖率 */
   splatCount?: number;
   /** 被跳过的东西，加载完可以直接在控制台看 */
+  memory?: number;
   skipped: string[];
 }
 
@@ -768,6 +769,26 @@ export async function buildTileObjects(
   }
 
   if (!group.children.length) stats.skipped.push('tile 无可用几何');
+
+  let totalGeoBytes = 0;
+  for (const obj of objects) {
+    const mesh = obj as THREE.Mesh;
+    const geo = mesh.geometry;
+    if (geo) {
+      if (geo.attributes) {
+        for (const attr of Object.values(geo.attributes)) {
+          if (attr && attr.array) totalGeoBytes += attr.array.byteLength;
+        }
+      }
+      if (geo.index && geo.index.array) totalGeoBytes += geo.index.array.byteLength;
+    }
+    if ((mesh as THREE.InstancedMesh).isInstancedMesh) {
+      const inst = mesh as THREE.InstancedMesh;
+      if (inst.instanceMatrix && inst.instanceMatrix.array) totalGeoBytes += inst.instanceMatrix.array.byteLength;
+      if (inst.instanceColor && inst.instanceColor.array) totalGeoBytes += inst.instanceColor.array.byteLength;
+    }
+  }
+  stats.memory = totalGeoBytes;
 
   group.userData.textureKeys = usedTextureKeys;
   return { group, stats, objects, textureKeys: usedTextureKeys };

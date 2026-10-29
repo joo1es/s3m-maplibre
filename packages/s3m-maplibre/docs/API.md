@@ -122,6 +122,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `pickable` | `boolean` | `true` | 是否响应点击 |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
 | `maxTriangles` | `number` | `Infinity` | 每个数据集驻留三角形总数的软上限（不限制）。`maxTiles` 管不住的场景用来做刹车，见[s3m-three 性能调优](../s3m-three/docs/API.md#移动端--差设备) |
+| `maxMemory` | `number` | `Infinity` | 每个数据集驻留显存/内存字节数的软上限（不限制）。几何+纹理显存超限触发 make-before-break 主动淘汰 |
 | `totalMaxTiles` | `number` | — | 多数据集全局瓦片总预算，在可见数据集间动态均衡分配配额，防止多图层叠合爆显存 |
 | `light` | `LightOptions` | — | 场景光照配置（环境光、主光、方位角、高度角及 headlamp/fixed 模式） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
@@ -285,6 +286,8 @@ readonly lodPixelRatioCap: number
 setMaxImageCache(n: number, datasetId?: string): void    // 纹理缓存条数，默认 128
 setMaxTriangles(n: number, datasetId?: string): void      // 驻留面数软上限，Infinity = 不限制（默认）
 readonly maxTriangles: number
+setMaxMemory(bytes: number, datasetId?: string): void         // 驻留显存字节软上限，Infinity = 不限制（默认）
+readonly maxMemory: number
 setAnisotropyCap(cap: number): void                       // 各向异性上限，Infinity = 取 GPU 最大值（默认）
 readonly anisotropyCap: number
 setMaxTextureSize(n: number): void                        // 纹理长边像素上限，Infinity = 不限制（默认）

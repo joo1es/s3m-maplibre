@@ -139,6 +139,12 @@ export interface S3MViewerOptions {
    */
   maxTriangles?: number;
   /**
+   * 每个数据集驻留显存/内存字节总数的软上限（默认 Infinity = 不限制）。
+   * 包含几何顶点缓冲（精确字节）与纹理显存估计。
+   * 超限时在每帧末尾（make-before-break）主动回收非显示的瓦片及其独占纹理。
+   */
+  maxMemory?: number;
+  /**
    * 纹理缓存条数上限（默认 128）。一条对应一张已解码的瓦片纹理，
    * 1024² 的 RGBA 一张约 4MB，128 条就是 512MB 显存 —— 低端设备建议 32~48。
    * 与 `maxTextureSize` 配合使用：后者降单张尺寸，这条降张数。

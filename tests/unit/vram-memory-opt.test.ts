@@ -225,4 +225,102 @@ describe('显存与内存优化 (VRAM & Memory Optimization)', () => {
       expect(ts.getExternalAtlas('atlas4')).toBeDefined();
     });
   });
+
+  describe('5. 显存字节级预算式主动回收 (VRAM Byte Budget - maxMemory)', () => {
+    test('maxMemory 默认 Infinity = 不限制，支持动态调整', () => {
+      const ts = new S3MTileset({
+        configUrl: 'http://example.com/config',
+      }) as any;
+
+      expect(ts.maxMemory).toBe(Infinity);
+      ts.setMaxMemory(1024 * 1024 * 512);
+      expect(ts.maxMemory).toBe(1024 * 1024 * 512);
+
+      // 非法或负数回退为 Infinity
+      ts.setMaxMemory(-1);
+      expect(ts.maxMemory).toBe(Infinity);
+      ts.setMaxMemory(0);
+      expect(ts.maxMemory).toBe(Infinity);
+    });
+
+    test('超显存预算时主动触发 make-before-break 淘汰非显示瓦片', () => {
+      const ts = new S3MTileset({
+        configUrl: 'http://example.com/config',
+        maxTiles: 100, // 瓦片数充足，不因瓦片数淘汰
+      }) as any;
+
+      // 构造父瓦片 root：1000 顶点 (12000 字节) + 1 张 256KB 纹理
+      const geoParent = new THREE.BufferGeometry();
+      geoParent.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3000), 3));
+      const groupParent = new THREE.Group();
+      groupParent.add(new THREE.Mesh(geoParent));
+      const texParent = new THREE.Texture();
+      (texParent as any).image = { width: 512, height: 512, data: new Uint8Array(262144) };
+
+      ts.textureCache.set('tex_root', texParent);
+      ts.registerTileTextures('root.s3mb', ['tex_root']);
+
+      const nodeParent = {
+        url: 'root.s3mb',
+        group: groupParent,
+        childUrls: ['c1.s3mb'],
+        lastSeen: 1,
+        stats: { meshes: 1, vertices: 1000, triangles: 1000, memory: 12000 },
+      };
+      groupParent.visible = false; // 已被子瓦替换，不显示
+
+      // 构造子瓦片 c1：正在显示
+      const geoChild = new THREE.BufferGeometry();
+      geoChild.setAttribute('position', new THREE.BufferAttribute(new Float32Array(3000), 3));
+      const groupChild = new THREE.Group();
+      groupChild.add(new THREE.Mesh(geoChild));
+      groupChild.visible = true;
+
+      const nodeChild = {
+        url: 'c1.s3mb',
+        group: groupChild,
+        parentUrl: 'root.s3mb',
+        childUrls: [],
+        lastSeen: 2,
+        stats: { meshes: 1, vertices: 1000, triangles: 1000, memory: 12000 },
+      };
+
+      ts.nodes.set('root.s3mb', nodeParent);
+      ts.nodes.set('c1.s3mb', nodeChild);
+
+      // 总内存 = 12000 (parent) + 12000 (child) + 262144 (tex_root) = 286144 字节
+      expect(ts.residentMemory()).toBe(286144);
+
+      // 设置 maxMemory 为 100000 字节（低于总显存，但大于子瓦片的 12000 字节）
+      ts.setMaxMemory(100000);
+
+      // 触发预算裁剪
+      const trimmed = ts._trimBudget();
+      expect(trimmed).toBe(true);
+
+      // 父瓦片被安全淘汰，子瓦片继续保留（不破坏显示）
+      expect(ts.nodes.has('root.s3mb')).toBe(false);
+      expect(ts.nodes.has('c1.s3mb')).toBe(true);
+      // 纹理引用归零，tex_root 也被清理，显存回落到 12000 <= 100000
+      expect(ts.residentMemory()).toBe(12000);
+      expect(ts.residentMemory()).toBeLessThanOrEqual(ts.maxMemory);
+    });
+
+    test('S3MViewer / S3MLayer 转发 setMaxMemory', () => {
+      const viewer = new S3MViewer({
+        maxMemory: 512 * 1024 * 1024,
+      }) as any;
+
+      expect(viewer.maxMemory).toBe(512 * 1024 * 1024);
+
+      const dm = viewer._datasetManager;
+      dm.registerDataset({ id: 'ds1', configUrl: 'http://example.com/1/config' });
+      const entry = dm.get('ds1')!;
+      entry.tileset = new S3MTileset({ configUrl: entry.options.configUrl }) as any;
+
+      viewer.setMaxMemory(256 * 1024 * 1024);
+      expect(viewer.maxMemory).toBe(256 * 1024 * 1024);
+      expect(entry.tileset.maxMemory).toBe(256 * 1024 * 1024);
+    });
+  });
 });

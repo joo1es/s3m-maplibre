@@ -97,9 +97,9 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 
 | 文件 | 体积 | 用途 |
 |---|---|---|
-| `s3m-maplibre.iife.js` | 887 KB（gzip 248 KB） | 内置 three + s3m-three，一行 script 开箱即用 |
-| `s3m-maplibre.iife.ext-three.js` | 212 KB（gzip 76 KB） | three 外置，用页面上的 `window.THREE` |
-| `s3m-three.iife.js` / `s3m-three.iife.ext-three.js` | 879 / 204 KB | 同上，只要渲染内核 |
+| `s3m-maplibre.iife.js` | 约 800+ KB | 内置 three + s3m-three，一行 script 开箱即用 |
+| `s3m-maplibre.iife.ext-three.js` | 约 200+ KB | three 外置，用页面上的 `window.THREE` |
+| `s3m-three.iife.js` / `s3m-three.iife.ext-three.js` | 约 800+ / 200+ KB | 同上，只要渲染内核 |
 
 ### 一行 script
 
@@ -535,7 +535,7 @@ const layer = new S3MLayer({
 | 拾取单次 | < 1 ms（与面数无关） |
 | 棱线构建 | 8ms 一帧切片，20 网格约 1.9s 总计，不阻塞交互 |
 
-调优建议见 [s3m-three API 文档#性能调优](./packages/s3m-three/docs/API.md#性能调优)。移动端与差设备另有几个可选刹车，**默认都不启用**（行为与旧版一致）：`lodPixelRatioCap`（LOD 判定屏幕高度的 DPR 上限，3x 屏上收益最大）、`maxTriangles`（按驻留面数淘汰）、`anisotropyCap`（各向异性上限）、`maxTextureSize`（纹理长边上限），见[移动端 / 差设备](./packages/s3m-three/docs/API.md#移动端--差设备)。
+调优建议见 [s3m-three API 文档#性能调优](./packages/s3m-three/docs/API.md#性能调优)。移动端与差设备另有几个可选刹车，**默认都不启用**（行为与旧版一致）：`lodPixelRatioCap`（LOD 判定屏幕高度的 DPR 上限，3x 屏上收益最大）、`maxTriangles`（按驻留面数淘汰）、`maxMemory`（按显存/内存字节预算主动淘汰）、`anisotropyCap`（各向异性上限）、`maxTextureSize`（纹理长边上限），见[移动端 / 差设备](./packages/s3m-three/docs/API.md#移动端--差设备)。
 
 ---
 

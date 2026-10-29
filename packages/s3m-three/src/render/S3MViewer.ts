@@ -717,7 +717,8 @@ export class S3MViewer {
       },
       this.options.maxTriangles ?? Infinity,
       this.options.maxImageCache ?? 128,
-      this._authenticate
+      this._authenticate,
+      this.options.maxMemory ?? Infinity
     );
     return entry;
   }
@@ -2457,6 +2458,29 @@ export class S3MViewer {
       this.options.maxTriangles = next;
       for (const entry of this.datasets.values()) {
         if (entry.tileset) entry.tileset.setMaxTriangles(next);
+      }
+    }
+  }
+
+  /** 当前每个数据集的驻留显存/内存字节预算。Infinity = 不限制 */
+  get maxMemory(): number {
+    return this.options.maxMemory ?? Infinity;
+  }
+
+  /**
+   * 调整每个数据集驻留显存字节数的软上限（默认 Infinity = 不限制）。
+   * 不传 `datasetId` 时对所有已存在数据集立即生效，并作为之后新增数据集的默认值。
+   * 实际裁剪发生在每帧调度末尾（make-before-break），不会当场开洞。
+   */
+  setMaxMemory(bytes: number, datasetId?: string): void {
+    const next = Number.isFinite(bytes) && bytes > 0 ? bytes : Infinity;
+    if (datasetId) {
+      const entry = this.datasets.get(datasetId);
+      if (entry?.tileset) (entry.tileset as any).setMaxMemory(next);
+    } else {
+      this.options.maxMemory = next;
+      for (const entry of this.datasets.values()) {
+        if (entry.tileset) (entry.tileset as any).setMaxMemory(next);
       }
     }
   }

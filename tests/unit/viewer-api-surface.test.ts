@@ -29,7 +29,7 @@ const PUBLIC_METHODS = [
   'getFeatureStyles', 'getFilter', 'getFilterField', 'getGPUPathManager', 'getGPUPathTime',
   'getLight', 'getLoadedSmids', 'getRayAt', 'getStyle', 'getThematicField',
   'getToneMapping', 'loadCreases', 'lodPixelRatioCap', 'lodRangeScale', 'materialQuality',
-  'maxImageCache', 'maxTextureSize', 'maxTriangles', 'mount', 'moveFeature',
+  'maxImageCache', 'maxMemory', 'maxTextureSize', 'maxTriangles', 'mount', 'moveFeature',
   'moveFeatureBy', 'pick', 'pickPosition', 'prewarmShading', 'recomputeAnchors',
   'registerGPUPath', 'removeDataset', 'removeFeatureStyle', 'renderFrame', 'restoreContext',
   'rotateFeature', 'rotateFeatureBy', 'sceneAnchor', 'select', 'setAnisotropyCap',
@@ -37,7 +37,7 @@ const PUBLIC_METHODS = [
   'setEnvironment', 'setExcavationBounds', 'setFeatureStyle', 'setFeaturesStyle', 'setFilter',
   'setGPUPathProgress', 'setGPUPathTime', 'setGroundMode', 'setGroundOcclude', 'setGroundOpacity',
   'setLight', 'setLightingPreset', 'setLodPixelRatioCap', 'setLodRangeScale', 'setMaterialQuality',
-  'setMaxImageCache', 'setMaxTextureSize', 'setMaxTriangles', 'setMode', 'setOpacity',
+  'setMaxImageCache', 'setMaxMemory', 'setMaxTextureSize', 'setMaxTriangles', 'setMode', 'setOpacity',
   'setStyle', 'setThematicColors', 'setThematicElevation', 'setToneMapping', 'stats',
   'stopPath', 'triggerRepaint', 'unbindGPUPath', 'unmount', 'unregisterGPUPath',
 ].sort();
