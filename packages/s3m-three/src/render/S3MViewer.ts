@@ -23,13 +23,25 @@
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
-import { authFetch, type AuthenticateFn } from '../core/AuthFetch.js';
-import { sortSplatMesh } from './SplatSorter.js';
-import { splatCenterBounds } from './SplatMaterial.js';
+import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
-import { setMaxAnisotropy, setAnisotropyCap, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap, setSrgbTextureDecode } from './TextureFactory.js';
-import { getMaterialQuality, setMaterialQuality, setColorPipeline } from './StyleMaterial.js';
-import { resolveLightingPreset, type LightingPreset } from './lightingPreset.js';
+import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
+import { getMaterialQuality, setMaterialQuality } from './StyleMaterial.js';
+import type { LightingPreset } from './lightingPreset.js';
+import { LightRig } from './viewer/LightRig.js';
+import { HeightIndex } from './viewer/HeightIndex.js';
+import { SplatLayer } from './viewer/SplatLayer.js';
+import { EdgeDecorator } from './viewer/EdgeDecorator.js';
+import { PickService } from './viewer/PickService.js';
+import { SelectionDecorator } from './viewer/SelectionDecorator.js';
+import type {
+  LightOptions,
+  S3MViewerOptions,
+  PickResult,
+  PickableRef,
+  PathFollowOptions,
+  MeshUserData,
+} from './viewer/types.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
@@ -39,17 +51,13 @@ import {
   createSharedUniforms,
   createStyledMaterial,
   createOutlineMaterial,
-  resolveEdgeModes,
-  sameEdgeModes,
   restoreBaseBlendState,
 } from './StyleMaterial.js';
 import type {
   OutlineMaterial,
-  OutlineStyleUniforms,
   StyledMaterial,
   StyledMaterialOptions,
   StyleMode,
-  SelectMode,
   S3MStyle,
   EdgeModes,
   EdgesOption,
@@ -63,35 +71,16 @@ import { Animator } from '../anim/Animator.js';
 import type { Channel, TransitionOptions } from '../anim/Animator.js';
 import { Path } from '../anim/Path.js';
 import type { EasingFn, EasingName } from '../anim/easing.js';
-import type { LineSharedUniforms, ThickLineMaterial, ThickLineStyleUniforms } from './EdgeLines.js';
+import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
 import { GPUPathManager } from './GPUPathManager.js';
 import type { GPUPathOptions } from './FeatureStyleManager.js';
-import {
-  buildFeatureEdgeSegments,
-  buildPositionBatchMap,
-  buildThickLineGeometry,
-  createLineSharedUniforms,
-  createThickLineMaterial,
-  positionQuantKey,
-} from './EdgeLines.js';
-import { mergeVerticesByPosition } from './MergeVertices.js';
-import {
-  resolveFeature,
-  measureSegments,
-  buildAttributes,
-  buildInstanceLookup,
-  pickEntryId,
-  DEFAULT_FLOOR_HEIGHT,
-} from '../core/FeatureInfo.js';
 import type { InstanceFeature } from '../core/FeatureInfo.js';
 import { AttributeQuery } from '../core/AttributeQuery.js';
-import type { AttributeQueryOptions, AttributeRow } from '../core/AttributeQuery.js';
+import type { AttributeQueryOptions } from '../core/AttributeQuery.js';
 import type {
-  Anchor,
   FeatureAttributes,
   GeoPackageEntry,
   ParsedTile,
-  PickSegment,
   SegmentBox,
   Stats,
   StyleUniforms,
@@ -110,16 +99,13 @@ import {
   FeatureStyleManager,
   type FeatureStyle,
   type ColorByFieldOptions,
-  type ThematicLegendEntry,
   type ThematicResult,
-  type BatchConflict,
   type BatchAudit,
   type FieldFilterOptions,
   type FieldFilterResult,
   type FieldElevationOptions,
   type FieldElevationResult,
   type S3MFilter,
-  resolveRotationMatrix,
   extractEulerAngles,
 } from './FeatureStyleManager.js';
 
@@ -156,224 +142,14 @@ export type {
 
 export { GroundManager, DatasetManager, FeatureStyleManager };
 
-const MAX_PICK_ID = 65534;
-
-export interface PickResult extends FeatureAttributes {
-  datasetId: string;
-  datasetName: string;
-  /** 网格编号 */
-  objectId: number;
-  /** 单体控制位（顶点区间型 = batchId，实例化型 = 状态纹理下标），-1 表示没有单体化信息 */
-  batchId: number;
-  /** 实例化几何命中的实例序号；非实例化为 undefined */
-  instanceIndex?: number;
-  skeletonName: string;
-  /** 单体中心经纬度，拿不到时为 null */
-  centerLngLat: [number, number] | null;
-  /** 命中点三维场景坐标 [x, y, z]（米，场景 ENU） */
-  point?: [number, number, number] | null;
-  /** 命中点经纬度 [lng, lat] */
-  lngLat?: [number, number] | null;
-  /** 命中点高程（米） */
-  altitude?: number | null;
-  mesh: THREE.Mesh;
-}
-
-export interface LightOptions {
-  /** 环境光强度，默认 0.4 */
-  ambientIntensity?: number;
-  /** 环境光颜色，十六进制或 CSS 颜色字符串，默认 0xffffff */
-  ambientColor?: number | string;
-  /** 半球光天空强度，默认 0.8 */
-  hemisphereIntensity?: number;
-  /** 半球光天空颜色，默认 0xffffff */
-  hemisphereColor?: number | string;
-  /** 半球光地面颜色，默认 0xb6c0cb */
-  hemisphereGroundColor?: number | string;
-  /** 主平行光强度，默认 1.0 */
-  keyLightIntensity?: number;
-  /** 主平行光强度别名（兼容写法） */
-  mainIntensity?: number;
-  /** 主平行光颜色，默认 0xffffff */
-  keyLightColor?: number | string;
-  /** 主平行光颜色别名（兼容写法） */
-  mainColor?: number | string;
-  /** 补光强度，默认 0.35 */
-  fillLightIntensity?: number;
-  /** 补光颜色，默认 0xffffff */
-  fillLightColor?: number | string;
-  /**
-   * 光照朝向模式：
-   * - 'headlamp': 默认头灯模式（随相机 bearing 旋转，受光面始终面向镜头）
-   * - 'fixed': 固定世界坐标方位角（如太阳光模拟）
-   */
-  mode?: 'headlamp' | 'fixed';
-  /** 方位角（度，0~360），固定模式下以正北为 0 顺时针，头灯模式下为相机相对偏角，默认 150 */
-  azimuth?: number;
-  /** 太阳/光源仰角（度，0~90），默认 50 */
-  altitude?: number;
-}
-
-export interface S3MViewerOptions {
-  /**
-   * 光照预设：
-   * - `'default'`（默认）：现有 PBR 打光，亮部线性总量 ≈ 2.55；
-   * - `'supermap'`：对齐 iClient3D 观感（暗部 0.46 / 亮部 2.44），远处不发灰、饱和度更高。
-   *   只改光源，不动材质与色调映射；`light` 里的显式字段仍然优先生效。
-   */
-  lightingPreset?: LightingPreset;
-  /** 光照参数配置（强度、颜色、朝向模式、太阳方位角/仰角等） */
-  light?: LightOptions;
-  /**
-   * 三角面材质深度偏移（共面摩尔纹 / 重合面归属的人工定序）。
-   * 例：factor -1 / units -2 把配置材质的片元深度略微拉近。
-   * 这是 mesh 粒度开关，见 BuildTileOptions.polygonOffset 的说明。
-   */
-  polygonOffset?: { factor: number; units: number };
-  /**
-   * 色调映射模式（默认 THREE.NoToneMapping，避免 ACESFilmic 压暗中暗部及导致底图与建筑色彩失真；
-   * 可传入 THREE.ACESFilmicToneMapping、THREE.LinearToneMapping、THREE.ReinhardToneMapping 等）
-   */
-  toneMapping?: THREE.ToneMapping;
-  /** 色调映射曝光度，默认 1.0 */
-  toneMappingExposure?: number;
-  /** 全局总驻留瓦片上限（多数据集多图层共享预算），在所有可见数据集之间动态均衡分配，彻底防止爆显存 */
-  totalMaxTiles?: number;
-  /** 单数据集简写 */
-  configUrl?: string;
-  /** 多数据集 */
-  datasets?: S3MDatasetOptions[];
-  style?: Partial<S3MStyle>;
-  /** 3D 物理地表面 / 基坑开挖配置 */
-  ground?: GroundOptions;
-  pickable?: boolean;
-  /** 每个数据集最多驻留瓦片 */
-  maxTiles?: number;
-  /** 每个数据集并发请求数 */
-  maxConcurrent?: number;
-  /**
-   * 图层级默认的降级处置策略（默认 `'warn'`），数据集可用 `unsupported` 单独覆盖。
-   * 见 `S3MTilesetOptions.unsupported`。
-   */
-  unsupported?: UnsupportedPolicy;
-  /** 是否用 Web Worker 解析经典 .s3mb 瓦片（默认开，崩溃自动降级主线程），见 S3MTilesetOptions.useWorker */
-  useWorker?: boolean;
-  /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
-  lodRangeScale?: number;
-  /**
-   * LOD 判定用屏幕高度时的「设备像素比上限」（默认不限制，行为与旧版一致）。
-   *
-   * LOD 的屏幕空间误差按 `canvasHeight` 物理像素算（与官方 `calcPixFromCam` 同口径），
-   * 于是 3x DPR 的手机上判定高度是 2556 而不是 852，细化层数与瓦片数都会远多于桌面。
-   * 传 2 表示「按 CSS 高度 × 2 截断」，砍掉 3x 屏的超采样余量；传 `Infinity` = 不截断。
-   *
-   * 代价：截断会把每块瓦片的屏幕投影放大同样倍数，几何误差与纹理密度同步变差，
-   * 所以默认不启用，由接入方按设备档位自行决定。运行时可用 `setLodPixelRatioCap()` 调整。
-   */
-  lodPixelRatioCap?: number;
-  /**
-   * 每个数据集驻留三角形总数的软上限（默认不限制）。
-   * 见 `S3MTilesetOptions.maxTriangles`：瓦片数管不住的场景（精模、大面片）用这条刹车。
-   */
-  maxTriangles?: number;
-  /**
-   * 纹理缓存条数上限（默认 128）。一条对应一张已解码的瓦片纹理，
-   * 1024² 的 RGBA 一张约 4MB，128 条就是 512MB 显存 —— 低端设备建议 32~48。
-   * 与 `maxTextureSize` 配合使用：后者降单张尺寸，这条降张数。
-   */
-  maxImageCache?: number;
-  /**
-   * 各向异性过滤上限（默认不封顶，取 GPU 报的最大值，通常 16）。
-   * 移动端封到 4 或 8 肉眼通常无差，采样成本明显下降。只影响**之后创建**的纹理。
-   */
-  anisotropyCap?: number;
-  /**
-   * 纹理长边像素上限（默认不限制）。
-   * 非图集的 RGBA / WebP 纹理会按 2× 盒式滤波逐次减半到上限内；DXT 压缩直传与
-   * 图集（UV 已重映射）不受影响。手机上 1024 与 2048 肉眼几乎无差，显存差 4 倍。
-   */
-  maxTextureSize?: number;
-  /**
-   * 光照模型（默认 `'pbr'`）。
-   *
-   * - `'pbr'`：`MeshStandardMaterial`，GGX + 环境球谐，质感最好也最贵
-   * - `'lambert'`：`MeshLambertMaterial`，只保留漫反射 + 平行光，片元开销约省一半；
-   *   白模 / 纯色 / 按高度着色这类不需要高光的模式肉眼差别很小
-   *
-   * 模块级全局状态：同页多个图层会互相覆盖，后创建的那个决定全局。
-   * 只影响**之后创建**的材质 —— 已加载的瓦片要重新加载才会换。
-   */
-  materialQuality?: 'pbr' | 'lambert';
-  /** 自定义瓦片构建器（测试 / 服务端渲染时注入） */
-  buildTile?: BuildTileFn | null;
-  /**
-   * 可选：业务属性查询配置（iServer 数据服务）。
-   * 配上之后才能用 `colorByField()` 按业务字段着色 —— 属性值不在 S3M 瓦片里，只能去数据服务查。
-   */
-  attributes?: AttributeQueryOptions;
-  /** 宿主请求重画的信号。MapLibre 传 `() => map.triggerRepaint()`；纯 three 宿主传自己的渲染循环 */
-  onRequestRepaint?: () => void;
-  /** 地图朝向（弧度），用于让灯光跟着视角走。不传则灯光方向固定 */
-  getBearing?: () => number;
-  /**
-   * 鉴权适配函数（全局默认，数据集可用自己的 `authenticate` 覆盖）。
-   * 内核主线程发出的全部请求（配置 scp / 瓦片 / 子图集 / 棱线缓存 / 属性查询）
-   * 发出前都过一遍，可改写 URL（加 `?token=`）或附加请求头。
-   * 不传 = 行为与旧版完全一致。见 `AuthenticateFn`。
-   */
-  authenticate?: AuthenticateFn;
-  onStats?: (stats: Stats) => void;
-  onReady?: (entry: S3MDatasetEntry) => void;
-  onPick?: (result: PickResult | null) => void;
-  onError?: (error: unknown) => void;
-  /**
-   * 首次出现瓦片后自动预热另一种 `shading` 变体（默认开）。
-   *
-   * `flat` / `smooth` 是编译期变体，不预热的话第一次 `setStyle({ shading })` 会同步
-   * 编译着色器、卡一帧。预热在首帧之后异步做，期间跳一两帧渲染，肉眼不可见。
-   */
-  prewarmShading?: boolean;
-}
-
-/* ------------------------------------------------------------------ 内部类型 */
-
-interface PickableRef {
-  datasetId: string;
-  mesh: THREE.Mesh;
-  tile: ParsedTile;
-  skeletonName: string;
-}
-
-interface MeshUserData {
-  pickId?: number;
-  datasetId?: string;
-  skeletonName?: string;
-  geoRef?: GeoPackageEntry;
-  tileRef?: ParsedTile;
-  primitiveType?: number;
-  /** 点云对象（THREE.Points）：不吃面着色，也没有棱可描 */
-  isPointCloud?: boolean;
-  /** CPU 端现算的棱线对象（等宽线 Mesh） */
-  edges?: THREE.Object3D | null;
-  /** 背面外扩轮廓壳（edges 含 'hull' 时挂上） */
-  edgeHull?: THREE.Mesh | null;
-  /** 数据自带棱线包（此时不再用 EdgesGeometry 现算） */
-  nativeEdges?: boolean;
-  /** 数据本身有没有棱线包（不受 forceCpuEdges 影响，用来运行中切换时重算 nativeEdges） */
-  nativeEdgesRaw?: boolean;
-  /** 数据自带的棱线对象本身 */
-  isEdgeLines?: boolean;
-  /** CPU 现算的等宽棱线（与 isEdgeLines 区分，便于刷新样式） */
-  isThickEdge?: boolean;
-  /** 背面外扩轮廓壳（edges 含 'hull' 时挂上） */
-  isEdgeHull?: boolean;
-  /** 选中单体的棱线对象 */
-  isSelectionEdge?: boolean;
-  /** 该网格正在淡入时占用的动画通道 key，瓦片淘汰时要回收 */
-  tileFadeKey?: string;
-  pickMaterial?: THREE.Material;
-  [key: string]: unknown;
-}
+/* 公共类型定义在 viewer/types.ts；这里 re-export 保持既有 import 路径不变 */
+export type {
+  PickResult,
+  LightOptions,
+  S3MViewerOptions,
+  PickableRef,
+  PathFollowOptions,
+} from './viewer/types.js';
 
 function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
   const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
@@ -436,25 +212,6 @@ const FEATURE_PROPS = ['translation', 'elevation', 'opacity', 'color', 'rotation
 type FeatureProp = (typeof FEATURE_PROPS)[number];
 
 /** 单体沿折线运动的参数 */
-export interface PathFollowOptions {
-  /** 走完全程的时长（毫秒）。不传则按 speed 或默认 2000ms 推算 */
-  duration?: number;
-  /** 线速度（米/秒）。给了 duration 就以 duration 为准 */
-  speed?: number;
-  /** 是否循环 */
-  loop?: boolean;
-  /** 是否把折线首尾相连 */
-  closed?: boolean;
-  /** 缓动曲线：作用在**已走距离**上，默认 linear（恒速） */
-  easing?: EasingName | EasingFn;
-  /** 路径整体偏移（米），相当于路径原点 */
-  offset?: [number, number, number];
-  /** 单次走完（非循环）时回调 */
-  onComplete?: () => void;
-}
-
-/* ------------------------------------------------------------------ 图层 */
-
 export class S3MViewer {
   readonly options: S3MViewerOptions;
   readonly pickable: boolean;
@@ -485,12 +242,8 @@ export class S3MViewer {
   readonly edgeMaterial: ThickLineMaterial;
   /** 选中棱线材质（同上，选中棱线的逐网格材质共享它的对象） */
   readonly selectionEdgeMaterial: ThickLineMaterial;
-  /** 全局棱线的外观 uniform：逐网格棱线材质直接复用这些对象 */
-  private readonly _edgeStyleUniforms: ThickLineStyleUniforms;
-  /** 选中棱线的外观 uniform */
-  private readonly _selEdgeStyleUniforms: ThickLineStyleUniforms;
-  /** 全局外扩轮廓的外观 uniform：逐网格轮廓壳共享这些对象 */
-  private readonly _hullStyleUniforms: OutlineStyleUniforms;
+  /** 棱线装饰（见 viewer/EdgeDecorator.ts） */
+  private readonly _edges: EdgeDecorator;
 
   /** 3D 物理地表面 / 基坑开挖管理器 */
   readonly groundManager: GroundManager;
@@ -515,29 +268,16 @@ export class S3MViewer {
     this._datasetManager.sceneAnchor = val;
   }
 
-  private readonly _pickables = new Map<number, PickableRef>();
-  private _pickSeq = 0;
-  private readonly _freePickIds: number[] = [];
+  /** 拾取表 / pickId 池 / 射线求交（见 viewer/PickService.ts） */
+  private readonly _picks: PickService;
   /** SMID → 包含它的网格。改单个单体样式时只重算这几块，不用全量扫 */
   private readonly _smidMeshes = new Map<number, Set<THREE.Mesh>>();
   /** 每块网格的世界高度范围，用来增量维护 uHeightMin / uHeightMax */
-  private readonly _meshHeight = new Map<THREE.Mesh, { min: number; max: number }>();
-  private _heightMin = Infinity;
-  private _heightMax = -Infinity;
-  private readonly _boxScratch = new THREE.Box3();
-  private _selection: PickResult | null = null;
-  private _selectedMeshes: THREE.Object3D[] = [];
-  private _outlineMesh: THREE.Mesh | null = null;
-  private _outlineMeshes: THREE.Mesh[] = [];
-  private _selectionEdges: THREE.Mesh | null = null;
-  private _selectionEdgeMeshes: THREE.Mesh[] = [];
-  private _edgesEnabled = false;
-  /** 当前生效的棱线画法（line / offset / hull / gpu），决定要不要建 / 拆哪种装饰 */
-  private _edgeModes: EdgeModes = resolveEdgeModes(false);
-  /** GPU 描边后处理（深度 + 法线），只在 edges 含 'gpu' 时按帧执行 */
-  private _gpuEdge: GpuEdgePass | null = null;
-  /** 给 GPU 描边传色用的临时 Color，避免每帧 new */
-  private readonly _gpuEdgeColor = new THREE.Color();
+  /** 世界高度范围增量维护（见 viewer/HeightIndex.ts） */
+  private readonly _heights: HeightIndex;
+  /** 选中态与装饰（见 viewer/SelectionDecorator.ts） */
+  private readonly _sel: SelectionDecorator;
+
   /** 瓦片淡入通道的自增序号（不用 pickId：pickId 会被回收复用） */
   private _tileFadeSeq = 0;
   /** setMode 编排的代次，用来作废被新调用顶掉的旧编排 */
@@ -554,15 +294,11 @@ export class S3MViewer {
   private readonly _pathScratch = new Float32Array(3);
   /** 求切线用的第二个采样点（包围盒换算 GPU 路径朝向时用） */
   private readonly _pathScratch2 = new Float32Array(3);
-  /** 预制棱线缓存（Crease Cache）：从外部 source-creases 载入的全局统一 LineSegments，性能最高、视觉最干净 */
-  private _creaseLines: THREE.LineSegments | null = null;
-  /** 数据自带的棱线对象（LineSegments），改棱线颜色时只刷这些，不再全场景 traverse */
-  private readonly _nativeEdgeLines = new Set<THREE.LineSegments>();
+
   /** 点云对象集合：透明度动画时只刷它们，避免每帧遍历全部 pickables */
   private readonly _pointClouds = new Set<THREE.Points>();
-  /** 泼溅排序状态：相机不动且没有新瓦片时，排序结果可以直接复用 */
-  private readonly _lastSplatSortView = new THREE.Matrix4();
-  private _splatsSorted = false;
+  /** 泼溅排序调度（见 viewer/SplatLayer.ts） */
+  private readonly _splats = new SplatLayer();
   /** 当前材质是否处于 transparent 状态，用来避免逐帧重复切换 program */
   private _opacityTransparent = false;
 
@@ -582,29 +318,10 @@ export class S3MViewer {
   private readonly _frameMvp = new THREE.Matrix4();
   /** 颜色换算用的临时对象，避免每帧 new */
   private readonly _colorScratch = new THREE.Color();
-  private _needsRepaint = true;
   private _frame = 0;
   private readonly _fps = { value: 0, last: 0 };
-  private _ambientLight!: THREE.AmbientLight;
-  private _hemiLight!: THREE.HemisphereLight;
-  private _keyLight!: THREE.DirectionalLight;
-  private _fillLight!: THREE.DirectionalLight;
-  /** 环境贴图的 PMREM 渲染目标（setEnvironment 建的，unmount 时释放） */
-  private _envRT: THREE.WebGLRenderTarget | null = null;
-  private readonly _lightOptions: Required<Omit<LightOptions, 'mainIntensity' | 'mainColor'>> = {
-    ambientIntensity: 0.4,
-    ambientColor: 0xffffff,
-    hemisphereIntensity: 0.8,
-    hemisphereColor: 0xffffff,
-    hemisphereGroundColor: 0xb6c0cb,
-    keyLightIntensity: 1.0,
-    keyLightColor: 0xffffff,
-    fillLightIntensity: 0.35,
-    fillLightColor: 0xffffff,
-    mode: 'headlamp',
-    azimuth: 150,
-    altitude: 50,
-  };
+  /** 光源 / 色调映射 / 环境贴图（见 viewer/LightRig.ts） */
+  private readonly _lights: LightRig;
 
   private readonly _datasetQueue: S3MDatasetOptions[];
 
@@ -636,13 +353,6 @@ export class S3MViewer {
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
     setMaterialQuality(options.materialQuality ?? 'pbr');
-    if (options.lightingPreset && options.lightingPreset !== 'default') {
-      Object.assign(this._lightOptions, resolveLightingPreset(options.lightingPreset));
-      this._applyColorPipeline(options.lightingPreset);
-    }
-    if (options.light) {
-      Object.assign(this._lightOptions, options.light);
-    }
     if (options.totalMaxTiles) {
       this._datasetManager.totalMaxTiles = options.totalMaxTiles;
     }
@@ -659,13 +369,12 @@ export class S3MViewer {
     if (!this.scene) {
       this.scene = new THREE.Scene();
       this.scene.add(this.groundManager.group);
-      this._addLights();
     }
     this._featureStyleManager = new FeatureStyleManager(
       () => this.style.floorHeight,
       () => this._requestRepaint(),
       () => {
-        if (this._selection) this._syncSelectionStyle();
+        if (this._sel.selection) this._sel.syncStyle();
       },
       () => this.getAllMeshes(),
       (mesh) => this._applyOverridesToMesh(mesh),
@@ -674,8 +383,56 @@ export class S3MViewer {
     );
 
     this.uniforms = createSharedUniforms();
+    // 光源状态在这里就位：LightRig 构造时会按 lightingPreset 切模块级颜色管线，
+    // 挂进场景要等 scene 建好（构造函数上面已经建了）。
+    this._lights = new LightRig({
+      scene: () => this.scene,
+      renderer: () => this.renderer,
+      uniforms: this.uniforms,
+      options: this.options,
+      getBearing: () => this._getBearing?.(),
+      // 走公共 triggerRepaint 而不是 _requestRepaint：宿主 / 单测会覆盖前者来观察重绘，
+      // 绕过它会让「有没有触发重绘」这件事失去观测点
+      repaint: () => this.triggerRepaint(),
+    });
+    this._lights.addToScene();
+    this._heights = new HeightIndex(this.uniforms);
+    const self = this;
+    this._picks = new PickService({
+      get picker() {
+        return self.picker;
+      },
+      get camera() {
+        return self.camera;
+      },
+      get scene() {
+        return self.scene;
+      },
+      get canvas() {
+        return self.canvas;
+      },
+      get style() {
+        return self.style;
+      },
+      get sceneAnchor() {
+        return self.sceneAnchor;
+      },
+      get datasets() {
+        return self.datasets;
+      },
+      get featureStyleManager() {
+        return self._featureStyleManager;
+      },
+      get smidMeshes() {
+        return self._smidMeshes;
+      },
+      lngLatFromWorld: (x, y) => self._lngLatFromWorld(x, y),
+      gpuPathPoseAt: (smid) => self._gpuPathPoseAt(smid),
+      isFeatureHidden: (smid, batchId) => self._isFeatureHidden(smid, batchId),
+    });
     // 纹理解码优先派给共享解析 Worker（崩溃自动回主线程，见 decodeTextureWithWorker）
-    setTextureOffThreadDecode(decodeTextureWithWorker);    this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
+    setTextureOffThreadDecode(decodeTextureWithWorker);
+    this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
     this._styleTarget = { ...this.style };
     this._opacityTransparent = (this.style.opacity ?? 1) < 0.999;
     this._applyStyleUniforms();
@@ -685,29 +442,35 @@ export class S3MViewer {
     this.animator.onActive = () => this._requestRepaint();
     this.outlineMaterial = createOutlineMaterial(this.uniforms);
 
-    this.lineShared = createLineSharedUniforms();
-    // 棱线外观 uniform：全局棱线材质与逐网格棱线材质**共用同一批对象**，
-    // _syncEdgeStyle 改一次，所有棱线（含淡入乘子）同时生效，保持 O(1)。
-    this._edgeStyleUniforms = {
-      uColor: { value: new THREE.Color(this.style.edgeColor) },
-      uWidth: { value: Math.max(0.1, this.style.edgeWidth ?? 1.5) },
-      uOpacity: { value: 0.6 },
-      uOffset: { value: this.style.edgeOffset ?? 0.15 },
-    };
-    this.edgeMaterial = createThickLineMaterial(this.lineShared, {}, this._edgeStyleUniforms);
-    this._selEdgeStyleUniforms = {
-      uColor: { value: new THREE.Color(this.style.outlineColor ?? this.style.selectColor) },
-      uWidth: { value: Math.max(0.1, this.style.outlineWidthPx ?? 3) },
-      uOpacity: { value: 1 },
-      uElevation: { value: this.style.selectElevation ?? 0 },
-    };
-    this.selectionEdgeMaterial = createThickLineMaterial(this.lineShared, {}, this._selEdgeStyleUniforms);
-    // 全局外扩轮廓的外观 uniform：逐网格轮廓壳复用这几个对象，改一次全场景生效
-    this._hullStyleUniforms = {
-      uColor: { value: new THREE.Color(this.style.edgeColor) },
-      uWidth: { value: Math.max(0, this.style.edgeHullWidth ?? 0.9) },
-      uOpacity: { value: 0.6 },
-    };
+    // 棱线装饰：内部持有共享 uniform 与全局材质，公共字段从它取出来保持 API 不变
+    this._edges = new EdgeDecorator({
+      uniforms: this.uniforms,
+      style: this.style,
+      styleTarget: this._styleTarget,
+      animator: this.animator,
+      pickables: this._picks.pickables,
+      scene: this.scene,
+      renderer: this.renderer,
+      camera: this.camera,
+      authenticate: this._authenticate,
+      requestRepaint: () => this.triggerRepaint(),
+    });
+    this.lineShared = this._edges.lineShared;
+    this.edgeMaterial = this._edges.edgeMaterial;
+    this.selectionEdgeMaterial = this._edges.selectionEdgeMaterial;
+    this._sel = new SelectionDecorator({
+      uniforms: this.uniforms,
+      style: this.style,
+      outlineMaterial: this.outlineMaterial,
+      selectionEdgeMaterial: this.selectionEdgeMaterial,
+      featureStyleManager: this._featureStyleManager,
+      smidMeshes: this._smidMeshes,
+      pointClouds: this._pointClouds,
+      applyPointCloudStyle: (pc, selected) => this._applyPointCloudStyle(pc, selected),
+      onPick: (r) => this.onPick(r),
+      requestRepaint: () => this.triggerRepaint(),
+      createSelectionEdgeMaterial: (mesh) => this._edges.createSelectionEdgeMaterial(mesh),
+    });
 
     // 关键：style.edges 是个开关，但构造函数从没据此启用过棱线，导致
     // `style: { edges: true }` 形同虚设、_edgesEnabled 永远是 false。
@@ -804,8 +567,7 @@ export class S3MViewer {
     this.picker?.dispose();
     this.picker = new Picker(this.renderer);
     // GPU 描边的 RT / 材质绑定在旧上下文上，整体丢弃，下一帧按需重建
-    this._gpuEdge?.dispose();
-    this._gpuEdge = null;
+    this._edges.disposeGpuEdge();
     // 共享 uniform / 材质引用不变，three 重新编译着色器时会自然接管；
     // 这里只确保下一帧尽快驱动一次渲染。
     this._requestRepaint();
@@ -818,169 +580,83 @@ export class S3MViewer {
     this.groundManager.dispose();
     this.picker?.dispose();
     this.picker = null;
-    this._envRT?.dispose();
-    this._envRT = null;
+    this._lights.dispose();
     this.outlineMaterial.dispose();
-    this._gpuEdge?.dispose();
-    this._gpuEdge = null;
+    this._edges.disposeGpuEdge();
     this.edgeMaterial.dispose();
     this.selectionEdgeMaterial.dispose();
     this.scene?.clear();
-    this._selectedMeshes = [];
-    this._outlineMeshes = [];
-    this._selectionEdgeMeshes = [];
-    this._outlineMesh = null;
-    this._selectionEdges = null;
+    this._sel.reset();
     this._smidMeshes.clear();
-    this._meshHeight.clear();
+    this._heights.clear();
     // 场景已经清空，还挂着的动画通道（瓦片淡入 / 单体位移）不能再对着死对象写
     this.animator.clear();
     this.animator.unregisterPrefix('tile.');
     this.animator.unregisterPrefix('feature.');
     this._pathSpecs.clear();
-    this._heightMin = Infinity;
-    this._heightMax = -Infinity;
+
     this.renderer?.dispose?.();
     this.renderer = null;
     this.canvas = null;
   }
 
-  private _createLights(): void {
-    this._ambientLight = new THREE.AmbientLight(this._lightOptions.ambientColor as any, this._lightOptions.ambientIntensity);
-    this._hemiLight = new THREE.HemisphereLight(
-      this._lightOptions.hemisphereColor as any,
-      this._lightOptions.hemisphereGroundColor as any,
-      this._lightOptions.hemisphereIntensity
-    );
-    this._keyLight = new THREE.DirectionalLight(this._lightOptions.keyLightColor as any, this._lightOptions.keyLightIntensity);
-    this._fillLight = new THREE.DirectionalLight(this._lightOptions.fillLightColor as any, this._lightOptions.fillLightIntensity);
-    this._updateLights();
+  /* ---------------------------------------------------------------- 光照 */
+
+  /**
+   * @internal 光源实例的转发 —— `lighting.test.ts` 直接读这几个字段。
+   * 实现全在 viewer/LightRig.ts。
+   */
+  get _ambientLight(): THREE.AmbientLight | null {
+    return this._lights.ambient;
+  }
+  get _hemiLight(): THREE.HemisphereLight | null {
+    return this._lights.hemi;
+  }
+  get _keyLight(): THREE.DirectionalLight | null {
+    return this._lights.key;
+  }
+  get _fillLight(): THREE.DirectionalLight | null {
+    return this._lights.fill;
+  }
+
+  /** @internal 光照位置按当前 bearing 重算，见 viewer/LightRig.ts */
+  _updateLights(): void {
+    this._lights.update();
   }
 
   private _addLights(): void {
-    if (!this.scene) return;
-    if (!this._ambientLight) this._createLights();
-    this.scene.add(this._ambientLight, this._hemiLight, this._keyLight, this._fillLight);
-  }
-
-  private _applyLightOptions(): void {
-    if (this._ambientLight) {
-      this._ambientLight.intensity = this._lightOptions.ambientIntensity;
-      this._ambientLight.color.set(this._lightOptions.ambientColor as any);
-    }
-    if (this._hemiLight) {
-      this._hemiLight.intensity = this._lightOptions.hemisphereIntensity;
-      this._hemiLight.color.set(this._lightOptions.hemisphereColor as any);
-      this._hemiLight.groundColor.set(this._lightOptions.hemisphereGroundColor as any);
-    }
-    if (this._keyLight) {
-      this._keyLight.intensity = this._lightOptions.keyLightIntensity;
-      this._keyLight.color.set(this._lightOptions.keyLightColor as any);
-    }
-    if (this._fillLight) {
-      this._fillLight.intensity = this._lightOptions.fillLightIntensity;
-      this._fillLight.color.set(this._lightOptions.fillLightColor as any);
-    }
-  }
-
-  /**
-   * 运行时切换光照预设：覆盖四个强度，颜色/朝向保持不变。
-   * 之后再调 `setLight({...})` 仍然可以逐项微调。
-   */
-  /**
-   * supermap 完整版 = 光照强度 + 颜色管线一起切：
-   * direct 管线下纹理不做 sRGB 解码、片元按官方常数 Lambert 直乘（见 lightingPreset.ts）。
-   * 两个都是模块级全局态，只影响之后创建的材质 / 纹理 —— 已加载瓦片要重载才换。
-   */
-  private _applyColorPipeline(preset: LightingPreset): void {
-    const direct = preset === 'supermap';
-    setColorPipeline(direct ? 'direct' : 'linear');
-    setSrgbTextureDecode(!direct);
-    // 官方不开各向异性：远处直接采高 mip 平均成纯色（"灰色滤镜"的一部分）。
-    // 我们默认 Infinity（倾斜摄影立面清晰度优先），supermap 模式必须收回。
-    setAnisotropyCap(direct ? 1 : Infinity);
+    this._lights.addToScene();
   }
 
   setLightingPreset(preset: LightingPreset): void {
-    Object.assign(this._lightOptions, resolveLightingPreset(preset));
-    this._applyColorPipeline(preset);
-    this.options.lightingPreset = preset;
-    this._applyLightOptions();
-    this._updateLights();
-    this._needsRepaint = true;
-    this.triggerRepaint();
+    this._lights.setLightingPreset(preset);
   }
 
-  /**
-   * 动态设置光照配置
-   */
+  /** 动态设置光照配置 */
   setLight(options: Partial<LightOptions>): void {
-    const normalized: Partial<LightOptions> = { ...options };
-    if (normalized.mainColor !== undefined && normalized.keyLightColor === undefined) {
-      normalized.keyLightColor = normalized.mainColor;
-    }
-    if (normalized.mainIntensity !== undefined && normalized.keyLightIntensity === undefined) {
-      normalized.keyLightIntensity = normalized.mainIntensity;
-    }
-    Object.assign(this._lightOptions, normalized);
-    this._applyLightOptions();
-    this._updateLights();
-    this._needsRepaint = true;
-    this.triggerRepaint();
+    this._lights.setLight(options);
   }
 
-  /**
-   * 获取当前光照配置快照
-   */
+  /** 获取当前光照配置快照 */
   getLight(): LightOptions {
-    return { ...this._lightOptions };
+    return this._lights.getLight();
   }
 
-  /**
-   * 动态设置色调映射模式与曝光度
-   */
+  /** 动态设置色调映射模式与曝光度 */
   setToneMapping(toneMapping: THREE.ToneMapping, exposure = 1.0): void {
-    this.options.toneMapping = toneMapping;
-    this.options.toneMappingExposure = exposure;
-    if (this.renderer) {
-      this.renderer.toneMapping = toneMapping;
-      this.renderer.toneMappingExposure = exposure;
-      this._needsRepaint = true;
-      this.triggerRepaint();
-    }
+    this._lights.setToneMapping(toneMapping, exposure);
   }
 
-  /**
-   * 获取当前色调映射模式与曝光度
-   */
+  /** 获取当前色调映射模式与曝光度 */
   getToneMapping(): { toneMapping: THREE.ToneMapping; toneMappingExposure: number } {
-    return {
-      toneMapping: this.renderer ? this.renderer.toneMapping : (this.options.toneMapping ?? THREE.NoToneMapping),
-      toneMappingExposure: this.renderer ? this.renderer.toneMappingExposure : (this.options.toneMappingExposure ?? 1.0),
-    };
+    return this._lights.getToneMapping();
   }
 
   /**
-   * 更新光照位置与方向：
-   * - 'headlamp': 随地图方位角 bearing 旋转，主光始终在镜头上方，受光面面向镜头；
-   * - 'fixed': 固定世界方位角（如模拟恒定日光）。
+   * 挂 / 摘环境贴图。见 viewer/LightRig.ts（PMREM 预滤波 + 旧 RT 释放）。
    */
-  private _updateLights(): void {
-    if (!this._keyLight || !this._fillLight) return;
-    const bearing = this._lightOptions.mode === 'fixed' ? 0 : (((this._getBearing?.() ?? 0) * Math.PI) / 180);
-    const place = (light: THREE.DirectionalLight | null, azOffsetDeg: number, elevDeg: number): void => {
-      if (!light) return;
-      const az = bearing + (azOffsetDeg * Math.PI) / 180;
-      const el = (elevDeg * Math.PI) / 180;
-      const c = Math.cos(el);
-      light.position.set(Math.sin(az) * c, Math.cos(az) * c, Math.sin(el)).multiplyScalar(1000);
-    };
-    place(this._keyLight, this._lightOptions.azimuth, this._lightOptions.altitude);
-    place(this._fillLight, this._lightOptions.azimuth + 65, Math.max(10, this._lightOptions.altitude - 20));
-    // direct 管线的官方 Lambert 用主光方向（共享 uniform，所有材质同步生效）
-    if (this.uniforms?.uSunDirection && this._keyLight) {
-      (this.uniforms.uSunDirection.value as THREE.Vector3).copy(this._keyLight.position).normalize();
-    }
+  setEnvironment(source: string | THREE.Texture | null, intensity = 1): Promise<void> {
+    return this._lights.setEnvironment(source, intensity);
   }
 
   /* ---------------------------------------------------------------- 数据集 */
@@ -1013,13 +689,11 @@ export class S3MViewer {
         onTile: (node, e) => {
           this._registerTile(node, e);
           this.onStats(this.stats);
-          this._needsRepaint = true;
           this._requestRepaint();
         },
         onTileRemoved: (node, e) => {
           this._unregisterTile(node, e);
           this.onStats(this.stats);
-          this._needsRepaint = true;
           this._requestRepaint();
         },
         onStats: () => {
@@ -1032,7 +706,7 @@ export class S3MViewer {
         },
         onReady: (e) => {
           this.onReady(e);
-          this._refreshAllHeights();
+          this._heights.refreshAll();
           if (!this.groundManager.excavationBounds) {
             this.groundManager.autoFitExcavation(this.datasets.values());
           }
@@ -1058,7 +732,7 @@ export class S3MViewer {
   /** 当地图 CRS 投影切换或宿主 map 挂载后，重新计算场景锚点与各数据集 offset */
   recomputeAnchors(): void {
     this._datasetManager.recomputeAnchors(this.geo);
-    this._refreshAllHeights();
+    this._heights.refreshAll();
     this._requestRepaint();
   }
 
@@ -1092,7 +766,7 @@ export class S3MViewer {
     }
     this._datasetManager.setDatasetHeight(id, h, this.geo);
     this._syncGroundHeight();
-    this._refreshAllHeights();
+    this._heights.refreshAll();
     this._requestRepaint();
   }
 
@@ -1124,7 +798,7 @@ export class S3MViewer {
       a = align ?? 'origin';
     }
     this._datasetManager.setDatasetAlign(id, a, this.geo);
-    this._refreshAllHeights();
+    this._heights.refreshAll();
     this._requestRepaint();
   }
 
@@ -1719,7 +1393,7 @@ export class S3MViewer {
   }
 
   auditBatches(): BatchAudit {
-    const res = this._featureStyleManager.auditBatches(this._pickables.values());
+    const res = this._featureStyleManager.auditBatches(this._picks.pickables.values());
     res.smids = this._smidMeshes.size;
     return res;
   }
@@ -1832,7 +1506,7 @@ export class S3MViewer {
 
   getAllMeshes(): THREE.Mesh[] {
     const list: THREE.Mesh[] = [];
-    for (const p of this._pickables.values()) list.push(p.mesh);
+    for (const p of this._picks.pickables.values()) list.push(p.mesh);
     return list;
   }
 
@@ -1843,14 +1517,6 @@ export class S3MViewer {
       if (set) for (const mesh of set) out.add(mesh);
     }
     return out;
-  }
-
-  private _markOverridesDirty(scope: Iterable<THREE.Mesh> | 'all' = 'all'): void {
-    if (scope === 'all') {
-      this._featureStyleManager.markOverridesDirty(undefined, this.getAllMeshes());
-    } else {
-      this._featureStyleManager.markOverridesDirty(scope);
-    }
   }
 
   flushOverrides(): void {
@@ -1865,18 +1531,18 @@ export class S3MViewer {
   removeDataset(id: string): void {
     const entry = this.datasets.get(id);
     if (!entry) return;
-    if (this._selection?.datasetId === id) this.select(null);
+    if (this._sel.selection?.datasetId === id) this.select(null);
     this._datasetManager.removeDataset(id, this.scene!, this.geo, (e) => {
       e.root.traverse((o) => {
         const mesh = o as THREE.Mesh;
         const ud = mesh.userData as MeshUserData;
         if (ud.pickId != null) {
-          this._pickables.delete(ud.pickId);
+          this._picks.pickables.delete(ud.pickId);
           this._releasePickId(ud.pickId);
           ud.pickId = undefined;
         }
         this._unindexMeshSmids(mesh);
-        this._removeMeshHeight(mesh);
+        this._heights.remove(mesh);
         mesh.geometry?.dispose?.();
         const styled = styledMaterialOf(mesh);
         if (styled) styled.dispose();
@@ -1884,7 +1550,7 @@ export class S3MViewer {
         this._featureStyleManager.disposeMesh(mesh);
       });
     });
-    for (const [pickId, p] of this._pickables) if (p.datasetId === id) this._pickables.delete(pickId);
+    for (const [pickId, p] of this._picks.pickables) if (p.datasetId === id) this._picks.pickables.delete(pickId);
     this.onStats(this.stats);
     this._requestRepaint();
   }
@@ -1896,7 +1562,7 @@ export class S3MViewer {
 
   setDatasetVisible(id: string, visible: boolean): void {
     this._datasetManager.setDatasetVisible(id, visible);
-    if (!visible && this._selection?.datasetId === id) this.select(null);
+    if (!visible && this._sel.selection?.datasetId === id) this.select(null);
     this._requestRepaint();
   }
 
@@ -1910,16 +1576,13 @@ export class S3MViewer {
     // forceCpuEdges：无视数据自带的棱线包，改由 CPU 现算。native 是 1px 的
     // LineBasicMaterial，edgeWidth / 外扩 / 单体跟随全都吃不上。
     // gpu 画法由 shader 自己描边，native 线段包同样不能留
-    const useNativeEdges =
-      hasNativeEdges && this.style.forceCpuEdges !== true && !this._edgeModes.gpu;
+    const useNativeEdges = this._edges.useNativeEdges(hasNativeEdges);
 
     for (const child of node.group.children) {
       // 数据自带的棱线包：只跟着 edges 开关显示，不参与拾取、不参与着色
       if ((child as THREE.LineSegments).isLineSegments && (child.userData as MeshUserData).isEdgeLines) {
-        // 一律登记进 _nativeEdgeLines：forceCpuEdges 之后又关掉时还要能把它们放出来
-        this._nativeEdgeLines.add(child as THREE.LineSegments);
-        child.visible = useNativeEdges && this._edgesEnabled;
-        this._styleEdgeLine(child as THREE.LineSegments);
+        // 一律登记：forceCpuEdges 之后又关掉时还要能把它们放出来
+        this._edges.registerNativeLine(child as THREE.LineSegments, useNativeEdges && this._edges.enabled);
         continue;
       }
 
@@ -1929,29 +1592,24 @@ export class S3MViewer {
       if (!mesh.isMesh && !isPoints) continue;
       if (isPoints) this._pointClouds.add(child as THREE.Points);
       // 新瓦片里的泼溅实例还没按当前视角排过，下一帧要重排
-      if (isPoints) this._splatsSorted = false;
+      if (isPoints) this._splats.markDirty();
       const ud = mesh.userData as MeshUserData;
       ud.pickId = this._allocPickId();
       ud.datasetId = entry.id;
       ud.nativeEdges = useNativeEdges;
       ud.nativeEdgesRaw = hasNativeEdges;
-      this._pickables.set(ud.pickId, {
+      this._picks.pickables.set(ud.pickId, {
         datasetId: entry.id,
         mesh,
         tile: node.tile,
         skeletonName: ud.skeletonName ?? '',
       });
       this._indexMeshSmids(mesh);
-      this._addMeshHeight(mesh);
+      this._heights.add(mesh);
       // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义
       // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义。
       // 自动描边受三道开关控制：全局 style.edges / 数据集 enableEdges / 地形绿地等关键字跳过。
-      if (!useNativeEdges && !isPoints && this._datasetEdgesEnabled(entry) && !this._shouldSkipAutoEdges(ud, entry.name)) {
-        // 数据集强制开启（enableEdges: true）时全局画法可能还是关的，退回默认折边线；
-        // 但 gpu 画法本来就不建几何，别在这里多此一举
-        if (this._edgeModes.line || this._edgeModes.hull) this._ensureEdgeDecoration(mesh);
-        else if (!this._edgeModes.gpu) this._ensureEdges(mesh);
-      }
+      this._edges.autoDecorate(mesh, entry, useNativeEdges);
 
       // 新瓦片要继承当前的不透明度与着色方式
       if (isPoints) {
@@ -1978,7 +1636,7 @@ export class S3MViewer {
 
       // 选中状态也要跟着继承：LOD 细化 / 瓦片重载会换掉 mesh，
       // 不重放就出现「点中的那栋楼一拉近就没高亮了」
-      this._replaySelectionOnto(mesh);
+      this._sel.replayOnto(mesh);
     }
   }
 
@@ -2030,64 +1688,9 @@ export class S3MViewer {
     });
   }
 
-  /**
-   * 把「当前选中」重放到一块新登记的 mesh 上。
-   *
-   * 为什么需要：选中高亮是直接写在各 mesh 材质的 uSelBatch / uSelWhole 上的，
-   * 而 LOD 细化、瓦片重载、淘汰回补都会换掉 mesh —— 不重放的话，用户点中的那栋楼
-   * 一细化就失去高亮（状态还在 _selection.smid 里，只是没人往新 mesh 上刷）。
-   */
-  /**
-   * 判断一块无 SMID 单体化信息的网格（如倾斜摄影或白模整块）是否空间覆盖当前选中命中点
-   */
-  private _isMeshCoveringSelection(mesh: THREE.Mesh, sel: PickResult): boolean {
-    if (!sel.point) return false;
-    const geom = mesh.geometry;
-    if (!geom) return false;
-    if (!geom.boundingBox) geom.computeBoundingBox();
-    if (!geom.boundingBox) return false;
-
-    // 将选中的三维场景点转入网格局部坐标系进行包围盒检测
-    const pt = new THREE.Vector3(sel.point[0], sel.point[1], sel.point[2]);
-    mesh.updateWorldMatrix(true, false);
-    const inv = mesh.matrixWorld.clone().invert();
-    const localPt = pt.applyMatrix4(inv);
-
-    // 留出 0.5 米容差，避免刚好处于三角网格边缘缝隙时漏判
-    const box = geom.boundingBox.clone().expandByScalar(0.5);
-    return box.containsPoint(localPt);
-  }
-
-  private _replaySelectionOnto(mesh: THREE.Mesh): void {
-    const sel = this._selection;
-    if (!sel) return;
-    const mat = styledMaterialOf(mesh);
-    if (!mat) return;
-
-    const ud = mesh.userData as MeshUserData;
-    let batchId = -1;
-    if (sel.smid != null) {
-      const pickInfo = ud.geoRef?.pickInfo as Record<string | number, unknown> | undefined;
-      const entry = pickInfo?.[sel.smid] ?? pickInfo?.[String(sel.smid)];
-      batchId = entry ? pickEntryId(entry as any) : -1;
-    }
-    // 拾取命中的那块 mesh 用原始 batchId；同一 smid 散在别的几何里时按各自的区间算
-    if (mesh === sel.mesh) batchId = sel.batchId;
-    // 这块几何里根本没有这个单体 → 不动它（否则会把无关瓦片一起点亮）
-    if (batchId < 0 && mesh !== sel.mesh) {
-      if (sel.smid == null && ud.datasetId === sel.datasetId && this._isMeshCoveringSelection(mesh, sel)) {
-        batchId = -1;
-      } else {
-        return;
-      }
-    }
-
-    mat.userData.uSelBatch.value = batchId;
-    mat.userData.uSelWhole.value = batchId < 0 ? 1 : 0;
-    if (!this._selectedMeshes.includes(mesh)) this._selectedMeshes.push(mesh);
-    if (isPointCloudObject(mesh)) this._applyPointCloudStyle(mesh, true);
-    this.uniforms.uSelMix.value = 1;
-    this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
+  /** @internal 把当前选中重放到新登记的 mesh 上，见 viewer/SelectionDecorator.ts */
+  _replaySelectionOnto(mesh: THREE.Mesh): void {
+    this._sel.replayOnto(mesh);
   }
 
   /** 瓦片被淘汰：从拾取表和场景里摘掉，并深度彻底释放所有几何体与材质显存 */
@@ -2095,7 +1698,7 @@ export class S3MViewer {
     node.group.traverse((child) => {
       const obj = child as any;
       if ((child as THREE.LineSegments).isLineSegments && obj.userData?.isEdgeLines) {
-        this._nativeEdgeLines.delete(child as THREE.LineSegments);
+        this._edges.unregisterNativeLine(child as THREE.LineSegments);
       }
       if (isPointCloudObject(child)) this._pointClouds.delete(child);
       // 淡入还没结束就被淘汰：把通道收掉，否则会对着已释放的材质继续写
@@ -2104,34 +1707,34 @@ export class S3MViewer {
         obj.userData.tileFadeKey = undefined;
       }
       if (obj.userData?.pickId != null) {
-        this._pickables.delete(obj.userData.pickId);
+        this._picks.pickables.delete(obj.userData.pickId);
         this._releasePickId(obj.userData.pickId);
         obj.userData.pickId = undefined;
       }
       if (obj.isMesh) {
-        const wasSelected = this._selectedMeshes.includes(obj);
+        const wasSelected = this._sel.selectedMeshes.includes(obj);
         if (wasSelected) {
-          this._selectedMeshes = this._selectedMeshes.filter((m) => m !== obj);
+          this._sel.selectedMeshes = this._sel.selectedMeshes.filter((m) => m !== obj);
         }
-        const currentSel = this._selection;
+        const currentSel = this._sel.selection;
         if (currentSel && currentSel.mesh === obj) {
           const smid = currentSel.smid;
           const carrier = (
             smid != null
               ? [...(this._smidMeshes.get(smid) ?? [])].find((m) => m !== obj && m.parent)
-              : this._selectedMeshes.find((m) => m !== obj && m.parent && (m.parent as any).visible) ??
-                this._selectedMeshes.find((m) => m !== obj && m.parent)
+              : this._sel.selectedMeshes.find((m) => m !== obj && m.parent && (m.parent as any).visible) ??
+                this._sel.selectedMeshes.find((m) => m !== obj && m.parent)
           ) as THREE.Mesh | undefined;
           if (carrier) {
             // 选中身份交给承载同一 smid 的另一块 mesh（通常是接替显示的子瓦）
-            this._selection = { ...currentSel, mesh: carrier };
-            this._replaySelectionOnto(carrier);
+            this._sel.selection = { ...currentSel, mesh: carrier };
+            this._sel.replayOnto(carrier);
           } else {
             this.select(null);
           }
         }
         this._unindexMeshSmids(obj);
-        this._removeMeshHeight(obj);
+        this._heights.remove(obj);
         this._featureStyleManager.disposeMesh(obj);
         const styled = styledMaterialOf(obj);
         styled?.dispose?.();
@@ -2156,20 +1759,6 @@ export class S3MViewer {
    * 拾取 ID 只有 2 个字节（RG 两个通道），65535 个网格就到头了，
    * 所以必须回收：瓦片淘汰 / 数据集移除时把 id 还回池子。
    */
-  private _allocPickId(): number {
-    const reused = this._freePickIds.pop();
-    if (reused !== undefined) return reused;
-    if (this._pickSeq > MAX_PICK_ID) {
-      for (let id = 0; id <= MAX_PICK_ID; id++) if (!this._pickables.has(id)) return id;
-      throw new Error(`[s3m] 可拾取网格超过 ${MAX_PICK_ID + 1} 个，2 字节 ID 编码不够用`);
-    }
-    return this._pickSeq++;
-  }
-
-  private _releasePickId(id: number): void {
-    this._freePickIds.push(id);
-  }
-
   /* ---------------------------------------------------------------- 样式 */
 
   /** 动态设置图层整体透明度 (0.0 ~ 1.0) */
@@ -2226,52 +1815,6 @@ export class S3MViewer {
 
   getStyle(): S3MStyle & { modeLabel: string } {
     return { ...this._styleTarget, modeLabel: STYLE_LABELS[this._styleTarget.mode] };
-  }
-
-  /**
-   * 挂 / 摘环境贴图。
-   *
-   * 金属度（`setStyle({ metalness })`）**必须**有环境图才看得出质感：
-   * PBR 的金属几乎没有漫反射，画面全靠 `scene.environment` 里的环境反射，
-   * 没有它时 metalness 一高就整片发黑，只剩两盏平行灯打成的小高光点。
-   *
-   * @param source 等距柱状图（.hdr / .jpg / .png，2:1）地址，或已加载的 `THREE.Texture`；
-   *               `null` = 关掉环境图
-   * @param intensity 环境光强度（`scene.environmentIntensity`，默认 1）
-   *
-   * 传入 URL 时纹理由内部加载并转成 PMREM（预滤波 mipmap）；传 Texture 时不会接管它的生命周期。
-   */
-  async setEnvironment(
-    source: string | THREE.Texture | null,
-    intensity = 1
-  ): Promise<void> {
-    if (!this.renderer || !this.scene) return;
-    this.scene.environmentIntensity = Math.max(0, intensity);
-
-    if (source == null) {
-      this.scene.environment = null;
-      this._envRT?.dispose();
-      this._envRT = null;
-      this._requestRepaint();
-      return;
-    }
-
-    const fromUrl = typeof source === 'string';
-    const tex = fromUrl ? await new THREE.TextureLoader().loadAsync(source) : source;
-    // PMREM 只认等距柱状图；普通贴图也按 2:1 全景处理
-    tex.mapping = THREE.EquirectangularReflectionMapping;
-
-    const pmrem = new THREE.PMREMGenerator(this.renderer);
-    pmrem.compileEquirectangularShader();
-    const rt = pmrem.fromEquirectangular(tex);
-    pmrem.dispose();
-    if (fromUrl) tex.dispose();
-
-    this.scene.environment = rt.texture;
-    // 上一张（同一个 viewer 反复换）要释放，否则显存里会一直堆
-    this._envRT?.dispose();
-    this._envRT = rt;
-    this._requestRepaint();
   }
 
   /** 把某个样式键的取值转成动画通道能吃的形状（标量 or 线性 RGB 三元组） */
@@ -2335,7 +1878,7 @@ export class S3MViewer {
       },
       write: (v) => {
         if (this.uniforms.uEdgeFade) this.uniforms.uEdgeFade.value = v[0];
-        this._syncEdgeStyle();
+        this._edges.syncStyle();
       },
     });
 
@@ -2366,7 +1909,7 @@ export class S3MViewer {
       key === 'edgeOffset' ||
       key === 'edgeHullWidth'
     ) {
-      this._refreshEdgeLines();
+      this._edges.refreshLines();
     }
   }
 
@@ -2399,8 +1942,8 @@ export class S3MViewer {
     // 临界角变了要重建 CPU 棱线（EdgesGeometry 的参数），开 / 关走 setEdges 整体刷新。
     // 必须先 _disposeEdges()：setEdges 只挑「还没有棱线」的网格来建，
     // 不先拆掉的话已经建好的会被全部跳过，临界角改了等于没改。
-    if (('edgeThreshold' in patch || 'forceCpuEdges' in patch) && this._edgesEnabled) {
-      this._disposeEdges();
+    if (('edgeThreshold' in patch || 'forceCpuEdges' in patch) && this._edges.enabled) {
+      this._edges.disposeEdgeGeometry();
       this.setEdges(this.style.edges);
     } else if (
       'edgeColor' in patch ||
@@ -2411,12 +1954,12 @@ export class S3MViewer {
       'edgeHullWidth' in patch
     ) {
       // 颜色 / 粗细 / 外推距离 / 外扩厚度都只是 uniform，拖着滑块逐帧改也不重建几何
-      this._refreshEdgeLines();
+      this._edges.refreshLines();
     }
-    if (this._selection) {
+    if (this._sel.selection) {
       // 换描边画法要重建几何；颜色 / 粗细 / 拔高只是 uniform，拖着滑块也不卡
-      if ('outline' in patch || 'outlineStyle' in patch) this.select(this._selection, { silent: true });
-      else this._syncSelectionStyle();
+      if ('outline' in patch || 'outlineStyle' in patch) this.select(this._sel.selection, { silent: true });
+      else this._sel.syncStyle();
     }
   }
 
@@ -2492,7 +2035,7 @@ export class S3MViewer {
       this._opacityTransparent = transparent;
       // 关键：若 depthWrite 开启（默认开启），即使半透明也保持深度写入，完美遮挡背面棱线，防止背面线条透出
       const keepDepth = this.style.depthWrite !== false;
-      for (const p of this._pickables.values()) {
+      for (const p of this._picks.pickables.values()) {
         if (isPointCloudObject(p.mesh)) continue;
         const m = styledMaterialOf(p.mesh);
         if (!m) continue;
@@ -2508,12 +2051,12 @@ export class S3MViewer {
     // 点云不走 StyleMaterial，自己有一套 uOpacity，逐帧刷的只有这几个对象
     for (const pc of this._pointClouds) this._applyPointCloudStyle(pc);
 
-    this._syncEdgeStyle();
+    this._edges.syncStyle();
     this._requestRepaint();
   }
 
   /** 单个点云对象同步当前样式（着色模式 + 不透明度 + 选中高亮） */
-  private _applyPointCloudStyle(points: THREE.Points, selected = this._selectedMeshes.includes(points)): void {
+  private _applyPointCloudStyle(points: THREE.Points, selected = this._sel.selectedMeshes.includes(points)): void {
     applyPointCloudStyle(points, this.style, this.uniforms, selected);
   }
 
@@ -2528,7 +2071,7 @@ export class S3MViewer {
     // shading 现在是共享 uniform（uFlatShading）驱动的运行期分支，不再是
     // flatShading define：翻一个 float 就完成切换，零重编译、零卡顿。
     const target = this.style.shading !== 'smooth' ? 1 : 0;
-    for (const p of this._pickables.values()) {
+    for (const p of this._picks.pickables.values()) {
       const m = styledMaterialOf(p.mesh);
       const u = m?.userData.uFlatShading;
       if (!u || u.value === target) continue;
@@ -2568,7 +2111,7 @@ export class S3MViewer {
       'uBatchTexActive',
       'uTileFade',
     ] as const;
-    for (const p of this._pickables.values()) {
+    for (const p of this._picks.pickables.values()) {
       const mesh = p.mesh;
       const raw = mesh.material;
       if (Array.isArray(raw)) continue; // styled 材质恒为单材质；数组材质（点云等）不归这里管
@@ -2603,7 +2146,7 @@ export class S3MViewer {
 
     // 场上还没有材质就没必要预热：program 会在首个材质出现时编译
     let hasMaterial = false;
-    for (const p of this._pickables.values()) {
+    for (const p of this._picks.pickables.values()) {
       if (styledMaterialOf(p.mesh)) {
         hasMaterial = true;
         break;
@@ -2631,60 +2174,14 @@ export class S3MViewer {
    * 加载 n 块瓦片就是 O(n²) 次矩阵乘 + n² 个垃圾对象。现在只在网格进出的记一次，
    * 全局值从缓存里滚：只有被移除的那块正好卡在边界上时，才回退到一次 O(n) 重算。
    */
-  private _addMeshHeight(mesh: THREE.Mesh): void {
-    const bb = mesh.geometry?.boundingBox;
-    if (!bb) return;
-    this._boxScratch.copy(bb).applyMatrix4(mesh.matrixWorld);
-    const min = this._boxScratch.min.z;
-    const max = this._boxScratch.max.z;
-    if (!Number.isFinite(min) || !Number.isFinite(max)) return;
-    this._meshHeight.set(mesh, { min, max });
-    if (min < this._heightMin) this._heightMin = min;
-    if (max > this._heightMax) this._heightMax = max;
-    this._pushHeightRange();
+  /** @internal 见 viewer/HeightIndex.ts（regressions.test.ts 直接调） */
+  _addMeshHeight(mesh: THREE.Mesh): void {
+    this._heights.add(mesh);
   }
 
-  private _removeMeshHeight(mesh: THREE.Mesh): void {
-    const rec = this._meshHeight.get(mesh);
-    if (!rec) return;
-    this._meshHeight.delete(mesh);
-    // 只有正好卡在边界上才需要重算，否则滚动的 min/max 依然成立
-    if (rec.min === this._heightMin || rec.max === this._heightMax) this._recomputeHeightRange();
-    else this._pushHeightRange();
-  }
-
-  /** 数据集整体位移（换高程偏移 / 重新布局）后，缓存的世界高度全部失效 */
-  private _refreshAllHeights(): void {
-    if (this._meshHeight.size === 0) return;
-    const meshes = [...this._meshHeight.keys()];
-    this._meshHeight.clear();
-    this._heightMin = Infinity;
-    this._heightMax = -Infinity;
-    for (const mesh of meshes) this._addMeshHeight(mesh);
-    this._pushHeightRange();
-  }
-
-  private _recomputeHeightRange(): void {
-    let min = Infinity;
-    let max = -Infinity;
-    for (const h of this._meshHeight.values()) {
-      if (h.min < min) min = h.min;
-      if (h.max > max) max = h.max;
-    }
-    this._heightMin = min;
-    this._heightMax = max;
-    this._pushHeightRange();
-  }
-
-  private _pushHeightRange(): void {
-    let min = this._heightMin;
-    let max = this._heightMax;
-    if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
-      min = 0;
-      max = 100;
-    }
-    this.uniforms.uHeightMin.value = min;
-    this.uniforms.uHeightMax.value = max;
+  /** @internal 见 viewer/HeightIndex.ts */
+  _removeMeshHeight(mesh: THREE.Mesh): void {
+    this._heights.remove(mesh);
   }
 
   /** 建 SMID → 网格 反查表，逐单体改样式时才知道该重算哪几块 */
@@ -2712,1232 +2209,154 @@ export class S3MViewer {
     }
   }
 
-  /**
-   * 全局棱线开关。
-   *
-   * 取值是 `boolean | EdgeStyle | EdgeStyle[]`（见 resolveEdgeModes）：
-   *   - `true` / `'line'`   折边线（旧口径）
-   *   - `'offset'`          折边线 + 沿边法线外推 `edgeOffset` 米
-   *   - `'hull'`            背面外扩轮廓（选中侧 outlineStyle:'hull' 的整场景版）
-   *   - `'gpu'`             纯片元描边：零几何、零额外 pass，线宽约 1 像素
-   *   - 数组                叠加，例如 `['line', 'hull']`
-   *
-   * 数据自带棱线包（primitiveType 13）时直接用，成本为零；`style.forceCpuEdges`
-   * 可以无视它，改由 CPU 现算 —— 那是 CPU 端的活，几十万面一次性建会卡住主线程
-   * （实测 20 个网格 1.9s），所以按 8ms 一帧切片，边建边出。
-   *
-   * 棱线本身用「屏幕空间等宽线」画（见 EdgeLines.ts）：WebGL 的 lineWidth 基本无效，
-   * 只有摊成面向屏幕的四边形，`edgeWidth` 才能真正调粗。
-   *
-   * 带 `transition` 时做「淡入 / 淡出」，**不对几何做插值**（几何没法插值）：
-   * 开：立刻置位 + 开始分片建线，同时 `uEdgeFade` 0→1 —— 建好一块亮一块，视觉上是渐显；
-   * 关：`uEdgeFade` 1→0，淡完才 dispose，避免棱线「啪」一下消失。
-   */
+  /* ---------------------------------------------------------------- 棱线 */
+
+  /** @internal 测试用：棱线是否开启（实现在 EdgeDecorator） */
+  get _edgesEnabled(): boolean {
+    return this._edges.enabled;
+  }
+  /** @internal 测试用：当前画法 */
+  get _edgeModes(): EdgeModes {
+    return this._edges.modes;
+  }
+  /** @internal 测试用：GPU 描边实例（可替换） */
+  get _gpuEdge(): GpuEdgePass | null {
+    return this._edges.gpuEdge;
+  }
+  set _gpuEdge(v: GpuEdgePass | null) {
+    this._edges.gpuEdge = v;
+  }
+
+  /** @internal 测试用：给一块网格补折边线 */
+  _ensureEdges(mesh: THREE.Mesh): void {
+    this._edges.ensureEdges(mesh);
+  }
+
+  /** @internal 测试用：拆掉一块网格的棱线装饰 */
+  _removeEdges(mesh: THREE.Mesh): void {
+    this._edges.removeEdges(mesh);
+  }
+
+  /** 全局棱线开关，实现在 viewer/EdgeDecorator.ts */
   setEdges(edges: EdgesOption, transition?: TransitionOptions): void {
-    const wantAnim = !!transition && ((transition.duration ?? 0) > 0 || !!transition.spring);
-    const modes = resolveEdgeModes(edges);
-    // 换画法（line ↔ hull ↔ offset）是结构变更：旧装饰必须拆掉再建，
-    // 否则会出现「切到 hull 了折边线还留着」这种叠影。
-    // 同一画法重复调用（滑块逐帧 setEdges(true)）不重建，几何是复用的。
-    const modesChanged = !sameEdgeModes(this._edgeModes, modes);
-
-    this._edgeModes = modes;
-    this._edgesEnabled = modes.enabled;
-    this.style.edges = edges;
-    this._styleTarget.edges = edges;
-
-    // 数据自带的棱线：直接切可见性（forceCpuEdges 时永远收起，改由 CPU 现算）。
-    // 只遍历注册时收集好的那批 LineSegments —— 全数据集 traverse 在几千节点下太贵。
-    // gpu 模式下 shader 自己描边，native 线段包必须收起，否则叠成双线
-    const nativeVisible = modes.enabled && !modes.gpu && this.style.forceCpuEdges !== true;
-    for (const lines of this._nativeEdgeLines) {
-      lines.visible = nativeVisible;
-      this._styleEdgeLine(lines);
-    }
-    this._syncEdgeStyle();
-
-    // 关掉 gpu 画法就把后处理资源还回去（整屏 RT 白占显存没意义）。
-    // 必须放在「整体关闭」的早退之前，否则关棱线时永远轮不到它。
-    if (!modes.gpu && this._gpuEdge) {
-      this._gpuEdge.dispose();
-      this._gpuEdge = null;
-    }
-
-    if (!modes.enabled) {
-      if (wantAnim) {
-        this.animator.to('style.edgeFade', 0, {
-          ...transition,
-          onComplete: () => {
-            this._disposeEdges();
-            this._requestRepaint();
-            transition?.onComplete?.();
-          },
-        });
-      } else {
-        this._setEdgeFade(1);
-        this._disposeEdges();
-      }
-      this._requestRepaint();
-      return;
-    }
-
-    if (modesChanged) this._disposeEdges();
-
-    const pending = [...this._pickables.values()]
-      .map((p) => p.mesh)
-      .filter((m) => {
-        const ud = m.userData as MeshUserData;
-        // 点云没有棱可描
-        if (isPointCloudObject(m)) return false;
-        // native 棱线还算不算数，取决于**当前**的 forceCpuEdges（它可以在运行中切换），
-        // 所以这里按注册时记下的原始标记重算，而不是沿用注册那一刻的结论。
-        ud.nativeEdges = ud.nativeEdgesRaw === true && this.style.forceCpuEdges !== true;
-        return !ud.nativeEdges && this._needsEdgeDecoration(ud);
-      });
-    let i = 0;
-    const step = (): void => {
-      const t0 = performance.now();
-      while (i < pending.length && performance.now() - t0 < 8) this._ensureEdgeDecoration(pending[i++]);
-      if (i < pending.length) setTimeout(step, 0);
-      else this._requestRepaint();
-    };
-    step();
-
-    if (wantAnim) {
-      // 从 0 起淡入：新建出来的棱线自动继承当前进度，不会半路冒出一条满亮度的线
-      this._setEdgeFade(0);
-      this.animator.to('style.edgeFade', 1, transition);
-    } else {
-      this._setEdgeFade(1);
-    }
+    this._edges.setEdges(edges, transition);
   }
 
-  /** 直接写棱线淡入乘子（不走动画通道） */
-  private _setEdgeFade(v: number): void {
-    if (this.uniforms.uEdgeFade) this.uniforms.uEdgeFade.value = v;
-    this._syncEdgeStyle();
-  }
-
-  /** 释放所有现算棱线几何 */
-  private _disposeEdges(): void {
-    for (const p of this._pickables.values()) this._removeEdges(p.mesh);
-  }
-
-  /**
-   * 挂载预制棱线缓存（Crease Cache）。
-   *
-   * 直接把 `source-creases.f32` 这类 Float32Array 缓冲载入为一组全局统一的
-   * LineSegments —— 相比逐 Mesh 现算 EdgesGeometry，性能高一个量级，视觉也最干净。
-   * 坐标按「场景本地坐标」（相对场景锚点的米）处理，与瓦片几何同一坐标系。
-   *
-   * @param url  棱线缓存地址（二进制 Float32 序列：x,y,z,x,y,z,… 成对成段）
-   */
-  async loadCreases(url: string): Promise<void> {
-    const resp = await authFetch(url, this._authenticate, 'creases');
-    if (!resp.ok) throw new Error(`[s3m] 棱线缓存加载失败: ${resp.status} ${url}`);
-    const buf = await resp.arrayBuffer();
-    const arr = new Float32Array(buf);
-    if (arr.length < 6) return;
-
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
-    const s = this.style;
-    const mat = new THREE.LineBasicMaterial({
-      color: new THREE.Color(s.edgeColor),
-      transparent: true,
-      opacity: Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * clampOpacity(s.opacity),
-      depthWrite: false,
-    });
-    const lines = new THREE.LineSegments(geo, mat);
-    lines.renderOrder = 2;
-    lines.frustumCulled = false;
-    lines.raycast = () => {};
-
-    this.clearCreases();
-    this._creaseLines = lines;
-    this.scene?.add(lines);
-    this._requestRepaint();
+  /** 挂载预制棱线缓存（Crease Cache），见 viewer/EdgeDecorator.ts */
+  loadCreases(url: string): Promise<void> {
+    return this._edges.loadCreases(url);
   }
 
   /** 移除并释放预制棱线缓存 */
   clearCreases(): void {
-    if (!this._creaseLines) return;
-    this.scene?.remove(this._creaseLines);
-    this._creaseLines.geometry.dispose();
-    (this._creaseLines.material as THREE.Material)?.dispose?.();
-    this._creaseLines = null;
-    this._requestRepaint();
-  }
-
-  /**
-   * 让全局棱线材质跟上 style.edgeColor / edgeWidth / edgeOpacity / edgeOffset。
-   *
-   * 全程 O(1)：只有一份共享 edgeMaterial（所有逐 mesh 棱线都用它）+ 一份预制缓存
-   * + 一批共享外观对象的轮廓壳，所以棱线淡入淡出只要改一个 uniform，
-   * 新建瓦片自动继承当前进度。
-   */
-  private _syncEdgeStyle(): void {
-    const s = this.style;
-    const fade = this.uniforms.uEdgeFade?.value ?? 1;
-    const opacity =
-      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) *
-      clampOpacity(s.opacity) *
-      fade;
-    const u = this.edgeMaterial.uniforms;
-    u.uColor.value.set(s.edgeColor);
-    u.uWidth.value = Math.max(0.1, s.edgeWidth ?? 1.5);
-    u.uOpacity.value = opacity;
-    // 外推距离只在 offset 画法下非 0；其它画法把线钉在面上（与改动前一致）
-    u.uOffset.value = this._edgeModes.offset ? Math.max(0, s.edgeOffset ?? 0.15) : 0;
-    // 外扩轮廓壳与折边线共用颜色 / 透明度，厚度是米制的单独一项
-    const h = this._hullStyleUniforms;
-    h.uColor.value.set(s.edgeColor);
-    h.uWidth.value = Math.max(0, s.edgeHullWidth ?? 0.9);
-    h.uOpacity.value = opacity;
-    // GPU 描边（edges: 'gpu'）是后处理，参数每帧从 style 现取，这里不用同步 uniform
-    // 预制棱线缓存（LineBasicMaterial）同步颜色 / 不透明度
-    if (this._creaseLines) {
-      const m = this._creaseLines.material as THREE.LineBasicMaterial;
-      m.color.set(s.edgeColor);
-      m.opacity = opacity;
-    }
-  }
-
-  /** 让数据自带的棱线跟着 style.edgeColor / opacity 走（这些是 LineBasicMaterial，改不了粗细） */
-  private _styleEdgeLine(lines: THREE.LineSegments): void {
-    const mat = lines.material as THREE.LineBasicMaterial;
-    if (!mat || !mat.color) return;
-    mat.color.set(this.style.edgeColor);
-    const baseOpacity = this.style.edgeOpacity ?? 0.6;
-    mat.opacity =
-      baseOpacity *
-      clampOpacity(this.style.opacity) *
-      (this.uniforms.uEdgeFade?.value ?? 1);
-    mat.transparent = true;
-    mat.polygonOffset = true;
-    mat.polygonOffsetFactor = -1;
-    mat.polygonOffsetUnits = -1;
-    mat.needsUpdate = true;
-  }
-
-  /**
-   * 刷新所有棱线外观。
-   *
-   * 数据自带的棱线是逐对象的 LineBasicMaterial，改颜色只能一个个写；但原来每次都要
-   * 遍历整个数据集树（几千个节点），颜色动画逐帧跑就是灾难。改成只刷注册时收集好的
-   * 那批 LineSegments，复杂度降到 O(棱线条数)。
-   */
-  private _refreshEdgeLines(): void {
-    this._syncEdgeStyle();
-    for (const lines of this._nativeEdgeLines) {
-      if (lines.parent) this._styleEdgeLine(lines);
-    }
-  }
-
-  /** 地形 / 绿地 / 道路 / 地面铺装等不参与自动描边（数据自带棱线包另说） */
-  private static readonly _EDGE_SKIP_KEYWORDS = [
-    'terrain', 'ground', 'vegetation', 'green', 'road', 'dem',
-    '绿地', '道路', '地面', '地形', '植被', '铺装',
-  ];
-
-  /** 数据集级别的棱线开关：enableEdges 优先，否则跟随全局 style.edges */
-  private _datasetEdgesEnabled(entry: S3MDatasetEntry): boolean {
-    const opt = entry.options?.enableEdges;
-    if (opt === true) return true;
-    if (opt === false) return false;
-    return this._edgesEnabled;
-  }
-
-  /** 该 mesh 是否命中「跳过自动描边」的关键字（skeletonName / 数据集名） */
-  private _shouldSkipAutoEdges(ud: MeshUserData, datasetName: string): boolean {
-    const hay = `${ud.skeletonName ?? ''} ${datasetName}`.toLowerCase();
-    return S3MViewer._EDGE_SKIP_KEYWORDS.some((k) => hay.includes(k));
-  }
-
-  /**
-   * 这块网格还缺哪种棱线装饰（缺就建，齐了就不动）。
-   *
-   * setEdges 的分片建线靠它筛「还没建完的」，注册新瓦片也靠它决定要不要动手。
-   */
-  private _needsEdgeDecoration(ud: MeshUserData): boolean {
-    if (this._edgeModes.line && !ud.edges) return true;
-    if (this._edgeModes.hull && !ud.edgeHull) return true;
-    return false;
-  }
-
-  /** 按当前画法补齐这块网格的棱线装饰 */
-  private _ensureEdgeDecoration(mesh: THREE.Mesh): void {
-    if (this._edgeModes.line) this._ensureEdges(mesh);
-    if (this._edgeModes.hull) this._ensureHull(mesh);
-  }
-
-  private _ensureEdges(mesh: THREE.Mesh): void {
-    const ud = mesh.userData as MeshUserData;
-    if (ud.edges || ud.nativeEdges || !mesh.geometry) return;
-    // 地形 / 绿地 / 道路等不参与自动描边（即使全局开棱线也要跳过）
-    if (this._shouldSkipAutoEdges(ud, '')) return;
-
-    const posAttr = mesh.geometry.getAttribute('position');
-    const indexCount = mesh.geometry.index?.count ?? (posAttr ? posAttr.count : 0);
-    // 棱线是 CPU 端建的，超大几何直接跳过，避免拖慢加载
-    if (indexCount > 120000) return;
-
-    // 1. 先做顶点容差焊合，让相邻三角形正确共享边索引。
-    //    S3M 几何常为「每面独立顶点」，不焊合的话 EdgesGeometry 会把每条三角形边都当成边界，棱线爆炸。
-    //    注意用本地实现而不是 three/examples/jsm —— jsm 子路径导入会在宿主里
-    //    制造第二份 three 实例（"Multiple instances of Three.js" 警告的元凶）。
-    //    tolerance 取米级模型下的 5mm，足以合并重合顶点又不会误并真实相邻面。
-    const welded = mergeVerticesByPosition(mesh.geometry, 0.005);
-    // 2. 调大临界角（默认 55°，可在 style.edgeThreshold 调），过滤浅坡与曲面细分，只保留真正的棱。
-    const thresholdAngle = this.style.edgeThreshold ?? 55;
-
-    // 'offset' 画法要额外带一条「边法线」才知道往哪推，所以走本地实现（它本来就算好了
-    // 相邻两面法线）；其余画法保持 EdgesGeometry 这条老路，几何输出与改动前逐字一致。
-    let segments: Float32Array | null;
-    let normals: Float32Array | undefined;
-    if (this._edgeModes.offset) {
-      const raw: number[] = [];
-      segments = buildFeatureEdgeSegments(welded, null, thresholdAngle, raw);
-      if (raw.length > 0) normals = new Float32Array(raw);
-    } else {
-      const source = new THREE.EdgesGeometry(welded, thresholdAngle);
-      const attr = source.getAttribute('position') as THREE.BufferAttribute | undefined;
-      segments = attr ? (attr.array as Float32Array) : null;
-      source.dispose();
-    }
-    welded.dispose();
-    if (!segments || segments.length < 6) return;
-
-    // 3. 回填每段棱线所属的单体 batchId。
-    //    EdgesGeometry 只输出坐标不输出顶点号，只能拿端点坐标去查「位置 → batchId」表。
-    //    没有这张表，单体一动棱线就留在原地——这正是「棱线跟随」的关键一环。
-    const TOL = 0.005;
-    const batchMap = buildPositionBatchMap(mesh.geometry, TOL);
-    let batchIds: Float32Array | undefined;
-    if (batchMap) {
-      const segCount = segments.length / 6;
-      batchIds = new Float32Array(segCount);
-      for (let i = 0; i < segCount; i++) {
-        const s = i * 6;
-        batchIds[i] =
-          batchMap.get(positionQuantKey(segments[s], segments[s + 1], segments[s + 2], 1 / TOL)) ?? -1;
-      }
-    }
-
-    const lines = new THREE.Mesh(
-      buildThickLineGeometry(segments, batchIds, normals),
-      this._createEdgeMaterial(mesh)
-    );
-    lines.renderOrder = 2;
-    // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
-    lines.frustumCulled = false;
-    lines.raycast = () => {};
-    (lines.userData as MeshUserData).isThickEdge = true;
-    ud.edges = lines;
-    mesh.add(lines); // 作为子节点，自动继承 mesh 的世界变换
-  }
-
-  /**
-   * 给一块网格挂「背面外扩轮廓」（整场景版）。
-   *
-   * 复用选中侧那套 `createOutlineMaterial`：顶点沿法线鼓 `edgeHullWidth` 米、只画背面，
-   * 于是被本体挡住的部分不显示，露出来的那圈就是描边。与折边线的差别在于——
-   * 这里**不建任何新几何**，成本只是把同一块网格多画一遍，折边判定那套 CPU 活全省了。
-   *
-   * 实例化几何拿不到逐实例变换（轮廓壳是 mesh 的子节点，不吃 instanceMatrix），
-   * 直接跳过：宁可这栋没描边，也不要所有实例的壳叠在原点。
-   */
-  private _ensureHull(mesh: THREE.Mesh): void {
-    const ud = mesh.userData as MeshUserData;
-    if (ud.edgeHull || !mesh.geometry) return;
-    if ((mesh as unknown as { isInstancedMesh?: boolean }).isInstancedMesh) return;
-    // 地形 / 绿地 / 道路等不参与自动描边（即使全局开棱线也要跳过）
-    if (this._shouldSkipAutoEdges(ud, '')) return;
-
-    // 逐网格一份材质（各绑各的单体状态纹理），外观 uniform 复用共享对象
-    const mat = createOutlineMaterial(
-      this.uniforms,
-      this.style.edgeHullWidth ?? 0.9,
-      this._hullStyleUniforms,
-      true
-    );
-    // 整块几何都要外扩：选中侧靠 uSelBatch 只扩一栋，全局必须置 whole
-    mat.uniforms.uSelWhole.value = 1;
-    mat.uniforms.uSelBatch.value = -1;
-    const styled = styledMaterialOf(mesh);
-    if (styled?.userData?.uBatchTex) {
-      mat.uniforms.uBatchTex.value = styled.userData.uBatchTex.value as THREE.Texture;
-      mat.uniforms.uBatchTexWidth.value = styled.userData.uBatchTexWidth.value as number;
-      mat.uniforms.uBatchTexActive.value = styled.userData.uBatchTexActive.value as number;
-    }
-
-    const hull = new THREE.Mesh(mesh.geometry, mat);
-    hull.renderOrder = 2;
-    hull.frustumCulled = false;
-    hull.raycast = () => {};
-    (hull.userData as MeshUserData).isEdgeHull = true;
-    ud.edgeHull = hull;
-    mesh.add(hull); // 作为子节点，自动继承 mesh 的世界变换
-  }
-
-  /**
-   * 给一块网格造专属的棱线材质。
-   *
-   * 棱线材质必须逐网格一份，因为它要绑定**这个网格**的单体状态纹理；但外观
-   * （颜色 / 粗细 / 透明度）必须全局统一——所以外观 uniform 直接复用
-   * `_edgeStyleUniforms` 里的对象，`_syncEdgeStyle()` 改一次全部生效，
-   * program 也因为着色器相同而只编译一次。
-   */
-  private _createEdgeMaterial(mesh: THREE.Mesh): ThickLineMaterial {
-    const styled = styledMaterialOf(mesh);
-    const batch = styled?.userData?.uBatchTex
-      ? {
-          uBatchTex: styled.userData.uBatchTex,
-          uBatchTex2: styled.userData.uBatchTex2,
-          uBatchMix: this.uniforms.uBatchMix,
-          uBatchTexWidth: styled.userData.uBatchTexWidth,
-          uBatchTexActive: styled.userData.uBatchTexActive,
-          uPathTex: this.uniforms.uPathTex,
-          uPathCount: this.uniforms.uPathCount,
-          uPathTexActive: this.uniforms.uPathTexActive,
-          uPathTime: this.uniforms.uPathTime,
-        }
-      : undefined;
-    return createThickLineMaterial(this.lineShared, {}, this._edgeStyleUniforms, batch);
-  }
-
-  /** 选中棱线的逐网格材质，道理同上 */
-  private _createSelectionEdgeMaterial(mesh: THREE.Mesh): ThickLineMaterial {
-    const styled = styledMaterialOf(mesh);
-    const batch = styled?.userData?.uBatchTex
-      ? {
-          uBatchTex: styled.userData.uBatchTex,
-          uBatchTex2: styled.userData.uBatchTex2,
-          uBatchMix: this.uniforms.uBatchMix,
-          uBatchTexWidth: styled.userData.uBatchTexWidth,
-          uBatchTexActive: styled.userData.uBatchTexActive,
-          uPathTex: this.uniforms.uPathTex,
-          uPathCount: this.uniforms.uPathCount,
-          uPathTexActive: this.uniforms.uPathTexActive,
-          uPathTime: this.uniforms.uPathTime,
-        }
-      : undefined;
-    return createThickLineMaterial(this.lineShared, {}, this._selEdgeStyleUniforms, batch);
-  }
-
-  private _removeEdges(mesh: THREE.Mesh): void {
-    const ud = mesh.userData as MeshUserData;
-
-    const lines = ud.edges;
-    if (lines) {
-      mesh.remove(lines);
-      (lines as THREE.Mesh).geometry?.dispose();
-      // 棱线材质现在是逐网格一份（要绑各自的 batch 纹理），得跟着释放
-      const mat = (lines as THREE.Mesh).material;
-      if (Array.isArray(mat)) {
-        mat.forEach((m) => (m as any)?.dispose?.());
-      } else {
-        (mat as any)?.dispose?.();
-      }
-      ud.edges = null;
-    }
-
-    // 外扩壳的 geometry 是**复用主网格的**，只能释放材质，不能 dispose 几何
-    const hull = ud.edgeHull;
-    if (hull) {
-      mesh.remove(hull);
-      const hmat = hull.material;
-      if (Array.isArray(hmat)) hmat.forEach((m) => (m as any)?.dispose?.());
-      else (hmat as any)?.dispose?.();
-      ud.edgeHull = null;
-    }
+    this._edges.clearCreases();
   }
 
   /* ---------------------------------------------------------------- 拾取 */
 
-  /** 获取指定屏幕像素对应的场景射线（用于高精度求交与穿透拾取） */
+  /** 屏幕像素 → 场景射线，见 viewer/PickService.ts */
   getRayAt(x: number, y: number): THREE.Ray | null {
-    if (!this.camera || !this.canvas) return null;
-    const canvas = this.canvas;
-    const w = canvas.clientWidth || canvas.width;
-    const h = canvas.clientHeight || canvas.height;
-    if (!w || !h) return null;
-
-    const ndcX = (x / w) * 2 - 1;
-    const ndcY = -(y / h) * 2 + 1;
-
-    const near = new THREE.Vector3(ndcX, ndcY, -1).unproject(this.camera);
-    const far = new THREE.Vector3(ndcX, ndcY, 1).unproject(this.camera);
-    const dir = far.clone().sub(near).normalize();
-    return new THREE.Ray(near, dir);
+    return this._picks.getRayAt(x, y);
   }
 
-  private _intersectMeshAtRay(mesh: THREE.Mesh, ray: THREE.Ray, instanceIndex?: number): THREE.Vector3 | null {
-    const raycaster = new THREE.Raycaster();
-    raycaster.ray.copy(ray);
-    const hits = raycaster.intersectObject(mesh, false);
-    if (!hits.length) return null;
-    if (instanceIndex != null) {
-      const match = hits.find((h) => h.instanceId === instanceIndex);
-      return match ? match.point : hits[0].point;
-    }
-    return hits[0].point;
-  }
-
-  private _buildPickResult(
-    hit: { objectId: number; batchId: number; instanceIndex?: number },
-    ref: PickableRef,
-    exactPoint?: THREE.Vector3,
-    ray?: THREE.Ray
-  ): PickResult | null {
-    const ud = ref.mesh.userData as MeshUserData;
-    // 泼溅走独立分支：它既没有 instanceMatrix，也没有 geoRef.pickInfo 里的单体表，
-    // 走下面那段会在 `_instanceFeature()` 拿到 null 直接返回 —— 表现是「点得中但拿不到结果」。
-    if (ud.isGaussianSplat) return this._buildSplatPickResult(hit, ref, exactPoint, ray);
-    let smid: number | null = null;
-    let batchId = hit.batchId;
-    let instanceIndex = hit.instanceIndex;
-    let geoRef = ud.geoRef;
-    let segments: Array<{ vertexOffset: number; vertexCount: number }> = [];
-
-    if (instanceIndex != null) {
-      const feature = this._instanceFeature(ref.mesh, geoRef, instanceIndex);
-      if (!feature) return null;
-      smid = feature.smid;
-      batchId = feature.batchId;
-    } else {
-      geoRef = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(hit.batchId) ?? ud.geoRef;
-      const resolved = resolveFeature(geoRef, hit.batchId);
-      smid = resolved.smid;
-      segments = resolved.segments;
-    }
-
-    if (this._isFeatureHidden(smid, batchId)) return null;
-
-    let box: SegmentBox | null = null;
-    let totalTriangles = 0;
-
-    if (instanceIndex != null) {
-      box = this._instanceBox(ref.mesh, instanceIndex);
-      totalTriangles = ref.mesh.geometry.index ? Math.round(ref.mesh.geometry.index.count / 3) : 0;
-    } else if (smid != null && this._smidMeshes.has(smid)) {
-      const meshes = this._smidMeshes.get(smid)!;
-      let minX = Infinity;
-      let minY = Infinity;
-      let minZ = Infinity;
-      let maxX = -Infinity;
-      let maxY = -Infinity;
-      let maxZ = -Infinity;
-      let count = 0;
-      for (const m of meshes) {
-        const mUd = m.userData as MeshUserData;
-        const mPick = mUd.geoRef?.pickInfo;
-        const entry = (mPick as Record<string | number, unknown> | undefined)?.[smid] ??
-          (mPick as Record<string | number, unknown> | undefined)?.[String(smid)];
-        const bId = entry ? pickEntryId(entry as any) : -1;
-        const mSegs = (entry as any)?.segments ?? (bId >= 0 ? resolveFeature(mUd.geoRef, bId).segments : []);
-        const mBox = measureSegments(m.geometry, mSegs);
-        if (mBox) {
-          if (mBox.minX < minX) minX = mBox.minX;
-          if (mBox.minY < minY) minY = mBox.minY;
-          if (mBox.minZ < minZ) minZ = mBox.minZ;
-          if (mBox.maxX > maxX) maxX = mBox.maxX;
-          if (mBox.maxY > maxY) maxY = mBox.maxY;
-          if (mBox.maxZ > maxZ) maxZ = mBox.maxZ;
-          count += mBox.count;
-          totalTriangles += mBox.triangles;
-        }
-      }
-      if (count > 0) {
-        box = { minX, minY, minZ, maxX, maxY, maxZ, count, triangles: totalTriangles };
-      }
-    }
-
-    if (!box) {
-      box = measureSegments(ref.mesh.geometry, segments);
-      if (!box && ref.mesh.geometry) {
-        if (!ref.mesh.geometry.boundingBox) ref.mesh.geometry.computeBoundingBox();
-        const bb = ref.mesh.geometry.boundingBox;
-        if (bb) {
-          box = {
-            minX: bb.min.x,
-            maxX: bb.max.x,
-            minY: bb.min.y,
-            maxY: bb.max.y,
-            minZ: bb.min.z,
-            maxZ: bb.max.z,
-            count: 0,
-            triangles: 0,
-          };
-        }
-      }
-    }
-    const geometry = ref.mesh.geometry;
-    const triangles = totalTriangles > 0 ? totalTriangles : (geometry.index ? Math.round(geometry.index.count / 3) : 0);
-    const attributes = buildAttributes({ smid, box, triangles, floorHeight: this.style.floorHeight });
-
-    let centerLngLat: [number, number] | null = null;
-    if (box && this.sceneAnchor) {
-      const v = new THREE.Vector3((box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2, (box.minZ + box.maxZ) / 2);
-      v.applyMatrix4(ref.mesh.matrixWorld);
-      const s = this.sceneAnchor.meterInMercator;
-      centerLngLat = this._lngLatFromWorld(v.x * s + this.sceneAnchor.x, -v.y * s + this.sceneAnchor.y);
-    }
-
-    // 精确命中点求交计算
-    let hitPoint: THREE.Vector3 | null = exactPoint ?? null;
-    if (!hitPoint && ray) {
-      hitPoint = this._intersectMeshAtRay(ref.mesh, ray, instanceIndex);
-    }
-
-    let point: [number, number, number] | null = null;
-    let lngLat: [number, number] | null = null;
-    let altitude: number | null = null;
-
-    if (hitPoint && this.sceneAnchor) {
-      const off = smid != null ? this._featureStyleManager.getFeatureEffectiveOffset(smid) : {};
-      const trans = off.translation;
-      const elev = off.elevation;
-      const finalPos = hitPoint.clone();
-
-      if (off.rotation) {
-        const rotMat = resolveRotationMatrix(off.rotation);
-        if (rotMat) {
-          const m3 = new THREE.Matrix3().set(
-            rotMat[0], rotMat[1], rotMat[2],
-            rotMat[3], rotMat[4], rotMat[5],
-            rotMat[6], rotMat[7], rotMat[8]
-          );
-          const piv = off.pivot ? new THREE.Vector3(off.pivot[0], off.pivot[1], off.pivot[2]) : new THREE.Vector3(0, 0, 0);
-          finalPos.sub(piv).applyMatrix3(m3).add(piv);
-        }
-      }
-
-      if (trans) finalPos.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
-      else if (elev) finalPos.z += elev;
-
-      point = [finalPos.x, finalPos.y, finalPos.z];
-      const s = this.sceneAnchor.meterInMercator;
-      lngLat = this._lngLatFromWorld(finalPos.x * s + this.sceneAnchor.x, -finalPos.y * s + this.sceneAnchor.y);
-      altitude = finalPos.z + (this.sceneAnchor.altitude ?? 0);
-    } else if (centerLngLat && box && this.sceneAnchor) {
-      lngLat = centerLngLat;
-      altitude = (box.minZ + box.maxZ) / 2 + (this.sceneAnchor.altitude ?? 0);
-    }
-
-    return {
-      datasetId: ref.datasetId,
-      datasetName: this.datasets.get(ref.datasetId)?.name ?? ref.datasetId,
-      objectId: hit.objectId,
-      batchId,
-      instanceIndex,
-      skeletonName: ref.skeletonName,
-      centerLngLat,
-      point,
-      lngLat,
-      altitude,
-      ...attributes,
-      mesh: ref.mesh,
-    };
-  }
-
-  /**
-   * 泼溅的拾取结果。
-   *
-   * 整块泼溅瓦片当一个单体（没有单体级 smid 可报），命中点由 `splatRaycast` 给出 ——
-   * 它按每个高斯的 3σ 球求交，比拾取那一趟为了命中率摊开的 4px 方块准得多。
-   * 包围盒必须由 `iCenter` 算：geometry 的 position 只是 [-1,1]² 的四边形角点。
-   */
-  private _buildSplatPickResult(
-    hit: { objectId: number; batchId: number; instanceIndex?: number },
-    ref: PickableRef,
-    exactPoint?: THREE.Vector3,
-    ray?: THREE.Ray
-  ): PickResult | null {
-    const anchor = this.sceneAnchor;
-    if (!anchor) return null;
-    const mesh = ref.mesh;
-
-    let hitPoint = exactPoint ?? null;
-    if (!hitPoint && ray) hitPoint = this._intersectMeshAtRay(mesh, ray);
-
-    const local = splatCenterBounds(mesh.geometry);
-    const box: SegmentBox | null = local
-      ? {
-          minX: local.minX,
-          minY: local.minY,
-          minZ: local.minZ,
-          maxX: local.maxX,
-          maxY: local.maxY,
-          maxZ: local.maxZ,
-          count: local.count,
-          triangles: 0,
-        }
-      : null;
-
-    const attributes = buildAttributes({
-      smid: null,
-      box,
-      triangles: 0,
-      floorHeight: this.style.floorHeight,
-    });
-
-    const s = anchor.meterInMercator;
-    let point: [number, number, number] | null = null;
-    let lngLat: [number, number] | null = null;
-    let altitude: number | null = null;
-    let centerLngLat: [number, number] | null = null;
-
-    if (hitPoint) {
-      point = [hitPoint.x, hitPoint.y, hitPoint.z];
-      lngLat = this._lngLatFromWorld(hitPoint.x * s + anchor.x, -hitPoint.y * s + anchor.y);
-      altitude = hitPoint.z + (anchor.altitude ?? 0);
-      // 泼溅命中的就是一个高斯，没有「单体中心」可言，用命中点当中心
-      centerLngLat = lngLat;
-    } else if (box) {
-      const v = new THREE.Vector3(
-        (box.minX + box.maxX) / 2,
-        (box.minY + box.maxY) / 2,
-        (box.minZ + box.maxZ) / 2
-      ).applyMatrix4(mesh.matrixWorld);
-      centerLngLat = this._lngLatFromWorld(v.x * s + anchor.x, -v.y * s + anchor.y);
-      altitude = v.z + (anchor.altitude ?? 0);
-    }
-
-    return {
-      datasetId: ref.datasetId,
-      datasetName: this.datasets.get(ref.datasetId)?.name ?? ref.datasetId,
-      objectId: hit.objectId,
-      batchId: -1,
-      instanceIndex: undefined,
-      skeletonName: ref.skeletonName,
-      centerLngLat,
-      point,
-      lngLat,
-      altitude,
-      ...attributes,
-      mesh,
-    };
-  }
-
-  /** 按 canvas 左上角的 CSS 像素坐标拾取。 */
+  /** 按 canvas 左上角的 CSS 像素坐标拾取 */
   pick(x: number, y: number): PickResult | null {
-    if (!this.picker || !this.scene || !this.camera || !this.sceneAnchor) return null;
-    const hit = this.picker.pick(this.scene, this.camera, x, y);
-    if (!hit) return null;
-
-    const ref = this._pickables.get(hit.objectId);
-    if (!ref) return null;
-
-    const ray = this.getRayAt(x, y);
-    return this._buildPickResult(hit, ref, undefined, ray ?? undefined);
+    return this._picks.pick(x, y);
   }
 
-  /**
-   * 拾取指定屏幕像素对应的世界坐标与场景位置。
-   * 优先与命中的建筑网格精确求交；未命中建筑时若视线与地表相交则返回地面交点。
-   */
+  /** 拾取并返回经纬度 + 高程 */
   pickPosition(x: number, y: number): { lngLat: [number, number]; altitude: number; point: [number, number, number] } | null {
-    if (!this.camera || !this.sceneAnchor) return null;
-
-    const hit = this.pick(x, y);
-    if (hit?.point && hit?.lngLat && hit.altitude != null) {
-      return {
-        lngLat: hit.lngLat,
-        altitude: hit.altitude,
-        point: hit.point,
-      };
-    }
-
-    const ray = this.getRayAt(x, y);
-    if (!ray) return null;
-
-    const groundPlane = new THREE.Plane(new THREE.Vector3(0, 0, 1), 0);
-    const target = new THREE.Vector3();
-    const intersect = ray.intersectPlane(groundPlane, target);
-    if (intersect) {
-      const s = this.sceneAnchor.meterInMercator;
-      const lngLat = this._lngLatFromWorld(intersect.x * s + this.sceneAnchor.x, -intersect.y * s + this.sceneAnchor.y);
-      const altitude = intersect.z + (this.sceneAnchor.altitude ?? 0);
-      return {
-        lngLat,
-        altitude,
-        point: [intersect.x, intersect.y, intersect.z],
-      };
-    }
-    return null;
+    return this._picks.pickPosition(x, y);
   }
 
-  /**
-   * 沿视线方向穿透拾取多个单体，按由近至远排序返回。
-   */
+  /** 穿透拾取：沿射线返回前 `limit` 个命中 */
   drillPick(x: number, y: number, limit = 10): PickResult[] {
-    if (!this.sceneAnchor || !this.camera) return [];
-    const ray = this.getRayAt(x, y);
-    if (!ray) return [];
-
-    const raycaster = new THREE.Raycaster();
-    raycaster.ray.copy(ray);
-
-    const meshes = [...this._pickables.values()]
-      .map((p) => p.mesh)
-      .filter((m) => {
-        let curr: THREE.Object3D | null = m;
-        while (curr) {
-          if (!curr.visible) return false;
-          curr = curr.parent;
-        }
-        return true;
-      });
-    const hits = raycaster.intersectObjects(meshes, false);
-    if (!hits.length) return [];
-
-    const results: PickResult[] = [];
-    const seenSmids = new Set<number>();
-    const seenBatches = new Set<string>();
-
-    for (const hit of hits) {
-      if (results.length >= limit) break;
-      const mesh = hit.object as THREE.Mesh;
-      const ud = mesh.userData as MeshUserData & { pickId?: number };
-      if (ud.pickId == null) continue;
-      const ref = this._pickables.get(ud.pickId);
-      if (!ref) continue;
-
-      let smid: number | null = null;
-      let batchId = -1;
-      let instanceIndex = hit.instanceId;
-
-      if (instanceIndex != null) {
-        const feature = this._instanceFeature(mesh, ud.geoRef, instanceIndex);
-        if (!feature) continue;
-        smid = feature.smid;
-        batchId = feature.batchId;
-      } else if (hit.faceIndex != null) {
-        const batchAttr = mesh.geometry.attributes.aBatchId;
-        if (batchAttr) {
-          const idx = mesh.geometry.index ? mesh.geometry.index.getX(hit.faceIndex * 3) : hit.faceIndex * 3;
-          batchId = Math.round(batchAttr.getX(idx));
-          const geoRef = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(batchId) ?? ud.geoRef;
-          const resolved = resolveFeature(geoRef, batchId);
-          smid = resolved.smid;
-        }
-      }
-
-      if (smid != null) {
-        if (seenSmids.has(smid)) continue;
-        seenSmids.add(smid);
-      } else {
-        const key = `${ud.pickId}:${batchId}:${instanceIndex ?? -1}`;
-        if (seenBatches.has(key)) continue;
-        seenBatches.add(key);
-      }
-
-      if (this._isFeatureHidden(smid, batchId)) continue;
-
-      const pickHit = {
-        objectId: ud.pickId,
-        batchId,
-        instanceIndex,
-      };
-      const res = this._buildPickResult(pickHit, ref, hit.point);
-      if (res) results.push(res);
-    }
-
-    return results;
+    return this._picks.drillPick(x, y, limit);
   }
 
-  /**
-   * 获取指定 SMID 单体的经纬度包围盒 [[minLng, minLat], [maxLng, maxLat]]。
-   * 若模型尚未加载到场景中或无此单体则返回 null。
-   */
+  /** 单体的经纬度包围盒 */
   getFeatureBounds(smid: number): [[number, number], [number, number]] | null {
-    if (!this.sceneAnchor) return null;
-    let minLng = Infinity;
-    let maxLng = -Infinity;
-    let minLat = Infinity;
-    let maxLat = -Infinity;
-    let found = false;
-
-    for (const ref of this._pickables.values()) {
-      const mesh = ref.mesh;
-      const ud = mesh.userData as MeshUserData;
-      const geoRef = ud.geoRef;
-      const pickInfo = geoRef?.pickInfo;
-      if (!pickInfo) continue;
-
-      let box: SegmentBox | null = null;
-      if ((mesh as THREE.InstancedMesh).isInstancedMesh) {
-        let lookup = ud.instanceLookup as Map<number, InstanceFeature> | undefined;
-        if (!lookup) {
-          lookup = buildInstanceLookup(pickInfo);
-          ud.instanceLookup = lookup;
-        }
-        for (const [instIdx, feat] of lookup) {
-          if (feat.smid === smid) {
-            box = this._instanceBox(mesh, instIdx);
-            break;
-          }
-        }
-      } else {
-        const infoMap = pickInfo as Record<string | number, unknown>;
-        const entry = infoMap[smid] ?? infoMap[String(smid)];
-        if (entry) {
-          const bId = pickEntryId(entry);
-          const resolved = resolveFeature(geoRef, bId);
-          box = measureSegments(mesh.geometry, resolved.segments);
-          if (!box && mesh.geometry) {
-            if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
-            const bb = mesh.geometry.boundingBox;
-            if (bb) {
-              box = {
-                minX: bb.min.x,
-                maxX: bb.max.x,
-                minY: bb.min.y,
-                maxY: bb.max.y,
-                minZ: bb.min.z,
-                maxZ: bb.max.z,
-                count: 0,
-                triangles: 0,
-              };
-            }
-          }
-        }
-      }
-
-      if (box) {
-        found = true;
-        const corners = [
-          new THREE.Vector3(box.minX, box.minY, box.minZ),
-          new THREE.Vector3(box.maxX, box.minY, box.minZ),
-          new THREE.Vector3(box.minX, box.maxY, box.minZ),
-          new THREE.Vector3(box.maxX, box.maxY, box.minZ),
-          new THREE.Vector3(box.minX, box.minY, box.maxZ),
-          new THREE.Vector3(box.maxX, box.minY, box.maxZ),
-          new THREE.Vector3(box.minX, box.maxY, box.maxZ),
-          new THREE.Vector3(box.maxX, box.maxY, box.maxZ),
-        ];
-
-        const off = smid != null ? this._featureStyleManager.getFeatureEffectiveOffset(smid) : {};
-        const trans = off.translation;
-        const elev = off.elevation;
-
-        const rotMat = off.rotation ? resolveRotationMatrix(off.rotation) : null;
-        let rotM3: THREE.Matrix3 | null = null;
-        let rotPiv: THREE.Vector3 | null = null;
-        if (rotMat) {
-          rotM3 = new THREE.Matrix3().set(
-            rotMat[0], rotMat[1], rotMat[2],
-            rotMat[3], rotMat[4], rotMat[5],
-            rotMat[6], rotMat[7], rotMat[8]
-          );
-          rotPiv = off.pivot ? new THREE.Vector3(off.pivot[0], off.pivot[1], off.pivot[2]) : new THREE.Vector3(0, 0, 0);
-        }
-
-        // GPU 路径：位移发生在顶点着色器里，包围盒要按同一套公式在 CPU 复算，
-        // 否则「运动中的车」的包围盒会停在路径原点（相机 fitBounds / 属性过滤都会错）。
-        const gpuPose = smid != null ? this._gpuPathPoseAt(smid) : null;
-        let headM3: THREE.Matrix3 | null = null;
-        if (gpuPose && gpuPose.yaw !== 0) {
-          const c = Math.cos(gpuPose.yaw);
-          const s = Math.sin(gpuPose.yaw);
-          // 与着色器的 mat3( c, s, 0, -s, c, 0, 0, 0, 1 ) 等价：GLSL 是列优先，
-          // three 的 Matrix3.set 是行优先，所以这里写成 (c, -s; s, c) 才是同一个矩阵。
-          headM3 = new THREE.Matrix3().set(c, -s, 0, s, c, 0, 0, 0, 1);
-        }
-
-        for (const c of corners) {
-          if (rotM3 && rotPiv) c.sub(rotPiv).applyMatrix3(rotM3).add(rotPiv);
-          if (headM3) {
-            const piv = rotPiv ?? new THREE.Vector3(0, 0, 0);
-            c.sub(piv).applyMatrix3(headM3).add(piv);
-          }
-          if (trans) c.add(new THREE.Vector3(trans[0], trans[1], trans[2]));
-          else if (elev) c.z += elev;
-          if (gpuPose) c.add(new THREE.Vector3(gpuPose.pos[0], gpuPose.pos[1], gpuPose.pos[2]));
-
-          c.applyMatrix4(mesh.matrixWorld);
-          const s = this.sceneAnchor.meterInMercator;
-          const [lng, lat] = this._lngLatFromWorld(c.x * s + this.sceneAnchor.x, -c.y * s + this.sceneAnchor.y);
-          if (lng < minLng) minLng = lng;
-          if (lng > maxLng) maxLng = lng;
-          if (lat < minLat) minLat = lat;
-          if (lat > maxLat) maxLat = lat;
-        }
-      }
-    }
-
-    if (!found) return null;
-    return [
-      [minLng, minLat],
-      [maxLng, maxLat],
-    ];
+    return this._picks.getFeatureBounds(smid);
   }
 
-  /** 实例序号 → 所属单体（按网格缓存反查表，实例多的数据不用每次重建） */
-  private _instanceFeature(
-    mesh: THREE.Mesh,
-    geoRef: GeoPackageEntry | undefined,
-    instanceIndex: number
-  ): InstanceFeature | null {
-    const ud = mesh.userData as MeshUserData & { instanceLookup?: Map<number, InstanceFeature> };
-    if (!ud.instanceLookup) ud.instanceLookup = buildInstanceLookup(geoRef?.pickInfo);
-    return ud.instanceLookup.get(instanceIndex) ?? null;
+  /** @internal 见 viewer/PickService.ts */
+  _intersectMeshAtRay(mesh: THREE.Mesh, ray: THREE.Ray, instanceIndex?: number): THREE.Vector3 | null {
+    return this._picks.intersectMeshAtRay(mesh, ray, instanceIndex);
   }
 
-  /** 实例化几何的单体包围盒：base mesh 的包围盒套上该实例的矩阵 */
-  private _instanceBox(mesh: THREE.Mesh, instanceIndex: number): SegmentBox | null {
-    const im = mesh as THREE.InstancedMesh;
-    if (!im.isInstancedMesh) return null;
-    const geometry = mesh.geometry;
-    if (!geometry.boundingBox) geometry.computeBoundingBox();
-    const bb = geometry.boundingBox;
-    if (!bb) return null;
-    const m = new THREE.Matrix4();
-    im.getMatrixAt(instanceIndex, m);
-    const box = bb.clone().applyMatrix4(m);
-    return {
-      minX: box.min.x,
-      minY: box.min.y,
-      minZ: box.min.z,
-      maxX: box.max.x,
-      maxY: box.max.y,
-      maxZ: box.max.z,
-      count: geometry.getAttribute('position')?.count ?? 0,
-      triangles: geometry.index ? Math.round(geometry.index.count / 3) : 0,
-    };
+  /** @internal 见 viewer/PickService.ts */
+  _buildPickResult(
+    hit: { objectId: number; batchId: number; instanceIndex?: number },
+    ref: PickableRef,
+    exactPoint?: THREE.Vector3,
+    ray?: THREE.Ray
+  ): PickResult | null {
+    return this._picks.buildPickResult(hit, ref, exactPoint, ray);
   }
 
-  /** 选中/取消选中单体。`silent` 为 true 时不回调 onPick。 */
-  select(result: PickResult | null, { silent = false }: { silent?: boolean } = {}): void {
-    // 清掉上一次
-    if (this._selection) {
-      for (const obj of this._selectedMeshes) {
-        // 点云：恢复成当前着色模式（去掉选中混色）
-        if (isPointCloudObject(obj)) {
-          this._applyPointCloudStyle(obj, false);
-          continue;
-        }
-        const mat = styledMaterialOf(obj as THREE.Mesh);
-        if (mat) {
-          mat.userData.uSelBatch.value = -1;
-          mat.userData.uSelWhole.value = 0;
-        }
-      }
-      this._selectedMeshes = [];
-      this._clearSelectionDecoration();
-      this._selection = null;
-    }
-
-    if (!result) {
-      this.uniforms.uSelMix.value = 0;
-      this.uniforms.uDim.value = 0;
-      this.outlineMaterial.uniforms.uSelBatch.value = -1;
-      this.outlineMaterial.uniforms.uSelWhole.value = 0;
-      this.outlineMaterial.uniforms.uElevation.value = 0;
-      this._requestRepaint();
-      if (!silent) this.onPick(null);
-      return;
-    }
-
-    this._selection = result;
-    const targetMeshes = new Set<THREE.Mesh>();
-    if (result.smid != null) {
-      const smidSet = this._smidMeshes.get(result.smid);
-      if (smidSet) {
-        for (const m of smidSet) targetMeshes.add(m);
-      }
-    }
-    targetMeshes.add(result.mesh);
-
-    for (const mesh of targetMeshes) {
-      const mat = styledMaterialOf(mesh);
-      if (!mat) continue;
-      let batchId = result.batchId;
-      if (result.instanceIndex != null && mesh === result.mesh) {
-        batchId = result.batchId;
-      } else if (result.smid != null) {
-        const ud = mesh.userData as MeshUserData;
-        const pickInfo = ud.geoRef?.pickInfo;
-        const entry = (pickInfo as Record<string | number, unknown> | undefined)?.[result.smid] ??
-          (pickInfo as Record<string | number, unknown> | undefined)?.[String(result.smid)];
-        const bId = entry ? pickEntryId(entry as any) : -1;
-        batchId = bId >= 0 ? bId : (mesh === result.mesh ? result.batchId : -1);
-      }
-      mat.userData.uSelBatch.value = batchId;
-      // 没有单体化信息时整块高亮，否则会出现「点中了但什么都没亮、其他全暗了」
-      mat.userData.uSelWhole.value = batchId < 0 ? 1 : 0;
-      this._selectedMeshes.push(mesh);
-    }
-    // 点云没有单体粒度：整块混成 selectColor，让选中至少看得见
-    for (const mesh of this._selectedMeshes) {
-      if (isPointCloudObject(mesh)) this._applyPointCloudStyle(mesh, true);
-    }
-    this.uniforms.uSelMix.value = 1;
-    this.uniforms.uDim.value = this.style.dimOthers ? 1 : 0;
-
-    if (this.style.outline) {
-      // 棱线 / 外扩轮廓都是按「面」设计的，点云画不出来也不该画
-      const decoMeshes = [...targetMeshes].filter((m) => !isPointCloudObject(m));
-      if (decoMeshes.length) {
-        if ((this.style.outlineStyle ?? 'edges') === 'edges') {
-          this._addSelectionEdges(result, decoMeshes);
-        } else {
-          this._addSelectionHull(result, decoMeshes);
-        }
-      }
-    }
-    this._requestRepaint();
+  /** @internal 见 viewer/PickService.ts */
+  _buildSplatPickResult(
+    hit: { objectId: number; batchId: number; instanceIndex?: number },
+    ref: PickableRef,
+    exactPoint?: THREE.Vector3,
+    ray?: THREE.Ray
+  ): PickResult | null {
+    return this._picks.buildSplatPickResult(hit, ref, exactPoint, ray);
   }
+
+  /** @internal 见 viewer/PickService.ts */
+  _instanceFeature(mesh: THREE.Mesh, geoRef: GeoPackageEntry | undefined, instanceIndex: number): InstanceFeature | null {
+    return this._picks.instanceFeature(mesh, geoRef, instanceIndex);
+  }
+
+  /** @internal 见 viewer/PickService.ts */
+  _instanceBox(mesh: THREE.Mesh, instanceIndex: number): SegmentBox | null {
+    return this._picks.instanceBox(mesh, instanceIndex);
+  }
+
+  /** @internal 拾取 id 池，见 viewer/PickService.ts */
+  _allocPickId(): number {
+    return this._picks.allocPickId();
+  }
+
+  /** @internal */
+  _releasePickId(id: number): void {
+    this._picks.releasePickId(id);
+  }
+
+  /** @internal 拾取表（测试直接读写），见 viewer/PickService.ts */
+  get _pickables(): Map<number, PickableRef> {
+    return this._picks.pickables;
+  }
+
+  /* ---------------------------------------------------------------- 选中 */
 
   /**
-   * 选中单体的棱线：只挑这个单体自己的三角面算折边，再画成屏幕空间等宽线。
-   * 抽出来的线段数很少（一栋楼通常几百到几千条），所以选中开销可以忽略。
+   * 选中一个单体（或整块网格），高亮与轮廓装饰见 viewer/SelectionDecorator.ts。
+   * 传 `null` 清空选中；`silent` 为真时不触发 `onPick`。
    */
-  private _addSelectionEdges(result: PickResult, meshes: Iterable<THREE.Mesh>): void {
-    this._syncSelectionStyle();
-    for (const mesh of meshes) {
-      const ud = mesh.userData as MeshUserData;
-      const geoRef = ud.geoRef;
-      let segments: PickSegment[] = [];
-      // 这块网格上的棱线全部属于选中的那个单体，整批填同一个 batchId，
-      // 顶点着色器才能从状态纹理里取到平移 / 拔高——选中跟随移动靠它。
-      let batchId = -1;
-      if (mesh === result.mesh && result.instanceIndex != null) {
-        // 实例化几何没有逐单体的顶点区间，整个 base mesh 就是这一栋的外形
-        segments = [{ vertexOffset: 0, vertexCount: mesh.geometry.getAttribute('position')?.count ?? 0 }];
-        const pickInfo = geoRef?.pickInfo;
-        const entry = (pickInfo as Record<string | number, unknown> | undefined)?.[result.smid ?? ''] ??
-          (pickInfo as Record<string | number, unknown> | undefined)?.[String(result.smid)];
-        batchId = entry ? pickEntryId(entry as any) : -1;
-      } else if (result.smid != null) {
-        const pickInfo = geoRef?.pickInfo;
-        const entry = (pickInfo as Record<string | number, unknown> | undefined)?.[result.smid] ??
-          (pickInfo as Record<string | number, unknown> | undefined)?.[String(result.smid)];
-        const bId = entry ? pickEntryId(entry as any) : -1;
-        batchId = bId;
-        segments = (entry as any)?.segments ?? (bId >= 0 ? resolveFeature(geoRef, bId).segments : []);
-      } else if (mesh === result.mesh) {
-        const localGeo = (ud.geoByBatchId as Map<number, GeoPackageEntry> | undefined)?.get(result.batchId) ?? geoRef;
-        segments = resolveFeature(localGeo, result.batchId).segments;
-        batchId = result.batchId;
-      }
-
-      const pairs = buildFeatureEdgeSegments(mesh.geometry, segments);
-      if (pairs && pairs.length > 0) {
-        const batchIds = batchId >= 0 ? new Float32Array(pairs.length / 6).fill(batchId) : undefined;
-        const lines = new THREE.Mesh(
-          buildThickLineGeometry(pairs, batchIds),
-          this._createSelectionEdgeMaterial(mesh)
-        );
-        lines.renderOrder = 4;
-        // 屏幕空间外扩后可能超出原包围球，关掉剔除更稳
-        lines.frustumCulled = false;
-        lines.raycast = () => {};
-        (lines.userData as MeshUserData).isSelectionEdge = true;
-        if (mesh === result.mesh && result.instanceIndex != null) {
-          this._applyInstanceTransform(lines, result);
-        }
-        mesh.add(lines); // 作为子节点，直接继承世界变换
-        this._selectionEdgeMeshes.push(lines);
-      }
-    }
-
-    if (this._selectionEdgeMeshes.length === 0) {
-      // 抽不出折边（退化几何 / 没有任何夹角）时退回外扩轮廓，至少保证选中可见
-      this._addSelectionHull(result, meshes);
-      return;
-    }
-    this._selectionEdges = this._selectionEdgeMeshes[0] ?? null;
+  select(result: PickResult | null, opts: { silent?: boolean } = {}): void {
+    this._sel.select(result, opts);
   }
 
-  /** 实例化几何：把某个实例的矩阵套到一个普通 Mesh/子节点上（子节点不参与父级的 instanceMatrix） */
-  private _applyInstanceTransform(obj: THREE.Object3D, result: PickResult): void {
-    const im = result.mesh as THREE.InstancedMesh;
-    if (result.instanceIndex == null || !im.isInstancedMesh) return;
-    const m = new THREE.Matrix4();
-    im.getMatrixAt(result.instanceIndex, m);
-    m.decompose(obj.position, obj.quaternion, obj.scale);
+  /** @internal 选中外观跟随样式变化，见 viewer/SelectionDecorator.ts */
+  _syncSelectionStyle(): void {
+    this._sel.syncStyle();
   }
 
-  /** 旧的描边画法：背面外扩法，整块几何一起上，靠 uSelBatch 只显示选中那栋 */
-  private _addSelectionHull(result: PickResult, meshes: Iterable<THREE.Mesh>): void {
-    const instanced = result.instanceIndex != null;
-    // 实例化：轮廓是这个实例的单独一份副本（普通 Mesh），所以整份都画；
-    // 顶点区间型：整块几何一起画，靠 uSelBatch 只显示选中那栋。
-    this.outlineMaterial.uniforms.uSelBatch.value = instanced ? -1 : result.batchId;
-    this.outlineMaterial.uniforms.uSelWhole.value = instanced || result.batchId < 0 ? 1 : 0;
-    this.outlineMaterial.uniforms.uElevation.value = instanced
-      ? this._selectionElevation(result)
-      : this.style.selectElevation ?? 0;
-
-    for (const mesh of meshes) {
-      const mat = styledMaterialOf(mesh);
-      if (mat?.userData?.uBatchTex) {
-        this.outlineMaterial.uniforms.uBatchTex.value = mat.userData.uBatchTex.value as THREE.Texture;
-        this.outlineMaterial.uniforms.uBatchTexWidth.value = mat.userData.uBatchTexWidth.value as number;
-        this.outlineMaterial.uniforms.uBatchTexActive.value = mat.userData.uBatchTexActive.value as number;
-      }
-      const outline = new THREE.Mesh(mesh.geometry, this.outlineMaterial);
-      outline.renderOrder = 3;
-      outline.frustumCulled = false;
-      outline.raycast = () => {};
-      if (mesh === result.mesh && result.instanceIndex != null) {
-        this._applyInstanceTransform(outline, result);
-      }
-      mesh.add(outline); // 作为子节点，直接继承世界变换
-      this._outlineMeshes.push(outline);
-    }
-    this._outlineMesh = this._outlineMeshes[0] ?? null;
+  /** @internal 测试用：当前选中 */
+  get _selection(): PickResult | null {
+    return this._sel.selection;
   }
 
-  /** 只改 uniform：颜色 / 粗细 / 拔高，拖着滑块实时生效，不重建几何 */
-  private _syncSelectionStyle(): void {
-    const s = this.style;
-    const u = this.selectionEdgeMaterial.uniforms;
-    u.uColor.value.set(s.outlineColor ?? s.selectColor);
-    u.uWidth.value = Math.max(0.1, s.outlineWidthPx ?? 3);
-    u.uOpacity.value = clampOpacity(s.opacity);
-    // 只加全局 selectElevation：单体自己的拔高已经写在状态纹理第 2 行 z 里，
-    // 顶点着色器采样时带出来了，这里再加一次就会双重拔高
-    if (u.uElevation) u.uElevation.value = s.selectElevation ?? 0;
-
-    // 外扩描边是另一个材质实例，单体状态纹理的开关是建的时候抄过去的。
-    // 先选中、再抬高（或反过来）时模板会停留在旧值，这里补一次同步。
-    for (const outline of this._outlineMeshes) {
-      const parent = outline.parent as THREE.Mesh | null;
-      const ud = parent ? styledMaterialOf(parent)?.userData : null;
-      if (ud?.uBatchTex) {
-        this.outlineMaterial.uniforms.uBatchTex.value = ud.uBatchTex.value;
-        this.outlineMaterial.uniforms.uBatchTexWidth.value = ud.uBatchTexWidth.value;
-        this.outlineMaterial.uniforms.uBatchTexActive.value = ud.uBatchTexActive.value;
-      }
-    }
+  /** @internal 测试用：被高亮的网格 */
+  get _selectedMeshes(): THREE.Object3D[] {
+    return this._sel.selectedMeshes;
   }
 
-  /** 选中单体的实际拔高 = 全局选中拔高 + 该单体的独立拔高（与着色器口径一致） */
-  private _selectionElevation(result: PickResult): number {
-    let elev = this.style.selectElevation ?? 0;
-    if (result.smid != null) {
-      const off = this._featureStyleManager.getFeatureEffectiveOffset(result.smid);
-      if (off.elevation) elev += off.elevation;
-    }
-    return elev;
-  }
-
-  private _clearSelectionDecoration(): void {
-    for (const outline of this._outlineMeshes) {
-      outline.parent?.remove(outline);
-    }
-    this._outlineMeshes = [];
-    this._outlineMesh = null;
-
-    for (const edges of this._selectionEdgeMeshes) {
-      edges.parent?.remove(edges);
-      edges.geometry.dispose();
-    }
-    this._selectionEdgeMeshes = [];
-    this._selectionEdges = null;
+  /** @internal 测试用：选中棱线的网格列表 */
+  get _selectionEdgeMeshes(): THREE.Mesh[] {
+    return this._sel.selectionEdgeMeshes;
   }
 
   /* ---------------------------------------------------------------- 渲染 */
@@ -3948,31 +2367,6 @@ export class S3MViewer {
    * 参数全部来自 style，不缓存：`edgeWidth` 在这里是「采样偏移」，线宽 ≈ 2×它；
    * `edgeThreshold` 是折边敏感度（夹角小于它不描），和 CPU 折边线同一口径。
    */
-  private _renderGpuEdges(canvas: HTMLCanvasElement): void {
-    if (!this.renderer || !this.scene || !this.camera) return;
-    const s = this.style;
-    const fade = this.uniforms.uEdgeFade?.value ?? 1;
-    const opacity =
-      Math.min(1, Math.max(0, s.edgeOpacity ?? 0.6)) * clampOpacity(s.opacity) * fade;
-    if (opacity <= 0.004) return;
-
-    if (!this._gpuEdge) this._gpuEdge = new GpuEdgePass();
-    if (!this._gpuEdge.supported(this.renderer)) return;
-
-    // 度数 → 归一化法线差（|Δn| = 2·sin(θ/2)），乘 0.6 让阈值落在「刚好能描出」的位置
-    const deg = Math.min(179, Math.max(1, s.edgeThreshold ?? 55));
-    const normalThreshold = 2 * Math.sin((deg * Math.PI) / 360) * 0.6;
-
-    this._gpuEdge.render(this.renderer, this.scene, this.camera, canvas.width, canvas.height, {
-      color: this._gpuEdgeColor.set(s.edgeColor),
-      opacity,
-      radius: Math.max(1, s.edgeWidth ?? 1.5),
-      normalThreshold,
-      depthThreshold: 0.08,
-    });
-  }
-
-  /** 等宽线要按设备像素换算线宽：uResolution 用绘图缓冲尺寸，uDpr 是缓冲 / CSS 的比值 */
   private _updateLineResolution(canvas: HTMLCanvasElement): void {
     const w = canvas.width || 1;
     const h = canvas.height || 1;
@@ -4125,16 +2519,9 @@ export class S3MViewer {
    * 乱序混合就是满屏彩色噪点。相机没动且没有新瓦片时整个跳过；
    * 单个瓦片顺序本来就对时 sortSplatMesh 内部也会跳过重写。
    */
-  private _sortSplats(): void {
-    const cam = this.camera;
-    if (!cam) return;
-    if (this._splatsSorted && this._lastSplatSortView.equals(cam.matrixWorldInverse)) return;
-    for (const pc of this._pointClouds) {
-      if (!(pc.userData as { isGaussianSplat?: boolean }).isGaussianSplat) continue;
-      sortSplatMesh(pc as unknown as THREE.Mesh, cam.matrixWorldInverse);
-    }
-    this._lastSplatSortView.copy(cam.matrixWorldInverse);
-    this._splatsSorted = true;
+  /** @internal 泼溅按视深重排，见 viewer/SplatLayer.ts */
+  _sortSplats(): void {
+    this._splats.sort(this.camera, this._pointClouds);
   }
 
   /**
@@ -4240,7 +2627,7 @@ export class S3MViewer {
       this.renderer.render(this.scene, this.camera);
       // GPU 描边必须画在主场景之后：它的全屏 quad 参与宿主深度测试，
       // 依赖本帧已经写好的深度（被地形挡住的地方不该描边）
-      if (this._edgeModes.gpu) this._renderGpuEdges(canvas);
+      this._edges.renderGpuEdges(canvas);
     }
 
     this._frame++;
@@ -4261,7 +2648,7 @@ export class S3MViewer {
       tilesetChanged;
 
     // 首帧画完、场上有材质了，再把另一种 shading 变体编出来（异步，不挡当前帧）
-    if (this._prewarmShadingEnabled && !this._shadingPrewarmed && this._pickables.size > 0) {
+    if (this._prewarmShadingEnabled && !this._shadingPrewarmed && this._picks.pickables.size > 0) {
       void this.prewarmShading();
     }
 

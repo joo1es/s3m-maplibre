@@ -67,13 +67,12 @@
  * 等价，但不需要官方的采样数组。顶点上取 fract 会让跨平铺边界的三角形反向扫纹理，别那样做。
  */
 import { BinaryReader } from './BinaryReader.js';
-import type { InflateFn, ParseOptions } from './S3MBParser.js';
+import type { InflateFn } from './S3MBParser.js';
 import type { GeoPackageEntry, GroupNode, PageLOD, ParsedTile, S3MAtlasRects, S3MTexture } from './types.js';
-import { parseGroupNodeEntries, parseSkeletonEntries, parsePickInfoEntries } from './S3MBParser.js';
-import { atlasAlphaMask, shrinkRectToOpaque } from './AtlasAlpha.js';
 import { packAtlases, decodeAtlasImage } from './AtlasPack.js';
 import type { PackedAtlases } from './AtlasPack.js';
 import { transcodeCRN } from './CRNDecode.js';
+import { parseGroupNodeEntries, parseSkeletonEntries, parsePickInfoEntries } from './S3MBParser.js';
 import { resolveTextureKind, PixelFormat, TextureCompress } from './TextureFormat.js';
 
 /** 图集子区域，以及它绑定的几何顶点区间 */

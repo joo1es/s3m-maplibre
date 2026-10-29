@@ -28,6 +28,32 @@ demo/  docs/     构建产物，**已纳入 git**
 
 ---
 
+## 1.1 `render/viewer/` 的模块边界
+
+`S3MViewer` 是 facade，真正的实现按**状态归属**分在 `render/viewer/` 下。改这些模块前先看两条：
+
+| 模块 | 负责 | 状态 |
+|---|---|---|
+| `LightRig` | 光源 / 色调映射 / 环境贴图 | `_lightOptions`、四个光源、`_envRT` |
+| `HeightIndex` | 世界高度范围增量维护 | `_meshHeight`、min/max |
+| `SplatLayer` | 泼溅排序调度 | `_lastView`、`_sorted` |
+| `EdgeDecorator` | 棱线 / 外扩轮廓 / GPU 描边 | `_modes`、`_nativeLines`、`_gpuEdge`、外观 uniform |
+| `PickService` | 拾取表、pickId 池、射线求交 | `pickables`、`_pickSeq`、`_freePickIds` |
+| `SelectionDecorator` | 选中高亮、轮廓装饰、跨瓦片重放 | `selection`、`selectedMeshes`、装饰引用 |
+
+两条硬规矩：
+
+1. **子模块里触发重绘一律走 `() => host.triggerRepaint()`，不要调 `_requestRepaint()`。**
+   单测会覆盖实例上的 `triggerRepaint` 来观察「有没有重绘」，绕过它测试就失去观测点。
+2. **子模块不要 `import` `S3MViewer` 的值**，只允许 `import type`。ESM 循环引用在 bun / vite 下
+   不报错，运行时才拿到 `undefined`。
+
+`TileRegistry` / `StyleController` / `FrameRenderer` **故意没拆**：`_registerTile` 是 8 个模块的
+汇合点（要改成事件才值得拆）；`style` 是公共实例字段（`viewer-api-surface.test.ts` 钉住了）；
+`renderFrame` 没有自己的状态，是唯一编排点。
+
+---
+
 ## 2. 三条不变式
 
 ### ① 默认行为不变

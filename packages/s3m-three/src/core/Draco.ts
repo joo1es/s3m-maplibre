@@ -32,7 +32,7 @@
  * `version === 3` 的判定对 3.01 瓦片不成立），实际解析不了这个服务，所以以实测为准。
  */
 import type { BinaryReader } from './BinaryReader.js';
-import type { AttrDType, IndexPackage, VertexAttribute, VertexPackage } from './types.js';
+import type { AttrDType, IndexPackage, VertexPackage } from './types.js';
 import type { DracoModule, DracoPointAttribute, DracoPointCloud } from '../vendor/draco_decoder.module.js';
 
 /* ------------------------------------------------------------ draco 枚举（本地副本） */
@@ -41,7 +41,6 @@ import type { DracoModule, DracoPointAttribute, DracoPointCloud } from '../vendo
 const ATTR_POSITION = 0;
 const ATTR_NORMAL = 1;
 const ATTR_COLOR = 2;
-const ATTR_GENERIC = 4;
 
 /** draco::DataType（DT_INVALID = 0 占位） */
 const DT_UINT8 = 2;

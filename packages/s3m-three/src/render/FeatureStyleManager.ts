@@ -18,7 +18,7 @@ import {
   buildAttributes,
   pickEntryId,
 } from '../core/FeatureInfo.js';
-import type { AttributeQuery, AttributeQueryOptions, AttributeRow } from '../core/AttributeQuery.js';
+import type { AttributeQuery, AttributeRow } from '../core/AttributeQuery.js';
 import type { StyledMaterial } from './StyleMaterial.js';
 import { restoreBaseBlendState } from './StyleMaterial.js';
 

@@ -403,7 +403,6 @@ export class S3MTileset {
   /** 子瓦片 URL → 父瓦片 URL，用于淘汰后补洞 */
   private readonly _parentOf = new Map<string, string>();
   private _frame = 0;
-  private _lodDbgOnce = false;
   /** 格式类永久错误只向上报一次，避免整棵瓦片树刷同样的日志 */
   private _permanentReported = false;
   /** 请求量的硬上限（软上限 maxTiles 的超额余量），见构造函数注释 */
