@@ -4,17 +4,16 @@
  * 从 `S3MViewer` 里整体搬出来的第一块 —— 它只依赖 `scene` / `renderer` / 共享
  * uniform / 宿主方位角，不碰几何、瓦片、拾取，是耦合最低的一块。
  *
- * ## 两个模块级全局态
+ * ## 颜色管线是图层级的
  *
- * `setColorPipeline` / `setSrgbTextureDecode` / `setAnisotropyCap` 都是模块级设置，
- * 影响**之后创建**的材质与纹理。所以切预设时已加载的瓦片要重载才换观感，
- * 这是已知的架构债（一个页面两个 viewer 用不同预设会互相污染），
- * 拆分没有改变这一点。
+ * 颜色管线 / 纹理解码 / 各向异性三者一起决定「官方 supermap 观感」，都由
+ * `ctx.applyRenderProfile` 落到本图层（见 `S3MViewer._applyRenderProfile`），
+ * 不再写模块级全局 —— 同页两个 viewer 用不同预设互不影响，已加载瓦片也会
+ * 当场重建材质、重传纹理，不用重载。
  */
 import * as THREE from 'three';
 import { resolveLightingPreset, type LightingPreset } from '../lightingPreset.js';
-import { setColorPipeline } from '../StyleMaterial.js';
-import { setAnisotropyCap, setSrgbTextureDecode } from '../TextureFactory.js';
+import type { ColorPipeline } from '../StyleMaterial.js';
 import type { LightOptions, S3MViewerOptions } from '../S3MViewer.js';
 import type { StyleUniforms } from '../../core/types.js';
 
@@ -49,6 +48,14 @@ export interface LightRigContext {
   getBearing?: () => number | undefined;
   /** 宿主需要重画的信号 */
   repaint: () => void;
+  /**
+   * 应用图层级渲染 profile（颜色管线 + 各向异性）。
+   *
+   * `initial = true` 是构造期：那时还没有瓦片与材质，落地方只记状态即可。
+   * 换掉以前的 `setColorPipeline` / `setSrgbTextureDecode` / `setAnisotropyCap`
+   * 三个模块级全局调用 —— 它们会让同页多图层互相污染。
+   */
+  applyRenderProfile: (p: { colorPipeline: ColorPipeline; anisotropyCap: number }, initial?: boolean) => void;
 }
 
 export class LightRig {
@@ -74,7 +81,7 @@ export class LightRig {
     const options = ctx.options;
     if (options.lightingPreset && options.lightingPreset !== 'default') {
       Object.assign(this._state, resolveLightingPreset(options.lightingPreset));
-      this.applyColorPipeline(options.lightingPreset);
+      this.applyColorPipeline(options.lightingPreset, true);
     }
     if (options.light) Object.assign(this._state, options.light);
   }
@@ -155,15 +162,18 @@ export class LightRig {
   /**
    * supermap 完整版 = 光照强度 + 颜色管线一起切：
    * direct 管线下纹理不做 sRGB 解码、片元按官方常数 Lambert 直乘（见 lightingPreset.ts）。
-   * 两个都是模块级全局态，只影响之后创建的材质 / 纹理 —— 已加载瓦片要重载才换。
+   *
+   * 这三样（管线 / 解码 / 各向异性）以前都是模块级全局，同页两个图层用不同预设
+   * 会互相污染；现在交给 `ctx.applyRenderProfile`，由图层自己持有并透传给材质与纹理。
    */
-  applyColorPipeline(preset: LightingPreset): void {
+  applyColorPipeline(preset: LightingPreset, initial = false): void {
     const direct = preset === 'supermap';
-    setColorPipeline(direct ? 'direct' : 'linear');
-    setSrgbTextureDecode(!direct);
     // 官方不开各向异性：远处直接采高 mip 平均成纯色（"灰色滤镜"的一部分）。
     // 我们默认 Infinity（倾斜摄影立面清晰度优先），supermap 模式必须收回。
-    setAnisotropyCap(direct ? 1 : Infinity);
+    this.ctx.applyRenderProfile(
+      { colorPipeline: direct ? 'direct' : 'linear', anisotropyCap: direct ? 1 : Infinity },
+      initial
+    );
   }
 
   setLightingPreset(preset: LightingPreset): void {

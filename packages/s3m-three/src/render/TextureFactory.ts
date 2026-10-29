@@ -32,6 +32,43 @@ export function setMaxAnisotropy(n: number, cap = Infinity): void {
 }
 
 /**
+ * 单次创建的纹理参数。三项都可缺省 —— 缺省时读模块级默认（`setSrgbTextureDecode`
+ * / `setMaxTextureSize` / `setAnisotropyCap`），所以老调用方行为逐字不变。
+ *
+ * 图层级隔离靠这条：`S3MLayer` 把自己的渲染 profile 透传进来，不再共享模块级状态。
+ */
+export interface TextureCreateOptions {
+  /** 是否做 sRGB 解码（默认读 `getSrgbTextureDecode()`）。`'direct'` 管线传 false */
+  srgbDecode?: boolean;
+  /** 长边像素上限（默认读 `setMaxTextureSize` 的值）。图集恒不缩放 */
+  maxSize?: number;
+  /** 各向异性上限（默认读 `setAnisotropyCap` 的值）。Infinity = 取 GPU 最大值 */
+  anisotropyCap?: number;
+}
+
+/** 把「上限」解析成实际的 anisotropy 值（GPU 最大值与 cap 取小） */
+function resolveAnisotropy(cap: number): number {
+  return Number.isFinite(cap) && cap > 0 ? Math.min(maxAnisotropy, Math.max(1, cap)) : maxAnisotropy;
+}
+
+/**
+ * 把各向异性上限**即时应用**到一批已上传的纹理。
+ *
+ * `anisotropy` 是采样参数，不需要重新解码 —— 改值 + `needsUpdate` 让 three 重传一次
+ * 即可，代价远小于重载瓦片。图集纹理（`configureAtlas` 打过 `s3mNoAniso` 标记）
+ * 保持 1：它关了 mip、靠子区域 rect 自己算层级，开各向异性会把相邻子区域混进来。
+ */
+export function applyAnisotropyCap(textures: Iterable<THREE.Texture>, cap: number): void {
+  const n = resolveAnisotropy(cap);
+  for (const tex of textures) {
+    if (!tex || (tex.userData as { s3mNoAniso?: boolean })?.s3mNoAniso) continue;
+    if (tex.anisotropy === n) continue;
+    tex.anisotropy = n;
+    tex.needsUpdate = true;
+  }
+}
+
+/**
  * 单独调各向异性上限（只影响之后创建的纹理）。
  * supermap 预设会设成 1 —— 官方 iClient3D 不开各向异性，斜视角直接采高 mip
  * 平均成纯色；我们默认拉满（Infinity）是为了倾斜摄影立面清晰度，代价是
@@ -114,15 +151,15 @@ export function getSrgbTextureDecode(): boolean {
   return srgbTextureDecode;
 }
 
-function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
+function configure<T extends THREE.Texture>(tex: T, srgb = true, opts: TextureCreateOptions = {}): T {
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
   tex.magFilter = THREE.LinearFilter;
   tex.minFilter = THREE.LinearMipmapLinearFilter;
   tex.generateMipmaps = true;
   // 各向异性过滤对斜视角立面清晰度的提升比提高分辨率更直接
-  tex.anisotropy = anisotropyCap === Infinity ? maxAnisotropy : Math.min(maxAnisotropy, anisotropyCap);
-  if (srgb && srgbTextureDecode) tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = resolveAnisotropy(opts.anisotropyCap ?? anisotropyCap);
+  if (srgb && (opts.srgbDecode ?? srgbTextureDecode)) tex.colorSpace = THREE.SRGBColorSpace;
   tex.flipY = false;
   tex.needsUpdate = true;
   return tex;
@@ -136,18 +173,23 @@ function configure<T extends THREE.Texture>(tex: T, srgb = true): T {
  * 自动选的层级会把相邻子区域混进来，远处就是一糊串色 —— 实测照抄公式但留着 GPU mip
  * 时，画面反而比不改更糟，就是因为这两个变量叠在一起了。
  */
-function configureAtlas<T extends THREE.Texture>(tex: T): T {
-  configure(tex);
+function configureAtlas<T extends THREE.Texture>(tex: T, opts: TextureCreateOptions = {}): T {
+  configure(tex, true, opts);
   tex.wrapS = THREE.ClampToEdgeWrapping;
   tex.wrapT = THREE.ClampToEdgeWrapping;
   tex.minFilter = THREE.LinearFilter;
   tex.generateMipmaps = false;
   tex.anisotropy = 1;
+  // 标记给 applyAnisotropyCap：图集不吃各向异性上限（见该函数注释）
+  (tex.userData as { s3mNoAniso?: boolean }).s3mNoAniso = true;
   tex.needsUpdate = true;
   return tex;
 }
 
-export async function createTexture(tex: S3MTexture | null | undefined): Promise<DecodedTexture> {
+export async function createTexture(
+  tex: S3MTexture | null | undefined,
+  opts: TextureCreateOptions = {}
+): Promise<DecodedTexture> {
   if (!tex || !tex.width || !tex.height) return { texture: null, decoded: 'empty' };
 
   // 图集纹理（flipY 的原始 DXT 图集 / AtlasPack 拼出来的 RGBA 大图 / leaf 组合画布）都必须
@@ -157,7 +199,7 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
   // 压缩直传只在「宿主 GL 支持 + 非图集」时开：图集要 flipY / 无 mip，压缩上传做不了翻行
   const wantCompressed = compressedTexturesSupported && !isAtlas;
   // 尺寸上限同样跳过图集：UV 已重映射到子区域，缩放会让整体错位
-  const sizeCap = isAtlas ? Infinity : maxTextureSize;
+  const sizeCap = isAtlas ? Infinity : (opts.maxSize ?? maxTextureSize);
   const data = await decodeTexture(tex, wantCompressed, sizeCap);
 
   if (!data.rgba && !data.blocks && !data.bitmap) {
@@ -194,7 +236,7 @@ export async function createTexture(tex: S3MTexture | null | undefined): Promise
     texture = dt;
   }
   texture.needsUpdate = true;
-  const configured = isAtlas ? configureAtlas(texture) : configure(texture);
+  const configured = isAtlas ? configureAtlas(texture, opts) : configure(texture, true, opts);
   if (data.blocks) {
     configured.generateMipmaps = false;
     // 带链 → 三线性取链上高层级（官方同款平均效果）；纯 level0 才退回 Linear 兜底

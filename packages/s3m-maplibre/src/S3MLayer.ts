@@ -515,6 +515,27 @@ export class S3MLayer extends HostRenderer {
     return this.viewer.materialQuality;
   }
 
+  /**
+   * 运行时切换**本图层**的颜色管线（`'linear'` | `'direct'`）。
+   *
+   * `'direct'` = 官方 iClient3D 的 sRGB 直乘管线（`lightingPreset: 'supermap'` 就是它）。
+   * 传 `duration > 0` 走 fade-through：压暗 → 换管线（重建材质 + 重传纹理）→ 亮回来，
+   * 不重新下载瓦片。不传 = 立即生效。
+   *
+   * 同页其它图层不受影响 —— 管线和纹理解码都是图层级的。
+   */
+  setColorPipeline(
+    q: 'linear' | 'direct',
+    opts?: { duration?: number; dim?: number }
+  ): Promise<void> {
+    return this.viewer.setColorPipeline(q, opts);
+  }
+
+  /** 当前颜色管线（本层没指定过就是模块级默认） */
+  get colorPipeline(): 'linear' | 'direct' {
+    return this.viewer.colorPipeline;
+  }
+
   /** 动态设置图层整体透明度 (0.0 ~ 1.0)，可带过渡 */
   setOpacity(opacity: number, transition?: TransitionOptions): void {
     this.viewer.setOpacity(opacity, transition);

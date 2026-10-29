@@ -13,6 +13,7 @@
  */
 import * as THREE from 'three';
 import { createTexture } from './TextureFactory.js';
+import type { TextureCreateOptions } from './TextureFactory.js';
 import { createSharedUniforms, createStyledMaterial } from './StyleMaterial.js';
 import { isTransparentMaterial, minVertexAlpha } from './materialAlpha.js';
 import type { StyledMaterial } from './StyleMaterial.js';
@@ -367,6 +368,16 @@ export interface BuildTileOptions {
    * 由 `S3MTileset` 从图层 / 数据集一路带下来，所以同页多个图层可以各用各的。
    */
   materialQuality?: 'pbr' | 'lambert';
+  /**
+   * 颜色管线，透传给 `createStyledMaterial`。不传 = 读模块级默认。
+   * 由 `S3MTileset` 从图层的渲染 profile 带下来。
+   */
+  colorPipeline?: 'linear' | 'direct';
+  /**
+   * 纹理创建参数（sRGB 解码 / 尺寸上限 / 各向异性上限），透传给 `createTexture`。
+   * 不传 = 各自读模块级默认。同样由图层的渲染 profile 带下来。
+   */
+  textureOptions?: TextureCreateOptions;
 }
 
 export interface BuildTileResult {
@@ -426,7 +437,7 @@ export async function buildTileObjects(
       if (prevPixels >= (tex.width ?? 0) * (tex.height ?? 0)) continue;
       textureByCode.delete(key);
     }
-    const { texture, decoded } = await createTexture(tex);
+    const { texture, decoded } = await createTexture(tex, options.textureOptions);
     if (texture) {
       textureByCode.set(key, texture);
       usedTextureKeys.push(key);
@@ -550,6 +561,7 @@ export async function buildTileObjects(
       secMap,
       // 图层 / 数据集的档位；undefined 时 createStyledMaterial 自己回落到模块级默认
       materialQuality: options.materialQuality,
+      colorPipeline: options.colorPipeline,
     });
     // 用户配置的深度偏移（共面摩尔纹 / 重合面归属的人工定序，见 BuildTileOptions 注释）
     if (options.polygonOffset) {

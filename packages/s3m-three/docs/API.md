@@ -172,10 +172,11 @@ new S3MViewer(options?: S3MViewerOptions)
 | （随 `useWorker`）DXT 压缩直传 | 自动 | 自动 | 宿主 GL 同时支持 `WEBGL_compressed_texture_s3tc`(+srgb) 时，dxt1/dxt5（含 CRN 转码产物）不解码直接 `CompressedTexture` 上传，显存与上传带宽降为 1/4~1/8；块长与 4×4 对齐公式不符、flipY 图集、移动端无扩展时自动回退 RGBA 解码 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 **DPR 上限**（不截断）。默认按 `canvasHeight` 物理像素算，与官方 `calcPixFromCam` 同口径；3x DPR 手机上由此会多细化、多拉瓦片，传 `2` 即按「CSS 高度 × 2」截断 |
-| `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = 取 GPU 最大值，通常 16）。移动端封到 4 / 8 肉眼通常无差，采样成本明显下降。只影响之后创建的纹理 |
-| `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。非图集的 RGBA / WebP 产物按 2× 盒式滤波减半到上限内；DXT 压缩直传与图集不受影响 |
+| `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = 取 GPU 最大值，通常 16）。移动端封到 4 / 8 肉眼通常无差，采样成本明显下降。**图层级**：运行时 `setAnisotropyCap()` 会立刻应用到已上传纹理（改采样参数 + 重传，不重解码、不重载瓦片），图集纹理恒为 1 |
+| `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。非图集的 RGBA / WebP 产物按 2× 盒式滤波减半到上限内；DXT 压缩直传与图集不受影响。**图层级**，但只影响之后解码的纹理（已解码的不重解） |
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限。一条 = 一张已解码的瓦片纹理，1024² RGBA 约 4MB，128 条即约 512MB 显存；低端设备 32~48。LRU，降下来下次淘汰时释放 |
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型。`lambert` 用 `MeshLambertMaterial` 替换 PBR，去掉 GGX 与环境球谐，片元约省一半；白模 / 纯色 / 按高度着色几乎无差。**图层级**：同页多个图层各用各的，互不覆盖；不传则跟随模块级默认（`setMaterialQuality`）。只影响之后创建的材质 |
+| `colorPipeline` | `'linear' \| 'direct'` | `'linear'` | 颜色管线。`direct` = 官方 iClient3D 的 sRGB 直乘（同时关掉纹理解码），`lightingPreset: 'supermap'` 会选它。**图层级**：同页多图层各用各的；已加载瓦片可运行时 `setColorPipeline(q, { duration })` 走 fade-through 平滑切过去（重建材质 + 重传纹理，不重下瓦片） |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 可选的 iServer 数据服务配置，配了才能用 `colorByField()` 等便利方法；不配就自己取数 + `setFeaturesStyle()`，见[业务字段](#业务字段锚点在库内对应关系在外部) |
 | `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
@@ -311,9 +312,29 @@ await viewer.setEnvironment('/env/city_2k.hdr', 1.0); // 等距柱状图（2:1�
 - **不传 = 不覆盖**（内部用 `-1` 当哨兵），保持数据自身的口径：`metalness` 恒 0，
   `roughness` 由 S3M 的 `shininess` 映射（常见 0.95）。
 - 只有 `materialQuality: 'pbr'`（默认）支持；`'lambert'` 模板里没有这两个 chunk，注入是 no-op。
+- **图层级**：两个 uniform 是每个 viewer 自己的一份，同页多个图层互不影响。
+- 过渡起点取数据侧常见值（`roughness` ≈ 0.95、`metalness` = 0），不是 0 —— 否则
+  `setStyle({ roughness: 0.2 }, { duration })` 会先跳到 0 再爬回来。
 - ⚠️ 金属几乎没有漫反射，**没有环境贴图时 `metalness` 一高就整片发黑**，只剩平行光的
   高光点。先 `setEnvironment()` 挂一张等距柱状图（内部会转成 PMREM 预滤波），
   强度由 `scene.environmentIntensity` 控制。
+
+### 颜色管线（`linear` / `direct`）与过渡
+
+```ts
+new S3MLayer({ colorPipeline: 'direct' });          // 建图层时定档（图层级）
+await layer.setColorPipeline('direct', { duration: 400 });  // 运行时平滑切
+```
+
+- `'direct'` = 官方 iClient3D 的 sRGB 直乘管线（贴图字节值不解码 → 常数 Lambert 直乘
+  → 输出前抵消 OETF），`lightingPreset: 'supermap'` 会同时选它并把各向异性收回 1。
+- 切换牵扯三样东西：材质宏（换 program）、纹理 `colorSpace`（重传）、各向异性档位。
+  **都不需要重新下载瓦片** —— 改完 `needsUpdate` 重传一次像素即可。
+- `duration > 0` 走 fade-through：压暗（`uFade` 到 0.35）→ 同一帧里换管线 → 亮回来。
+  不做逐像素混合：两条管线的差异有一部分在采样端（硬件 sRGB 解码 vs 原始字节），
+  要混合就得让贴图恒为原始字节并在片元里手动解码，那会改掉默认路径的采样数学。
+- 同页多个图层各持自己的管线，`setColorPipeline` 只影响本层。
+- `setAnisotropyCap()` 同样即时生效（改采样参数 + 重传），不再"只影响之后创建的纹理"。
 
 ### 单体样式与状态
 
@@ -400,7 +421,7 @@ setMaxTriangles(n: number, datasetId?: string): void   // Infinity = 不限制�
 readonly maxTriangles: number
 setMaxMemory(bytes: number, datasetId?: string): void  // 显存字节上限，Infinity = 不限制（默认）
 readonly maxMemory: number
-setAnisotropyCap(cap: number): void           // Infinity = 取 GPU 最大值（默认）
+setAnisotropyCap(cap: number): void           // Infinity = 取 GPU 最大值（默认）；即时应用到已上传纹理
 readonly anisotropyCap: number
 setMaxTextureSize(n: number): void            // Infinity = 不限制（默认）
 readonly maxTextureSize: number

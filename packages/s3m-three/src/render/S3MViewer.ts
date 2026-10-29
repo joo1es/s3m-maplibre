@@ -25,8 +25,9 @@ import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
-import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
-import { getMaterialQuality, normalizeMaterialQuality } from './StyleMaterial.js';
+import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap, applyAnisotropyCap } from './TextureFactory.js';
+import type { TextureCreateOptions } from './TextureFactory.js';
+import { getMaterialQuality, normalizeMaterialQuality, getColorPipeline, normalizeColorPipeline } from './StyleMaterial.js';
 import type { LightingPreset } from './lightingPreset.js';
 import { LightRig } from './viewer/LightRig.js';
 import { HeightIndex } from './viewer/HeightIndex.js';
@@ -62,6 +63,7 @@ import type {
   EdgeModes,
   EdgesOption,
   MaterialQuality,
+  ColorPipeline,
 } from './StyleMaterial.js';
 import { applyPointCloudStyle, isOwnedPointCloudMaterial } from './PointCloudMaterial.js';
 import type { DegradationKind, UnsupportedPolicy } from '../core/degradations.js';
@@ -204,6 +206,18 @@ const STYLE_SCALAR_KEYS = [
   'outlineWidth',
 ] as const;
 
+/**
+ * 标量样式键在「用户还没设过」时的动画起点。
+ *
+ * 只对 `metalness` / `roughness` 有意义：它们的 uniform 默认是 -1（不覆盖，保持数据
+ * 自身的值），从 -1 插值没意义 —— 取数据侧常见值当起点，过渡才不会先跳到 0。
+ * 其余键缺省仍是 0（与旧行为一致）。
+ */
+const SCALAR_ANIM_START: Partial<Record<(typeof STYLE_SCALAR_KEYS)[number], number>> = {
+  metalness: 0, // S3M 数据的 metalness 恒为 0
+  roughness: 0.95, // shininess 映射后的常见值，见 GeometryBuilder 的 roughness
+};
+
 /** 能逐帧插值的颜色键（在线性空间插值，与 shader 消费端一致） */
 const STYLE_COLOR_KEYS = ['colorA', 'colorB', 'colorC', 'selectColor', 'edgeColor'] as const;
 
@@ -257,6 +271,17 @@ export class S3MViewer {
    * 传了值就只认自己，多图层同页各用各的，互不覆盖。
    */
   private _materialQuality: MaterialQuality | undefined;
+  /**
+   * 本图层的颜色管线。
+   *
+   * `undefined` = 没指定，跟随模块级默认（`getColorPipeline()`）。
+   * 与 materialQuality 同理：传了值就只认自己，同页多图层互不污染 —— 这条尤其重要，
+   * 因为 `lightingPreset: 'supermap'` 会同时改管线、纹理解码方式与各向异性，
+   * 以前是三个模块级全局一起被改写。
+   */
+  private _colorPipeline: ColorPipeline | undefined;
+  /** fade-through 编排的代次：中途再切一次，旧编排作废（与 setMode 同一套） */
+  private _pipelineGen = 0;
   /** 单体样式、专题着色与状态纹理管理器 */
   private readonly _featureStyleManager: FeatureStyleManager;
   /** GPU 路径动画管理器 */
@@ -395,7 +420,12 @@ export class S3MViewer {
     );
 
     this.uniforms = createSharedUniforms();
-    // 光源状态在这里就位：LightRig 构造时会按 lightingPreset 切模块级颜色管线，
+    // 图层 profile 先落位（显式传了就只认自己），再把 LightRig 挂上来 ——
+    // 它构造时会按 lightingPreset 覆盖一次管线，这一步走的是图层级通道，
+    // 不再去改模块级全局（以前三个全局一起被改写，同页多图层互相污染）。
+    this._colorPipeline = normalizeColorPipeline(options.colorPipeline);
+    this._applyRenderProfile({}, true);
+    // 光源状态在这里就位：LightRig 构造时会按 lightingPreset 切图层颜色管线，
     // 挂进场景要等 scene 建好（构造函数上面已经建了）。
     this._lights = new LightRig({
       scene: () => this.scene,
@@ -406,6 +436,8 @@ export class S3MViewer {
       // 走公共 triggerRepaint 而不是 _requestRepaint：宿主 / 单测会覆盖前者来观察重绘，
       // 绕过它会让「有没有触发重绘」这件事失去观测点
       repaint: () => this.triggerRepaint(),
+      // 构造期（initial）只记状态：那时还没有材质可重建、没有数据集可同步
+      applyRenderProfile: (p, initial) => this._applyRenderProfile(p, initial),
     });
     this._lights.addToScene();
     this._heights = new HeightIndex(this.uniforms);
@@ -1855,7 +1887,13 @@ export class S3MViewer {
       this.animator.register(`style.${key}`, {
         dim: 1,
         read: (out) => {
-          out[0] = Number((this.style as unknown as Record<string, number>)[key] ?? 0);
+          // 金属度 / 粗糙度没设过时 uniform 是 -1（= 不覆盖，保持数据自身的值），
+          // 动画起点不能取 0：那会让 roughness 从 0.95 先跳到 0 再爬回去。
+          // 这里给的是数据侧的常见值（S3M 的 shininess 映射后 ≈0.95、metalness 恒 0），
+          // 过渡起点因此是连续的。
+          out[0] = Number(
+            (this.style as unknown as Record<string, number>)[key] ?? SCALAR_ANIM_START[key] ?? 0
+          );
         },
         write: (v) => {
           (this.style as unknown as Record<string, number>)[key] = v[0];
@@ -2115,6 +2153,112 @@ export class S3MViewer {
     return this._materialQuality ?? getMaterialQuality();
   }
 
+  /**
+   * 运行时切换**本图层**的颜色管线（`'linear'` | `'direct'`）。
+   *
+   * `'direct'` = 官方 iClient3D 的 sRGB 直乘管线（配合纹理解码关 sRGB），
+   * 见 `lightingPreset: 'supermap'`。切换牵扯三样东西：材质宏（换 program）、
+   * 纹理 colorSpace（重传，**不重新下载瓦片**）、以及各向异性档位。
+   *
+   * 给 `duration > 0` 时走 fade-through：压暗 → 在同一帧回调里换管线 → 亮回来。
+   * 逐像素混合做不到干净 —— 两条管线的差异有一部分在采样端（硬件 sRGB 解码 vs
+   * 原始字节），要混合就得让贴图恒为原始字节并在片元里手动解码，那会改掉默认路径。
+   */
+  setColorPipeline(q: ColorPipeline, opts: { duration?: number; dim?: number } = {}): Promise<void> {
+    const next = normalizeColorPipeline(q) ?? 'linear';
+    if (next === this.colorPipeline) return Promise.resolve();
+
+    const d = Math.max(0, opts.duration ?? 0);
+    if (d <= 0) {
+      this._applyRenderProfile({ colorPipeline: next });
+      return Promise.resolve();
+    }
+
+    const dim = Math.min(1, Math.max(0.05, opts.dim ?? 0.35));
+    const gen = ++this._pipelineGen;
+    return new Promise<void>((resolve) => {
+      this.animator.to('style.fade', dim, {
+        duration: d,
+        easing: 'easeInOutQuad',
+        onComplete: () => {
+          // 中途又切了一次：这次编排作废，收尾交给新的那次
+          if (gen !== this._pipelineGen) {
+            resolve();
+            return;
+          }
+          this._applyRenderProfile({ colorPipeline: next });
+          this.animator.to('style.fade', 1, {
+            duration: d,
+            easing: 'easeInOutQuad',
+            onComplete: resolve,
+          });
+        },
+      });
+    });
+  }
+
+  /** 当前颜色管线（本图层指定了就用本图层的，否则是模块级默认） */
+  get colorPipeline(): ColorPipeline {
+    return this._colorPipeline ?? getColorPipeline();
+  }
+
+  /** 本图层此刻该用的纹理创建参数（图层的渲染 profile 就落在这里） */
+  private _textureOptions(): TextureCreateOptions {
+    return {
+      // direct 管线的前提是贴图字节值不解码，两者必须一起切
+      srgbDecode: this.colorPipeline !== 'direct',
+      maxSize: this.options.maxTextureSize ?? Infinity,
+      anisotropyCap: this.options.anisotropyCap ?? Infinity,
+    };
+  }
+
+  /**
+   * 应用图层渲染 profile（颜色管线 / 各向异性上限）。
+   *
+   * `initial` = 构造期：只记状态并推给数据集管理器，不重建材质、不重传纹理
+   * （那时还没有瓦片）。
+   */
+  private _applyRenderProfile(
+    patch: { colorPipeline?: ColorPipeline; anisotropyCap?: number },
+    initial = false
+  ): void {
+    const prev = this.colorPipeline;
+    if (patch.colorPipeline !== undefined) {
+      this._colorPipeline = normalizeColorPipeline(patch.colorPipeline) ?? 'linear';
+    }
+    if (patch.anisotropyCap !== undefined) this.options.anisotropyCap = patch.anisotropyCap;
+
+    const textureOptions = this._textureOptions();
+    // 之后加载的瓦片按新参数走（已建好的数据集也要跟着换）
+    this._datasetManager.setRenderProfile({ colorPipeline: this.colorPipeline, textureOptions });
+    if (initial) return;
+
+    // 管线变了才需要换 program；只改各向异性时重建纯属浪费
+    if (this.colorPipeline !== prev) this._rebuildStyledMaterials();
+    this._syncCachedTextures(textureOptions);
+    this._requestRepaint();
+  }
+
+  /**
+   * 把纹理解码方式 / 各向异性同步到**已上传**的纹理上。
+   *
+   * 两者都不需要重新解码：`colorSpace` 改了 + `needsUpdate` 让 three 重传一次像素，
+   * `anisotropy` 同理。所以切管线不用重拉瓦片，代价只有一次纹理上传。
+   */
+  private _syncCachedTextures(opts: TextureCreateOptions): void {
+    const want = opts.srgbDecode ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+    for (const entry of this.datasets.values()) {
+      const cache = entry.tileset?.textureCache;
+      if (!cache) continue;
+      for (const tex of cache.values()) {
+        if (tex.colorSpace === want) continue;
+        tex.colorSpace = want;
+        tex.needsUpdate = true;
+      }
+      applyAnisotropyCap(cache.values(), opts.anisotropyCap ?? Infinity);
+    }
+  }
+
   /** 按创建参数原位重建所有 styled 材质（materialQuality 切换用） */
   private _rebuildStyledMaterials(): void {
     // 逐材质 own uniform 的状态要在重建时搬过去，否则选中高亮 / 瓦片淡入会闪没
@@ -2134,9 +2278,14 @@ export class S3MViewer {
       const old = raw as StyledMaterial | undefined;
       if (!old?.userData?.isStyled || !old.userData?.s3mOpts) continue;
       const opts = old.userData.s3mOpts as StyledMaterialOptions;
-      // 显式传本层档位：s3mOpts 里记的是创建时的参数，可能是 undefined（跟随全局），
-      // 重建时必须钉成本层当前档位，否则「别处改了全局」会把这一层带跑。
-      const fresh = createStyledMaterial({ ...opts, uniforms: this.uniforms, materialQuality: this.materialQuality });
+      // 显式传本层档位与管线：s3mOpts 里记的是创建时的参数，可能是 undefined（跟随全局），
+      // 重建时必须钉成本层当前值，否则「别处改了全局」会把这一层带跑。
+      const fresh = createStyledMaterial({
+        ...opts,
+        uniforms: this.uniforms,
+        materialQuality: this.materialQuality,
+        colorPipeline: this.colorPipeline,
+      });
       for (const key of PRESERVED) {
         const src = old.userData[key] as { value: unknown } | undefined;
         const dst = fresh.userData[key] as { value: unknown } | undefined;
@@ -2508,16 +2657,19 @@ export class S3MViewer {
   }
 
   /**
-   * 调整各向异性过滤上限（默认 Infinity = 取 GPU 最大值）。
-   * 只影响**之后创建**的纹理——已上传的纹理需要重新上传才会变，代价远大于收益，
-   * 所以切换档位请在建图层前决定，或接受「新瓦片按新档位、旧瓦片保持原样」。
+   * 调整本图层的各向异性过滤上限（默认 Infinity = 取 GPU 最大值）。
+   *
+   * 与 0.4.22 之前不同：已上传的纹理**会立刻跟着变**（改 sampling 参数 + 重传，
+   * 不需要重新解码，也不需要重载瓦片），所以切 `lightingPreset: 'supermap'` 时
+   * 立面清晰度是当场变的，不再等新瓦片。
    */
   setAnisotropyCap(cap: number): void {
     const next = Number.isFinite(cap) && cap > 0 ? Math.max(1, cap) : Infinity;
     this.options.anisotropyCap = next;
+    // 同步模块级默认：直接调 createTexture / buildTileObjects 的老用法仍读它
     const gpuMax = this.renderer?.capabilities.getMaxAnisotropy?.() ?? 1;
     setMaxAnisotropy(gpuMax, next);
-    this._requestRepaint();
+    this._applyRenderProfile({ anisotropyCap: next });
   }
 
   /** 当前纹理长边像素上限。Infinity = 不限制 */
@@ -2528,12 +2680,16 @@ export class S3MViewer {
   /**
    * 调整纹理长边像素上限（默认 Infinity = 不限制）。
    * 只影响之后解码的纹理；非图集的 RGBA / WebP 产物按 2× 减半逼近上限。
-   * 注意这是**模块级**设置（图集 / 解码 Worker 共享），多 viewer 实例会互相覆盖。
+   *
+   * 图层级：只改本层，同页其它图层不受影响（同时同步模块级默认，照顾直接调
+   * `createTexture` 的老用法）。已解码的纹理不会重解 —— 那是另一件事。
    */
   setMaxTextureSize(n: number): void {
     const next = Number.isFinite(n) && n >= 1 ? n : Infinity;
     this.options.maxTextureSize = next;
     setTextureSizeCap(next);
+    // 只推给数据集，不动材质也不重传纹理（尺寸上限只影响「之后解码」的纹理）
+    this._datasetManager.setRenderProfile({ textureOptions: this._textureOptions() });
     this._requestRepaint();
   }
 

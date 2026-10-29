@@ -13,6 +13,7 @@ import type { AuthenticateFn } from '../core/AuthFetch.js';
 import type { Anchor } from '../core/types.js';
 import type { UnsupportedPolicy } from '../core/degradations.js';
 import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
+import type { TextureCreateOptions } from './TextureFactory.js';
 
 export type DatasetAlignment = 'origin' | 'bottom' | 'top' | 'center';
 
@@ -115,6 +116,23 @@ export class DatasetManager {
     for (const entry of this.datasets.values()) {
       if (entry.options.materialQuality) continue;
       entry.tileset?.setMaterialQuality(q);
+    }
+  }
+
+  /**
+   * 图层级渲染 profile 默认值（颜色管线 / 纹理参数）。
+   * 与 `defaultMaterialQuality` 不同，它没有数据集级覆盖 —— 管线和纹理解码是
+   * 图层级的观感设定，逐数据集混着来只会让同一屏出现两套色彩空间。
+   */
+  defaultColorPipeline: 'linear' | 'direct' | undefined = undefined;
+  defaultTextureOptions: TextureCreateOptions | undefined = undefined;
+
+  /** 图层 profile 变更：同步给已存在的数据集（之后加载的瓦片才用新参数） */
+  setRenderProfile(p: { colorPipeline?: 'linear' | 'direct'; textureOptions?: TextureCreateOptions }): void {
+    if (p.colorPipeline !== undefined) this.defaultColorPipeline = p.colorPipeline;
+    if (p.textureOptions !== undefined) this.defaultTextureOptions = p.textureOptions;
+    for (const entry of this.datasets.values()) {
+      entry.tileset?.setRenderProfile(p);
     }
   }
 
@@ -250,6 +268,9 @@ export class DatasetManager {
       polygonOffset: ds.polygonOffset,
       // 数据集 > 图层 > 模块级默认（undefined 一路传下去，由 createStyledMaterial 回落）
       materialQuality: ds.materialQuality ?? this.defaultMaterialQuality,
+      // 颜色管线 / 纹理参数只有图层级（见 setRenderProfile 注释）
+      colorPipeline: this.defaultColorPipeline,
+      textureOptions: this.defaultTextureOptions,
       useWorker: ds.useWorker,
       authenticate: ds.authenticate ?? authenticate,
       unsupported: ds.unsupported,

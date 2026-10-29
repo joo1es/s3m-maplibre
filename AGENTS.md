@@ -299,8 +299,9 @@ node tools/release.mjs patch --push    # 一条命令发版（改版本 + 构建
 - **注释解释决策，不复述代码。** 反例：`// 遍历网格`；正例：`// 只在位移/旋转动画时关视锥裁剪，静止必须恢复，否则包围盒会滞后`。
 - **数学、单位、坐标系**是这块最容易出错的地方，涉及投影换算时把单位写进注释（像素 / mercator 0..1 / ENU 米）。
 - 不知道宿主内部实现时，**去 `node_modules/maplibre-gl/dist/*.js` 里读实现**，不要凭印象下结论（比如 `nearZ = canvasHeight / 50` 是写死的）。
-- 新增模块级全局状态（`TextureFactory` 的 anisotropy / textureSize、`StyleMaterial` 的 colorPipeline）要接受：**同页多图层会互相覆盖，后创建的赢**。要 per-viewer 就得把状态挂到 viewer 上，那是另一个量级的改动，先别顺手改（`materialQuality` 已经这么改过了，可以照抄那条链路）。
-- `StyleMaterial` 的 `materialQuality` 已经是**图层级**的（0.4.22 起）：`S3MViewer` 构造时只记自己的档位、不写模块级默认，`setMaterialQuality` 也只重建本层材质。档位沿 `S3MViewer → DatasetManager → S3MTileset → buildTileObjects → createStyledMaterial` 透传，链路任何一环掉了都会静默退回模块级默认（多层又互相打脸），加环节时记得一起带。`undefined` = 跟随模块级默认，别改成 `'pbr'`，否则老代码 `setMaterialQuality('lambert')` 一行改全场就失效了。
+- `StyleMaterial` 的 `materialQuality` / `colorPipeline`、`TextureFactory` 的 `srgbDecode` / `anisotropyCap` / `maxTextureSize` 现在都是**图层级**的（0.4.22 起）：`S3MViewer` 构造时只记自己的值、不写模块级默认，setter 只改本层。档位沿 `S3MViewer → DatasetManager → S3MTileset → buildTileObjects → createTexture / createStyledMaterial` 透传，链路任何一环掉了都会静默退回模块级默认（多层又互相打脸），加环节时记得一起带。`undefined` = 跟随模块级默认，别改成具体值，否则老代码 `setMaterialQuality('lambert')` / `setColorPipeline('direct')` 一行改全场就失效了。
+- 新加**模块级全局状态**仍然要接受「同页多图层互相覆盖」，除非照上面那条链路做成图层级：把状态挂到 viewer 上 → 透传到资源创建点 → 给 setter 留一条「改已加载资源」的路径（重建材质 / 重传纹理 / 重解码，代价依次升高）。
+- `lightingPreset: 'supermap'` 会同时改管线、纹理解码、各向异性三样，走的是 `LightRig.applyColorPipeline → ctx.applyRenderProfile`。改它的时候别绕回模块级 `setColorPipeline` / `setSrgbTextureDecode`，那样会把同页别的图层一起改掉。
 - 提交信息：`feat(scope): 中文描述` / `fix(scope): …` / `chore: release …`，按功能主题拆多个 commit。**没有明确指令不要 push。**
 
 ---

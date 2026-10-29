@@ -174,6 +174,18 @@ export interface S3MViewerOptions {
    * `setMaterialQuality()` 原位重建。
    */
   materialQuality?: 'pbr' | 'lambert';
+  /**
+   * 颜色管线（默认 `'linear'`）。
+   *
+   * - `'linear'`：纹理 sRGB 解码 → 线性 PBR 光照 → linear→sRGB 输出（three 标准姿势）
+   * - `'direct'`：官方 iClient3D 的 sRGB 直乘管线，同时把纹理解码关掉（字节值原样进
+   *   shader）。`lightingPreset: 'supermap'` 会选它
+   *
+   * **图层级**：只定这一层，同页多图层各用各的；不传 = 跟随模块级默认。
+   * 已加载瓦片可以在运行时用 `setColorPipeline(q, { duration })` 平滑切过去
+   * （重建材质 + 重传纹理，不重新下载瓦片）。
+   */
+  colorPipeline?: 'linear' | 'direct';
   /** 自定义瓦片构建器（测试 / 服务端渲染时注入） */
   buildTile?: BuildTileFn | null;
   /**

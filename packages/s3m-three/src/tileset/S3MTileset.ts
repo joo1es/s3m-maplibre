@@ -32,6 +32,7 @@ import type {
 } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { TileGeometryData } from '../core/TileGeometry.js';
+import type { TextureCreateOptions } from '../render/TextureFactory.js';
 import type { Group, Texture } from 'three';
 
 function dirOf(url: string): string {
@@ -248,6 +249,10 @@ export type BuildTileFn = (
     polygonOffset?: { factor: number; units: number };
     /** 光照模型档位（透传给 buildTileObjects），见 BuildTileOptions.materialQuality */
     materialQuality?: 'pbr' | 'lambert';
+    /** 颜色管线（透传给 buildTileObjects），见 BuildTileOptions.colorPipeline */
+    colorPipeline?: 'linear' | 'direct';
+    /** 纹理创建参数（透传给 buildTileObjects → createTexture） */
+    textureOptions?: TextureCreateOptions;
   }
 ) => Promise<{ group: Group; stats: Partial<Stats> }>;
 
@@ -265,6 +270,10 @@ export interface S3MTilesetOptions {
    * 由 DatasetManager 从图层 / 数据集设置带下来。
    */
   materialQuality?: 'pbr' | 'lambert';
+  /** 颜色管线，透传给 buildTileObjects。不传 = 读模块级默认。由图层的渲染 profile 带下来 */
+  colorPipeline?: 'linear' | 'direct';
+  /** 纹理创建参数（sRGB 解码 / 尺寸上限 / 各向异性上限），透传给 createTexture */
+  textureOptions?: TextureCreateOptions;
   /**
    * 是否用 Web Worker 解析经典 `.s3mb` 瓦片（默认开）。
    *
@@ -479,6 +488,8 @@ export class S3MTileset {
   private _buildTile: BuildTileFn | null;
   private readonly _polygonOffset: { factor: number; units: number } | undefined;
   private _materialQuality: 'pbr' | 'lambert' | undefined;
+  private _colorPipeline: 'linear' | 'direct' | undefined;
+  private _textureOptions: TextureCreateOptions | undefined;
   private readonly _uniforms: StyleUniforms | null;
   /** 经典 .s3mb 的 Worker 解析客户端；undefined = 尚未尝试创建，null = 不可用/已降级 */
   private _workerClient: S3MWorkerClient | null | undefined;  private readonly _useWorker: boolean;
@@ -500,6 +511,8 @@ export class S3MTileset {
     this._buildTile = options.buildTile ?? null;
     this._polygonOffset = options.polygonOffset;
     this._materialQuality = options.materialQuality;
+    this._colorPipeline = options.colorPipeline;
+    this._textureOptions = options.textureOptions;
     // 着色器共享 uniform，由 S3MLayer 持有并传进来
     this._uniforms = options.uniforms ?? null;
     this._useWorker = options.useWorker !== false;
@@ -738,6 +751,15 @@ export class S3MTileset {
    */
   setMaterialQuality(q: 'pbr' | 'lambert' | undefined): void {
     this._materialQuality = q;
+  }
+
+  /**
+   * 运行时改本数据集的渲染 profile（颜色管线 / 纹理参数）。
+   * 只影响**之后**构建的瓦片材质与纹理；场上已有的由 `S3MViewer` 统一重建 / 重传。
+   */
+  setRenderProfile(p: { colorPipeline?: 'linear' | 'direct'; textureOptions?: TextureCreateOptions }): void {
+    if (p.colorPipeline !== undefined) this._colorPipeline = p.colorPipeline;
+    if (p.textureOptions !== undefined) this._textureOptions = p.textureOptions;
   }
 
   /**
@@ -1264,6 +1286,8 @@ export class S3MTileset {
         assembled,
         polygonOffset: this._polygonOffset,
         materialQuality: this._materialQuality,
+        colorPipeline: this._colorPipeline,
+        textureOptions: this._textureOptions,
       });
       const { group, stats } = buildRes;
       const texKeys = (buildRes as any).textureKeys ?? (group.userData?.textureKeys as string[] | undefined) ?? Object.keys(tile.textures ?? {});

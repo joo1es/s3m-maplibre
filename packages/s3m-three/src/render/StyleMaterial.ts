@@ -317,7 +317,9 @@ export function getMaterialQuality(): MaterialQuality {
  *   （0.8·NdotL + 0.7）、输出前抵消 renderer 的 OETF。与 `setSrgbTextureDecode(false)`
  *   配套使用，`lightingPreset: 'supermap'` 会同时打开两者。
  *
- * 与 materialQuality 同一套全局约定：只影响之后创建的材质，已加载瓦片要重载才换。
+ * 与 materialQuality 同一套约定：这里只是**模块级默认值**，不是全局开关 ——
+ * 图层显式传了 `colorPipeline` 就只认自己，没传才读这里。只影响之后创建的材质，
+ * 已加载瓦片要重载或在图层上调 `setColorPipeline` 才会换。
  */
 export type ColorPipeline = 'linear' | 'direct';
 let colorPipeline: ColorPipeline = 'linear';
@@ -328,6 +330,13 @@ export function setColorPipeline(p: ColorPipeline): void {
 
 export function getColorPipeline(): ColorPipeline {
   return colorPipeline;
+}
+
+/** 归一颜色管线：只认 'linear' / 'direct'，其余返回 undefined（= 去读模块级默认） */
+export function normalizeColorPipeline(p: unknown): ColorPipeline | undefined {
+  if (p === 'direct') return 'direct';
+  if (p === 'linear') return 'linear';
+  return undefined;
 }
 
 export type StyledMaterial = (THREE.MeshStandardMaterial | THREE.MeshLambertMaterial) & {
@@ -1128,6 +1137,11 @@ export interface StyledMaterialOptions {
    * 一路透传到这里，不再让所有图层共享同一份模块级状态。
    */
   materialQuality?: MaterialQuality;
+  /**
+   * 颜色管线。不传 = 读模块级默认（`getColorPipeline()`），行为与旧版一致。
+   * 与 `materialQuality` 同一套：图层把自己的 profile 透传进来，同页互不污染。
+   */
+  colorPipeline?: ColorPipeline;
 }
 
 /**
@@ -1230,7 +1244,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   if (texCoordZ) mat.defines = { ...(mat.defines as Record<string, string>), S3M_TEXCOORD_Z: '' };
   if (secMap) mat.defines = { ...mat.defines, S3M_ATLAS_SEC: '' };
   // supermap 完整版：官方 sRGB 直乘管线（配合 setSrgbTextureDecode(false)）
-  const direct = colorPipeline === 'direct';
+  const direct = (opts.colorPipeline ?? colorPipeline) === 'direct';
   if (direct) mat.defines = { ...mat.defines, S3M_DIRECT_COLOR: '' };
   // 官方 uTextureDim = (base宽, base高, bake宽, bake高)，取实际绑定纹理的像素尺寸
   const uAtlasDim = { value: new THREE.Vector2(opts.map?.image?.width || 1, opts.map?.image?.height || 1) };

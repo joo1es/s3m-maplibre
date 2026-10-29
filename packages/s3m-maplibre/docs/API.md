@@ -288,8 +288,12 @@ setMaxTriangles(n: number, datasetId?: string): void      // 驻留面数软上�
 readonly maxTriangles: number
 setMaxMemory(bytes: number, datasetId?: string): void         // 驻留显存字节软上限，Infinity = 不限制（默认）
 readonly maxMemory: number
-setAnisotropyCap(cap: number): void                       // 各向异性上限，Infinity = 取 GPU 最大值（默认）
+setAnisotropyCap(cap: number): void                       // 各向异性上限，Infinity = 取 GPU 最大值（默认）；即时应用到已上传纹理
 readonly anisotropyCap: number
+setColorPipeline(q: 'linear' | 'direct', opts?: { duration?: number; dim?: number }): Promise<void>
+readonly colorPipeline: 'linear' | 'direct'               // 图层级；duration > 0 走压暗过渡
+setMaterialQuality(q: 'pbr' | 'lambert'): void            // 图层级；原位重建本层材质
+readonly materialQuality: 'pbr' | 'lambert'
 setMaxTextureSize(n: number): void                        // 纹理长边像素上限，Infinity = 不限制（默认）
 readonly maxTextureSize: number
 readonly maxImageCache: number
