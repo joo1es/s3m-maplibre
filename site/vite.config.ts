@@ -21,6 +21,24 @@ const DEMO_ENTRY = 'demo.html';
 const DEMO_ROUTES = new Set(['/demo', '/demo/', '/demo.html', '/demo/index.html']);
 
 /**
+ * 独立的分析页入口。
+ *
+ * 必须显式列出：中间件没命中就会 `next()`，而 Vite 的 SPA fallback 会把
+ * 未命中的路径吐成 `index.html`（文档站）—— 文档站的 entry-client 要求
+ * 页面里有 `s3m-page-data`，于是控制台报「页面不是由 SSG 生成」，
+ * 看起来像是分析页坏了，其实是路由没接住。
+ */
+const ANALYSIS_ENTRY = 'analysis.html';
+const ANALYSIS_ROUTES = new Set([
+  '/analysis',
+  '/analysis/',
+  '/analysis.html',
+  '/demo/analysis',
+  '/demo/analysis/',
+  '/demo/analysis.html',
+]);
+
+/**
  * 本地预览：vite dev 时在中间件里直接做一次 SSG，
  * 这样一个端口同时提供文档（/、/three.html）与 demo（/demo/），
  * 改 markdown 或组件保存后刷新即可看到真实产出，不用跑全量 build。
@@ -84,6 +102,17 @@ function siteDev(): Plugin {
             res.end(
               template.replace(HYDRATION_OUTLET, hydrationScript).replace(OUTLET, render()),
             );
+            return;
+          }
+
+          // ---- 分析页：纯客户端应用，直接吐模板（没有 SSR 注入） ----
+          if (ANALYSIS_ROUTES.has(url)) {
+            const template = await server.transformIndexHtml(
+              `/${ANALYSIS_ENTRY}`,
+              await readFile(at(`./${ANALYSIS_ENTRY}`), 'utf8'),
+            );
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.end(template);
             return;
           }
 

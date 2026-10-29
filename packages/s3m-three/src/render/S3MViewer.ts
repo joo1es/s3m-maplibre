@@ -70,7 +70,30 @@ import type { DegradationKind, UnsupportedPolicy } from '../core/degradations.js
 import { Picker } from './Picker.js';
 import { GpuEdgePass } from './GpuEdgePass.js';
 import { Animator } from '../anim/Animator.js';
-import type { Channel, TransitionOptions } from '../anim/Animator.js';
+import {
+  buildClipPlanes,
+  lineOfSight as computeLineOfSight,
+  measureSegment,
+  polygonArea,
+  polygonAreaHorizontal,
+  polygonPerimeter,
+  polylineLength,
+  polylineLengthHorizontal,
+} from '../analysis/index.js';
+import type {
+  ClipOptions,
+  LineOfSightOptions,
+  LineOfSightResult,
+  LngLatAlt,
+  MeasureResult,
+  SkylineResult,
+  Vec3,
+  ViewshedResult,
+} from '../analysis/index.js';
+import { skylineFromDepth } from '../analysis/skyline.js';
+import { computeViewshed, makeCubeDistanceSampler } from '../analysis/viewshed.js';
+import { captureRadialCube, captureSkylineDepth } from './analysis/DepthPass.js';
+import type { DepthCaptureContext } from './analysis/DepthPass.js';import type { Channel, TransitionOptions } from '../anim/Animator.js';
 import { Path } from '../anim/Path.js';
 import type { EasingFn, EasingName } from '../anim/easing.js';
 import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
@@ -88,7 +111,7 @@ import type {
   StyleUniforms,
 } from '../core/types.js';
 
-import { lngLatFromWorld, type GeoAdapter } from './GeoAdapter.js';
+import { lngLatFromWorld, worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 
 import {
   DatasetManager,
@@ -282,6 +305,8 @@ export class S3MViewer {
   private _colorPipeline: ColorPipeline | undefined;
   /** fade-through 编排的代次：中途再切一次，旧编排作废（与 setMode 同一套） */
   private _pipelineGen = 0;
+  /** 当前裁剪配置；renderer 就绪前后都要能设，所以单独存一份（见 `_applyClipping`） */
+  private _clip: ClipOptions | null = null;
   /** 单体样式、专题着色与状态纹理管理器 */
   private readonly _featureStyleManager: FeatureStyleManager;
   /** GPU 路径动画管理器 */
@@ -566,6 +591,8 @@ export class S3MViewer {
     this.renderer = this._createRenderer(canvas, gl);
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
     this._syncTextureCapabilities(gl);
+    // 裁剪是构造期就能设的（还没 mount 时 `_applyClipping` 会先跳过），这里补挂一次
+    this._applyClipping();
 
     this.scene = new THREE.Scene();
     this.scene.add(this.groundManager.group);
@@ -608,6 +635,8 @@ export class S3MViewer {
     this.renderer = this._createRenderer(this.canvas, gl);
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
     this._syncTextureCapabilities(gl);
+    // 新 renderer 的 clippingPlanes 是空的，裁剪状态要重新挂上去
+    this._applyClipping();
     this.picker?.dispose();
     this.picker = new Picker(this.renderer);
     // GPU 描边的 RT / 材质绑定在旧上下文上，整体丢弃，下一帧按需重建
@@ -2444,6 +2473,208 @@ export class S3MViewer {
   /** 单体的经纬度包围盒 */
   getFeatureBounds(smid: number): [[number, number], [number, number]] | null {
     return this._picks.getFeatureBounds(smid);
+  }
+
+  /* -------------------------------------------------------------- 三维空间分析 */
+
+  /**
+   * 经纬度 + 高程 → 场景 ENU 米制坐标。
+   *
+   * 场景锚点可能还没就绪（没加数据集），此时按世界原点处理 —— 量算 API 会因此
+   * 给出「以原点为基准」的结果，但不会抛错。真实使用里锚点在 addDataset 之后必然存在。
+   */
+  private _sceneFromLngLat(p: LngLatAlt): Vec3 {
+    const anchor = this.sceneAnchor;
+    if (!anchor) return [0, 0, 0];
+    const s = anchor.meterInMercator;
+    const w = worldFromLngLat(this.geo, p.lng, p.lat, p.altitude);
+    // 注意 y 取反：three 的 y 向上，墨卡托 y 向下（与 PickService.pickPosition 互逆）
+    return [(w.x - anchor.x) / s, -(w.y - anchor.y) / s, p.altitude - (anchor.altitude ?? 0)];
+  }
+
+  /**
+   * 经纬度 + 绝对高程 → 场景 ENU 米制坐标。
+   *
+   * 外围要做「分析代理几何」（底图建筑挤出）、或者在 three 里画自定义标注时，
+   * 都得先把经纬度落到这个坐标系里 —— 场景的 ENU 原点在 `sceneAnchor`，
+   * 不是经纬度，所以必须走这个换算。
+   */
+  lngLatToPoint(p: LngLatAlt): Vec3 {
+    return this._sceneFromLngLat(p);
+  }
+
+  /** 场景 ENU 米制坐标 → 经纬度 + 绝对高程（`pointToLngLat` 的逆） */
+  pointToLngLat(v: Vec3): LngLatAlt {
+    return this._lngLatFromScene(v);
+  }
+
+  /** 场景 ENU 米制坐标 → 经纬度 + 绝对高程 */
+  private _lngLatFromScene(v: Vec3): LngLatAlt {
+    const anchor = this.sceneAnchor;
+    if (!anchor) return { lng: 0, lat: 0, altitude: v[2] };
+    const s = anchor.meterInMercator;
+    const [lng, lat] = lngLatFromWorld(this.geo, v[0] * s + anchor.x, -v[1] * s + anchor.y);
+    return { lng, lat, altitude: v[2] + (anchor.altitude ?? 0) };
+  }
+
+  /**
+   * 两点量算：三维距离 / 水平距离 / 高差。
+   *
+   * 输入是经纬度 + 绝对高程（`pickPosition` 的返回值直接能用），
+   * 内部换算到 ENU 米再算，所以不会受投影单位影响。
+   */
+  measureDistance(a: LngLatAlt, b: LngLatAlt): MeasureResult {
+    return measureSegment(this._sceneFromLngLat(a), this._sceneFromLngLat(b));
+  }
+
+  /** 折线长度（三维 + 水平投影两套口径） */
+  measurePolyline(points: readonly LngLatAlt[]): { length3D: number; lengthHorizontal: number } {
+    const scene = points.map((p) => this._sceneFromLngLat(p));
+    return { length3D: polylineLength(scene), lengthHorizontal: polylineLengthHorizontal(scene) };
+  }
+
+  /**
+   * 多边形量算：坡面真实面积 / 水平投影面积 / 周长。
+   *
+   * 建筑面积、用地面积按 `areaHorizontal` 算；坡面覆盖面积按 `area3D`。
+   */
+  measurePolygon(points: readonly LngLatAlt[]): {
+    area3D: number;
+    areaHorizontal: number;
+    perimeter: number;
+  } {
+    const scene = points.map((p) => this._sceneFromLngLat(p));
+    return {
+      area3D: polygonArea(scene),
+      areaHorizontal: polygonAreaHorizontal(scene),
+      perimeter: polygonPerimeter(scene),
+    };
+  }
+
+  /**
+   * 通视分析：两点之间是否被已加载的 S3M 几何挡住。
+   *
+   * 走 CPU 射线求交（`Raycaster` 打全部 pickable mesh），几十万面量级是几十毫秒，
+   * 适合点击式查询；要拖拽时逐帧刷新，得等深度图版本的批量采样。
+   *
+   * 注意范围：**只认 S3M 场景里的几何**。MapLibre 底图地形与 MVT 建筑不在这个场景里，
+   * 它们不参与遮挡（见 `docs/API.md` 的「分析范围」）。
+   */
+  lineOfSight(a: LngLatAlt, b: LngLatAlt, opts: LineOfSightOptions = {}): LineOfSightResult {
+    const from = this._sceneFromLngLat(a);
+    const to = this._sceneFromLngLat(b);
+    return computeLineOfSight(from, to, (origin, dir, maxDistance) => {
+      const hit = this._picks.raycastDistance(origin, dir, maxDistance);
+      if (!hit) return null;
+      return { distance: hit.distance, point: hit.point };
+    }, opts);
+  }
+
+  /**
+   * 裁剪 / 剖切（平面、Box、十字）。
+   *
+   * 平面列表挂在**本图层的 renderer** 上（每个 `S3MLayer` 一个 `WebGLRenderer`），
+   * 所以天然是图层级：同页别的图层不受影响。传 `null` 取消裁剪。
+   *
+   * 已知边界：只做「切掉」，不做**封口**——剖开后看到的是空壳/背面；
+   * 凹多边形裁剪需要多组半空间并集，three 的 `clippingPlanes` 表达不了（只能凸）。
+   */
+  setClipping(opt: ClipOptions | null): void {
+    this._clip = opt;
+    this._applyClipping();
+    this._requestRepaint();
+  }
+
+  /** 当前裁剪配置（`null` = 未裁剪） */
+  get clipping(): ClipOptions | null {
+    return this._clip;
+  }
+
+  private _applyClipping(): void {
+    const r = this.renderer;
+    if (!r) return; // mount 前先记着，`_createRenderer` 之后会补一次
+    if (!this._clip) {
+      r.clippingPlanes = [];
+      return;
+    }
+    r.clippingPlanes = buildClipPlanes(this._clip).map(
+      (p) => new THREE.Plane(new THREE.Vector3(p.normal[0], p.normal[1], p.normal[2]), p.constant)
+    );
+  }
+
+  /** 分析用的离屏采集上下文（renderer / scene / camera 都可能在 mount 前为空） */
+  private _depthCtx(): DepthCaptureContext {
+    return {
+      renderer: () => this.renderer,
+      scene: () => this.scene,
+      camera: () => this.camera,
+    };
+  }
+
+  /**
+   * 天际线分析：用当前视角渲染一张深度图，按列抽出「方位角 → 仰角」曲线。
+   *
+   * 一次调用 = 一趟额外渲染 + 一次全图回读，**不要每帧调**。
+   * 典型用法是相机停下来（`moveend`）后算一次。
+   *
+   * @param opts.width 采集分辨率（默认 640）。精度由它决定：
+   *   640 宽 ≈ 0.56°/列，1280 宽 ≈ 0.28°/列。
+   */
+  skyline(opts: {
+    width?: number;
+    height?: number;
+    step?: number;
+    /** 额外参与遮挡的代理几何（底图建筑 / 地形网格），只在这一趟深度渲染里存在 */
+    include?: readonly THREE.Object3D[];
+  } = {}): SkylineResult | null {
+    const cap = captureSkylineDepth(
+      this._depthCtx(),
+      opts.width ?? 640,
+      opts.height ?? 360,
+      opts.include
+    );
+    if (!cap) return null;
+    return skylineFromDepth({
+      rgba: cap.rgba,
+      width: cap.width,
+      height: cap.height,
+      inverseViewProj: cap.inverseViewProj,
+      cameraPos: cap.cameraPos,
+      step: opts.step,
+    });
+  }
+
+  /**
+   * 360° 可视域（地面栅格版）：从观察点朝 6 个方向各渲染一次深度，
+   * 再在 CPU 上对地面网格逐格判定可见性。
+   *
+   * 一次调用 = 6 趟额外渲染 + 6 次回读，成本明显高于天际线，
+   * 只在点击/松手时算。返回的 `raster` 可以直接当贴图画在地面上。
+   */
+  viewshed(opts: {
+    /** 观察点（经纬度 + 地面高程；眼高由 `eyeHeight` 另加） */
+    origin: LngLatAlt;
+    /** 分析半径（米） */
+    radius: number;
+    /** 栅格边长（默认 96） */
+    grid?: number;
+    /** 眼高（米，默认 1.7） */
+    eyeHeight?: number;
+    /** 立方体深度图分辨率（默认 128；越大边缘越准，回读越慢） */
+    size?: number;
+    /** 额外参与遮挡的代理几何（底图建筑 / 地形网格），只在这一趟深度渲染里存在 */
+    include?: readonly THREE.Object3D[];
+  }): ViewshedResult | null {
+    const eye = opts.eyeHeight ?? 1.7;
+    const origin = this._sceneFromLngLat({ ...opts.origin, altitude: opts.origin.altitude + eye });
+    const size = opts.size ?? 128;
+    const faces = captureRadialCube(this._depthCtx(), origin, size, opts.radius, opts.include);
+    if (!faces) return null;
+    return computeViewshed(origin, makeCubeDistanceSampler(faces, size, opts.radius), {
+      radius: opts.radius,
+      grid: opts.grid,
+      groundZ: 0,
+    });
   }
 
   /** @internal 见 viewer/PickService.ts */

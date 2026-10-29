@@ -36,7 +36,13 @@ async function main() {
     build: {
       outDir: DIST,
       emptyOutDir: true,
-      rollupOptions: { input: { demo: path.join(SITE, 'demo.html') } },
+      // 两个入口：主 demo（Solid + SSR）与独立的空间分析页（纯 TS，无 SSR）
+      rollupOptions: {
+        input: {
+          demo: path.join(SITE, 'demo.html'),
+          analysis: path.join(SITE, 'analysis.html'),
+        },
+      },
     },
   });
 
@@ -75,12 +81,19 @@ async function main() {
   await mkdir(path.join(TARGET, 'assets'), { recursive: true });
   await cp(path.join(DIST, 'assets'), path.join(TARGET, 'assets'), { recursive: true });
 
+  // 空间分析页：纯客户端应用，没有 SSR 注入，直接把 vite 产出的 html 拷过去。
+  // 放在 demo/ 同级（而不是 demo/analysis/index.html）是为了让 `./assets/` 相对路径成立。
+  const analysisHtml = await readFile(path.join(DIST, 'analysis.html'), 'utf8');
+  await writeFile(path.join(TARGET, 'analysis.html'), analysisHtml, 'utf8');
+
   // 单文件时代的入口，已经被 src/demo/main.js 取代
   await rm(path.join(TARGET, 'main.js'), { force: true });
 
   const size = (await stat(path.join(TARGET, 'index.html'))).size;
   const assets = await readdir(path.join(TARGET, 'assets'));
+  const aSize = (await stat(path.join(TARGET, 'analysis.html'))).size;
   console.log(`  ✓ demo/index.html  ${(size / 1024).toFixed(0)} KB，assets ${assets.length} 个`);
+  console.log(`  ✓ demo/analysis.html  ${(aSize / 1024).toFixed(0)} KB`);
 
   // dist-demo/ 与 dist-demo-ssr/ 只是中转站，产物已经落到 demo/，留着只会越积越多。
   // 清理是尽力而为：这两个目录都在 .gitignore 里，删不掉只占点磁盘，

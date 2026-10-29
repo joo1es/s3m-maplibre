@@ -294,6 +294,16 @@ setColorPipeline(q: 'linear' | 'direct', opts?: { duration?: number; dim?: numbe
 readonly colorPipeline: 'linear' | 'direct'               // 图层级；duration > 0 走压暗过渡
 setMaterialQuality(q: 'pbr' | 'lambert'): void            // 图层级；原位重建本层材质
 readonly materialQuality: 'pbr' | 'lambert'
+lngLatToPoint(p: LngLatAlt): [number, number, number]   // 经纬度 → 场景 ENU（画代理几何用）
+pointToLngLat(v: [number, number, number]): LngLatAlt
+measureDistance(a: LngLatAlt, b: LngLatAlt): { distance3D; distanceHorizontal; heightDiff }
+measurePolyline(points: LngLatAlt[]): { length3D; lengthHorizontal }
+measurePolygon(points: LngLatAlt[]): { area3D; areaHorizontal; perimeter }
+lineOfSight(a: LngLatAlt, b: LngLatAlt, opts?): LineOfSightResult
+setClipping(opt: ClipOptions | null): void                // 平面 / Box / 十字，图层级
+readonly clipping: ClipOptions | null
+skyline(opts?: { width?; height?; step?; include?: Object3D[] }): SkylineResult | null  // 一次深度 pass，别每帧调
+viewshed(opts: { origin; radius; grid?; eyeHeight?; size?; include? }): ViewshedResult | null  // 6 次 pass
 setMaxTextureSize(n: number): void                        // 纹理长边像素上限，Infinity = 不限制（默认）
 readonly maxTextureSize: number
 readonly maxImageCache: number

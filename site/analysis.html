@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>S3M 三维空间分析 — 量算 / 通视 / 裁剪 / 天际线 / 可视域</title>
+    <meta
+      name="description"
+      content="s3m-maplibre 的三维空间分析演示：距离面积量算、通视、Box/十字剖切、天际线、360° 可视域。"
+    />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #0b101b;
+        font: 13px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: #e2e8f0;
+      }
+      #map {
+        position: absolute;
+        inset: 0;
+      }
+      /* 量算 / 可视域的绘制层：盖在画布上，pointer-events 关掉，点击仍然进地图 */
+      #overlay {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+      }
+      #toolbar {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        max-width: calc(100% - 24px);
+        z-index: 5;
+      }
+      #toolbar button {
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid rgba(148, 163, 184, 0.35);
+        background: rgba(15, 23, 42, 0.85);
+        color: #e2e8f0;
+        cursor: pointer;
+        font-size: 12px;
+        backdrop-filter: blur(6px);
+      }
+      #toolbar button:hover {
+        border-color: #38bdf8;
+      }
+      #toolbar button.on {
+        background: #0ea5e9;
+        border-color: #0ea5e9;
+        color: #04121f;
+        font-weight: 600;
+      }
+      #hud {
+        position: absolute;
+        bottom: 12px;
+        left: 12px;
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        white-space: pre-line;
+        max-width: min(560px, calc(100% - 24px));
+        backdrop-filter: blur(6px);
+        z-index: 5;
+      }
+      #hud b {
+        color: #38bdf8;
+      }
+      #sky {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        width: 280px;
+        height: 160px;
+        border-radius: 8px;
+        background: rgba(15, 23, 42, 0.85);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        display: none;
+        z-index: 5;
+      }
+      #sky.on {
+        display: block;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <canvas id="overlay"></canvas>
+    <canvas id="sky" width="280" height="160"></canvas>
+    <div id="toolbar"></div>
+    <div id="hud">正在加载 CBD 数据集…</div>
+    <script type="module" src="/src/analysis/main.ts"></script>
+  </body>
+</html>

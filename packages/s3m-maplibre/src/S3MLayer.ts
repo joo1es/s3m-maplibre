@@ -47,8 +47,15 @@ import type {
   PathFollowOptions,
   GPUPathOptions,
   GPUPathManager,
+  LngLatAlt,
+  MeasureResult,
+  LineOfSightOptions,
+  LineOfSightResult,
+  ClipOptions,
+  SkylineResult,
+  ViewshedResult,
 } from 's3m-three';
-import type { Ray, ToneMapping } from 'three';
+import type { Object3D, Ray, ToneMapping } from 'three';
 import { Matrix4 } from 'three';
 import {
   buildOrthoMVP,
@@ -534,6 +541,93 @@ export class S3MLayer extends HostRenderer {
   /** 当前颜色管线（本层没指定过就是模块级默认） */
   get colorPipeline(): 'linear' | 'direct' {
     return this.viewer.colorPipeline;
+  }
+
+  /* ------------------------------------------------------------ 三维空间分析 */
+
+  /**
+   * 两点量算（三维距离 / 水平距离 / 高差）。
+   *
+   * 入参直接用 `pickPosition(x, y)` 的返回值，交互（取点、画线、标签）留给应用层。
+   */
+  measureDistance(a: LngLatAlt, b: LngLatAlt): MeasureResult {
+    return this.viewer.measureDistance(a, b);
+  }
+
+  /**
+   * 经纬度 + 绝对高程 → 场景 ENU 米制坐标。
+   * 外围画自定义几何（例如给分析用的底图建筑代理）时要用它做换算。
+   */
+  lngLatToPoint(p: LngLatAlt): [number, number, number] {
+    return this.viewer.lngLatToPoint(p);
+  }
+
+  /** 场景 ENU 米制坐标 → 经纬度 + 绝对高程 */
+  pointToLngLat(v: [number, number, number]): LngLatAlt {
+    return this.viewer.pointToLngLat(v);
+  }
+
+  /** 折线长度（三维 + 水平投影） */
+  measurePolyline(points: readonly LngLatAlt[]): { length3D: number; lengthHorizontal: number } {
+    return this.viewer.measurePolyline(points);
+  }
+
+  /** 多边形量算（坡面面积 / 水平投影面积 / 周长） */
+  measurePolygon(points: readonly LngLatAlt[]): {
+    area3D: number;
+    areaHorizontal: number;
+    perimeter: number;
+  } {
+    return this.viewer.measurePolygon(points);
+  }
+
+  /**
+   * 通视分析。只认本图层已加载的 S3M 几何，底图地形与 MVT 建筑不参与遮挡。
+   */
+  lineOfSight(a: LngLatAlt, b: LngLatAlt, opts?: LineOfSightOptions): LineOfSightResult {
+    return this.viewer.lineOfSight(a, b, opts);
+  }
+
+  /**
+   * 裁剪 / 剖切（平面、Box、十字）。只影响本图层；传 `null` 取消。
+   * 不做封口，剖开后是空壳。
+   */
+  setClipping(opt: ClipOptions | null): void {
+    this.viewer.setClipping(opt);
+  }
+
+  /** 当前裁剪配置 */
+  get clipping(): ClipOptions | null {
+    return this.viewer.clipping;
+  }
+
+  /**
+   * 天际线分析：用当前视角渲染一次深度图，返回「方位角 → 仰角」曲线。
+   * 一次调用 = 一趟额外渲染 + 一次回读，**不要每帧调**（相机停下后算一次即可）。
+   * 呈现（2D 曲线 / 遮罩）由应用层画。
+   */
+  skyline(opts?: {
+    width?: number;
+    height?: number;
+    step?: number;
+    include?: readonly Object3D[];
+  }): SkylineResult | null {
+    return this.viewer.skyline(opts);
+  }
+
+  /**
+   * 360° 可视域（地面栅格版）：从观察点 6 个方向各渲染一次，返回地面可见性栅格。
+   * 一次调用成本明显高于天际线，只在点击 / 松手时算。
+   */
+  viewshed(opts: {
+    origin: LngLatAlt;
+    radius: number;
+    grid?: number;
+    eyeHeight?: number;
+    size?: number;
+    include?: readonly Object3D[];
+  }): ViewshedResult | null {
+    return this.viewer.viewshed(opts);
   }
 
   /** 动态设置图层整体透明度 (0.0 ~ 1.0)，可带过渡 */

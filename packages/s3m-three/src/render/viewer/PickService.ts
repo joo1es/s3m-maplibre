@@ -408,6 +408,53 @@ export class PickService {
   }
 
   /**
+   * 沿给定射线求**最近**交点距离（通视分析用）。
+   *
+   * 与 `pick` 不同：不走 GPU、不认批次，只回答「这条线上最先撞到什么」，
+   * 所以一次查询的代价是 O(已加载三角面)，几十万面的场景在几十毫秒量级，
+   * 适合点击式查询；要逐帧连续更新得换深度图方案（见 `docs/API.md`）。
+   *
+   * @param origin 起点（场景 ENU 米）
+   * @param dir 单位方向
+   * @param maxDistance 只关心这个距离内的交点
+   */
+  raycastDistance(
+    origin: readonly [number, number, number],
+    dir: readonly [number, number, number],
+    maxDistance: number
+  ): { distance: number; point: [number, number, number] } | null {
+    if (!this.host.scene) return null;
+    const meshes = [...this.pickables.values()]
+      .map((p) => p.mesh)
+      .filter((m) => {
+        // 被隐藏的单体所在网格、以及整层隐藏的都要排除，否则会「撞到看不见的墙」
+        let curr: THREE.Object3D | null = m;
+        while (curr) {
+          if (!curr.visible) return false;
+          curr = curr.parent;
+        }
+        return true;
+      });
+    if (!meshes.length) return null;
+
+    const raycaster = new THREE.Raycaster();
+    raycaster.set(
+      new THREE.Vector3(origin[0], origin[1], origin[2]),
+      new THREE.Vector3(dir[0], dir[1], dir[2]).normalize()
+    );
+    raycaster.near = 0;
+    raycaster.far = maxDistance;
+
+    const hits = raycaster.intersectObjects(meshes, false);
+    if (!hits.length) return null;
+    const h = hits[0];
+    return {
+      distance: h.distance,
+      point: [h.point.x, h.point.y, h.point.z],
+    };
+  }
+
+  /**
    * 沿视线方向穿透拾取多个单体，按由近至远排序返回。
    */
   drillPick(x: number, y: number, limit = 10): PickResult[] {

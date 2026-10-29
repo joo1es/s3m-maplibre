@@ -138,6 +138,11 @@ export { setMaterialQuality, getMaterialQuality } from './render/StyleMaterial.j
 
 export { Picker } from './render/Picker.js';
 export { GpuEdgePass } from './render/GpuEdgePass.js';
+
+/* 三维空间分析内核：纯数学，不依赖 WebGL，可单独用于服务端 / Worker */
+export * from './analysis/index.js';
+export { captureSkylineDepth, captureRadialCube, buildCubeCameras, CUBE_FACES } from './render/analysis/DepthPass.js';
+export type { DepthCaptureContext, SkylineCapture } from './render/analysis/DepthPass.js';
 export type { GpuEdgeParams } from './render/GpuEdgePass.js';
 export type { PickHit } from './render/Picker.js';
 

@@ -410,6 +410,106 @@ getFeatureBounds(smid: number): [[number, number], [number, number]] | null
 
 拾取走 GPU：把「物体编号 + batchId」编码成 RGBA 渲染到 **1×1** 离屏目标再读那一个像素——viewport 仍是整块画布、原点平移到点击点，于是整幅画面按原样光栅化，只有点击点那一格落在目标上。代价与三角面数无关，且天然只命中最前面的可见面。
 
+### 三维空间分析（量算 / 通视 / 裁剪）
+
+```ts
+measureDistance(a: LngLatAlt, b: LngLatAlt): { distance3D; distanceHorizontal; heightDiff }
+measurePolyline(points: LngLatAlt[]): { length3D; lengthHorizontal }
+measurePolygon(points: LngLatAlt[]): { area3D; areaHorizontal; perimeter }
+
+lineOfSight(a: LngLatAlt, b: LngLatAlt, opts?): {
+  visible: boolean; distance: number; blockedDistance: number | null;
+  blockedPoint: [number, number, number] | null; visibleRatio: number;
+}
+
+setClipping(opt: ClipOptions | null): void      // 平面 / Box / 十字
+readonly clipping: ClipOptions | null
+
+skyline(opts?: { width?; height?; step? }): SkylineResult | null
+viewshed(opts: { origin: LngLatAlt; radius: number; grid?; eyeHeight?; size? }): ViewshedResult | null
+```
+
+- 入参是**经纬度 + 绝对高程**，直接用 `pickPosition(x, y)` 的返回值；交互（取点、拖拽、标签、撤销）属于应用层，不进库。
+- 纯数学部分（距离 / 面积 / 通视判定 / 半空间生成）导出在 `s3m-three` 根上，**不依赖 WebGL**，可以在 Worker 或服务端复用。
+- 面积有两套口径：`area3D` 是坡面真实面积（Newell 法），`areaHorizontal` 是水平投影（鞋带公式）。建筑面积、用地面积按后者。
+- `lineOfSight` 走 CPU 射线求交（`Raycaster` 打全部 pickable mesh），几十万面是几十毫秒量级，适合点击式查询；要拖拽时逐帧刷新得等深度图批量采样版本。
+- 裁剪是**图层级**的（每个 `S3MLayer` 一个 `WebGLRenderer`，平面挂在它的 `clippingPlanes` 上），同页其它图层不受影响。传 `null` 取消。
+- **两个已知边界**：① 只做「切掉」不做**封口**，剖开后看到的是空壳/背面；② 半空间求交只能表达凸区域，凹多边形裁剪需要多组并集，three 的 `clippingPlanes` 表达不了。
+- **分析范围只包含 S3M 场景里的几何**：MapLibre 底图地形与 MVT 建筑不在这个场景里，不参与遮挡判断。
+
+**天际线 / 360° 可视域**（P1）走的是「一次离屏深度 pass + CPU 归约」：
+
+- `skyline()`：用当前视角渲染一张 `RGBADepthPacking` 深度图，按列取最上面的几何像素，
+  反投影成（方位角, 仰角）。一次调用 = 一趟额外渲染 + 一次全图回读，**不要每帧调**，
+  相机停下后算一次。精度由 `width` 决定（640 宽 ≈ 0.56°/列）。
+- 结果里除了角度，还有 `screen`（每列天际线像素的**归一化屏幕坐标** `[x0,y0,x1,y1,…]`）
+  和 `hasGeometry`（纯天空列）。要在**地图上描天际线**，直接用这两个：
+  深度图本来就是屏幕空间的产物，换算成角度只为读数，画线再投影一次反而多一层误差。
+  `hasGeometry = 0` 的列必须断开，否则线会横穿天空掉到画面底部。
+- 天际线绑定位姿：镜头一动就作废，应用层要在 `movestart` 清掉、`moveend` 按需重算。
+- `viewshed()`：从观察点朝 6 个方向各渲染一次「到观察点的距离」，再在 CPU 上对
+  地面网格逐格比较，返回 `raster`（1 可见 / 0 遮挡 / -1 无效）。一次调用 = 6 趟渲染 + 6 次回读，
+  成本明显更高，只在点击/松手时算。
+- 两者都**不做建筑立面逐像素着色**（那要把立方体深度注入每种材质的 shader）。
+- 已知限制：`overrideMaterial` 换材质时**实例化网格（点云/树木）不参与遮挡**。
+
+#### 分析范围：只含 S3M 场景，底图内容要外围自己补
+
+`skyline()` / `viewshed()` / `lineOfSight()` 都只看 **S3M 场景里的几何**：
+
+- MapLibre 的 `fill-extrusion` 建筑、terrain 地形不在 three 场景里，**不参与遮挡**；
+- raster 底图本来就没有高度，没什么可参与；
+- 也**读不到** MapLibre 的深度：自定义图层画在主 framebuffer 里，帧内拿不出来；而深度 pass 用的是自己的 FBO + `overrideMaterial`，两套深度不共享。
+
+要「整座城市的天际线」，只能**复制一份几何**进来。这一步属于外围，库提供两个必要的原语：
+`lngLatToPoint()`（经纬度 → 场景 ENU）和 `include`（只参与这一趟深度渲染的额外几何）。
+
+```ts
+// 1) 从底图矢量源取当前视野的建筑（高度字段各家不同，见下面的坑）
+const feats = map.querySourceFeatures('openmaptiles', { sourceLayer: 'building' });
+
+// 2) 轮廓 → 场景 ENU → 挤出
+const proxy = new THREE.Group();
+for (const f of feats) {
+  const h = Number(f.properties.render_height ?? f.properties.height ?? 0);
+  if (!(h > 0)) continue;
+  const shape = new THREE.Shape(
+    f.geometry.coordinates[0].map(([lng, lat]) => {
+      const p = layer.lngLatToPoint({ lng, lat, altitude: 0 });
+      return new THREE.Vector2(p[0], p[1]);
+    })
+  );
+  proxy.add(new THREE.Mesh(new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false })));
+}
+
+// 3) 只喂给这一趟深度渲染：不进主渲染，不会和 MapLibre 重复画
+const r = layer.skyline({ width: 1280, height: 720, include: [proxy] });
+```
+
+`include` 的语义：对象在采集期间临时挂进 viewer 场景，采集完立刻摘掉
+（已经有 parent 的会被跳过）。`viewshed()` 同样支持这个参数。
+
+**三个坑**：
+
+1. **高度字段口径不统一** —— `render_height`（OpenMapTiles）/ `height`（OSM 原始）/ `building:levels × 3`，
+   要和底图样式里 `fill-extrusion-height` 的表达式保持一致，否则会出现「分析里有一栋、画面上没有」。
+2. **要素会重复** —— `querySourceFeatures` 返回当前视野内所有已加载瓦片的要素，跨瓦片边界的建筑会出现多次，
+   需要按 id 或几何去重，否则代理几何叠在一起（对天际线无害，对统计有害）。
+3. **代理 ≠ 画面** —— 底图如果用了 `fill-extrusion-height` 插值或 terrain 抬升，代理和实际渲染会有偏差；
+   要完全一致，就得让底图建筑也由自己渲染，那已经超出「分析」的范围了。
+
+`demo/analysis.html` 里有可运行的例子：「含底图天际线」（只喂分析）+「显示代理」（把代理塞进画面看效果）。
+
+```ts
+type ClipOptions =
+  | { type: 'plane'; normal: [number, number, number]; point: [number, number, number] }
+  | { type: 'box'; a: [number, number, number]; b: [number, number, number] }
+  | { type: 'cross'; center: [number, number, number]; keepX: 1 | -1; keepY: 1 | -1;
+      horizontal?: boolean; keepZ?: 1 | -1 };
+```
+
+法线一律指向**保留侧**（与 three 的 `Plane` 口径一致：`normal·p + constant >= 0` 保留）。
+
 ### LOD 与统计
 
 ```ts
