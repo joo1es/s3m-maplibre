@@ -2,10 +2,12 @@
  * DXT1 / DXT3 / DXT5 纹理解码（squish 算法的 JS 移植）
  *
  * 来源：SuperMap iClient3D S3M SDK（Apache-2.0）。
- * 迁移到 TS 时做了两件事，算法本身未改：
+ * 迁移到 TS 时做了三件事，算法本身未改：
  *   1. 补齐类型；
  *   2. 修掉 `DecompressAlphaDxt3` 里把 `block` 误写成未定义全局 `bytes` 的笔误
- *      （DXT3 纹理此前会直接 ReferenceError）。
+ *      （DXT3 纹理此前会直接 ReferenceError）；
+ *   3. 修掉 `DecompressImage565` 块行下标少减 1 的笔误（见下方函数内注释，
+ *      format ≤ 11 的 DXT1 顶部块行曾整行变黑）。
  */
 
 const kDxt1 = 1 << 0;
@@ -158,7 +160,10 @@ function DecompressImage565(rgb565: Uint16Array, width: number, height: number, 
   const blockHeight = height / 4;
   for (let blockY = 0; blockY < blockHeight; blockY++) {
     for (let blockX = 0; blockX < blockWidth; blockX++) {
-      i = 4 * ((blockHeight - blockY) * blockWidth + blockX);
+      // 与 DecompressImage 的 height - 1 - sy 同口径：倒着取流中块行做 flipY。
+      // 写成 blockHeight - blockY 会让 blockY=0 读到数组界外（Uint16Array 越界读
+      // 得 undefined，位运算后归 0），顶部块行解成全黑、其余块行整体错位一行。
+      i = 4 * ((blockHeight - 1 - blockY) * blockWidth + blockX);
       c[0] = blocks[i];
       c[1] = blocks[i + 1];
       r0 = c[0] & 0x1f;

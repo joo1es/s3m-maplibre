@@ -73,14 +73,11 @@ describe('DXTTextureDecode 快路径与边界分支', () => {
     expect(out[p3 + 3]).toBe(0);
   });
 
-  // 已知缺陷待修复：
-  // DecompressImage565 内部计算 block 偏移时少减了 1：
+  // 回归（issue #2）：DecompressImage565 的块偏移曾少减 1：
   //   原式：i = 4 * ((blockHeight - blockY) * blockWidth + blockX);
-  //   正确应为：i = 4 * ((blockHeight - 1 - blockY) * blockWidth + blockX);
-  // 导致当 blockY=0 时读越界变成全黑（读到 blocks 数组界外）。
-  // 此处保留真正正确的期望断言（标准 8 字节 block 输入、断言首像素正确取到 0x001f），
-  // 使用 it.skip 标记，修复该缺陷后移除 skip 即可转为回归断言。
-  it.skip('format <= 11 走 rgb565 快路径 (DecompressImage565) [已知缺陷: 块行下标越界]', () => {
+  // blockY=0 时读到 blocks 数组界外（Uint16Array 越界读得 undefined，位运算后归 0），
+  // 顶部块行解成全黑、其余块行整体错位一行。修复后该用例转为常驻回归断言。
+  it('format <= 11 走 rgb565 快路径 (DecompressImage565)：单块不越界', () => {
     // 标准单 block (4x4 像素) 输入，总长恰好 8 字节（4 个 uint16）
     const block = new Uint8Array(8);
     const u16Block = new Uint16Array(block.buffer, block.byteOffset, 4);
@@ -96,6 +93,43 @@ describe('DXTTextureDecode 快路径与边界分支', () => {
     const u16Out = new Uint16Array(out.buffer, out.byteOffset, 16);
     // 正确 flipY 解码后输出的首像素应为 c[0] 即 0x001f
     expect(u16Out[0]).toBe(0x001f);
+  });
+
+  // 回归（issue #2）：8x8 = 2x2 个 DXT1 块，每块一个纯色，逐块断言，
+  // 钉死「块行按 flipY 取流中第 blockHeight-1-blockY 行」的行序口径——
+  // 少减 1 时顶部块行越界变黑、底行拿到的是流中底行（没翻转），两个错都抓得到。
+  it('format <= 11 走 rgb565 快路径：8x8 多块行序/flipY 逐块断言', () => {
+    const width = 8;
+    const height = 8;
+    const blockW = width / 4;
+    const blockH = height / 4;
+    // 流中 2x2 块按 raster 序填：红 / 绿 / 蓝 / 白（每块 word0=word1=纯色，selector 全 0 → 全取 c[0]）
+    const colors = [0xf800, 0x07e0, 0x001f, 0xffff];
+    const data = new Uint8Array(4 * 8);
+    const u16Blocks = new Uint16Array(data.buffer);
+    for (let b = 0; b < 4; b++) {
+      u16Blocks[b * 4 + 0] = colors[b];
+      u16Blocks[b * 4 + 1] = colors[b];
+      u16Blocks[b * 4 + 2] = 0;
+      u16Blocks[b * 4 + 3] = 0;
+    }
+
+    const out = new Uint8Array(width * height * 2);
+    DXTTextureDecode.decode(out, width, height, data, 10);
+    const u16Out = new Uint16Array(out.buffer);
+
+    // 输出块 (bx, by) 的 16 个像素都应等于流中块 (bx, blockH-1-by) 的颜色
+    for (let by = 0; by < blockH; by++) {
+      for (let bx = 0; bx < blockW; bx++) {
+        const expected = colors[(blockH - 1 - by) * blockW + bx];
+        for (let py = 0; py < 4; py++) {
+          for (let px = 0; px < 4; px++) {
+            const idx = (by * 4 + py) * width + bx * 4 + px;
+            expect(u16Out[idx]).toBe(expected);
+          }
+        }
+      }
+    }
   });
 
   it('format 18 (DXT3) 解码：显式 4-bit alpha 正确解码到输出像素', () => {
