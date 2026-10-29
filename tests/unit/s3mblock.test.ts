@@ -89,6 +89,28 @@ describe('S3MBLOCK 容器与内嵌瓦片', () => {
     expect(Object.keys(tile.textures)).toEqual(expect.arrayContaining(Object.keys(tp)));
   });
 
+  test('叶子瓦片外层 pageLodCount 为 0 时，内层 groupNode 的 pageLods/geodes/矩阵必须保留', async () => {
+    const { parseS3MBlockGroups } = await import('../../packages/s3m-three/src/core/S3MBlockParser');
+    const leafBlock = readFileSync(join(FIXTURES, 'leaf/6_00.s3mblock'));
+    const groups = await parseS3MBlockGroups(toArrayBuffer(leafBlock), { inflate });
+    expect(groups.names).toContain('6_000000');
+    const leafIndex = groups.names.indexOf('6_000000');
+    const leafTile = groups.tiles[leafIndex]!;
+
+    // 以前：容器外层 pageLodCount=0 时 mappedLods 变为空数组，导致丢失全部 geodes 矩阵，
+    // 渲染时回退单位矩阵，瓦片偏移数公里（如 Road@OlympicGreen 闪烁后瞬移/消失）。
+    expect(leafTile.groupNode.pageLods.length).toBeGreaterThan(0);
+    const lod0 = leafTile.groupNode.pageLods[0]!;
+    expect(lod0.geodes.length).toBeGreaterThan(0);
+    const matrix = lod0.geodes[0]!.matrix;
+    expect(matrix).toBeDefined();
+    expect(matrix).toHaveLength(16);
+    // 6_000000 内层自带真实位移 (-99.69, -1002.78, -0.08)，不能丢失
+    expect(matrix![12]).toBeCloseTo(-99.6929, 3);
+    expect(matrix![13]).toBeCloseTo(-1002.784, 3);
+    expect(lod0.boundingSphere.radius).toBeGreaterThan(0);
+  });
+
   test('图集矩形：逐顶点落到所属子区域，UV 保持原值', async () => {
     const tile = await parse('0.s3mblock');
     const geoName = Object.keys(tile.geoPackage)[0]!;

@@ -960,19 +960,31 @@ export async function parseS3MBlockGroups(
     const atlasRects = buildAtlasRects(geoPackage, texturePackage, packed);
     const textures = buildTextureTable(texturePackage);
 
-    // pageLOD：容器提供的 LOD/子瓦片信息是权威；geodes 在内层 groupNode 里
-    const innerLods = groupNode.pageLods;
-    const mergedLods: PageLOD[] = pageLods.map((lod, i) => {
-      const inner = innerLods[i];
-      return {
-        rangeValue: lod.rangeValue,
-        rangeMode: lod.rangeMode,
-        boundingSphere: lod.boundingSphere,
-        childTile: lod.childTile,
-        geodes: inner?.geodes ?? [],
-        ...(inner?.obb ? { obb: inner.obb } : {}),
-      };
-    });
+    // pageLOD：容器提供的 LOD/子瓦片信息是权威；geodes 在内层 groupNode 里。
+    // 注意：叶子瓦片（没有子代）在容器外层通常 pageLodCount 为 0，
+    // 此时绝对不能清空 pageLods，必须回退使用内层 groupNode 携带的真实 pageLOD
+    // （含关键的 geode 空间变换矩阵与包围球）。否则叶子瓦片会丢失 geode 矩阵，
+    // 退化为单位矩阵渲染，表现为「闪烁后瞬移/偏移数公里」以及因视锥剔除「渲染着消失」。
+    const innerLods = groupNode.pageLods ?? [];
+    let mergedLods: PageLOD[];
+    if (pageLods.length === 0) {
+      mergedLods = innerLods;
+    } else {
+      mergedLods = pageLods.map((lod, i) => {
+        const inner = innerLods[i];
+        return {
+          rangeValue: lod.rangeValue,
+          rangeMode: lod.rangeMode,
+          boundingSphere: lod.boundingSphere,
+          childTile: lod.childTile,
+          geodes: inner?.geodes ?? [],
+          ...(inner?.obb ? { obb: inner.obb } : {}),
+        };
+      });
+      if (innerLods.length > pageLods.length) {
+        mergedLods.push(...innerLods.slice(pageLods.length));
+      }
+    }
 
     tiles.push({
       version,

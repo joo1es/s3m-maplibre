@@ -96,25 +96,49 @@ byte[4] 's3m\0' + zlib
 
 ## 五、S3MBLOCK / texblock（纹理分包）
 
-从 `3D-CBD/Xiaopin@CBD` 逐字节标定，并与官方 `@supermapgis/s3m-content-loader` 的 `S3MBlockBufferLoader` 交叉验证。 —— **B 级**
+从 `3D-CBD/Xiaopin@CBD` 与 `3D-OlympicGreen-2`（Road / Building）逐字节标定，并与官方 `@supermapgis/s3m-content-loader` 的 `S3MBlockBufferLoader` 交叉验证。 —— **B 级**
 
-容器：
+### 5.1 容器结构
+
+一个 `.s3mblock` 文件不是“单块瓦片”，而是**一整棵 LOD 子树的打包**（例如 `1_00.s3mblock` 依次包含 `1_00`、`1_0000`、`1_000000` 三层 LOD 组）。
 
 ```
-float32 blockVersion              // 2.1
-uint32 groupCount                 // RO 组数，实测 1
-  每组重复：
-  String  name                    // "0.s3mblock"
-  if blockVersion <= 3.0: uint32 pageLodCount，每组 {float32 rangeValue; uint16 rangeMode; f64 sphere}
-  ...（组内是 zlib 压缩的 v2 瓦片体 + 内嵌纹理图集）
+float32 blockVersion              // 2.1 或 3.0
+uint32  groupCount                // RO 组数（LOD 档位数，实测 1 ~ 5 组）
+  每组重复（按 LOD 从粗到细排列）：
+    String  name                  // 组名，如 "1_00"、"1_0000"、"1_000000"
+    if blockVersion <= 3.0:
+      uint32 pageLodCount         // 外层 pageLOD 条数（注意：叶子瓦片恒为 0，见下文）
+      for 0..pageLodCount:
+        float32 rangeValue        // 切换阈值（RangeMode=1 时为屏幕像素直径）
+        uint16  rangeMode         // 1 = Pixel_Size_OnScreen, 0 = Distance_From_EyePoint
+        float64 sphere.center.xyz // 包围球中心（ENU 米）
+        float64 sphere.radius     // 包围球半径（米）
+        String  childTile         // 下一级瓦片名，如 "1_0000.s3mblock"
+    float32 version               // 内层瓦片数据版本（如 2.1 或 3.0）
+    if version >= 3:
+      uint32 compressedType       // 压缩方式（0 = 默认 zlib）
+    uint32 unzipSize              // 解压后字节数
+    uint32 zipSize                // 压缩块字节数
+    byte   zipData[zipSize]       // zlib 压缩的瓦片体（含段目录：GroupNode / 骨架 / 图集 / 材质 / 单体化）
 ```
 
-关键语义：
+### 5.2 关键语义与常见坑
 
-- 纹理**不跟瓦片走**，作为「图集」内嵌在块里，材质通过图集 id（如 `-667946976.texblock`）引用，几何顶点的 UV 绑定到图集的子区域 → 解析时要把 UV 重映射进图集空间，多图集走货架式装箱（`AtlasPack`）。
-- **根块（`6.s3mblock`）的图集是内嵌的**（`isSaveData=1`）；但**子瓦（`6_00` / `6_01`）的图集段只有元信息**：`data = null` + `requestNames`，像素在同目录的 `.texblock` 里。不补这一步的后果不是「糊一点」，而是**子瓦整块无贴图**——`tile.textures` 里根本没有这条纹理，建筑变成纯白几何。
-- **只认 `requestNames`。`childTexNames` 是下一级 LOD 的图集指针**，它有自己的 `subTexInfos`：同一个精灵在父级叫 `1460_3`（96×64）、子级叫 `1460_2`（192×128），排布也不一样。拿父级的 rect 去套子级像素必然错位 —— 上一版就是这么把画面搞坏的。官方从不拿它换像素，那个 LOD 的瓦片自己会加载。
-- leaf 多精灵的图集没有整图像素，只有 `subTexInfos` 里每块一个 rect，按 `subName` 把精灵贴回各 rect 组合成整张自上而下 RGBA 画布（`composeLeafAtlas`）。精灵自带「左 2/3 base + 右 1/3 内联 mip 金字塔」，与 `StyleMaterial` 的 `s3mAtlasLod` 2/3 采样公式配套，rect 一个像素都不用改。
+- **叶子瓦片（Leaf）外层 `pageLodCount` 恒为 0，绝对不能冲掉内层 `groupNode`**：
+  - S3MBLOCK 的外层 pageLOD 仅记录具有下级子代的瓦片调度门限与下级文件名。到了子树末端的叶子瓦片（没有后续子代），外层记录的 `pageLodCount` 恒为 `0`；
+  - 真正包含几何摆放的权威数据在**解压后的内层 GroupNode 段**里：内层始终带有一组完整的 `PageLOD`，其中挂着该瓦片的核心 `geodes`（每个 geode 携带 4×4 的 `matrix` 空间局部变换矩阵，以及包围球与 OBB）；
+  - **历史血泪 Bug**：若用外层 `pageLods.map(...)` 覆盖内层，当叶子瓦片外层为 0 条时，`mergedLods` 会直接变成空数组 `[]`，彻底丢弃内层的 `geodes`。渲染器取不到 geode 矩阵回退为单位矩阵，在存在场景大偏移的数据集（如 `Road@OlympicGreen` 矩阵平移为 `[-130, -1354, -0.15]` 米）中，表现为**瓦片细化瞬间闪烁并瞬移数公里**；且由于网格坐标偏离几公里，被 Three.js 视锥裁剪直接剔除，表现为**道路加载着加载着整片消失**；
+  - **正确处理方式**：当外层 `pageLods.length === 0` 时，直接回退并完整保留内层 `groupNode.pageLods`；若内层层数多于外层，亦将超出的内层条目追加保留；
+  - **官方 loader 对账**：官方 `@supermapgis/s3m-content-loader` 在解压完直接使用内层的 `groupNode = ShellEntitiesLoader.load(...)`，外层 pageLOD 仅用来跳过字节流，官方从不把内层清空。
+- **纹理不跟瓦片走（图集机制）**：
+  - 材质通过图集 id（如 `-667946976.texblock`）引用，几何顶点的 UV 绑定到图集的子区域 → 解析时要把 UV 重映射进图集空间，多图集走货架式装箱（`AtlasPack`）。
+- **根块与子瓦的图集分离**：
+  - 根块（`6.s3mblock`）的图集是内嵌的（`isSaveData=1`）；但子瓦（`6_00` / `6_01`）的图集段只有元信息：`data = null` + `requestNames`，像素在同目录的 `.texblock` 里。必须补齐外部图集，否则子瓦整块无贴图变成纯白。
+- **只认 `requestNames`，禁止用 `childTexNames` 替换像素**：
+  - `childTexNames` 是下一级 LOD 的图集指针，它有自己的 `subTexInfos`。同一个精灵在父级与子级的命名（如 `1460_3` vs `1460_2`）和排布不同，拿父级的 rect 去套子级像素必然错位。官方从不拿它换像素。
+- **Leaf 多精灵组合画布**：
+  - leaf 多精灵的图集没有整图像素，只有 `subTexInfos` 里每块一个 rect，按 `subName` 把精灵贴回各 rect 组合成整张自上而下 RGBA 画布（`composeLeafAtlas`）。精灵自带「左 2/3 base + 右 1/3 内联 mip 金字塔」，与 `StyleMaterial` 的 `s3mAtlasLod` 2/3 采样公式配套，rect 一个像素都不用改。
 
 ---
 

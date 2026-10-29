@@ -233,13 +233,25 @@ const poffsetParam = new URLSearchParams(window.location.search).get('poffset');
 const layerPolygonOffset =
   poffsetParam === '1' ? { factor: -1, units: -2 } : poffsetParam === '-1' ? { factor: 1, units: 2 } : undefined;
 
+// ?maxTiles=Infinity | 64 | 0：瓦片预算调试。默认 4096（要装得下近处所有可见瓦片）。
+// 注意这里只能在**构造时**生效 —— 图层没有 setMaxTiles / maxTiles 访问器，
+// 运行时 `layer.maxTiles = ...` 只会挂一个内核不读的野字段。
+const maxTilesParam = new URLSearchParams(window.location.search).get('maxTiles');
+const layerMaxTiles = (() => {
+  if (maxTilesParam === null || maxTilesParam === '') return 4096;
+  if (/^infinity$/i.test(maxTilesParam.trim())) return Infinity;
+  const n = Number(maxTilesParam);
+  return Number.isFinite(n) && n >= 0 ? n : 4096;
+})();
+
 const layer = new S3MLayer({
   id: 's3m',
   polygonOffset: layerPolygonOffset,
   // 预算要能装下「近处所有可见瓦片」。这个数据集光是根瓦片就有 79 块，
   // 预算给 64 时每帧都在淘汰-重下-再淘汰，子瓦片永远挤不进显示，纹理就永远停在
   // 最粗一级的雪碧图（一栋楼只剩十几像素、再被 uv 平铺几十遍）。
-  maxTiles: 4096,
+  // ?maxTiles=Infinity 可关掉淘汰，用来区分「消失是淘汰还是渲染」。
+  maxTiles: layerMaxTiles,
   maxConcurrent: 4,
   style: {
     mode: STYLE.TEXTURE,
@@ -257,6 +269,14 @@ const layer = new S3MLayer({
     edgeOpacity: 0.45,
   },
   onStats: (s) => {
+    // 第一次出统计时回显内核真实预算，用来确认 ?maxTiles= 有没有生效
+    if (!window.__s3mBudgetLogged) {
+      const ts = [...layer.datasets.values()][0]?.tileset;
+      if (ts) {
+        window.__s3mBudgetLogged = true;
+        console.log('[s3m] budget', { maxTiles: ts.maxTiles, hardCap: ts.hardCap, nodes: ts.nodes.size });
+      }
+    }
     $('stTiles').textContent = s.tiles;
     $('stMeshes').textContent = s.meshes;
     $('stTris').textContent = fmt(s.triangles);
