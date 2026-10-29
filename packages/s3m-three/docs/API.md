@@ -175,7 +175,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = 取 GPU 最大值，通常 16）。移动端封到 4 / 8 肉眼通常无差，采样成本明显下降。只影响之后创建的纹理 |
 | `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。非图集的 RGBA / WebP 产物按 2× 盒式滤波减半到上限内；DXT 压缩直传与图集不受影响 |
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限。一条 = 一张已解码的瓦片纹理，1024² RGBA 约 4MB，128 条即约 512MB 显存；低端设备 32~48。LRU，降下来下次淘汰时释放 |
-| `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型。`lambert` 用 `MeshLambertMaterial` 替换 PBR，去掉 GGX 与环境球谐，片元约省一半；白模 / 纯色 / 按高度着色几乎无差。模块级全局，只影响之后创建的材质 |
+| `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型。`lambert` 用 `MeshLambertMaterial` 替换 PBR，去掉 GGX 与环境球谐，片元约省一半；白模 / 纯色 / 按高度着色几乎无差。**图层级**：同页多个图层各用各的，互不覆盖；不传则跟随模块级默认（`setMaterialQuality`）。只影响之后创建的材质 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 可选的 iServer 数据服务配置，配了才能用 `colorByField()` 等便利方法；不配就自己取数 + `setFeaturesStyle()`，见[业务字段](#业务字段锚点在库内对应关系在外部) |
 | `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
@@ -1319,7 +1319,7 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 | `anisotropyCap` | 各向异性过滤上限，默认取 GPU 最大值。移动端 4 / 8 通常肉眼无差 |
 | `maxTextureSize` | 纹理长边像素上限，默认不限制。手机上 1024 即可，显存降到 1/4 |
 | `maxImageCache` | 纹理缓存条数，默认 128。低端机 32~48，和 `maxTextureSize` 一起管显存 |
-| `materialQuality: 'lambert'` | 换成 Lambert 光照，片元约省一半。白模 / 按高度配色看不出差别，贴图模式会略平 |
+| `materialQuality: 'lambert'` | 换成 Lambert 光照，片元约省一半。白模 / 按高度配色看不出差别，贴图模式会略平。图层级设置，同页其它图层不受影响 |
 | `maxImageCache` | 原始图集与 leaf 段图像记录的 LRU 缓存容量上限（默认 128），超限自动淘汰旧缓存，防止漫游时内存不断累积 |
 | 纹理引用计数 | 瓦片淘汰时按引用计数释放未被其他瓦片复用的 `Texture` 并调用 `dispose()`，真正归还 GPU 显存 |
 | 几何/材质深度释放 | 瓦片注销时深度遍历对象树，彻底释放 `Mesh`、`Points`（点云/高斯泼溅）以及 `LineSegments`（棱线包）的 `BufferGeometry` 与材质 |

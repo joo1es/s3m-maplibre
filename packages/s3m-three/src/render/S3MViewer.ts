@@ -26,7 +26,7 @@ import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
-import { getMaterialQuality, setMaterialQuality } from './StyleMaterial.js';
+import { getMaterialQuality, normalizeMaterialQuality } from './StyleMaterial.js';
 import type { LightingPreset } from './lightingPreset.js';
 import { LightRig } from './viewer/LightRig.js';
 import { HeightIndex } from './viewer/HeightIndex.js';
@@ -249,6 +249,14 @@ export class S3MViewer {
   readonly groundManager: GroundManager;
   /** 多数据集生命周期与锚点管理器 */
   private readonly _datasetManager = new DatasetManager();
+  /**
+   * 本图层的光照模型档位。
+   *
+   * `undefined` = 没指定，跟随模块级默认（`getMaterialQuality()`）—— 老代码
+   * `setMaterialQuality('lambert')` 一行改全场的用法靠这条继续有效。
+   * 传了值就只认自己，多图层同页各用各的，互不覆盖。
+   */
+  private _materialQuality: MaterialQuality | undefined;
   /** 单体样式、专题着色与状态纹理管理器 */
   private readonly _featureStyleManager: FeatureStyleManager;
   /** GPU 路径动画管理器 */
@@ -352,7 +360,11 @@ export class S3MViewer {
     this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
-    setMaterialQuality(options.materialQuality ?? 'pbr');
+    // 只记本层的档位，**不写模块级全局**：以前这里 setMaterialQuality(...) 会把全局
+    // 改掉，于是同页后创建的图层顺手把先创建的图层也打回去了（多层互相覆盖的根因）。
+    this._materialQuality = normalizeMaterialQuality(options.materialQuality);
+    // 之后 addDataset 的数据集按这个默认建材质（数据集自己指定则用自己的）
+    this._datasetManager.defaultMaterialQuality = this._materialQuality;
     if (options.totalMaxTiles) {
       this._datasetManager.totalMaxTiles = options.totalMaxTiles;
     }
@@ -2082,22 +2094,25 @@ export class S3MViewer {
   }
 
   /**
-   * 运行时切换材质质感（`'pbr'` | `'lambert'`）。
+   * 运行时切换**本图层**的材质质感（`'pbr'` | `'lambert'`）。
    *
-   * 档位是模块级设置（影响之后新建的材质）；已加载瓦片的材质在这里**原位重建**：
-   * 不重拉瓦片、不重建几何，按创建时记录的参数（`userData.s3mOpts`）换一个
-   * 新材质实例，并保留逐材质状态（选中编号、瓦片淡入、批量状态纹理）。
-   * 切换后 program 需要重新编译一次（lambert / pbr 是不同着色器），这是唯一开销。
+   * 档位是图层级的：只改这一层，同页其它图层不受影响（也不会去动模块级默认）。
+   * 已加载瓦片的材质在这里**原位重建**：不重拉瓦片、不重建几何，按创建时记录的
+   * 参数（`userData.s3mOpts`）换一个新材质实例，并保留逐材质状态（选中编号、
+   * 瓦片淡入、批量状态纹理）。切换后 program 需要重新编译一次（lambert / pbr 是
+   * 不同着色器），这是唯一开销。
    */
   setMaterialQuality(q: MaterialQuality): void {
-    setMaterialQuality(q);
+    this._materialQuality = normalizeMaterialQuality(q) ?? 'pbr';
+    // 已建好的数据集也要跟着换，否则之后新加载的瓦片还是旧档位（和重建结果打架）
+    this._datasetManager.setDefaultMaterialQuality(this._materialQuality);
     this._rebuildStyledMaterials();
     this._requestRepaint();
   }
 
-  /** 当前材质质感档位 */
+  /** 当前材质质感档位（本图层指定了就用本图层的，否则是模块级默认） */
   get materialQuality(): MaterialQuality {
-    return getMaterialQuality();
+    return this._materialQuality ?? getMaterialQuality();
   }
 
   /** 按创建参数原位重建所有 styled 材质（materialQuality 切换用） */
@@ -2119,7 +2134,9 @@ export class S3MViewer {
       const old = raw as StyledMaterial | undefined;
       if (!old?.userData?.isStyled || !old.userData?.s3mOpts) continue;
       const opts = old.userData.s3mOpts as StyledMaterialOptions;
-      const fresh = createStyledMaterial({ ...opts, uniforms: this.uniforms });
+      // 显式传本层档位：s3mOpts 里记的是创建时的参数，可能是 undefined（跟随全局），
+      // 重建时必须钉成本层当前档位，否则「别处改了全局」会把这一层带跑。
+      const fresh = createStyledMaterial({ ...opts, uniforms: this.uniforms, materialQuality: this.materialQuality });
       for (const key of PRESERVED) {
         const src = old.userData[key] as { value: unknown } | undefined;
         const dst = fresh.userData[key] as { value: unknown } | undefined;

@@ -44,6 +44,11 @@ export interface S3MDatasetOptions {
   /** 三角面材质深度偏移（共面摩尔纹 / 重合面归属），见 BuildTileOptions.polygonOffset */
   polygonOffset?: { factor: number; units: number };
   /**
+   * 本数据集的光照模型档位（不填则用图层级设置）。
+   * 只影响该数据集**之后创建**的材质。
+   */
+  materialQuality?: 'pbr' | 'lambert';
+  /**
    * 是否对该数据集生成几何棱线（CPU 端 EdgesGeometry）。
    * - 不填：跟随全局 `style.edges`
    * - true / false：强制开 / 关（例如地形、绿地、道路只显示材质、不描边）
@@ -93,6 +98,25 @@ export class DatasetManager {
   readonly datasets = new Map<string, S3MDatasetEntry>();
   sceneAnchor: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null = null;
   totalMaxTiles: number = 0;
+  /**
+   * 图层级默认光照模型档位（`undefined` = 跟随模块级默认）。
+   * 数据集自己指定了 `materialQuality` 就用自己的。
+   */
+  defaultMaterialQuality: 'pbr' | 'lambert' | undefined = undefined;
+
+  /**
+   * 图层档位变更：同步给已存在的数据集（它们之后加载的瓦片才用新档位；
+   * 场上已有材质由 `S3MViewer._rebuildStyledMaterials` 原位重建）。
+   *
+   * 数据集自己指定过档位的不动 —— 那是它显式要的，不该被图层级设置覆盖。
+   */
+  setDefaultMaterialQuality(q: 'pbr' | 'lambert' | undefined): void {
+    this.defaultMaterialQuality = q;
+    for (const entry of this.datasets.values()) {
+      if (entry.options.materialQuality) continue;
+      entry.tileset?.setMaterialQuality(q);
+    }
+  }
 
   get(id: string): S3MDatasetEntry | undefined {
     return this.datasets.get(id);
@@ -224,6 +248,8 @@ export class DatasetManager {
       lodRangeScale: ds.lodRangeScale ?? defaultLodRangeScale,
       buildTile: buildTile ?? null,
       polygonOffset: ds.polygonOffset,
+      // 数据集 > 图层 > 模块级默认（undefined 一路传下去，由 createStyledMaterial 回落）
+      materialQuality: ds.materialQuality ?? this.defaultMaterialQuality,
       useWorker: ds.useWorker,
       authenticate: ds.authenticate ?? authenticate,
       unsupported: ds.unsupported,

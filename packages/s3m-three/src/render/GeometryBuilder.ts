@@ -360,6 +360,13 @@ export interface BuildTileOptions {
    * 偏移量随斜率/距离缩放，量级在微米级，正常相邻面不受影响。
    */
   polygonOffset?: { factor: number; units: number };
+  /**
+   * 光照模型档位，透传给 `createStyledMaterial`。
+   *
+   * 不传 = 读模块级默认（`getMaterialQuality()`），与旧行为一致。
+   * 由 `S3MTileset` 从图层 / 数据集一路带下来，所以同页多个图层可以各用各的。
+   */
+  materialQuality?: 'pbr' | 'lambert';
 }
 
 export interface BuildTileResult {
@@ -541,6 +548,8 @@ export async function buildTileObjects(
       // uv 第三分量（custom0）：几何带了这条流，材质才走官方的「按 z 决定采样」分支
       texCoordZ: hasTexCoordZ && !!map,
       secMap,
+      // 图层 / 数据集的档位；undefined 时 createStyledMaterial 自己回落到模块级默认
+      materialQuality: options.materialQuality,
     });
     // 用户配置的深度偏移（共面摩尔纹 / 重合面归属的人工定序，见 BuildTileOptions 注释）
     if (options.polygonOffset) {

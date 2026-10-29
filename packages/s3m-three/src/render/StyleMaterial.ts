@@ -272,13 +272,29 @@ export const DEFAULT_STYLE: S3MStyle = {
 export type MaterialQuality = 'pbr' | 'lambert';
 
 /**
- * 当前光照模型。模块级全局 —— 与 anisotropy / maxTextureSize 同一套设计，
- * 同页多个图层会互相覆盖，后创建的那个决定全局。只影响**之后创建**的材质。
+ * 模块级默认档位。**只是默认值**，不是全局开关：
+ * - `S3MViewer` / `S3MLayer` 构造时传了 `materialQuality` 的，只定自己那一层，
+ *   不读也不写这里（多图层同页互不干扰）；
+ * - 没传的图层、以及直接调 `createStyledMaterial` / `buildTileObjects` 的场景，
+ *   仍然读这里 —— 老代码 `setMaterialQuality('lambert')` 一行改全场的用法照旧有效。
+ *
+ * 只影响**之后创建**的材质；已加载的瓦片要重载或在 viewer 上调
+ * `setMaterialQuality` 才会换。
  */
 let materialQuality: MaterialQuality = 'pbr';
 
 /**
- * 切换光照模型。
+ * 归一档位：只认 'pbr' / 'lambert'，其余（含 undefined）返回 undefined，
+ * 表示「没指定，去读模块级默认」。
+ */
+export function normalizeMaterialQuality(q: unknown): MaterialQuality | undefined {
+  if (q === 'lambert') return 'lambert';
+  if (q === 'pbr') return 'pbr';
+  return undefined;
+}
+
+/**
+ * 设置模块级默认档位（不是全局开关，见上面的 `materialQuality` 注释）。
  *
  * 'pbr'（默认）= `MeshStandardMaterial`，GGX + 环境球谐，质感最好也最贵。
  * 'lambert' = `MeshLambertMaterial`，只保留漫反射 + 平行光，片元开销约省一半；
@@ -1105,6 +1121,13 @@ export interface StyledMaterialOptions {
   texCoordZ?: boolean;
   /** 图集材质的第二套纹理（官方 BakeTex，光照烘焙），与 base 相乘 */
   secMap?: THREE.Texture | null;
+  /**
+   * 光照模型档位。不传 = 读模块级默认（`getMaterialQuality()`），行为与旧版一致。
+   *
+   * 传了就按传的建 —— 图层级隔离靠这条：`S3MLayer` / `S3MViewer` 把自己的档位
+   * 一路透传到这里，不再让所有图层共享同一份模块级状态。
+   */
+  materialQuality?: MaterialQuality;
 }
 
 /**
@@ -1152,6 +1175,9 @@ const FRAG_SURFACE = /* glsl */ `
 
 export function createStyledMaterial(opts: StyledMaterialOptions): StyledMaterial {
   const uniforms = opts.uniforms;
+  // 档位解析：显式传参 > 模块级默认。图层级隔离就靠这一行 —— 各图层把自己的
+  // 档位透传进来，不再共享同一份模块级状态。
+  const quality: MaterialQuality = normalizeMaterialQuality(opts.materialQuality) ?? getMaterialQuality();
   // 两种光照模型共用的参数。注入的 chunk 只动 diffuseColor / normal / transformed，
   // 在 Standard 与 Lambert 的 shader 里都存在同名 include，所以模板不用分支。
   const baseParams = {
@@ -1170,7 +1196,7 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
     alphaTest: opts.alphaTest ?? 0,
   };
   const mat = (
-    materialQuality === 'lambert'
+    quality === 'lambert'
       ? new THREE.MeshLambertMaterial(baseParams)
       : new THREE.MeshStandardMaterial({
           ...baseParams,
@@ -1311,6 +1337,8 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   mat.userData.uFlatShading = uFlatShading;
   // 记录创建参数：materialQuality 运行时切换时按原参数重建材质（换类不换外观）
   mat.userData.s3mOpts = opts;
+  // 记录实际生效的档位：重建 / 排查时不用再猜当时读的是哪一层设置
+  mat.userData.s3mQuality = quality;
   mat.userData.isStyled = true;
   return mat;
 }

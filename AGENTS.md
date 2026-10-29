@@ -299,7 +299,8 @@ node tools/release.mjs patch --push    # 一条命令发版（改版本 + 构建
 - **注释解释决策，不复述代码。** 反例：`// 遍历网格`；正例：`// 只在位移/旋转动画时关视锥裁剪，静止必须恢复，否则包围盒会滞后`。
 - **数学、单位、坐标系**是这块最容易出错的地方，涉及投影换算时把单位写进注释（像素 / mercator 0..1 / ENU 米）。
 - 不知道宿主内部实现时，**去 `node_modules/maplibre-gl/dist/*.js` 里读实现**，不要凭印象下结论（比如 `nearZ = canvasHeight / 50` 是写死的）。
-- 新增模块级全局状态（`TextureFactory` 的 anisotropy / textureSize、`StyleMaterial` 的 materialQuality）要接受：**同页多图层会互相覆盖，后创建的赢**。要 per-viewer 就得把状态挂到 viewer 上，那是另一个量级的改动，先别顺手改。
+- 新增模块级全局状态（`TextureFactory` 的 anisotropy / textureSize、`StyleMaterial` 的 colorPipeline）要接受：**同页多图层会互相覆盖，后创建的赢**。要 per-viewer 就得把状态挂到 viewer 上，那是另一个量级的改动，先别顺手改（`materialQuality` 已经这么改过了，可以照抄那条链路）。
+- `StyleMaterial` 的 `materialQuality` 已经是**图层级**的（0.4.22 起）：`S3MViewer` 构造时只记自己的档位、不写模块级默认，`setMaterialQuality` 也只重建本层材质。档位沿 `S3MViewer → DatasetManager → S3MTileset → buildTileObjects → createStyledMaterial` 透传，链路任何一环掉了都会静默退回模块级默认（多层又互相打脸），加环节时记得一起带。`undefined` = 跟随模块级默认，别改成 `'pbr'`，否则老代码 `setMaterialQuality('lambert')` 一行改全场就失效了。
 - 提交信息：`feat(scope): 中文描述` / `fix(scope): …` / `chore: release …`，按功能主题拆多个 commit。**没有明确指令不要 push。**
 
 ---

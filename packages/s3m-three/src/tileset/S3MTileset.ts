@@ -246,6 +246,8 @@ export type BuildTileFn = (
     assembled?: TileGeometryData;
     /** 深度偏移配置（透传给 buildTileObjects），见 BuildTileOptions.polygonOffset */
     polygonOffset?: { factor: number; units: number };
+    /** 光照模型档位（透传给 buildTileObjects），见 BuildTileOptions.materialQuality */
+    materialQuality?: 'pbr' | 'lambert';
   }
 ) => Promise<{ group: Group; stats: Partial<Stats> }>;
 
@@ -258,6 +260,11 @@ export interface S3MTilesetOptions {
   buildTile?: BuildTileFn | null;
   /** 三角面材质深度偏移（共面摩尔纹 / 重合面归属），透传给 buildTileObjects */
   polygonOffset?: { factor: number; units: number };
+  /**
+   * 光照模型档位，透传给 buildTileObjects。不传 = 读模块级默认。
+   * 由 DatasetManager 从图层 / 数据集设置带下来。
+   */
+  materialQuality?: 'pbr' | 'lambert';
   /**
    * 是否用 Web Worker 解析经典 `.s3mb` 瓦片（默认开）。
    *
@@ -471,6 +478,7 @@ export class S3MTileset {
   private isS3MV1 = false;
   private _buildTile: BuildTileFn | null;
   private readonly _polygonOffset: { factor: number; units: number } | undefined;
+  private _materialQuality: 'pbr' | 'lambert' | undefined;
   private readonly _uniforms: StyleUniforms | null;
   /** 经典 .s3mb 的 Worker 解析客户端；undefined = 尚未尝试创建，null = 不可用/已降级 */
   private _workerClient: S3MWorkerClient | null | undefined;  private readonly _useWorker: boolean;
@@ -491,6 +499,7 @@ export class S3MTileset {
     // 渲染层可注入：Node 环境下不需要 three，也能跑 URL / 解析链路
     this._buildTile = options.buildTile ?? null;
     this._polygonOffset = options.polygonOffset;
+    this._materialQuality = options.materialQuality;
     // 着色器共享 uniform，由 S3MLayer 持有并传进来
     this._uniforms = options.uniforms ?? null;
     this._useWorker = options.useWorker !== false;
@@ -720,6 +729,15 @@ export class S3MTileset {
    */
   setMaxMemory(bytes: number): void {
     this.maxMemory = Number.isFinite(bytes) && bytes > 0 ? bytes : Infinity;
+  }
+
+  /**
+   * 运行时改本数据集的光照模型档位。只影响**之后**构建的瓦片材质；
+   * 场上已有材质由 `S3MViewer.setMaterialQuality` 原位重建。
+   * `undefined` = 跟随模块级默认。
+   */
+  setMaterialQuality(q: 'pbr' | 'lambert' | undefined): void {
+    this._materialQuality = q;
   }
 
   /**
@@ -1245,6 +1263,7 @@ export class S3MTileset {
         uniforms: this._uniforms,
         assembled,
         polygonOffset: this._polygonOffset,
+        materialQuality: this._materialQuality,
       });
       const { group, stats } = buildRes;
       const texKeys = (buildRes as any).textureKeys ?? (group.userData?.textureKeys as string[] | undefined) ?? Object.keys(tile.textures ?? {});

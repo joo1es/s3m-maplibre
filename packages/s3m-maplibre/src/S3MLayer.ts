@@ -501,14 +501,16 @@ export class S3MLayer extends HostRenderer {
   }
 
   /**
-   * 运行时切换材质质感（`'pbr'` | `'lambert'`）：原位重建现有 styled 材质，
-   * 不重拉瓦片、不重建几何。lambert 开销更低，低端设备 / 白模场景适用。
+   * 运行时切换**本图层**的材质质感（`'pbr'` | `'lambert'`）：原位重建本层的 styled
+   * 材质，不重拉瓦片、不重建几何。lambert 开销更低，低端设备 / 白模场景适用。
+   *
+   * 档位是图层级的：同页别的图层不受影响，所以可以「这一层 pbr、那一层 lambert」。
    */
   setMaterialQuality(q: 'pbr' | 'lambert'): void {
     this.viewer.setMaterialQuality(q);
   }
 
-  /** 当前材质质感档位 */
+  /** 当前材质质感档位（本层没指定过就是模块级默认） */
   get materialQuality(): 'pbr' | 'lambert' {
     return this.viewer.materialQuality;
   }

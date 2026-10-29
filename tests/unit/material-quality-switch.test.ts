@@ -3,8 +3,11 @@
  *
  * 动机：`materialQuality` 原来只在构造时生效（模块级 setMaterialQuality），
  * 运行时切换只影响之后新建的材质，已加载瓦片保持旧质感。新增
- * `S3MViewer.setMaterialQuality(q)`：设全局档位 + 原位重建现有 styled 材质
+ * `S3MViewer.setMaterialQuality(q)`：设本图层档位 + 原位重建现有 styled 材质
  * （不重拉瓦片、不重建几何），并保留逐材质状态（选中编号、瓦片淡入）。
+ *
+ * 档位后来从模块级全局改成了图层级（见 material-quality-per-layer.test.ts），
+ * 所以这里断言的是 `v.materialQuality`，不再断言模块级默认。
  *
  * 不依赖 WebGL：用 makeViewer + registerMesh 的既有模式验证。
  */
@@ -32,13 +35,15 @@ function registerMesh(viewer: S3MViewer, smid: number): THREE.Mesh {
 }
 
 describe('setMaterialQuality 运行时切换', () => {
-  test('pbr → lambert：材质类变为 MeshLambert，全局档位同步', () => {
+  test('pbr → lambert：材质类变为 MeshLambert，本图层档位同步', () => {
     const v = makeViewer();
     const mesh = registerMesh(v, 910);
     expect(mesh.material).toBeInstanceOf(THREE.MeshStandardMaterial); // 默认 pbr
 
     v.setMaterialQuality('lambert');
-    expect(getMaterialQuality()).toBe('lambert');
+    expect(v.materialQuality).toBe('lambert');
+    // 档位是图层级的：不再写模块级默认（否则同页别的图层会被带跑）
+    expect(getMaterialQuality()).toBe('pbr');
     expect(mesh.material).toBeInstanceOf(THREE.MeshLambertMaterial);
     v.dispose();
   });
