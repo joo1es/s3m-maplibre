@@ -1395,34 +1395,11 @@ viewer.flushOverrides();
 
 ## 已知限制
 
-- **Draco 压缩几何**已支持（v3.01 点云分支）：内联 wasm 按需 `import`，解码后与标准骨架同路输出 attribute，点云按 `primitiveType = 1` 走 `THREE.Points`，分类码 / 强度 / 权重三种自定义属性一并解出。两点要留意：一是**容器与规范描述对不上**，字段顺序是从真实瓦片逐字节标定的（`payloadSize` / `dracoSize` / `"DRACO"` 魔数 / `skeletonStreamSize` 四重自校验兜读偏，另有单骨架 64M 点数上限），官方 SDK 的 `parseDracoSkeleton` 字段顺序多一个 `materialCount` 且 `version === 3` 的判定对 v3.01 不成立，解析不了同一个服务，不能照抄；二是这条路径**还没有回归测试钉住**（目前只有排查探针脚本），改 `core/Draco.ts` 的字段顺序必须拿真实瓦片复验。
-- **实例化单体**（`pickInfo` 里给的是 `instanceIds` 而不是 `batchId`，白模常见）只做了渲染，没做按单体控制：`setFeatureStyle` / `filterByField` / `elevateByField` / GPU 拾取走的都是 `aBatchId`，这条路径对实例化几何不生效。要支持得把每个实例单独上色，得改 InstancedMesh 的 instanceColor + 拾取编码。
-- **CRN 纹理**已支持，且已在真实服务上验证：内联的 crunch wasm 转回 DXT 后走现成解码，DXT 具体格式看 CRN 头，wasm 约 76KB、只有真遇到 CRN 时才动态加载。**判定看 `compressType` 而不是 `pixelFormat`**——实测 v3.00 是 `ct=26 / pf=13`、行标是 `ct=50000 / pf=32856`，按 `pixelFormat` 26 / 27 判断会把真实 CRN 整包丢掉（模型变灰模）。判定收敛在 `packages/s3m-three/src/core/TextureFormat.ts`（`resolveTextureKind` / `TextureCompress` / `dxtPixelFormatOf`，已从包入口导出）。用 `bun run probe:crn -- --crn <数据集 config 地址>` 可以对任意服务跑「尺寸吻合 / 色数 / 粗糙度 / ASCII 预览」的实测。
-- **纹理分包（`s3m:TextureSharing` / S3MBLOCK）已完整支持**：
-  - **容器结构**：`.s3mblock` 单文件容器 = 若干 RO 组，每组包含一段 pageLOD 元信息 + zlib 压缩的 v2 瓦片体（段目录：groupNode / 骨架 / secondColor / 图集 / 材质 / 单体化）；纹理是图集（`isSaveData`），材质按图集 id（`-N.texblock`）引用，几何顶点区间绑定到图集子区域；
-  - **解析与 UV 重映射**：解析端把顶点 UV 用 `fract` 平铺语义重映射进图集空间，多图集自动走货架式装箱合并（`AtlasPack`），下游材质直接绑定整张图集；
-  - **细级 LOD（leaf）外部图集加载**：细级瓦片的图集未内嵌原始像素（`data = null`），由 `_fillExternalAtlases` 解析子请求名（`_subRequestNames`）：
-    - 支持展开 `Tex_x.texblock#<三位数字串>` 多精灵容器索引；
-    - 对齐官方 `Uci` 规范的 pack 请求：URL 拼装 `extratiles=<names>` 批量合并拉取，避免高并发零碎请求；
-    - 响应体通过 `parseTexblockSegments` 解码 `kMi` 分段记录，并通过 `leafRequestCache` 与 `_leafPending` 实现跨瓦片并发请求自动去重缓存；
-    - **组合画布与装配**：对 leaf 模式，解出子精灵 RGBA 缓冲，按 `subTexInfos[i]` 的偏移量（`offsetX`、`offsetY`）以标准自上而下行序拷贝进高分辨率组合画布；
-    - **安全判定与重拼**：外部图集接入前通过 `evaluateAtlasUpgrade` 进行长宽比与下采样色差校验，判定通过后由 `rebuildBlockTextureState` 重新生成拼图与重算归一化 `texRect`；
-  - 实现位于 `core/S3MBlockParser.ts`、`core/AtlasPack.ts` 与 `tileset/S3MTileset.ts`，并通过 `tests/unit/s3mblock.test.ts`、`tests/unit/leaf-atlas.test.ts` 和 `tests/unit/leaf-uv-render.test.ts` 交叉验证钉住。
-- **多块 MeshOpt 骨架**（`blockCount > 1`）已支持。这类骨架里**每块后面紧跟自己的索引包**（不是所有块之后再统一放一份），索引是块内局部编号；解析时按块顺序合并顶点流，再把每块索引加上顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包。实测 `3D-WorkSpace_pbr1/pbrmodel` 的 `blockCount=2` / `3` 瓦片可正常加载。
-- **切线顶点流**只跳过不解码（渲染没有法线贴图通道），带 TANGENT 的数据不会被判失败。
-- **S3M 1.x（`.s3m`，SuperMapCache）已支持**。这类服务的 `config` 返回 `SuperMapCache` XML（`sml:FileType = OSGBFile`），位置与范围按米制盒反算（见「锚点」）；瓦片是 `73 33 6D 00` 魔数 + zlib 的老容器，`parseS3MB` 认出魔数后交给 `core/S3M1Parser.ts`，输出同形状的 `ParsedTile`，下游渲染 / LOD / 拾取零改动。
-  **注意：它的下一级 LOD 并不是 `.osgb`** —— XML 里 `RangeDataList` 写的 `..._L16_0.osgb` 只是切片时的原始文件名，服务实际发布的是同名换 `.s3m` 后缀，走 `datas/<数据源>/data/path/<瓦片目录>/<名>.s3m`（实测 L16/L17/L18 全部 200，`?sceneName=` 不参与寻址）。所以整棵 LOD 树都是同一种容器，**不需要 OSG Binary 解码器**；早先「因为子瓦是 .osgb 所以做不了」的结论是没验证就下的，已作废。
-  已标定：`73 33 6D 00` 魔数 + zlib；解压后 `uint32 xmlSize + XML + 补齐 4 字节对齐（实测 2~3 个 0x30，不是固定标记）+ (uint32 size + data) × 3`，三段长度链在四块样本上全部精确闭合；几何流 = `uint32 meshCount` + 每块网格 `{ geoName, 7, 772, V, 0 }` + `V × 16B` 顶点 `(x, y, z, z)` + 数组区 + `uint32 1` + `uint32 materialId`（与 XML 材质号一致）；纹理流 = `uint32 count` + 每条 `{ id, width, height, format, size, flag }` + `size` 字节（实测 `format=14`、0.5 B/px = DXT1，`28 + size` 精确等于段长）；索引确认为 u16（值域最大恰为 `V-1`）；几何里**没有法线数组**，接解码时要 `computeVertexNormals()`。
-  接这种格式时有三个坑，都是实测出来的，别凭直觉：
-  1. **几何里没有法线数组**（全段扫 `|v|≈1` 的最长游程只有 4~10 个），建完要 `computeVertexNormals()`；
-  2. **头里的 `format` 不是 `S3MPixelFormat` 枚举** —— 实测四块瓦片都是 `14`，而这枚举里 14 = BGRA（4 B/px），照搬就会把 0.5 B/px 的 DXT1 当 4 字节读，满屏彩噪。必须按 `size / (width*height)` 反推（`pixelFormatOfBpp`）；
-  3. **UV 是「v = 0 对应文件首行」**，与 DXT 解码器内部那次 GL 方向的 Y 翻转相反。不抵消的话几何的 v（实测 0.483~0.983）会正好采到图集空的那半张 —— 区域均值亮度 5.6 对比 76.1，模型上就是一片黑块。所以 v1 纹理要置 `S3MTexture.flipY = true`。
-
-  子瓦地址规则见 `s3m1ChildUrl`：XML 的 `RangeDataList` 给的是切片时残留的 `.osgb` 名，实际发布是同名换 `.s3m` 并插在 `datas/<数据源>/data/path/<瓦片目录>/` 下；父瓦自己已经在 `data/path` 下时只能换文件名，再插一层就成了 `data/path/data/path/...` 全部 404（有回归测试钉住）。
-- **高斯泼溅（`3DGaussianSplatting`）只按点渲染**。加载、细化、出图整条链路是通的（这类瓦片没有索引包，顶点即点，`GeometryBuilder` 会补一个「顶点即点」的伪包走 `THREE.Points`；不补的话整块瓦片落到「无可用几何」被丢掉，这是之前"加载不出来"的第二个原因）。但画出来的是带顶色的点集，不是真正的泼溅：`gsScale` / `gsRotation` 两条自定义流的量化格式还没标定，而且颜色是 RGBA（A 通道是泼溅不透明度），现在的顶点色路径会丢掉 alpha。要上 EWA splatting 得先按深度层级取样把这两条流对准，再补协方差 + 深度排序的 alpha 混合。
-- **KTX2** 不在 S3M 的 `pixelFormat` 枚举里，iServer 也不会发；要支持需自行引入 `basis_transcoder.wasm` 并解析容器，属于「换数据源才需要考虑」的项。
-- **骨骼动画**解析了但未驱动。
-- 跨城市量级的数据集叠加会有 float32 精度问题。
+- **实例化单体（`instanceMode` 16 / 17）**：白模中较常见（`pickInfo` 里给的是 `instanceIds` 而不是 `batchId`）。目前支持正常网格渲染，单体级操作（`setFeatureStyle` / `filterByField` / `elevateByField`）与 GPU 单体拾取走的都是 `aBatchId`，对实例化几何暂不生效。
+- **切线（TANGENT）顶点流不参与法线贴图**：着色器目前未接入切线空间法线贴图通道，TANGENT 顶点流直接跳过不解码；带 TANGENT 的模型可正常着色渲染，不受影响。
+- **骨骼动画未挂接驱动**：S3M 数据中的骨骼动画元信息与 JSON 已解析，但目前未接入逐帧骨骼驱动。
+- **KTX2 纹理未内置**：S3M 官方 `pixelFormat` 枚举与主流 iServer 服务不包含 KTX2 / Basis 压缩纹理，当前未内置 `basis_transcoder.wasm` 转码。
+- **多数据集跨城市叠加精度**：跨城市广域（数十公里以上）多个不同中心的数据集叠加受 WebGL 单精度 float32 深度和位置精度限制，建议同场景数据集位于同一城市量级内（几公里内）。
 
 ---
 

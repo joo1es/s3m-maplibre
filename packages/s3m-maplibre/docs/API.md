@@ -629,7 +629,7 @@ e[14] = -2 · far · near' / (far - near')
 - **`layer.viewer.geo` 在 MapLibre 上经常是 `null`，这是正常的**：`createMapLibreGeoAdapter()` 只有从宿主拿到 `WorldCoordinateHelper`（`transform.worldCoordinateHelper` 等 4 个候选位置）时才生效，拿不到就返回 `null`，渲染层自动回退标准 Web 墨卡托——正是 MapLibre 的默认 CRS，数值完全一致。当前 MapLibre 5.24 的 dist 里并没有这个成员，所以在 MapLibre 上这条 adapter 分支实际是空跑的。**自己换算经纬度时不要用 `if (viewer.geo)` 当门槛**，直接用 `worldFromLngLat(viewer.geo, lng, lat)`（`s3m-three` 导出，内部自带兜底），否则会把本来能用的墨卡托路径挡掉。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
 
-解析 / 几何 / 纹理 / 单体化相关的已知限制（Draco 回归覆盖、实例化单体、CRN 判定、切线流、KTX2、骨骼动画）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。
+解析 / 几何 / 纹理 / 单体化相关的已知限制（实例化单体样式与拾取、切线流、骨骼动画等）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。
 
 ---
 

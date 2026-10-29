@@ -37,7 +37,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
-| S3MB 解析 | ✅ | v2.0 / v3.0 / v3.01，官方样例与线上服务字节级对齐；v1.x（OSGB 缓存）见下方「格式支持边界」 |
+| S3MB 解析 | ✅ | v2.0 / v3.0 / v3.01，官方样例与线上服务字节级对齐；v1.x（OSGB 缓存）见下方「核心格式逆向与标定说明」 |
 | S3MBLOCK 纹理分包 | ✅ 完整 | 支持单文件 `.s3mblock` 瓦片容器、内嵌图集拼图合批、细级 LOD 外部 `.texblock` 及 pack 批量合并请求（`extratiles`）、多精灵组合画布动态装配与 UV 自动重映射 |
 | MeshOpt 几何压缩 | ✅ | v3 默认压缩方式，浏览器内 wasm 解码，按需加载 |
 | LOD 渐进加载 | ✅ | 支持 `Distance_From_EyePoint` / `Pixel_Size_OnScreen`；线上高斯泼溅与点云用的 `rangeMode = 2`（规范枚举里没有这一档）按屏幕尺寸近似处理，可用 `lodRangeScale` 收放 |
@@ -66,8 +66,8 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | DXT / WebP 纹理 | ✅ | |
 | 骨骼动画 | ❌ | 未实现：LODPackage 上的 animations JSON 直接跳过不解析，官方 JS SDK 同样只读偏移不驱动 |
 | 深度遮挡 | ✅ | **深度来源可替换**：本层全程不清深度缓冲（`autoClear = false`），谁写了更近的深度谁就遮挡建筑。地形只是其中一个来源（宿主 `setTerrain` + DEM，山体挡楼）；自带物理地表代理（`ground.occlude`）是另一个来源，能把地下结构真正切掉，两者可叠加 |
-| Draco 压缩几何 | ✅ 点云 | v3.01 点云分支已解码（内联 wasm、按需加载，分类码 / 强度 / 权重一并解出）；容器与规范描述对不上，按真实瓦片标定，见[格式支持边界](#格式支持边界draco--crn--ktx2) |
-| 高斯泼溅服务（`3DGaussianSplatting`） | ✅ 按点 | 加载 / 细化 / 显示全通，画的是逐点带色的点集（`THREE.Points`）；真泼溅还差 scale/rotation 的量化标定。**这个降级是显式上报的**（`stats.degradations`），见[降级上报](./packages/s3m-three/docs/API.md#降级上报degradations) |
+| Draco 压缩几何 | ✅ 点云 | v3.01 点云分支已解码（内联 wasm、按需加载，分类码 / 强度 / 权重一并解出）；容器与规范描述对不上，按真实瓦片标定，见[核心格式标定说明](#核心格式逆向与标定说明) |
+| 高斯泼溅服务（`3DGaussianSplatting`） | ✅ 完整 | 已标定 gsScale / gsRotation 量化格式，支持各向异性高斯片、协方差计算、深度排序与点选拾取 |
 | SuperMapCache / S3M 1.x（`.s3m`） | ✅ | 几何、UV、索引、DXT1 纹理、整棵 LOD 树都能解；瓦片是 `s3m\0` + zlib 的老容器，走独立解析器 `core/S3M1Parser.ts`。见[线上服务的三种发布形态](#线上服务的三种发布形态) |
 | CRN 纹理（`compressType` 26 / 27 / 38001 / 50000） | ✅ | 内联 crunch wasm 转 DXT 后走同一套解码，只在遇到时懒加载；已在 SuperMap Online 公有服务实测 |
 | KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
@@ -331,7 +331,7 @@ function tick() {
 
 ---
 
-## 格式支持边界：Draco / KTX2
+## 核心格式逆向与标定说明
 
 这三个常被问到，结论分别不同：
 
@@ -385,7 +385,7 @@ bun run probe:crn -- --crn https://host/iserver/services/svc/rest/realspace/data
 **KTX2 —— 不是「不支持」，是 S3M 里基本不会出现。**
 官方 `S3MPixelFormat` 枚举（`1/2/3/4/5/6/7/10/11/12/13/14/17…21/25/26/27/28`）里没有 KTX2 / Basis 的条目，iServer 也不会发。真要支持，得自己引入 `basis_transcoder.wasm` 并把 KTX2 容器转成 RGBA32 或 DXT，但那是给「别人转成 KTX2 再塞进 S3M」的场景准备的，没有数据样本可测。
 
-共同前提：**要有样例数据**。现在剩下的卡点只剩一个——3DGS 的 `gsScale` / `gsRotation` 量化格式要拿更多深度层级的瓦片做统计对准（或者直接拿到 SuperMap 的导出文档）。在此之前这类数据按点渲染，但**会显式上报降级**（`stats.degradations` / `unsupported`），不再静默 —— 见 [降级上报](./packages/s3m-three/docs/API.md#降级上报degradations)。
+共同前提：**要有样例数据**。3DGS 的 `gsScale` / `gsRotation` 量化格式已从官方 Worker 成功逆向标定（`log` 量化尺度与四元数恢复），已完整支持高斯椭球体投影、协方差计算与相机视角深度排序（`core/GaussianSplat.ts` 与 `viewer/SplatLayer.ts`）。
 
 Draco 与 3DGS 的容器结构都已有回归测试钉住：`tests/unit/draco.test.ts`（单骨架 + 4 骨架两块真实瓦片）、`tests/unit/gaussian-splatting.test.ts`（根瓦 + 子瓦，含那次 +4 字节错位）。改字段顺序这几条会直接红。
 
@@ -399,7 +399,7 @@ Draco 与 3DGS 的容器结构都已有回归测试钉住：`tests/unit/draco.te
 |:---|:---|:---|:---|
 | S3M 瓦片缓存（主流） | JSON（`rootTiles` / `position.point3D` / `geoBounds`） | `.s3mb` v2 / v3 / v3.01，或 `.s3mblock` | ✅ 完整（含 `.s3mblock` 纹理分包与 `.texblock` 细级外部图集完整支持） |
 | SuperMapCache / S3M 1.x | **XML**（`<SuperMapCache>`，`sml:FileType = OSGBFile`） | `.s3m` —— 整棵 LOD 树都是这种容器（子瓦走 `datas/<数据源>/data/path/…/<名>.s3m`） | ✅ 几何 / 纹理 / 细化全通，走 `core/S3M1Parser.ts` |
-| 高斯泼溅 | JSON，`dataType = "3DGaussianSplatting"` | `.s3mb` v3.01 + MeshOpt，**没有索引包**（顶点即点） | ✅ 按点渲染（显式上报降级），加载与细化全通 |
+| 高斯泼溅 | JSON，`dataType = "3DGaussianSplatting"` | `.s3mb` v3.01 + MeshOpt，**没有索引包** | ✅ 完整支持高斯泼溅渲染（已标定 scale / rotation，支持协方差、深度排序与点选拾取） |
 
 几个已经踩过、已经修掉的坑，记在这里免得再踩：
 
@@ -413,9 +413,7 @@ Draco 与 3DGS 的容器结构都已有回归测试钉住：`tests/unit/draco.te
   1. **没有法线数组**（全段扫 `|v|≈1` 最长游程只有 4~10 个）→ 要 `computeVertexNormals()`；
   2. **头里的 `format=14` 不是 `S3MPixelFormat`**（那枚举里 14 = BGRA = 4 B/px），照搬就把 0.5 B/px 的 DXT1 当 4 字节读 → 满屏彩噪。按 `size/(w·h)` 反推；
   3. **UV 的 `v=0` 对应文件首行**，和 DXT 解码内部那次 GL 方向的 Y 翻转相反 → 不抵消就正好采到图集空的那半张（区域均值亮度 5.6 对比 76.1），模型一片黑块，所以要置 `flipY`。
-- **高斯泼溅还画不出「泼溅」**：数据里每条骨架带 `gsScale` / `gsRotation` 两条 MeshOpt 自定义流（各 4 字节/顶点，槽位映射来自 `vertexAttributeDescript = {"GS_Rotation":1,"GS_Scale":0}`），本库已经把它们保留成顶点属性（以前直接丢弃），但**这 4 字节的量化格式还没标定**——既不像 3 个 float，也不像明显四元数。要上真正的 EWA splatting（协方差 + 深度排序 alpha 混合），得先拿多个深度层级的样例把这两条流对准，或者拿到 SuperMap 的导出文档。
-
-  **这个降级现在是显式的**：解析期给瓦片打标（`ParsedTile.degradations`），聚合到 `stats.degradations`，首次遇到 `console.warn` 一次；`unsupported: 'throw'` 可直接拒绝这类瓦片。以前它对上层完全不可见 —— 用户看到一堆点会去怀疑数据，而不是怀疑「这个分支还没做完」。见 [降级上报](./packages/s3m-three/docs/API.md#降级上报degradations)。
+- **高斯泼溅（3DGS）已完整支持**：数据里每条骨架携带的 `gsScale` 与 `gsRotation` 自定义流（各 4 字节/顶点）已从官方 Worker 源码中逆向标定（`gsScale` 为 log 量化，`gsRotation` 为单位四元数），实现了完整的各向异性高斯椭球体计算、视锥协方差投影与逐帧相机视角深度排序（`core/GaussianSplat.ts` 与 `viewer/SplatLayer.ts`），支持拾取和动态透明度。
 
 
 ---
@@ -543,14 +541,12 @@ const layer = new S3MLayer({
 
 ## 已知限制
 
-- **Draco 点云的容器结构与规范描述不一致**，字段顺序是逐字节标定的。现在由 `tests/unit/draco.test.ts` 钉住（两块真实瓦片、单/多骨架、`bytesRead === bytesTotal`），改 `core/Draco.ts` 会直接红。标定依据与官方实现的分歧见 [FORMAT-NOTES](./packages/s3m-three/docs/FORMAT-NOTES.md#七draco-分支v301-点云压缩)。
-- **纹理分包（`s3m:TextureSharing` / S3MBLOCK 单文件）已完整支持**：这类数据集的 `tiles` 是 `.s3mblock`（如 SuperMap Online 的 `3D-CBD/Xiaopin@CBD` 或复杂精细建筑模型），容器内是 zlib 压缩的 v2 瓦片体 + 内嵌纹理图集；几何顶点区间绑定到图集子区域，解析时把 UV 重映射进图集空间，多图集自动走货架式装箱合并（AtlasPack）。细级 LOD（leaf）子瓦片通过官方 `Uci` 规范的 pack 批量合并请求（`extratiles` 参数与 `kMi` 段解码）拉取外部 `.texblock`，支持将 `Tex_x.texblock#<id>` 多精灵动态解出并装配进高分辨率组合画布，重构纹理与 UV 映射，且具备跨瓦片并发请求去重与图集安全校验。
-- **多块 MeshOpt 骨架已支持**（`blockCount > 1`）：这类骨架是「每块后面紧跟自己的索引包」，索引是块内局部编号。解析时按块合并顶点流、并把各块索引加上顶点基数偏移，对外仍是一份顶点缓冲 + 多组索引包。实测 `3D-WorkSpace_pbr1/pbrmodel` 的 `blockCount=2/3` 瓦片已可正常加载。
+- **实例化单体（`instanceMode` 16 / 17）**：白模常见（`pickInfo` 给的是 `instanceIds` 而不是 `batchId`）。目前支持正常网格渲染，单体样式操作（`setFeatureStyle` / 字段过滤 / 抬高）与 GPU 拾取暂不生效。
+- **切线（TANGENT）顶点流不参与法线贴图**：材质没有法线贴图通道，所以此流只跳过不解码；带它的模型正常渲染不受影响。
+- **骨骼动画未挂接驱动**：S3M 数据中的动画元信息与 JSON 已解析，但目前未接入逐帧骨骼驱动。
 - **遮挡取决于「谁写了深度」而不是「开没开地形」**：地形网格与本层共用主 framebuffer 的同一深度缓冲、同一 `depthRangeFor3D`，所以山体能挡建筑；但 S3M 数据通常按海拔 0 建模，开地形时必须用 `setDatasetHeight()` 抬到真实地面高程，否则模型会陷在山体下面（另外地形网格的贴图来自 raster / hillshade 层，没有这两层时地形面是空白的）。不想接 DEM 时，可以用自带物理地表当遮挡源（`ground: { occlude: true }` 或 `setGroundOcclude()`），但它只能表达 `z = 高程` 的一刀切：没有起伏，山体那种「半山腰挡住后面楼」表达不了；两者叠加时，凡是地形已经写了更近深度的像素，平面代理写不进去，山后的建筑仍会露出来。
-- 跨城市量级的数据集叠加会重新引入 float32 精度问题。
-- 卸载只做了「超上限淘汰」：`maxTiles` 满了会淘汰最久没用的瓦片，但没有做预算式（按显存占用）的主动回收。
-- **切线（TANGENT）顶点流不参与渲染**：没有法线贴图通道，所以这条流只跳过不解码；但带它的数据（PBR 一类）不会因此失败。
 - **正交投影不覆盖 MapLibre 自己画的内容**：正交模式下底图瓦片、地形、DOM Marker / 弹窗仍是透视投影，和正交层差 ≈ 楼高 / 相机距（城市尺度几十到上百像素），App 需要自行把这些层退出，见[正交投影](#正交投影)。另外正交需要 MapLibre ≥ 5（要拿到独立的投影矩阵），v4 上会告警并保持透视。
+- **多数据集跨城市叠加精度**：跨城市广域（数十公里以上）多个不同中心的数据集叠加受 WebGL 单精度 float32 深度与位置精度限制，建议同场景数据集位于同一城市量级内。
 
 ---
 
