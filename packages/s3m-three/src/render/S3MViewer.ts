@@ -2997,20 +2997,12 @@ export class S3MViewer {
   }
 
   /**
-   * 渲染一帧。所有宿主相关量都由调用方喂进来，viewer 不碰任何地图 API：
-   *
-   * @param mvp        宿主本帧的 world→clip 矩阵（列主序 16 元素）
-   * @param cameraEnu  相机在场景 ENU 里的位置（米，相对场景锚点）
-   * @param fovRad     垂直视场角（弧度），用于 LOD 屏幕误差
-   * @param canvasHeight 绘图缓冲高度（像素），LOD 判定用
-   * @returns 是否需要宿主继续驱动下一帧（动态着色 / 瓦片加载中 / LOD 发生变化）
-   */
-  /**
    * 运动模糊路径（`_motionBlurCfg` 非空时接管「场景 → 屏幕」）。
    *
    * 返回 false = 不能用（WebGL1 / 尺寸非法），调用方回退直渲 —— 配置保留不丢，
    * 上下文恢复成 WebGL2 后下一帧自动生效。
-   * `damp: 'auto'` 在这里按实时 FPS 解析（fps 为 0 的启动阶段按 60fps 保守取值）。
+   * `damp: 'auto'` 在这里按实时 FPS 解析（fps 为 0 的启动阶段按 60fps 保守取值），
+   * `maxOffset` 已在 `normalizeMotionBlur` 里归一化（默认 0.05，屏宽百分比）。
    */
   private _renderMotionBlur(width: number, height: number): boolean {
     const renderer = this.renderer;
@@ -3023,12 +3015,22 @@ export class S3MViewer {
     this._motionBlur.render(renderer, scene, camera, width, height, {
       mode: cfg.mode,
       damp: cfg.damp === 'auto' ? autoMotionBlurDamp(this.fps) : cfg.damp,
+      maxOffset: cfg.maxOffset,
       mvp: this._frameMvp,
       mvpInverse: camera.projectionMatrixInverse,
     });
     return true;
   }
 
+  /**
+   * 渲染一帧。所有宿主相关量都由调用方喂进来，viewer 不碰任何地图 API：
+   *
+   * @param mvp        宿主本帧的 world→clip 矩阵（列主序 16 元素）
+   * @param cameraEnu  相机在场景 ENU 里的位置（米，相对场景锚点）
+   * @param fovRad     垂直视场角（弧度），用于 LOD 屏幕误差
+   * @param canvasHeight 绘图缓冲高度（像素），LOD 判定用
+   * @returns 是否需要宿主继续驱动下一帧（动态着色 / 瓦片加载中 / LOD 发生变化）
+   */
   renderFrame(opts: {
     mvp: ArrayLike<number>;
     cameraEnu: [number, number, number];

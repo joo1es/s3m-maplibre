@@ -548,8 +548,9 @@ export class S3MLayer extends HostRenderer {
    * 运行时开关运动模糊后处理；`null` = 关闭并释放显存。
    *
    * 低端设备上用来在感知层面弥补低帧率（卡顿 / 边缘闪烁），默认关闭。
-   * 见内核 `S3MViewerOptions.motionBlur`：`mode`（afterimage / velocity）与
-   * `damp`（拖尾长度，`'auto'` 按实时 FPS 收敛）。WebGL1 自动回退直渲。
+   * 见内核 `S3MViewerOptions.motionBlur`：`mode`（afterimage / velocity）、
+   * `damp`（拖尾长度，`'auto'` 按实时 FPS 收敛）与 `maxOffset`
+   * （velocity 拖影上限，屏宽百分比，缺省 0.05）。WebGL1 自动回退直渲。
    */
   setMotionBlur(cfg: MotionBlurOptions | null | undefined): void {
     this.viewer.setMotionBlur(cfg);

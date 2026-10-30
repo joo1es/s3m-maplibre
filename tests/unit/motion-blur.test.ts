@@ -112,18 +112,26 @@ describe('motionBlur 选项归一化（normalizeMotionBlur）', () => {
     expect(normalizeMotionBlur(5 as never)).toBeNull();
   });
 
-  test('传了对象 = 开启：mode 缺省 / 非法回退 afterimage，damp 缺省 auto', () => {
-    expect(normalizeMotionBlur({})).toEqual({ mode: 'afterimage', damp: 'auto' });
-    expect(normalizeMotionBlur({ mode: 'bogus' as never })).toEqual({ mode: 'afterimage', damp: 'auto' });
-    expect(normalizeMotionBlur({ mode: 'velocity' })).toEqual({ mode: 'velocity', damp: 'auto' });
+  test('传了对象 = 开启：mode 缺省 / 非法回退 afterimage，damp 缺省 auto，maxOffset 缺省 0.05', () => {
+    expect(normalizeMotionBlur({})).toEqual({ mode: 'afterimage', damp: 'auto', maxOffset: 0.05 });
+    expect(normalizeMotionBlur({ mode: 'bogus' as never })).toEqual({ mode: 'afterimage', damp: 'auto', maxOffset: 0.05 });
+    expect(normalizeMotionBlur({ mode: 'velocity' })).toEqual({ mode: 'velocity', damp: 'auto', maxOffset: 0.05 });
   });
 
   test('damp 数值钳到 [0, 0.98]，NaN 当 auto', () => {
-    expect(normalizeMotionBlur({ damp: 0.5 })).toEqual({ mode: 'afterimage', damp: 0.5 });
-    expect(normalizeMotionBlur({ damp: 1.7 })).toEqual({ mode: 'afterimage', damp: 0.98 });
-    expect(normalizeMotionBlur({ damp: -2 })).toEqual({ mode: 'afterimage', damp: 0 });
-    expect(normalizeMotionBlur({ damp: Number.NaN })).toEqual({ mode: 'afterimage', damp: 'auto' });
-    expect(normalizeMotionBlur({ damp: 'auto' })).toEqual({ mode: 'afterimage', damp: 'auto' });
+    expect(normalizeMotionBlur({ damp: 0.5 })).toEqual({ mode: 'afterimage', damp: 0.5, maxOffset: 0.05 });
+    expect(normalizeMotionBlur({ damp: 1.7 })).toEqual({ mode: 'afterimage', damp: 0.98, maxOffset: 0.05 });
+    expect(normalizeMotionBlur({ damp: -2 })).toEqual({ mode: 'afterimage', damp: 0, maxOffset: 0.05 });
+    expect(normalizeMotionBlur({ damp: Number.NaN })).toEqual({ mode: 'afterimage', damp: 'auto', maxOffset: 0.05 });
+    expect(normalizeMotionBlur({ damp: 'auto' })).toEqual({ mode: 'afterimage', damp: 'auto', maxOffset: 0.05 });
+  });
+
+  test('maxOffset（velocity 拖影上限，屏宽百分比）钳到 [0, 1]，NaN / 非法回默认 0.05', () => {
+    expect(normalizeMotionBlur({ mode: 'velocity', maxOffset: 0.2 }).maxOffset).toBe(0.2);
+    expect(normalizeMotionBlur({ maxOffset: -1 }).maxOffset).toBe(0);
+    expect(normalizeMotionBlur({ maxOffset: 5 }).maxOffset).toBe(1);
+    expect(normalizeMotionBlur({ maxOffset: Number.NaN }).maxOffset).toBe(0.05);
+    expect(normalizeMotionBlur({ maxOffset: 'big' as never }).maxOffset).toBe(0.05);
   });
 });
 
@@ -152,6 +160,51 @@ describe('autoMotionBlurDamp（FPS 自适应拖尾）', () => {
   });
 });
 
+/* ------------------------------------------------------------------ 2.5 PR #6 审查修复 */
+
+describe('PR #6 审查修复：RT 类型与 maxOffset', () => {
+  test('三张 RT 均为 HalfFloatType —— 线性高光不在 tone map 之前被 clamp 到 [0,1]', () => {
+    const v = makeViewer({ motionBlur: {} });
+    stubPipeline(v);
+    frame(v);
+    const pass = (v as unknown as {
+      _motionBlur: {
+        rtScene: THREE.WebGLRenderTarget | null;
+        rtPrevRead: THREE.WebGLRenderTarget | null;
+        rtPrevWrite: THREE.WebGLRenderTarget | null;
+      };
+    })._motionBlur;
+    // UnsignedByteType 存线性值会把 >1 的高光 / 自发光截断，合成 tone map 后与直渲有可感知色差
+    expect(pass.rtScene!.texture.type).toBe(THREE.HalfFloatType);
+    expect(pass.rtPrevRead!.texture.type).toBe(THREE.HalfFloatType);
+    expect(pass.rtPrevWrite!.texture.type).toBe(THREE.HalfFloatType);
+    v.dispose();
+  });
+
+  test('velocity 的 uMaxOffset 从配置读取（拖影上限可配），默认 0.05 与旧行为一致', () => {
+    const v = makeViewer({ motionBlur: { mode: 'velocity', maxOffset: 0.12 } });
+    stubPipeline(v);
+    frame(v);
+    const pass = (v as unknown as { _motionBlur: { velocityMat: { uniforms: Record<string, { value: unknown }> } } })._motionBlur;
+    expect(pass.velocityMat.uniforms.uMaxOffset.value).toBe(0.12);
+    v.dispose();
+
+    const v2 = makeViewer({ motionBlur: { mode: 'velocity' } });
+    stubPipeline(v2);
+    frame(v2);
+    const pass2 = (v2 as unknown as { _motionBlur: { velocityMat: { uniforms: Record<string, { value: unknown }> } } })._motionBlur;
+    expect(pass2.velocityMat.uniforms.uMaxOffset.value).toBe(0.05);
+    v2.dispose();
+  });
+
+  test('maxOffset 归一化结果经 getter 透出（运行时可改）', () => {
+    const v = makeViewer();
+    v.setMotionBlur({ mode: 'velocity', maxOffset: 0.3 });
+    expect(v.motionBlur).toEqual({ mode: 'velocity', damp: 'auto', maxOffset: 0.3 });
+    v.dispose();
+  });
+});
+
 /* ------------------------------------------------------------------ 3. 默认行为不变（不变式①） */
 
 describe('默认不传 motionBlur 时行为不变', () => {
@@ -172,7 +225,7 @@ describe('默认不传 motionBlur 时行为不变', () => {
 describe('afterimage 模式帧序列', () => {
   test('稳态帧：场景→RT、混合→ping-pong RT、合成→宿主 framebuffer，共 3 次渲染', () => {
     const v = makeViewer({ motionBlur: { mode: 'afterimage' } });
-    expect(v.motionBlur).toEqual({ mode: 'afterimage', damp: 'auto' });
+    expect(v.motionBlur).toEqual({ mode: 'afterimage', damp: 'auto', maxOffset: 0.05 });
     const { events } = stubPipeline(v);
     frame(v); // 首帧：累积链起步
     events.length = 0;
@@ -279,7 +332,7 @@ describe('velocity 模式帧序列', () => {
 describe('WebGL1 上静默回退直渲', () => {
   test('配置仍在（getter 照常返回），但渲染路径走老路径', () => {
     const v = makeViewer({ motionBlur: { mode: 'velocity' } });
-    expect(v.motionBlur).toEqual({ mode: 'velocity', damp: 'auto' });
+    expect(v.motionBlur).toEqual({ mode: 'velocity', damp: 'auto', maxOffset: 0.05 });
     const { events } = stubPipeline(v, false);
     frame(v);
     expect(renderCount(events)).toBe(1);
@@ -304,7 +357,7 @@ describe('setMotionBlur 运行时开关', () => {
 
     v.setMotionBlur({ mode: 'velocity', damp: 0.5 });
     expect(repaints).toBe(1); // 子模块触发重绘一律走 triggerRepaint（观测点）
-    expect(v.motionBlur).toEqual({ mode: 'velocity', damp: 0.5 });
+    expect(v.motionBlur).toEqual({ mode: 'velocity', damp: 0.5, maxOffset: 0.05 });
     frame(v);
     expect(renderCount(events)).toBe(3); // velocity 两步
 

@@ -32,6 +32,8 @@
  *   轮廓之外的残影会被丢弃（不写深度就不能保住遮挡正确性）。
  * - 透明混合的顺序语义有细微变化：直渲是「逐片元 tone map 后混合」，这里是
  *   「线性混合后统一 tone map」，半透明重叠区的色值有极小偏差。
+ * - RT 用 HalfFloatType（半精度浮点）：线性空间的高光 / 自发光不被 clamp 到 [0,1]，
+ *   代价是三张全屏纹理显存 ×2、带宽 ×2 —— 低端机的取舍见 docs 的性能调优。
  *
  * 只支持 WebGL2（`gl_FragDepth` + `DepthTexture`）。WebGL1 上 `supported()` 返回
  * false，调用方回退直渲路径，行为与不开运动模糊一致。
@@ -50,17 +52,24 @@ export interface MotionBlurOptions {
    * `'auto'`（默认）按实时 FPS 收敛 —— 帧率越低拖影越长，公式见 `autoMotionBlurDamp`。
    */
   damp?: number | 'auto';
+  /**
+   * 拖影上限（仅 velocity 用）：速度向量的最大屏幕偏移，取绘图缓冲宽度的百分比，0~1。
+   * 默认 `0.05`（屏宽 5%）—— 瞬移 / 视角跳变时不整屏拉丝。快速甩动想要更长拖尾调大即可。
+   */
+  maxOffset?: number;
 }
 
 /** 归一化后的配置（viewer 内部持有） */
 export interface MotionBlurConfig {
   mode: 'afterimage' | 'velocity';
   damp: number | 'auto';
+  maxOffset: number;
 }
 
 /**
  * 选项归一化。不传 / null / 非对象 = 关闭（返回 null）；传了对象 = 开启：
- * mode 缺省或非法回退 `'afterimage'`；damp 缺省 / NaN = `'auto'`，数值钳到 [0, 0.98]。
+ * mode 缺省或非法回退 `'afterimage'`；damp 缺省 / NaN = `'auto'`，数值钳到 [0, 0.98]；
+ * maxOffset 缺省 / NaN = 0.05，数值钳到 [0, 1]。
  * 0.98 封顶是防「永远糊着」——damp 趋近 1 时残影按几何级数衰减，30 帧都散不掉。
  */
 export function normalizeMotionBlur(o: MotionBlurOptions | null | undefined): MotionBlurConfig | null {
@@ -70,7 +79,12 @@ export function normalizeMotionBlur(o: MotionBlurOptions | null | undefined): Mo
   if (typeof o.damp === 'number' && Number.isFinite(o.damp)) {
     damp = Math.min(0.98, Math.max(0, o.damp));
   }
-  return { mode, damp };
+  // maxOffset 是屏宽百分比：>1 等于不设上限（整屏拉丝），负数无意义
+  let maxOffset = 0.05;
+  if (typeof o.maxOffset === 'number' && Number.isFinite(o.maxOffset)) {
+    maxOffset = Math.min(1, Math.max(0, o.maxOffset));
+  }
+  return { mode, damp, maxOffset };
 }
 
 /**
@@ -91,6 +105,8 @@ export function autoMotionBlurDamp(fps: number): number {
 export interface MotionBlurParams {
   mode: 'afterimage' | 'velocity';
   damp: number;
+  /** velocity 拖影上限（屏宽百分比，来自归一化后的配置） */
+  maxOffset: number;
   /** 本帧 world→clip（viewer 的 _frameMvp，已乘 ENU 矩阵） */
   mvp: THREE.Matrix4;
   /** mvp 的逆（viewer 的 camera.projectionMatrixInverse，每帧已维护） */
@@ -283,12 +299,14 @@ export class MotionBlurPass {
     this.disposeTargets();
     const w = Math.max(1, width);
     const h = Math.max(1, height);
-    // 场景 RT：颜色 + 深度纹理（深度既用于 velocity 反推，也用于合成时写回 gl_FragDepth）
+    // 场景 RT：颜色 + 深度纹理（深度既用于 velocity 反推，也用于合成时写回 gl_FragDepth）。
+    // HalfFloatType 是必须的：RT 里存的是 tone map 之前的线性值，UnsignedByteType 会把
+    // 高光 / 自发光（>1）clamp 到 [0,1]，合成 tone map 后与直渲有可感知色差；代价是显存 ×2。
     this.rtScene = new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.LinearFilter,
       magFilter: THREE.LinearFilter,
       format: THREE.RGBAFormat,
-      type: THREE.UnsignedByteType,
+      type: THREE.HalfFloatType,
       depthBuffer: true,
       stencilBuffer: false,
       generateMipmaps: false,
@@ -305,12 +323,13 @@ export class MotionBlurPass {
     const w = Math.max(1, width);
     const h = Math.max(1, height);
     const mk = () => {
-      // WebGL 保证新分配纹理零初始化，配合「首帧 damp=0」不需要显式 clear
+      // WebGL 保证新分配纹理零初始化，配合「首帧 damp=0」不需要显式 clear。
+      // 与场景 RT 同为 HalfFloat：累积链的中间值同样在线性空间，clamp 会逐帧劣化高光
       const rt = new THREE.WebGLRenderTarget(w, h, {
         minFilter: THREE.LinearFilter,
         magFilter: THREE.LinearFilter,
         format: THREE.RGBAFormat,
-        type: THREE.UnsignedByteType,
+        type: THREE.HalfFloatType,
         depthBuffer: false,
         stencilBuffer: false,
         generateMipmaps: false,
@@ -345,7 +364,6 @@ export class MotionBlurPass {
     if (!rtScene) return;
 
     // ---- 1. 场景 → RT（线性空间，透明底。clear color 状态要还原，宿主没让我们改它） ----
-    const prevOverride = scene.overrideMaterial;
     const prevClearColor = renderer.getClearColor(new THREE.Color());
     const prevClearAlpha = renderer.getClearAlpha();
     renderer.setRenderTarget(rtScene);
@@ -353,7 +371,6 @@ export class MotionBlurPass {
     renderer.setClearColor(0x000000, 0);
     renderer.clear(true, true, true);
     renderer.render(scene, camera);
-    scene.overrideMaterial = prevOverride;
 
     // ---- 2. 模糊 + 上屏 ----
     if (params.mode === 'velocity') {
@@ -364,6 +381,7 @@ export class MotionBlurPass {
       (u.uCurInv.value as THREE.Matrix4).copy(params.mvpInverse);
       // 首帧（或刚从 afterimage 切过来还没 prev）prev = cur → 零速度，纯透传
       (u.uPrevMvp.value as THREE.Matrix4).copy(this._hasPrev ? this._prevMvp : params.mvp);
+      u.uMaxOffset.value = params.maxOffset;
       this.setQuadMaterial(this.velocityMat);
       renderer.setRenderTarget(null);
       renderer.setViewport(0, 0, width, height);
@@ -378,7 +396,8 @@ export class MotionBlurPass {
       const u = this.blendMat.uniforms;
       u.tCur.value = rtScene.texture;
       u.tPrev.value = this.rtPrevRead.texture;
-      u.uDamp.value = firstAccum ? 0 : Math.min(0.98, Math.max(0, params.damp));
+      // damp 由 normalizeMotionBlur 钳过、auto 已由 viewer 解析成数值，这里直传
+      u.uDamp.value = firstAccum ? 0 : params.damp;
       this.setQuadMaterial(this.blendMat);
       renderer.setRenderTarget(this.rtPrevWrite);
       renderer.setViewport(0, 0, width, height);
