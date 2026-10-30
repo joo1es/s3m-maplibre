@@ -225,14 +225,45 @@ interface MeshRecord {
   position: Float32Array;
   uv: Float32Array;
   indexCount: number;
-  indices: Uint16Array;
+  indices: Uint16Array | Uint32Array;
+  primitiveType: number;
   materialId: string;
   /** 实例矩阵（每实例 16 float：3×4 行主序 + RGBA），没有实例化时为 undefined */
   instances?: Float32Array;
 }
 
-/** 索引头的第 3 个 dword，全版本固定 */
-const INDEX_HEADER_MARK = 0x00040100;
+/**
+ * 校验 p 偏移处是否为合法的 S3M 1.x 索引头：
+ *   dword[0] = 1 (idxKind)
+ *   dword[1] = indexCount
+ *   dword[2] = mark，按字节小端存储：
+ *     byte 0: indexType (0=u16, 1/3=u32)
+ *     byte 1: useIndex (恒 1)
+ *     byte 2: primitiveType (1=POINTS, 2=LINES, 3=LINE_STRIP, 4=TRIANGLES, 5/6=STRIP/FAN, 13=EDGES)
+ *     byte 3: reserved (恒 0)
+ * 校验紧随其后的索引数据（4 字节对齐）之后，记录尾标记恒为 1。
+ */
+function isValidIndexHeader(view: DataView, p: number): boolean {
+  if (view.getUint32(p, true) !== 1) return false;
+  const count = view.getUint32(p + 4, true);
+  if (count === 0 || count > 10_000_000) return false;
+  const mark = view.getUint32(p + 8, true);
+  const indexType = mark & 0xff;
+  const useIndex = (mark >> 8) & 0xff;
+  const primitiveType = (mark >> 16) & 0xff;
+  const reserved = (mark >> 24) & 0xff;
+  if (useIndex !== 1 || reserved !== 0) return false;
+  if (indexType !== 0 && indexType !== 1 && indexType !== 3) return false;
+  if (![1, 2, 3, 4, 5, 6, 13].includes(primitiveType)) return false;
+  if (primitiveType === 4 && count % 3 !== 0) return false;
+  if (primitiveType === 2 && count % 2 !== 0) return false;
+
+  const wide = indexType === 1 || indexType === 3;
+  const indexBytes = count * (wide ? 4 : 2);
+  const tailOffset = (p + 12 + indexBytes + 3) & ~3;
+  if (tailOffset + 8 > view.byteLength) return false;
+  return view.getUint32(tailOffset, true) === 1;
+}
 
 /**
  * v1 里每个实例记录固定 20 个 float（80 字节）：
@@ -321,11 +352,7 @@ function readInstances(
 function findIndexHeader(view: DataView, from: number): number {
   const limit = view.byteLength - 12;
   for (let p = from; p <= limit; p += 4) {
-    if (view.getUint32(p, true) !== 1) continue;
-    const count = view.getUint32(p + 4, true);
-    if (count === 0 || count % 3 !== 0) continue;
-    if (view.getUint32(p + 8, true) !== INDEX_HEADER_MARK) continue;
-    return p;
+    if (isValidIndexHeader(view, p)) return p;
   }
   return -1;
 }
@@ -471,15 +498,29 @@ function readGeometry(
       }
     }
 
-    // 索引头 [1, indexCount, 0x00040100]
+    // 索引头 [1, indexCount, mark]
     const idxKind = br.u32();
     const indexCount = br.u32();
-    br.u32(); // 常量标记
-    if (idxKind !== 1 || indexCount === 0 || indexCount % 3 !== 0) {
-      throw new Error(`[s3m] S3M 1.x 索引头不符：网格 ${geoName} kind=${idxKind} count=${indexCount}`);
+    const mark = br.u32();
+    const indexType = mark & 0xff;
+    const useIndex = (mark >> 8) & 0xff;
+    const primitiveType = (mark >> 16) & 0xff;
+    if (idxKind !== 1 || indexCount === 0 || useIndex !== 1) {
+      throw new Error(`[s3m] S3M 1.x 索引头不符：网格 ${geoName} kind=${idxKind} count=${indexCount} mark=0x${mark.toString(16)}`);
     }
-    const indices = new Uint16Array(indexCount);
-    for (let i = 0; i < indexCount; i++) indices[i] = br.u16();
+    if (primitiveType === 4 && indexCount % 3 !== 0) {
+      throw new Error(`[s3m] S3M 1.x 索引头不符：网格 ${geoName} 三角形索引数 ${indexCount} 非 3 的倍数`);
+    }
+    if (primitiveType === 2 && indexCount % 2 !== 0) {
+      throw new Error(`[s3m] S3M 1.x 索引头不符：网格 ${geoName} 线段索引数 ${indexCount} 非 2 的倍数`);
+    }
+    const wide = indexType === 1 || indexType === 3;
+    const indices = wide ? new Uint32Array(indexCount) : new Uint16Array(indexCount);
+    if (wide) {
+      for (let i = 0; i < indexCount; i++) indices[i] = br.u32();
+    } else {
+      for (let i = 0; i < indexCount; i++) indices[i] = br.u16();
+    }
     if (br.offset > geoSize) throw new Error(`[s3m] S3M 1.x 索引越界：网格 ${geoName}`);
     br.align4();
 
@@ -495,6 +536,7 @@ function readGeometry(
       uv,
       indexCount,
       indices,
+      primitiveType,
       materialId,
       ...(instances ? { instances } : {}),
     });
@@ -511,10 +553,10 @@ function readGeometry(
  */
 export function pixelFormatOfBpp(bpp: number, rawFormat: number): number {
   if (!Number.isFinite(bpp) || bpp <= 0) return rawFormat;
-  if (Math.abs(bpp - 0.5) < 0.02) return 17; // DXT1
-  if (Math.abs(bpp - 1) < 0.02) return 21; // DXT5
-  if (Math.abs(bpp - 4) < 0.02) return 14; // BGRA
-  if (Math.abs(bpp - 3) < 0.02) return 10; // RGB
+  if (Math.abs(bpp - 0.5) < 0.05 || (bpp >= 0.6 && bpp <= 0.75)) return 17; // DXT1（含全 mip 链 ~0.667 B/px）
+  if (Math.abs(bpp - 1) < 0.05 || (bpp >= 1.25 && bpp <= 1.5)) return 21; // DXT5（含全 mip 链 ~1.333~1.44 B/px）
+  if (Math.abs(bpp - 4) < 0.05) return 14; // BGRA
+  if (Math.abs(bpp - 3) < 0.05) return 10; // RGB
   console.warn(`[s3m] S3M 1.x 纹理密度 ${bpp.toFixed(3)} B/px 不在已知档位，按原 format=${rawFormat} 交给上层判定`);
   return rawFormat;
 }
@@ -668,9 +710,9 @@ export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Opti
     }
     const pack: IndexPackage = {
       indexCount: mesh.indexCount,
-      indexType: 0, // 0 = UNSIGNED_SHORT
+      indexType: mesh.indices instanceof Uint32Array ? 1 : 0,
       useIndex: 1,
-      primitiveType: 4, // TRIANGLES
+      primitiveType: mesh.primitiveType ?? 4,
       indices: new Uint8Array(mesh.indices.buffer, mesh.indices.byteOffset, mesh.indices.byteLength),
       passNames: [mesh.materialId],
     };

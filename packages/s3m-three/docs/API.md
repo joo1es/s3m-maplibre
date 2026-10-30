@@ -1369,9 +1369,9 @@ bun run test:meshopt
 
 **这两条 GS 流的量化格式还没标定**（4 字节 / 点，既不像 3 个 float，也不像明显四元数），所以渲染层目前只是把它们带到顶点属性上备用，没有接进真正的 splat 着色器。
 
-### Draco 点云几何
+### Draco 几何（点云与三角网格）
 
-v3.01 的点云数据还有一条 Draco 压缩分支（骨架 tag = `DRACO`）。接法与 MeshOpt 相同：内联 wasm 解码器（约 266KB）只在真的遇到时动态 `import`，解码后并入同一套 attribute 组装，点云按 `primitiveType = 1` 交给 `THREE.Points`，分类码 / 强度 / 权重三种自定义属性一并解出来。
+v3.01 支持 Draco 压缩分支（骨架 tag = `DRACO`），涵盖点云与三角网格（`TRIANGULAR_MESH`）。接法与 MeshOpt 相同：内联 wasm 解码器（约 266KB）只在遇到时动态 `import`，解码后并入同一套 attribute 组装：点云按 `primitiveType = 1` 交给 `THREE.Points`（分类码/强度/权重一并解出）；三角网格按面解出顶点索引与法线，按 `primitiveType = 4` 交给 `THREE.Mesh`。遇到未知几何类型自动 warn 降级并跳过，避免整层崩溃。
 
 **这个分支的字段顺序与规范描述对不上，是从真实瓦片逐字节标定的**（偏移以骨架 tag 字段之后为 0）：
 
