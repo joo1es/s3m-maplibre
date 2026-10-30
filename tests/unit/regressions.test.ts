@@ -25,6 +25,7 @@ import { S3MLayer } from '../../packages/s3m-maplibre/src/index';
 import { createSharedUniforms, createStyledMaterial } from '../../packages/s3m-three/src/render/StyleMaterial';
 import { Picker } from '../../packages/s3m-three/src/render/Picker';
 import { transcodeCRN } from '../../packages/s3m-three/src/core/CRNDecode';
+import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
 
 let realFetch: typeof globalThis.fetch;
 let realNow: typeof performance.now;
@@ -495,5 +496,51 @@ describe('11. 瓦片层级可见性切换（HLOD 互斥，防止父子重叠 Z-f
     ts.update([0, 0, 20000], Math.PI / 3, 1000);
     expect(parent.group.visible).toBe(true);
     expect(child.group.visible).toBe(false);
+  });
+});
+
+describe('12. EdgeDecorator 的 host 绑定必须跟 mount 后的活实例走（GPU 描边静默失效）', () => {
+  /**
+   * 0048a99 拆分 S3MViewer 时，EdgeHost 的 scene / renderer / camera 被写成构造期的
+   * **值快照** —— 而 mount() 与 restoreContext() 都会换掉这三个对象，于是
+   * `renderGpuEdges` 读到的 renderer 恒为 null、静默 return：`edges: 'gpu'` 完全不画。
+   * 这里锁定：mount 之后（renderer / scene / camera 已替换成新实例）GPU 描边
+   * 必须真的跑两遍渲染（法线 RT + 全屏 quad）。
+   */
+  test('edges: gpu 在 mount 后仍然后处理（host 不能拿构造期的 null renderer）', () => {
+    stallFetch();
+    const v = new S3MViewer({ style: { edges: 'gpu' } });
+    v.sceneAnchor = { x: 0, y: 0, z: 0, meterInMercator: 1 };
+    // 模拟 mount：scene / renderer / camera 全部换成新实例（值快照会全部失联）
+    let renders = 0;
+    (v as unknown as { canvas: unknown }).canvas = { width: 200, height: 100 };
+    (v as unknown as { camera: unknown }).camera = new THREE.PerspectiveCamera();
+    (v as unknown as { renderer: unknown }).renderer = {
+      getContext: () => ({ isContextLost: () => false }),
+      capabilities: { isWebGL2: true },
+      setViewport: () => {},
+      resetState: () => {},
+      setRenderTarget: () => {},
+      getClearColor: (c: THREE.Color) => c,
+      setClearColor: () => {},
+      getClearAlpha: () => 1,
+      setClearAlpha: () => {},
+      clear: () => {},
+      render: () => {
+        renders++;
+      },
+      dispose: () => {},
+    };
+
+    v.renderFrame({
+      mvp: new THREE.Matrix4().identity().toArray(),
+      cameraEnu: [0, 0, 1000],
+      fovRad: 0.6,
+      canvasHeight: 100,
+    });
+
+    // 直渲 1 次 + GPU 描边 2 次（法线 RT + 全屏 quad）= 3。host 绑定失效时只有 1 次。
+    expect(renders).toBe(3);
+    v.dispose();
   });
 });
