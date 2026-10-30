@@ -251,7 +251,7 @@ bun run build  # 只产出，不起服务
 
 `bun run build` 会按 `s3m-three → s3m-maplibre → docs → demo` 的顺序全部产出，其中 docs/ 与 demo/index.html 都由 `site/` 构建（共用一份 `site/vite.config.ts`，只是入口和输出目录不同；产物位置不变，URL 不变）。
 
-演示自带两份本地样例数据（北京 CBD 的 CCTV、comModel，离线可用），另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并默认勾选第一个。
+演示自带两份本地样例数据（北京 CBD 的 CCTV、comModel，离线可用），另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并标注类型（地形 / 影像打标签），默认勾选第一个**模型类**数据集。
 
 演示包含：数据集叠加开关、着色模式、透明度、平面/平滑着色、选中描边（棱线 / 外扩两种画法，粗细可调）、全局棱线、点击属性卡；右侧面板还能填 iServer 数据服务地址，按业务字段（KEYID / SmMaxZ…）上色出图例、按区间过滤、按字段值抬高。
 
@@ -401,10 +401,12 @@ Draco 与 3DGS 的容器结构都已有回归测试钉住：`tests/unit/draco.te
 | S3M 瓦片缓存（主流） | JSON（`rootTiles` / `position.point3D` / `geoBounds`） | `.s3mb` v2 / v3 / v3.01，或 `.s3mblock` | ✅ 完整（含 `.s3mblock` 纹理分包与 `.texblock` 细级外部图集完整支持） |
 | SuperMapCache / S3M 1.x | **XML**（`<SuperMapCache>`，`sml:FileType = OSGBFile`） | `.s3m` —— 整棵 LOD 树都是这种容器（子瓦走 `datas/<数据源>/data/path/…/<名>.s3m`） | ✅ 几何 / 纹理 / 细化全通，走 `core/S3M1Parser.ts` |
 | 高斯泼溅 | JSON，`dataType = "3DGaussianSplatting"` | `.s3mb` v3.01 + MeshOpt，**没有索引包** | ✅ 完整支持高斯泼溅渲染（已标定 scale / rotation，支持协方差、深度排序与点选拾取） |
+| 地形 / 影像缓存 | **XML**（`FileExtentName = Terrainz` 是地形；`Type = Image` 是影像） | 按金字塔寻址的栅格瓦片，**没有瓦片清单** | ❌ 明确报错「是地形/影像缓存，本层仅支持模型类 S3M 数据集」，不伪装成「缺少 root tile」 |
 
 几个已经踩过、已经修掉的坑，记在这里免得再踩：
 
 - **`config` 不带后缀**。`datas/<名>/config.xml` 会 406「当前资源不支持请求体中的媒体类型」，`datas/<名>/config` 才对。数据源名可以是中文（如 `寿宁阁`），走 `new URL()` 会自动百分号编码。
+- **混合服务里的第一个数据集可能是地形/影像**（如 `3D-OlympicGreen_Plan` 的 `beijingdem`）。这类 config 也是 XML，但没有瓦片清单，当模型加载只会撞出误导性的「配置中缺少 root tile」。现在 `classifyDatasetKind` 按 `FileExtentName=Terrainz`（地形）与 `Type=Image`（影像）提前识别、`init` 阶段就明确报错；「缺少 root tile」的报错也会带上 config 的类型标记，能区分「清单当配置」「桌面导出漏清单」「非模型缓存」三种病因。
 - **OSGB 的 XML 里没有经纬度范围**，只有 `<sml:Position>`（经纬度原点）和 `<sml:BoundingBox>`（以该原点为中心的**米制**局部盒）。直接读 `Left/Right/Top/Bottom` 会得到全 0，于是视角甩到几内亚湾，锚点校验还会把唯一正确的 `position` 判成异常。现在按等距圆柱近似反算（`Δlon = x / (111320·cos φ)`、`Δlat = y / 110540`）。
 - **OSGB 的瓦片名带 `+`**（`Tile_+002_+001`）。iServer 的 Java 侧按 `URLDecoder` 解路径，未编码的 `+` 会变成空格 → 404「瓦片数据不存在」；`new URL()` 又认为 `+` 在 path 里合法而不编码。所以拼出来的每个瓦片 URL 都得把 `+` 补成 `%2B`（同一个地址实测：裸 `+` 404，`%2B` 200）。
 - **v3.01 的 `position` 换成了 `position.point3D` + `unit`**（老数据是 `position.x/y/z` + `units`），两个键名都得认，否则投影单位是米的数据会被当成度。

@@ -1407,15 +1407,24 @@ ts.update([0, 0, 500], 0.64, 900); // 相机在局部 ENU 的位置
 https://host/iserver/services/3D-xxx/rest/realspace/datas/<数据源名>/config
 ```
 
-数据源名可以是中文（如 `寿宁阁`），`new URL()` 会自动百分号编码；后缀只能写 `config`，写 `config.xml` 会 406。只给到 `…/realspace/datas` 时拿到的是一个资源清单数组，`JSON.parse` 不报错但没有 `position` / `rootTiles`，表现为「视角跳到 (0,0) + 一句缺少 root tile」——先用 `…/datas.json` 列出数据源，再逐个拼 `/config`。
+数据源名可以是中文（如 `寿宁阁`），`new URL()` 会自动百分号编码；后缀只能写 `config`，写 `config.xml` 会 406。只给到 `…/realspace/datas` 时拿到的是一个资源清单数组，`JSON.parse` 不报错但没有 `position` / `rootTiles`，表现为「视角跳到 (0,0) + 一句缺少 root tile」——先用 `…/datas.json` 列出数据源，再逐个拼 `/config`。这类报错会带上 config 的类型标记（`FileExtentName` / `Type` / `fileType` / `dataType`），便于区分「清单当配置」和「桌面导出漏瓦片清单」两种病因。
 
-配套导出的三个纯函数，方便自建数据集列表与做体检：
+混合服务（模型 + 地形 + 影像共存）里还有第三种触发面：地形/影像数据集的 config 也是 XML，但**没有瓦片清单**。`init` 会按类型标记提前拒绝并说明病因（见 [FORMAT-NOTES 第二章](./FORMAT-NOTES.md#二先判断是哪一种数据)），不再落到「缺少 root tile」：
+
+```
+Error: 数据集 beijingdem 是地形缓存（FileExtentName=Terrainz），本层仅支持模型类 S3M 数据集
+```
+
+配套导出的五个纯函数，方便自建数据集列表与做体检：
 
 ```ts
-parseConfigText(text)      // JSON 与 SuperMapCache XML 两种配置统一成同一种形状（含 fileType）
+parseConfigText(text)      // JSON 与 SuperMapCache XML 两种配置统一成同一种形状（含 fileType / fileExtentName / cacheType）
+classifyDatasetKind(config) // → 'model' | 'terrain' | 'imagery'；只有认出确凿的非模型标记才判 terrain / imagery
 usableGeoBounds(bounds)    // 判断 geoBounds 是否真的可用；不可用返回 null（见「锚点」）
 fixPathEncoding(url)       // 补路径里没编码但服务端会改写的字符：+ → %2B、空格 → %20
 ```
+
+`classifyDatasetKind` 的判别字段来自实测：地形 = `FileExtentName=Terrainz`；影像 = `Type=Image`（影像的 `FileExtentName` 是 `jpg_png` 这类扩展名样式，不可靠）。认不出标记的一律返回 `'model'`，保证行为与旧版一致；`init` 对非模型数据集抛出的错误上带 `datasetKind` 属性，数据集列表 UI 可以据此标注或跳过。
 
 `fixPathEncoding` 这条是硬需求：OSGB 转出来的瓦片名就是 `Tile_+002_+001`，而 iServer 按 `URLDecoder` 解路径，未编码的 `+` 会变成空格 → 404「瓦片数据不存在」。`new URL()` 认为 `+` 在 path 里合法，不会替我们编码，所以拼完 URL 必须补这一刀（query 里的 `+` 不动，那本来就是空格约定）。
 

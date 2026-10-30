@@ -167,7 +167,7 @@ interface S3MDatasetOptions {
 https://host/iserver/services/3D-xxx/rest/realspace/datas/<数据源名>/config
 ```
 
-三个容易踩的点（详见 [s3m-three 的 S3MTileset 一节](../../s3m-three/docs/API.md#s3mtileset)）：后缀只能写 `config`，写成 `config.xml` 会 406；`<数据源名>` 可以是中文，直接给到 `…/datas` 拿到的是资源清单而不是配置；OSGB 倾斜摄影那类服务的 `config` 返回 XML 且瓦片是 S3M 1.x，位置能定准但几何不支持，会明确报错。
+三个容易踩的点（详见 [s3m-three 的 S3MTileset 一节](../../s3m-three/docs/API.md#s3mtileset)）：后缀只能写 `config`，写成 `config.xml` 会 406；`<数据源名>` 可以是中文，直接给到 `…/datas` 拿到的是资源清单而不是配置；OSGB 倾斜摄影那类服务的 `config` 返回 XML 且瓦片是 S3M 1.x，位置能定准但几何不支持，会明确报错。混合服务（模型 + 地形 + 影像共存）里的地形/影像数据集（如 `3D-OlympicGreen_Plan` 的 `beijingdem`）会在 `init` 阶段被 `classifyDatasetKind` 识别并明确报「是地形/影像缓存，本层仅支持模型类 S3M 数据集」，不再伪装成「配置中缺少 root tile」；自建数据集列表时可用导出的 `parseConfigText` + `classifyDatasetKind` 提前标注类型。
 
 `addDataset` 在图层 `onAdd` 之前调用会抛错（此时还没有 WebGL 上下文）。
 

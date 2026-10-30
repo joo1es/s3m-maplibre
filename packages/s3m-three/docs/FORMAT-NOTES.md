@@ -33,6 +33,16 @@ C 级的处置原则：**只在新样本进来时提高级别，不靠推理提�
 | SuperMapCache / S3M 1.x | **XML**（`<SuperMapCache>`，`sml:FileType = OSGBFile`） | `.s3m`（整棵 LOD 树同一种容器） | `S3M1Parser` |
 | 高斯泼溅 | JSON，`dataType = "3DGaussianSplatting"` | `.s3mb` v3.01 + MeshOpt，**无索引包** | `S3MBParser` + `MeshOpt` |
 
+还有第四种撞法（issue #7）：**容器形态识别对了（XML），但内容不是模型**。混合服务（模型 + 地形 + 影像共存，iServer / supermapol 上很常见）里地形/影像数据集的 config 也是 SuperMapCache XML，只是按 `Level0Width/Level0Height + Levels` 的金字塔寻址、**没有瓦片清单**。实测判别字段（3D-OlympicGreen_Plan，2026-10-30）：
+
+| 数据集 | config 根节点 | 判别字段 |
+|:---|:---|:---|
+| `beijingdem`（地形） | `<SuperMapCache>` | `sml:FileExtentName = Terrainz` |
+| `beijingimg`（影像） | `<SuperMapCache_Unicode>` | `sml:Type = Image`（它的 FileExtentName 是 `jpg_png` 这种扩展名样式，**不可靠**） |
+| `Building` 等（模型） | `<SuperMapCache>` | `sml:FileType = OSGBFile / OSGBCacheFile`，无 FileExtentName / Type |
+
+`classifyDatasetKind(config)` 按上表识别，认出地形/影像时 `S3MTileset.init` 会在解析锚点之前明确报错（错误带 `datasetKind` 属性），不再落到误导性的「配置中缺少 root tile」。
+
 **S3M 1.x 必须靠魔数分流，不能靠配置。** 头 4 字节 `73 33 6D 00`（`"s3m\0"`）紧接 `78 da` 的 zlib。不分流的话，头 4 字节会被 float32 读成 1e-38 的「版本号」，再把 zlib 头当长度，报出来的是 `RangeError: Invalid typed array length` —— 一个彻底误导人的错。
 
 ---

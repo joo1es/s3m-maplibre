@@ -195,6 +195,10 @@ export function parseConfigText(text: string): Record<string, unknown> {
 
     return {
       fileType: tagVal('FileType') ?? undefined,
+      // 地形/影像缓存的判别字段（见 classifyDatasetKind）：FileExtentName=Terrainz 是地形，
+      // <sml:Type>Image</sml:Type> 是影像（影像的 FileExtentName 是 jpg_png 这种扩展名样式，不可靠）
+      fileExtentName: tagVal('FileExtentName') ?? undefined,
+      cacheType: tagVal('Type') ?? undefined,
       position: { x: posX, y: posY, z: posZ, units: 'Degree' },
       geoBounds: { left, right, top, bottom },
       heightRange: Number.isFinite(minH) || Number.isFinite(maxH) ? { min: minH, max: maxH } : undefined,
@@ -203,6 +207,53 @@ export function parseConfigText(text: string): Record<string, unknown> {
     };
   }
   return JSON.parse(trimmed) as Record<string, unknown>;
+}
+
+/** config 能认出的数据集类别（判别规则见 classifyDatasetKind） */
+export type DatasetKind = 'model' | 'terrain' | 'imagery';
+
+/**
+ * 按 config 的类型标记识别数据集类别。
+ *
+ * 同一个 `…/datas/<名>/config` URL 底下可能是模型、地形、影像三种完全不同的缓存
+ * （FORMAT-NOTES 第二章）。地形/影像是按 Level0 金字塔寻址的栅格缓存，**没有瓦片清单**，
+ * 当模型加载只会一路走到「配置中缺少 root tile」，把「类型不支持」伪装成「配置缺字段」
+ * （issue #7：混合服务第一个数据集 beijingdem 是 Terrainz 地形缓存）。
+ *
+ * 判别字段取自实测（supermapol 3D-OlympicGreen_Plan，2026-10-30）：
+ *   地形 XML： FileExtentName = Terrainz
+ *   影像 XML： FileExtentName = jpg_png（扩展名样式，不可靠）+ Type = Image
+ *   模型 XML： FileType = OSGBFile / OSGBCacheFile，无 FileExtentName / Type
+ *
+ * 保守原则：只有认出确凿的非模型标记才判 terrain / imagery，其余（含 JSON 配置、
+ * 无标记的 XML）一律 'model' —— 保证「认不出」时行为与旧版一致（不变式 ①）。
+ */
+export function classifyDatasetKind(config: Record<string, unknown> | null | undefined): DatasetKind {
+  if (!config || typeof config !== 'object') return 'model';
+  if (String(config.fileExtentName ?? '').trim().toLowerCase() === 'terrainz') return 'terrain';
+  if (String(config.cacheType ?? '').trim().toLowerCase() === 'image') return 'imagery';
+  return 'model';
+}
+
+/** 拼一句能区分 config 形态的上下文（FileExtentName / Type / fileType / dataType），供报错使用 */
+function configTypeHint(config: Record<string, unknown>): string {
+  const parts: string[] = [];
+  if (config.fileExtentName) parts.push(`FileExtentName=${config.fileExtentName}`);
+  if (config.cacheType) parts.push(`Type=${config.cacheType}`);
+  if (config.fileType) parts.push(`fileType=${config.fileType}`);
+  if (config.dataType) parts.push(`dataType=${config.dataType}`);
+  return parts.length ? parts.join(', ') : '无类型标记';
+}
+
+/** 从 configUrl 里抠出数据集名（…/datas/<名>/config）；抠不出就原样返回，报错时能对上服务里的数据集 */
+function datasetNameOf(configUrl: string): string {
+  const m = /\/datas\/([^/?#]+)/i.exec(configUrl);
+  if (!m) return configUrl;
+  try {
+    return decodeURIComponent(m[1]!);
+  } catch {
+    return m[1]!;
+  }
 }
 
 export interface TileNode {
@@ -539,11 +590,31 @@ export class S3MTileset {
     const text = await res.text();
     const config = parseConfigText(text);
     this.config = config;
+
+    // 地形/影像缓存（金字塔栅格，无瓦片清单）不能当模型加载：走到下面「缺少 root tile」
+    // 那步只会得到一句把「类型不支持」伪装成「配置缺字段」的报错（issue #7），
+    // 所以在锚点解析之前先按类型标记拒掉，把病因说清楚。
+    const kind = classifyDatasetKind(config);
+    if (kind !== 'model') {
+      const err = new Error(
+        `数据集 ${datasetNameOf(this.configUrl)} 是${kind === 'terrain' ? '地形' : '影像'}缓存（${configTypeHint(config)}），本层仅支持模型类 S3M 数据集`
+      ) as Error & { datasetKind: DatasetKind };
+      // 程序化判别用：调用方（如数据集列表 UI）可以据此标注/跳过该数据集
+      err.datasetKind = kind;
+      throw err;
+    }
+
     this.anchor = this._resolveAnchor(config);
 
     // iServer 的 realspace 配置用 rootTiles（可多棵树），桌面导出的用 tiles
     const roots = (config.rootTiles ?? config.tiles ?? []) as Array<{ url: string }>;
-    if (!roots.length) throw new Error('配置中缺少 root tile');
+    if (!roots.length) {
+      // 带上 config 的类型标记：地形/影像缓存（本应在前一步被拒）与「configUrl 误指向
+      // …/datas 清单」「桌面导出漏瓦片清单」是三种不同的病因，文案必须能区分
+      throw new Error(
+        `配置中缺少 root tile（${configTypeHint(config)}）——若是地形/影像数据集，或 configUrl 误指向 …/datas 数据集清单，本层仅支持模型类 S3M 数据集`
+      );
+    }
 
     this.rootUrls.length = 0;
     for (const r of roots) {

@@ -149,6 +149,8 @@
       .ds input { margin: 0; accent-color: #38bdf8; cursor: pointer; }
       .ds .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #cbd5e1; font-size: 11.5px; }
       .ds .tag { color: #64748b; font-size: 10.5px; font-variant-numeric: tabular-nums; flex: none; font-family: ui-monospace, monospace; }
+      /* 地形/影像数据集的类型标注（本层仅支持模型类，勾了也只会明确报错） */
+      .ds .tag.kind { color: #d97706; font-family: inherit; padding: 1px 5px; border: 1px solid rgba(217, 119, 10, 0.4); border-radius: 4px; }
       .ds .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; }
 
       /* 着色模式分段按钮 */
