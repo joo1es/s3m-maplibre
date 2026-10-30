@@ -138,6 +138,8 @@ export { setMaterialQuality, getMaterialQuality } from './render/StyleMaterial.j
 
 export { Picker } from './render/Picker.js';
 export { GpuEdgePass } from './render/GpuEdgePass.js';
+export { MotionBlurPass, normalizeMotionBlur, autoMotionBlurDamp } from './render/MotionBlurPass.js';
+export type { MotionBlurOptions, MotionBlurConfig, MotionBlurParams } from './render/MotionBlurPass.js';
 
 /* 三维空间分析内核：纯数学，不依赖 WebGL，可单独用于服务端 / Worker */
 export * from './analysis/index.js';

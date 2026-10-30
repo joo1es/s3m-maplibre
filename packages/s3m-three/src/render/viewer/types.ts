@@ -15,6 +15,7 @@ import type { UnsupportedPolicy } from '../../core/degradations.js';
 import type { AttributeQueryOptions } from '../../core/AttributeQuery.js';
 import type { AuthenticateFn } from '../../core/AuthFetch.js';
 import type { LightingPreset } from '../lightingPreset.js';
+import type { MotionBlurOptions } from '../MotionBlurPass.js';
 import type { S3MStyle } from '../StyleMaterial.js';
 import type { BuildTileFn } from '../../tileset/S3MTileset.js';
 import type { S3MDatasetEntry, S3MDatasetOptions } from '../DatasetManager.js';
@@ -174,6 +175,24 @@ export interface S3MViewerOptions {
    * `setMaterialQuality()` 原位重建。
    */
   materialQuality?: 'pbr' | 'lambert';
+  /**
+   * 可选的运动模糊后处理（**默认关闭**，不传 = 渲染路径与旧版逐字一致）。
+   *
+   * 低端 / 移动设备帧率低，运动物体的卡顿（judder）与边缘闪烁（shimmer）靠
+   * 「帧间残影」在感知层面填补 —— 它不提升分辨率 / 几何 / 静态画质，只对
+   * 正在运动的画面有效，所以只在低端设备上按需开启。
+   *
+   * - `mode: 'afterimage'`（缺省）：当前帧 + 上一帧全屏混合，几乎零边际 GPU 成本；
+   *   不是方向感知的，快速平移时是「拖影」。
+   * - `mode: 'velocity'`：按上一帧 ↔ 当前帧相机矩阵逐像素反推屏幕速度，沿速度方向
+   *   多 tap 采样（方向感知的真·运动模糊，只覆盖相机运动）。
+   * - `damp`：拖尾长度（仅 afterimage），`'auto'`（缺省）按实时 FPS 收敛 ——
+   *   帧率越低拖影越长；数值会被钳到 [0, 0.98]。
+   *
+   * 运行时可用 `setMotionBlur()` 开关（null = 关闭并释放显存）。仅 WebGL2：
+   * WebGL1 上静默回退直渲。
+   */
+  motionBlur?: MotionBlurOptions;
   /**
    * 颜色管线（默认 `'linear'`）。
    *

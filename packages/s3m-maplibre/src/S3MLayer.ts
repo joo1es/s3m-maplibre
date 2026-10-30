@@ -42,6 +42,7 @@ import type {
   GroundMode,
   LightOptions,
   LightingPreset,
+  MotionBlurOptions,
   TransitionOptions,
   Path,
   PathFollowOptions,
@@ -541,6 +542,22 @@ export class S3MLayer extends HostRenderer {
   /** 当前颜色管线（本层没指定过就是模块级默认） */
   get colorPipeline(): 'linear' | 'direct' {
     return this.viewer.colorPipeline;
+  }
+
+  /**
+   * 运行时开关运动模糊后处理；`null` = 关闭并释放显存。
+   *
+   * 低端设备上用来在感知层面弥补低帧率（卡顿 / 边缘闪烁），默认关闭。
+   * 见内核 `S3MViewerOptions.motionBlur`：`mode`（afterimage / velocity）与
+   * `damp`（拖尾长度，`'auto'` 按实时 FPS 收敛）。WebGL1 自动回退直渲。
+   */
+  setMotionBlur(cfg: MotionBlurOptions | null | undefined): void {
+    this.viewer.setMotionBlur(cfg);
+  }
+
+  /** 当前运动模糊配置；null = 关闭 */
+  get motionBlur(): MotionBlurOptions | null {
+    return this.viewer.motionBlur;
   }
 
   /* ------------------------------------------------------------ 三维空间分析 */
