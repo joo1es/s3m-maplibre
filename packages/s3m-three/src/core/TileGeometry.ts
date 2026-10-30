@@ -598,13 +598,12 @@ function assembleSkeleton(
     // 用图集的哪个子区域、按 2 的几次幂缩放」。语义见 core/TexCoordZ.ts。
     // 注意：按语义查槽（找 TextureCoordMatrix），不要固定取 custom0；
     // 绝对不能把 VertexWeight（高度值）等其它语义属性当成贴图矩阵；
-    // 且 dimension: 0 或全为哨兵（-99999）时视为无第三分量，跳过采样/图集选择逻辑。
+    // 若全为哨兵（-99999）则视为无第三分量，跳过采样/图集选择逻辑。
     else if (
       (attr.semantic === 'TextureCoordMatrix' ||
         attr.semantic === 'aTextureCoordMatrix' ||
         (attr.semantic === 'custom0' && !vp.vertexAttributes.some((a) => a.semantic === 'TextureCoordMatrix' || a.semantic === 'VertexWeight'))) &&
-      (attr.components ?? 1) >= 1 &&
-      attr.dimension !== 0
+      (attr.components ?? 1) >= 1
     ) {
       const plain = deinterleave(attr);
       const arr = plain.array as Float32Array;

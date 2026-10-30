@@ -48,16 +48,6 @@ export function applyCustomAttributeSemantics(
       const idx = vp.vertexAttributes.indexOf(attr);
       vp.attrLocation[category] = idx;
       vp.attrLocation[`a${category}`] = idx;
-
-      const checkDimZero = (source: unknown): boolean => {
-        if (!source || !Array.isArray(source)) return false;
-        const found = source.find((d: any) => d && (d.category === category || d.name === category));
-        return !!(found && found.range && found.range.dimension === 0);
-      };
-
-      if (checkDimZero(configDescript) || checkDimZero(descript)) {
-        attr.dimension = 0;
-      }
     }
   }
 }

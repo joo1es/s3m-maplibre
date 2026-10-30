@@ -87,6 +87,23 @@ describe('Issue #9: 标准 S3MB 分支 custom 槽语义映射与 aTextureCoordMa
     }
   });
 
+  test('当 TextureCoordMatrix 含有图集矩阵值（如 65536/65792）时，即便 configDescript 中 range.dimension 为 0，也必须正常保留并生成 aTexCoordZ', async () => {
+    const buf = readFileSync(TILE_271);
+    const tile = await parseS3MB(buf.buffer, { vertexAttributeDescript: configDescript });
+    const skel = Object.values(tile.geoPackage)[0]!;
+    const texMatAttr = skel.vertexPackage.vertexAttributes.find((a) => a.semantic === 'TextureCoordMatrix')!;
+    const f32 = new Float32Array(texMatAttr.data.buffer, texMatAttr.data.byteOffset, texMatAttr.data.byteLength / 4);
+    // 模拟地板或管道的有值状态（65536 = level 1, 65792 = level 1 + xTran 1）
+    f32.fill(65792);
+
+    const { primitives } = assembleTileGeometry(tile, { vertexAttributeDescript: configDescript });
+    expect(primitives.length).toBeGreaterThan(0);
+    for (const prim of primitives) {
+      expect(prim.attributes.aTexCoordZ).toBeDefined();
+      expect(prim.attributes.aTexCoordZ!.array[0]).toBe(65792);
+    }
+  });
+
   test('Worker 端到端：透传 vertexAttributeDescript 并产出无 aTexCoordZ 的正确几何', async () => {
     const worker = S3MWorkerClient.create();
     if (!worker) return; // 环境不支持 Worker 时安全跳过
