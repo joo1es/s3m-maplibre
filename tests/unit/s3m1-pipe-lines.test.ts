@@ -89,9 +89,10 @@ test('S3M 1.x 管线几何组装：实体线段默认可见，且保留材质颜
 import { pixelFormatOfBpp } from '../../packages/s3m-three/src/core/S3M1Parser';
 
 test('pixelFormatOfBpp：压缩纹理密度判定含 mipmap 链与边界值', () => {
-  // DXT1: 单张 0.5 B/px，含完整 mip 链 ~0.667 B/px
+  // DXT1: 单张 0.5 B/px，含完整 mip 链 ~0.667~0.669 B/px (3D-srsb 等)
   expect(pixelFormatOfBpp(0.5, 14)).toBe(17);
   expect(pixelFormatOfBpp(0.667, 14)).toBe(17);
+  expect(pixelFormatOfBpp(0.669, 14)).toBe(17);
 
   // DXT5: 单张 1.0 B/px，含完整 mip 链 ~1.333~1.44 B/px
   expect(pixelFormatOfBpp(1.0, 14)).toBe(21);
