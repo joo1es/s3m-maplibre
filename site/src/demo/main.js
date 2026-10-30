@@ -1,6 +1,6 @@
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
-import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat, enableMapLibreOrtho } from 's3m-maplibre';
+import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat, enableMapLibreOrtho, parseConfigText, classifyDatasetKind } from 's3m-maplibre';
 import pkg from 's3m-maplibre/package.json';
 
 
@@ -396,7 +396,7 @@ async function resolveUrlToDatasets(rawUrl) {
         // 这是 iServer datas 集合！
         // 关键："如果只有没有指定数据集 就列出所有数据集默认勾选第一个"
         const colors = ['#2563eb', '#8b95a3', '#059669', '#d97706', '#7c3aed', '#ec4899', '#06b6d4'];
-        return data.map((item, index) => {
+        const list = data.map((item, index) => {
           const cfgUrl = item.path.startsWith('http')
             ? `${item.path}/config`
             : new URL(`${item.path}/config`, cleanUrl).href;
@@ -404,10 +404,29 @@ async function resolveUrlToDatasets(rawUrl) {
             id: item.name,
             name: item.name === 'zhoubian' ? '周边底模' : item.name,
             configUrl: cfgUrl,
-            checked: index === 0, // 仅第 1 个默认勾选，其余展示在列表待勾选
+            checked: false, // 探测完类型再定（见下）
             color: colors[index % colors.length],
+            kind: 'model',
           };
         });
+
+        // 混合服务（模型 + 地形 + 影像共存）里第一个数据集可能是地形（如 3D-OlympicGreen_Plan
+        // 的 beijingdem），当模型加载只会报错。逐个拉 config 认一下类型：列表上标注出来，
+        // 默认勾选优先第一个「模型类」数据集；探测失败按模型兜底（与旧版行为一致）。
+        await Promise.all(
+          list.map(async (d) => {
+            try {
+              const r = await fetch(d.configUrl);
+              if (!r.ok) return;
+              d.kind = classifyDatasetKind(parseConfigText(await r.text()));
+            } catch {
+              /* 探测失败不影响列表展示，按模型走 */
+            }
+          })
+        );
+        const firstModel = list.findIndex((d) => d.kind === 'model');
+        list[firstModel === -1 ? 0 : firstModel].checked = true;
+        return list;
       }
     }
   } catch (err) {
@@ -524,6 +543,7 @@ function renderDatasetUI() {
       <input type="checkbox" ${d.checked ? 'checked' : ''} data-ds="${d.id}" />
       <span class="sw" style="background:${d.color}"></span>
       <span class="nm" title="${d.name}">${d.name}</span>
+      ${d.kind && d.kind !== 'model' ? `<span class="tag kind" title="本层仅支持模型类 S3M 数据集，勾选会明确报错">${d.kind === 'terrain' ? '地形' : '影像'}</span>` : ''}
       <span class="tag" id="tag-${d.id}">${d.checked ? '加载中' : '未加载'}</span>`;
     host.appendChild(label);
   }

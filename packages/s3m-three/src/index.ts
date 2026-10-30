@@ -60,8 +60,8 @@ export {
 export type { GeoAdapter } from './render/GeoAdapter.js';
 
 // —— 瓦片层
-export { S3MTileset } from './tileset/S3MTileset.js';
-export type { TileNode, BuildTileFn, S3MTilesetOptions } from './tileset/S3MTileset.js';
+export { S3MTileset, parseConfigText, classifyDatasetKind } from './tileset/S3MTileset.js';
+export type { TileNode, BuildTileFn, S3MTilesetOptions, DatasetKind } from './tileset/S3MTileset.js';
 
 // —— 渲染层
 export { S3MViewer } from './render/S3MViewer.js';

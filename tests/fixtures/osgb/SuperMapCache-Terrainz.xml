@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="GB18030"?>
+<SuperMapCache xmlns:sml="http://www.supermap.com/SuperMapCache">
+<sml:Version>2.000000</sml:Version>
+<sml:NetCachePath/>
+<sml:LocalCachePath/>
+<sml:CacheName>beijingdem</sml:CacheName>
+<sml:FileExtentName>Terrainz</sml:FileExtentName>
+<sml:StoreType BlockScale="3">MIXED_FILES</sml:StoreType>
+<sml:TileSplitType>LOCAL</sml:TileSplitType>
+<sml:Projection>Geographic</sml:Projection>
+<sml:HeightRange>
+<sml:MaxHeight>670.000000</sml:MaxHeight>
+<sml:MinHeight>35.000000</sml:MinHeight>
+</sml:HeightRange>
+<sml:Bounds>
+<sml:Left>3.851633616543106</sml:Left>
+<sml:Top>39.822729320505751</sml:Top>
+<sml:Right>4.055122303986733</sml:Right>
+<sml:Bottom>39.767785031884827</sml:Bottom>
+</sml:Bounds>
+<sml:PlaneBounds>
+<sml:Left>428761.892915833217558</sml:Left>
+<sml:Top>4433045.949957065284252</sml:Top>
+<sml:Right>451414.149984249379486</sml:Right>
+<sml:Bottom>4426929.579725785180926</sml:Bottom>
+</sml:PlaneBounds>
+<sml:Level0>
+<sml:Level0Width>180.000000000000000</sml:Level0Width>
+<sml:Level0Height>180.000000000000000</sml:Level0Height>
+</sml:Level0>
+<sml:Levels>
+<sml:Level>8</sml:Level>
+<sml:Level>9</sml:Level>
+<sml:Level>10</sml:Level>
+<sml:Level>11</sml:Level>
+<sml:Level>12</sml:Level>
+<sml:Level>13</sml:Level>
+<sml:Level>14</sml:Level>
+<sml:Level>15</sml:Level>
+<sml:Level>16</sml:Level>
+</sml:Levels>
+<sml:HasSpatialIndex>TRUE</sml:HasSpatialIndex>
+<sml:HasCalculationData>TRUE</sml:HasCalculationData>
+<sml:Available>
+<sml:TilesBounds level="8">
+<sml:TileBounds>
+<sml:StartCol>261</sml:StartCol>
+<sml:StartRow>184</sml:StartRow>
+<sml:EndCol>261</sml:EndCol>
+<sml:EndRow>184</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="9">
+<sml:TileBounds>
+<sml:StartCol>522</sml:StartCol>
+<sml:StartRow>369</sml:StartRow>
+<sml:EndCol>523</sml:EndCol>
+<sml:EndRow>369</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="10">
+<sml:TileBounds>
+<sml:StartCol>1045</sml:StartCol>
+<sml:StartRow>738</sml:StartRow>
+<sml:EndCol>1047</sml:EndCol>
+<sml:EndRow>738</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="11">
+<sml:TileBounds>
+<sml:StartCol>2091</sml:StartCol>
+<sml:StartRow>1476</sml:StartRow>
+<sml:EndCol>2094</sml:EndCol>
+<sml:EndRow>1477</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="12">
+<sml:TileBounds>
+<sml:StartCol>4183</sml:StartCol>
+<sml:StartRow>2952</sml:StartRow>
+<sml:EndCol>4188</sml:EndCol>
+<sml:EndRow>2954</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="13">
+<sml:TileBounds>
+<sml:StartCol>8367</sml:StartCol>
+<sml:StartRow>5905</sml:StartRow>
+<sml:EndCol>8376</sml:EndCol>
+<sml:EndRow>5908</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="14">
+<sml:TileBounds>
+<sml:StartCol>16734</sml:StartCol>
+<sml:StartRow>11811</sml:StartRow>
+<sml:EndCol>16753</sml:EndCol>
+<sml:EndRow>11816</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="15">
+<sml:TileBounds>
+<sml:StartCol>33469</sml:StartCol>
+<sml:StartRow>23623</sml:StartRow>
+<sml:EndCol>33506</sml:EndCol>
+<sml:EndRow>23633</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+<sml:TilesBounds level="16">
+<sml:TileBounds>
+<sml:StartCol>66938</sml:StartCol>
+<sml:StartRow>47247</sml:StartRow>
+<sml:EndCol>67012</sml:EndCol>
+<sml:EndRow>47267</sml:EndRow>
+</sml:TileBounds>
+</sml:TilesBounds>
+</sml:Available>
+</SuperMapCache>

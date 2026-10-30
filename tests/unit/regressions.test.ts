@@ -18,9 +18,11 @@
  * 所以这里对 fetch / performance.now / console.warn 的替换都在每个用例内成对还原。
  */
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import * as THREE from 'three';
 import { buildTileObjects } from '../../packages/s3m-three/src/render/GeometryBuilder';
-import { S3MTileset } from '../../packages/s3m-three/src/tileset/S3MTileset';
+import { S3MTileset, classifyDatasetKind, parseConfigText } from '../../packages/s3m-three/src/tileset/S3MTileset';
 import { S3MLayer } from '../../packages/s3m-maplibre/src/index';
 import { createSharedUniforms, createStyledMaterial } from '../../packages/s3m-three/src/render/StyleMaterial';
 import { Picker } from '../../packages/s3m-three/src/render/Picker';
@@ -542,5 +544,131 @@ describe('12. EdgeDecorator 的 host 绑定必须跟 mount 后的活实例走（
     // 直渲 1 次 + GPU 描边 2 次（法线 RT + 全屏 quad）= 3。host 绑定失效时只有 1 次。
     expect(renders).toBe(3);
     v.dispose();
+  });
+});
+
+describe('13. 地形/影像缓存（Terrainz / Type=Image）不能伪装成「缺少 root tile」（issue #7）', () => {
+  /**
+   * 混合服务（模型 + 地形 + 影像共存）里，地形/影像数据集的 config 是按
+   * Level0Width/Level0Height + Levels 金字塔寻址的栅格缓存 XML，**没有瓦片清单**。
+   * 修复前它们一路走到 `if (!roots.length) throw new Error('配置中缺少 root tile')`，
+   * 把「不支持的数据类型」伪装成「配置缺字段」，排查会被带偏。
+   *
+   * 夹具是真实服务（supermapol 3D-OlympicGreen_Plan）的两个 config，抓取于 2026-10-30：
+   *   beijingdem → SuperMapCache XML，FileExtentName = Terrainz（地形，无瓦片清单）
+   *   beijingimg → SuperMapCache_Unicode XML，FileExtentName = jpg_png + Type = Image（影像）
+   * 注意 issue 里的猜测（影像 = Imagez/Image）与实测不符：影像的 FileExtentName 是
+   * 文件扩展名样式（jpg_png），可靠判别字段是 <sml:Type>Image</sml:Type>。
+   */
+  const TERRAIN_XML = readFileSync(join(import.meta.dir, '../fixtures/osgb/SuperMapCache-Terrainz.xml'), 'utf8');
+  const IMAGE_XML = readFileSync(join(import.meta.dir, '../fixtures/osgb/SuperMapCache-Image.xml'), 'utf8');
+  const MODEL_XML = readFileSync(join(import.meta.dir, '../fixtures/osgb/SuperMapCache-OSGB.xml'), 'utf8');
+  const DEM_CONFIG =
+    'https://www.supermapol.com/realspace/services/3D-OlympicGreen_Plan/rest/realspace/datas/beijingdem/config';
+
+  const mockConfigFetch = (body: string) => {
+    globalThis.fetch = (async () =>
+      new Response(body, { status: 200, headers: { 'Content-Type': 'application/xml' } })) as unknown as typeof fetch;
+  };
+
+  test('parseConfigText 带出 fileExtentName / cacheType：两种栅格缓存都认得出，且都没有瓦片清单', () => {
+    const dem = parseConfigText(TERRAIN_XML);
+    expect(dem.fileExtentName).toBe('Terrainz');
+    expect(dem.cacheType).toBeUndefined();
+    expect((dem.rootTiles as unknown[]).length).toBe(0);
+
+    const img = parseConfigText(IMAGE_XML);
+    expect(img.fileExtentName).toBe('jpg_png');
+    expect(img.cacheType).toBe('Image');
+    expect((img.rootTiles as unknown[]).length).toBe(0);
+  });
+
+  test('classifyDatasetKind：Terrainz → terrain、Type=Image → imagery、模型 / 无标记 → model', () => {
+    expect(classifyDatasetKind(parseConfigText(TERRAIN_XML))).toBe('terrain');
+    expect(classifyDatasetKind(parseConfigText(IMAGE_XML))).toBe('imagery');
+    // 模型类（OSGB 倾斜摄影 XML、JSON 的 dataType）与没有任何标记的一律按模型走，
+    // 保证「不传 / 认不出」时行为与旧版逐字一致（不变式 ①）
+    expect(classifyDatasetKind(parseConfigText(MODEL_XML))).toBe('model');
+    expect(classifyDatasetKind({ dataType: 'BIM' })).toBe('model');
+    expect(classifyDatasetKind({})).toBe('model');
+  });
+
+  test('init 拿到地形 config：报「是地形缓存」而不是「缺少 root tile」，也不再先吐锚点 warning', async () => {
+    mockConfigFetch(TERRAIN_XML);
+    const warns: unknown[][] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => warns.push(args);
+    try {
+      const ts = mkTileset({ configUrl: DEM_CONFIG });
+      let err: unknown;
+      try {
+        await ts.init();
+      } catch (e) {
+        err = e;
+      }
+      expect(err).toBeInstanceOf(Error);
+      const msg = String((err as Error).message);
+      expect(msg).toContain('beijingdem'); // 数据集名来自 configUrl，一眼能对上服务里的哪个数据集
+      expect(msg).toContain('地形');
+      expect(msg).toContain('Terrainz');
+      expect(msg).toContain('仅支持模型类');
+      expect(msg).not.toContain('缺少 root tile'); // 病因说清楚了，别再留误导文案
+      expect((err as { datasetKind?: string }).datasetKind).toBe('terrain'); // 程序化判别用
+      // 修复前：先吐「position 与 geoBounds 不一致」再抛误导性错误；前置识别后 warning 不该出现
+      expect(
+        warns.map((w) => String(w[0])).some((s) => s.includes('position 与 geoBounds 不一致'))
+      ).toBe(false);
+    } finally {
+      console.warn = realWarn;
+    }
+  });
+
+  test('init 拿到影像 config（Type=Image）：同样前置拒绝', async () => {
+    mockConfigFetch(IMAGE_XML);
+    const ts = mkTileset({
+      configUrl:
+        'https://www.supermapol.com/realspace/services/3D-OlympicGreen_Plan/rest/realspace/datas/beijingimg/config',
+    });
+    let err: unknown;
+    try {
+      await ts.init();
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const msg = String((err as Error).message);
+    expect(msg).toContain('beijingimg');
+    expect(msg).toContain('影像');
+    expect(msg).toContain('Image');
+    expect(msg).toContain('仅支持模型类');
+    expect(msg).not.toContain('缺少 root tile');
+  });
+
+  test('「缺少 root tile」带上类型上下文：能一眼看出 config 是哪种形态', async () => {
+    // API.md 记载过的另一个触发面：configUrl 误指向 …/datas 清单 / 桌面导出漏瓦片清单。
+    // 病因不同，文案必须能把两种情况区分开。
+    mockConfigFetch(JSON.stringify({ dataType: 'BIM' }));
+    const ts = mkTileset({ configUrl: 'https://h/iserver/services/3D-x/rest/realspace/datas/Building/config' });
+    let err: unknown;
+    try {
+      await ts.init();
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const msg = String((err as Error).message);
+    expect(msg).toContain('缺少 root tile');
+    expect(msg).toContain('dataType=BIM'); // 有什么类型标记就带什么，没有就明说「无类型标记」
+  });
+
+  test('模型 XML（OSGBFile）不受影响：init 照常走到根瓦加载', async () => {
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (/\/config(\?|$)/.test(url)) return new Response(MODEL_XML, { status: 200 });
+      return new Response('not found', { status: 404 }); // 根瓦 404：_load 内部吞掉，不影响断言
+    }) as unknown as typeof fetch;
+    const ts = mkTileset({ configUrl: 'https://h/realspace/datas/Config/config' });
+    await ts.init(); // 不抛「仅支持模型类」才算通过 —— 前置识别不能误伤模型缓存
+    expect(ts.isS3MV1).toBe(true);
   });
 });
