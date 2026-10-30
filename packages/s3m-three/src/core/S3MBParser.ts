@@ -12,6 +12,7 @@
 import { BinaryReader } from './BinaryReader.js';
 import { parseDracoGeometry } from './Draco.js';
 import { parseMeshOptGeometry } from './MeshOpt.js';
+import { applyCustomAttributeSemantics } from './CustomAttributes.js';
 import { isS3M1Buffer, parseS3M1 } from './S3M1Parser.js';
 import type { DegradationKind } from './degradations.js';
 import type {
@@ -53,6 +54,8 @@ export interface ParseOptions {
   inflate?: InflateFn;
   /** 逐段追踪偏移，调试解析用 */
   trace?: (section: string, detail?: unknown, offset?: number) => void;
+  /** config.json 声明的顶点属性描述清单（用于语义重映射与维度判定） */
+  vertexAttributeDescript?: unknown;
 }
 
 /** 默认解压：zlib（文件头 78 9C / 78 DA）。浏览器与 Node 18+ 均可用。 */
@@ -73,9 +76,8 @@ function pushAttr(
   offset = 0,
   divisor?: number,
   dtype: AttrDType = 'f32'
-): void {
-  vp.attrLocation[semantic] = vp.vertexAttributes.length;
-  vp.vertexAttributes.push({
+): VertexAttribute {
+  const attr: VertexAttribute = {
     semantic,
     data,
     components,
@@ -83,7 +85,10 @@ function pushAttr(
     offsetInBytes: offset,
     divisor,
     dtype,
-  });
+  };
+  vp.attrLocation[semantic] = vp.vertexAttributes.length;
+  vp.vertexAttributes.push(attr);
+  return attr;
 }
 
 function newVertexPackage(): VertexPackage {
@@ -248,15 +253,19 @@ function parseInstanceInfo(r: BinaryReader, vp: VertexPackage, version: number):
   }
 }
 
-function parseVertexAttrExtension(r: BinaryReader, vp: VertexPackage): void {
+export { applyCustomAttributeSemantics } from './CustomAttributes.js';
+
+function parseVertexAttrExtension(r: BinaryReader, vp: VertexPackage): VertexAttribute[] {
   const n = r.u32();
+  const attrs: VertexAttribute[] = [];
   for (let i = 0; i < n; i++) {
     const count = r.u32();
     const dim = r.u16();
     const type = r.u16();
     const size = AttrTypeSize[type] ?? 4;
-    pushAttr(vp, `custom${i}`, r.bytes(count * dim * size), dim, dim * size);
+    attrs.push(pushAttr(vp, `custom${i}`, r.bytes(count * dim * size), dim, dim * size));
   }
+  return attrs;
 }
 
 function parseTangent(r: BinaryReader): void {
@@ -267,7 +276,7 @@ function parseTangent(r: BinaryReader): void {
   r.skip(n * dim * 4);
 }
 
-function parseStandardSkeleton(r: BinaryReader, vp: VertexPackage, version: number): void {
+function parseStandardSkeleton(r: BinaryReader, vp: VertexPackage, version: number, options?: ParseOptions): void {
   if (version >= 3) r.u32(); // streamSize
 
   parseVertex(r, vp);
@@ -278,9 +287,17 @@ function parseStandardSkeleton(r: BinaryReader, vp: VertexPackage, version: numb
   parseInstanceInfo(r, vp, version);
 
   if (version >= 3) {
-    parseVertexAttrExtension(r, vp);
+    const extAttrs = parseVertexAttrExtension(r, vp);
     const descript = r.string();
-    vp.customVertexAttribute = descript ? JSON.parse(descript) : undefined;
+    try {
+      vp.customVertexAttribute = descript ? JSON.parse(descript) : undefined;
+    } catch {
+      vp.customVertexAttribute = descript;
+    }
+    if (!vp.customVertexAttribute && options?.vertexAttributeDescript) {
+      vp.customVertexAttribute = options.vertexAttributeDescript;
+    }
+    applyCustomAttributeSemantics(vp, extAttrs, options?.vertexAttributeDescript);
     r.align4();
     parseTangent(r);
   }
@@ -386,7 +403,8 @@ function isFiniteBox(box: { center: Vec3; xExtent: Vec3; yExtent: Vec3; zExtent:
 export async function parseSkeletonEntries(
   r: BinaryReader,
   version: number,
-  trace?: ParseOptions['trace']
+  trace?: ParseOptions['trace'],
+  options?: ParseOptions
 ): Promise<Record<string, GeoPackageEntry>> {
   const count = r.u32();
   const geoPackage: Record<string, GeoPackageEntry> = {};
@@ -419,7 +437,7 @@ export async function parseSkeletonEntries(
     let indexPackages: IndexPackage[] = [];
 
     if (tag === VertexTag.STANDARD) {
-      parseStandardSkeleton(r, vp, version);
+      parseStandardSkeleton(r, vp, version, options);
       indexPackages = parseIndexPackages(r, version);
     } else if (tag === VertexTag.COMPRESSED) {
       if (version >= 3) {
@@ -462,10 +480,11 @@ export async function parseSkeletonEntries(
 export async function parseSkeletons(
   r: BinaryReader,
   version: number,
-  trace?: ParseOptions['trace']
+  trace?: ParseOptions['trace'],
+  options?: ParseOptions
 ): Promise<Record<string, GeoPackageEntry>> {
   r.u32(); // streamSize
-  const geoPackage = await parseSkeletonEntries(r, version, trace);
+  const geoPackage = await parseSkeletonEntries(r, version, trace, options);
 
   // v1/v2 在骨架数组之后还有一段附加流。官方写法是
   //   bytesOffset += secColorSize; bytesOffset += 4;
@@ -649,7 +668,7 @@ export async function parseS3MB(arrayBuffer: ArrayBuffer, options: ParseOptions 
   trace?.('fileOptions', fileOptions, t.offset);
   const groupNode = parseGroupNode(t, version);
   trace?.('groupNode', groupNode.pageLods.length, t.offset);
-  const geoPackage = await parseSkeletons(t, version, trace);
+  const geoPackage = await parseSkeletons(t, version, trace, options);
   trace?.('skeletons', Object.keys(geoPackage).length, t.offset);
   const textures = parseTextures(t);
   trace?.('textures', Object.keys(textures).length, t.offset);

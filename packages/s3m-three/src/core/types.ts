@@ -35,6 +35,8 @@ export interface VertexAttribute {
   /** 非 0 表示实例属性 */
   divisor?: number;
   dtype: AttrDType;
+  /** 声明的维度（若为 0 表示虽然占位但无有效分量） */
+  dimension?: number;
 }
 
 export interface IndexPackage {
@@ -201,6 +203,7 @@ export interface ParsedTile {
   materials: unknown;
   pickInfo: unknown;
   extensions?: unknown;
+  vertexAttributeDescript?: unknown;
   /**
    * 解析成功、但渲染能力不完整的项（机器可读）。
    *

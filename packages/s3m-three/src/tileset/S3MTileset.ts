@@ -941,7 +941,7 @@ export class S3MTileset {
     }
     if (this._workerClient) {
       try {
-        return await this._workerClient.parseTile(buffer, true);
+        return await this._workerClient.parseTile(buffer, true, true, this.config?.vertexAttributeDescript);
       } catch (e) {
         if (e instanceof WorkerDeadError) {
           // 脚本加载失败 / 崩溃属于环境问题，永久退回主线程；瓦片本身的问题照常抛
@@ -951,7 +951,7 @@ export class S3MTileset {
         }
       }
     }
-    return { tile: await parseS3MB(buffer) };
+    return { tile: await parseS3MB(buffer, { vertexAttributeDescript: this.config?.vertexAttributeDescript }) };
   }
 
   /**
