@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Draco 几何解码器（google/draco，wasm 内联）的类型声明
  *
  * 只声明 S3M 用到的部分。两个坑：
@@ -41,6 +41,11 @@ export interface DracoPointCloud {
   __destroy__(): void;
 }
 
+
+/** draco::Mesh - inherits from PointCloud, additionally provides face info (used for TRIANGULAR_MESH branch) */
+export interface DracoMesh extends DracoPointCloud {
+  num_faces(): number;
+}
 export interface DracoStatus {
   ok(): boolean;
   error_msg(): string;
@@ -54,6 +59,14 @@ export interface DracoDecoder {
     byteLength: number,
     out: DracoPointCloud
   ): DracoStatus;
+  /** 解码三角网格（TRIANGULAR_MESH 分支） */
+  DecodeArrayToMesh(
+    data: Uint8Array,
+    byteLength: number,
+    out: DracoMesh
+  ): DracoStatus;
+  /** 从已解码的 Mesh 取第 faceIndex 个面的 3 个顶点索引到 DracoInt32Array */
+  GetFaceFromMesh(mesh: DracoMesh, faceIndex: number, out: DracoInt32Array): boolean;
   /** 按属性在几何里的序号取 */
   GetAttribute(pc: DracoPointCloud, index: number): DracoPointAttribute;
   /** 按 unique_id 取；不存在时返回 null */
@@ -113,6 +126,7 @@ export interface DracoUInt32Array {
 export interface DracoModule {
   Decoder: new () => DracoDecoder;
   PointCloud: new () => DracoPointCloud;
+  Mesh: new () => DracoMesh;
   DracoFloat32Array: new () => DracoFloat32Array;
   DracoInt8Array: new () => DracoInt8Array;
   DracoUInt8Array: new () => DracoUInt8Array;

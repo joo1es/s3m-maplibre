@@ -1,4 +1,4 @@
-/**
+﻿/**
  * S3M v3 Draco 几何压缩（Skeleton 的 Draco 分支）
  *
  * 与 MeshOpt 一样，这里的布局不是照规范写的 —— 规范里的 Draco 分支描述和实际数据
@@ -33,7 +33,7 @@
  */
 import type { BinaryReader } from './BinaryReader.js';
 import type { AttrDType, IndexPackage, VertexPackage } from './types.js';
-import type { DracoModule, DracoPointAttribute, DracoPointCloud } from '../vendor/draco_decoder.module.js';
+import type { DracoMesh, DracoModule, DracoPointAttribute, DracoPointCloud } from '../vendor/draco_decoder.module.js';
 
 /* ------------------------------------------------------------ draco 枚举（本地副本） */
 
@@ -56,6 +56,9 @@ const DRACO_MAGIC = 'DRACO';
 
 /** primitiveType = 1：点云包（渲染层据此走 THREE.Points） */
 const POINT_PRIMITIVE = 1;
+
+/** primitiveType = 4：三角网格包（渲染层据此走 THREE.Mesh，对应 gl.TRIANGLES） */
+const TRIANGLE_PRIMITIVE = 4;
 
 /** 单个 skeleton 的点数上限，防头读错时开出天文数字的缓冲 */
 const MAX_POINTS = 64 * 1024 * 1024;
@@ -243,13 +246,27 @@ export async function parseDracoGeometry(r: BinaryReader, vp: VertexPackage): Pr
   /* ---- 2. 解码 ---- */
 
   const decoder = new draco.Decoder();
+  const geomType = decoder.GetEncodedGeometryType(data);
+
+  if (geomType === GEOM_TRIANGULAR_MESH) {
+    // 三角网格分支：draco mesh 内部自带面索引，不需要容器里的 IndexPackage
+    // 官方 S3ModelParser 对 Draco 分支的索引包解析阶段是空操作（see Issue #5）
+    const mesh = new draco.Mesh();
+    try {
+      return decodeDracoMesh(draco, decoder, mesh, data, vp, posUniqueId, normalUniqueId, colorUniqueId);
+    } finally {
+      try { draco.destroy(decoder); draco.destroy(mesh); } catch { /* ignore */ }
+    }
+  }
+
+  // 点云分支（GEOM_POINT_CLOUD）或其他未知类型
   const geometry = new draco.PointCloud();
   try {
-    const geomType = decoder.GetEncodedGeometryType(data);
     if (geomType !== GEOM_POINT_CLOUD) {
-      throw new Error(
-        `[s3m] Draco ${geomType === GEOM_TRIANGULAR_MESH ? '三角网格' : '未知'} 几何暂未实现（仅支持点云）`
-      );
+      // 未知几何类型：warn 并降级为空包，避免整层崩溃
+      console.warn(`[s3m] Draco 未知几何类型 ${geomType}，跳过该骨架`);
+      vp.verticesCount = 0;
+      return [pointPack()];
     }
 
     const status = decoder.DecodeArrayToPointCloud(data, data.length, geometry);
@@ -369,6 +386,151 @@ function pointPack(): IndexPackage {
     useIndex: 0,
     primitiveType: POINT_PRIMITIVE,
     indices: null,
+    passNames: [],
+  };
+}
+
+/**
+ * 解码 Draco TRIANGULAR_MESH 几何体，填充 VertexPackage 并返回带索引的 IndexPackage。
+ *
+ * 按官方 S3MDracoDecode.js 逻辑（Issue #5 调研）：
+ *   - DecodeArrayToMesh → num_faces → 逐面 GetFaceFromMesh → 填入索引缓冲
+ *   - primitiveType = TRIANGLE_PRIMITIVE（4），让渲染层走 THREE.Mesh
+ *   - 容器头（posUniqueId/normalUniqueId/colorUniqueId）与点云共用，直接复用属性装配代码
+ *
+ * 调用方负责 destroy(decoder) 和 destroy(mesh)。
+ */
+function decodeDracoMesh(
+  draco: DracoModule,
+  decoder: InstanceType<DracoModule['Decoder']>,
+  mesh: DracoMesh,
+  data: Uint8Array,
+  vp: VertexPackage,
+  posUniqueId: number,
+  normalUniqueId: number,
+  colorUniqueId: number,
+): IndexPackage[] {
+  const status = decoder.DecodeArrayToMesh(data, data.length, mesh);
+  if (!status.ok()) throw new Error(`[s3m] Draco mesh 解码失败：${status.error_msg()}`);
+
+  const numPoints = mesh.num_points();
+  if (!Number.isInteger(numPoints) || numPoints < 0 || numPoints > MAX_POINTS) {
+    throw new Error(`[s3m] Draco mesh 顶点数异常：${numPoints}`);
+  }
+  const numFaces = mesh.num_faces();
+
+  if (numPoints === 0 || numFaces === 0) {
+    vp.verticesCount = 0;
+    return [meshPack(new Uint8Array(0), 0, 0)];
+  }
+
+  /* ---- 属性装配（与点云分支共用逻辑，但三角网格有法线） ---- */
+
+  for (let i = 0; i < mesh.num_attributes(); i++) {
+    const attr = decoder.GetAttribute(mesh, i);
+    const uid = attr.unique_id();
+    const comps = Math.max(1, attr.num_components());
+
+    if (uid === posUniqueId || attr.attribute_type() === ATTR_POSITION) {
+      if (attr.data_type() !== DT_FLOAT32) {
+        throw new Error(`[s3m] Draco mesh 位置属性不是 float32（dt=${attr.data_type()}）`);
+      }
+      const raw = readAttribute(draco, decoder, mesh, attr) as Float32Array | null;
+      if (!raw) throw new Error('[s3m] Draco mesh 位置属性读取失败');
+      const out = new Float32Array(numPoints * 3);
+      for (let p = 0; p < numPoints; p++) {
+        out[p * 3] = raw[p * comps] ?? 0;
+        out[p * 3 + 1] = raw[p * comps + 1] ?? 0;
+        out[p * 3 + 2] = raw[p * comps + 2] ?? 0;
+      }
+      pushAttr(vp, 'position', new Uint8Array(out.buffer), 3, 12, 0, undefined, 'f32');
+      continue;
+    }
+
+    if (uid === normalUniqueId || attr.attribute_type() === ATTR_NORMAL) {
+      if (attr.data_type() === DT_FLOAT32) {
+        const raw = readAttribute(draco, decoder, mesh, attr) as Float32Array | null;
+        if (raw) {
+          // 法线量化由 draco 解码时自动还原为 float32
+          const out = new Float32Array(numPoints * 3);
+          for (let p = 0; p < numPoints; p++) {
+            out[p * 3] = raw[p * comps] ?? 0;
+            out[p * 3 + 1] = raw[p * comps + 1] ?? 0;
+            out[p * 3 + 2] = raw[p * comps + 2] ?? 0;
+          }
+          pushAttr(vp, 'normal', new Uint8Array(out.buffer), 3, 12, 0, undefined, 'f32');
+        }
+      }
+      continue;
+    }
+
+    if (uid === colorUniqueId || attr.attribute_type() === ATTR_COLOR) {
+      const raw = readAttribute(draco, decoder, mesh, attr);
+      if (raw) {
+        const out = new Uint8Array(numPoints * 4);
+        const isFloat = raw instanceof Float32Array;
+        for (let p = 0; p < numPoints; p++) {
+          const o = p * comps;
+          if (isFloat) {
+            out[p * 4] = clamp255(raw[o] ?? 1);
+            out[p * 4 + 1] = clamp255(raw[o + 1] ?? 1);
+            out[p * 4 + 2] = clamp255(raw[o + 2] ?? 1);
+          } else {
+            out[p * 4] = raw[o] ?? 255;
+            out[p * 4 + 1] = raw[o + 1] ?? 255;
+            out[p * 4 + 2] = raw[o + 2] ?? 255;
+          }
+          out[p * 4 + 3] = comps >= 4 && !isFloat ? (raw[o + 3] ?? 255) : 255;
+        }
+        pushAttr(vp, 'color', out, 4, 4, 0, undefined, 'u8');
+      }
+      continue;
+    }
+    // 其余属性（texCoord 等）：暂不处理，等真实瓦片来后按需补齐
+  }
+
+  if (vp.attrLocation.position === undefined) {
+    throw new Error('[s3m] Draco mesh 缺少 position 属性');
+  }
+
+  vp.verticesCount = numPoints;
+
+  /* ---- 三角面索引构建（按官方逻辑：numPoints <= 65535 用 U16，否则 U32） ---- */
+  const useU16 = numPoints <= 65535;
+  const indices = useU16
+    ? new Uint16Array(numFaces * 3)
+    : new Uint32Array(numFaces * 3);
+
+  const face = new draco.DracoInt32Array();
+  try {
+    let n = 0;
+    for (let f = 0; f < numFaces; f++) {
+      decoder.GetFaceFromMesh(mesh, f, face);
+      indices[n++] = face.GetValue(0);
+      indices[n++] = face.GetValue(1);
+      indices[n++] = face.GetValue(2);
+    }
+  } finally {
+    draco.destroy(face);
+  }
+
+  return [meshPack(new Uint8Array(indices.buffer), numFaces * 3, useU16 ? 0 : 1)];
+}
+
+/**
+ * 三角网格索引包。
+ *
+ * @param indicesBytes - Uint16Array 或 Uint32Array 的字节视图
+ * @param indexCount   - 索引总数（numFaces × 3）
+ * @param indexType    - 0 = Uint16, 1 = Uint32（与 IndexPackage.indexType 约定一致）
+ */
+function meshPack(indicesBytes: Uint8Array, indexCount: number, indexType: number): IndexPackage {
+  return {
+    indexCount,
+    indexType,
+    useIndex: 1,
+    primitiveType: TRIANGLE_PRIMITIVE,
+    indices: indexCount > 0 ? indicesBytes : null,
     passNames: [],
   };
 }
