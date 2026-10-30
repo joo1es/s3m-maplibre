@@ -43,6 +43,7 @@
     "@types/bun": "^1.4.4",
     "@types/markdown-it": "^14.2.0",
     "@types/three": "^0.169.0",
+    "draco3d": "^1.5.9",
     "maplibre-gl": "^5.0.0",
     "markdown-it": "^15.0.3",
     "meshoptimizer": "0.18.1",
