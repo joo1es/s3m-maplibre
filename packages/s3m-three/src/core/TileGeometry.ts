@@ -20,6 +20,7 @@ import type {
   ParsedTile,
   VertexAttribute,
 } from './types.js';
+import { applyCustomAttributeSemantics } from './CustomAttributes.js';
 
 /**
  * S3M 规范里 `DrawPrimitiveType` 的两个特殊值（原住 GeometryBuilder，随组装层
@@ -297,6 +298,7 @@ export interface AssembleOptions {
    * `useWorker: false` 或 Worker 崩溃降级时它落在主线程上。
    */
   dedupeCoincident?: boolean;
+  vertexAttributeDescript?: unknown;
 }
 
 /* ------------------------------------------------------------------ 合批合并 */
@@ -556,8 +558,15 @@ interface SkeletonAsm {
 }
 
 /** 每骨架只解一次交错流（同一骨架被多个 pack / geode 引用时共享同一份数据） */
-function assembleSkeleton(name: string, geo: GeoPackageEntry, tile: ParsedTile, skipped: string[]): SkeletonAsm | null {
+function assembleSkeleton(
+  name: string,
+  geo: GeoPackageEntry,
+  tile: ParsedTile,
+  skipped: string[],
+  options?: AssembleOptions
+): SkeletonAsm | null {
   const vp = geo.vertexPackage;
+  applyCustomAttributeSemantics(vp, undefined, (tile as any).vertexAttributeDescript ?? options?.vertexAttributeDescript);
   const positionAttr = vp.vertexAttributes.find((a) => a.semantic === 'position');
   if (!positionAttr) {
     skipped.push(`${name} 无 position`);
@@ -585,11 +594,29 @@ function assembleSkeleton(name: string, geo: GeoPackageEntry, tile: ParsedTile, 
     else if (attr.semantic === 'normal') normalData = deinterleave(attr);
     else if (attr.semantic === 'uv') uvData = deinterleave(attr);
     else if (attr.semantic === 'uv2') uv1Data = deinterleave(attr);
-    // custom0 = uv 的第三分量，官方 aTextureCoordMatrix：决定「这张贴图用不用、
-    // 用图集的哪个子区域、按 2 的几次幂缩放」。BIM/OSGB 转出来的数据依赖它，
-    // 丢掉就会把本该纯色的墙面贴上整张材质图。语义见 core/TexCoordZ.ts。
-    else if (attr.semantic === 'custom0' && (attr.components ?? 1) >= 1) {
-      texCoordZData = deinterleave(attr);
+    // uv 第三分量（官方 aTextureCoordMatrix）：决定「这张贴图用不用、
+    // 用图集的哪个子区域、按 2 的几次幂缩放」。语义见 core/TexCoordZ.ts。
+    // 注意：按语义查槽（找 TextureCoordMatrix），不要固定取 custom0；
+    // 绝对不能把 VertexWeight（高度值）等其它语义属性当成贴图矩阵；
+    // 若全为哨兵（-99999）则视为无第三分量，跳过采样/图集选择逻辑。
+    else if (
+      (attr.semantic === 'TextureCoordMatrix' ||
+        attr.semantic === 'aTextureCoordMatrix' ||
+        (attr.semantic === 'custom0' && !vp.vertexAttributes.some((a) => a.semantic === 'TextureCoordMatrix' || a.semantic === 'VertexWeight'))) &&
+      (attr.components ?? 1) >= 1
+    ) {
+      const plain = deinterleave(attr);
+      const arr = plain.array as Float32Array;
+      let hasValid = false;
+      for (let i = 0; i < arr.length; i++) {
+        if (arr[i]! >= -99900) {
+          hasValid = true;
+          break;
+        }
+      }
+      if (hasValid) {
+        texCoordZData = plain;
+      }
     }
   }
 
@@ -752,7 +779,7 @@ export function assembleTileGeometry(tile: ParsedTile, options: AssembleOptions 
 
   const skeletons = new Map<string, SkeletonAsm>();
   for (const [name, geo] of Object.entries(tile.geoPackage ?? {})) {
-    const asm = assembleSkeleton(name, geo, tile, skipped);
+    const asm = assembleSkeleton(name, geo, tile, skipped, options);
     if (asm) {
       skeletons.set(name, asm);
       stats.vertices += geo.vertexPackage.verticesCount || 0;

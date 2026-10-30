@@ -18,6 +18,7 @@
 import type { BinaryReader } from './BinaryReader.js';
 import type { IndexPackage, VertexAttribute, VertexPackage } from './types.js';
 import type { MeshoptDecoder } from '../vendor/meshopt_decoder.module.js';
+import { applyCustomAttributeSemantics } from './CustomAttributes.js';
 
 /** 顶点语义是位标记，不是枚举序号 */
 export const MeshOptSemantic = {
@@ -451,6 +452,7 @@ export async function parseMeshOptGeometry(
   for (let i = 0; i < vp.vertexAttributes.length; i++) {
     vp.attrLocation[`a${vp.vertexAttributes[i].semantic}`] = i;
   }
+  applyCustomAttributeSemantics(vp);
 
   return { info, indexPackages };
 }

@@ -88,12 +88,17 @@ export class S3MWorkerClient {
    * 解析一块瓦片。buffer 会被 structured clone（不 transfer），主线程保留原 buffer 以便崩溃后降级重解。
    * assemble = true 时顺带在 Worker 里做纯数据几何组装，返回 { tile, geometry } 一次带回。
    */
-  parseTile(buffer: ArrayBuffer, assemble = false, batching = true): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
+  parseTile(
+    buffer: ArrayBuffer,
+    assemble = false,
+    batching = true,
+    vertexAttributeDescript?: unknown
+  ): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
     if (this.dead) return Promise.reject(new WorkerDeadError('s3m 解析 Worker 已终止'));
     const id = ++this._seq;
     return new Promise<{ tile: ParsedTile; geometry?: TileGeometryData }>((resolve, reject) => {
       this._pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      this._worker.postMessage({ type: 'parse', id, buffer, assemble, batching });
+      this._worker.postMessage({ type: 'parse', id, buffer, assemble, batching, vertexAttributeDescript });
     });
   }
 

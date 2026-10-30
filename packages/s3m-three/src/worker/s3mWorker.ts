@@ -28,6 +28,7 @@ type ParseRequest = {
   /** 解析后顺带做纯数据几何组装（解交错 / 法线 / 合批），一次往返带回 */
   assemble?: boolean;
   batching?: boolean;
+  vertexAttributeDescript?: unknown;
 };
 type TexRequest = { type: 'tex'; id: number; tex: S3MTexture; compressed?: boolean; maxSize?: number };
 type Request = ParseRequest | TexRequest;
@@ -52,10 +53,13 @@ ctx.onmessage = async (e: MessageEvent<Request>) => {
   const { id } = msg;
   try {
     if (msg.type === 'parse') {
-      const tile = await parseS3MB(msg.buffer);
+      const tile = await parseS3MB(msg.buffer, { vertexAttributeDescript: msg.vertexAttributeDescript });
       if (msg.assemble) {
         // 解析 + 组装一起做，避免 tile 回主线程后再整块克隆回来一次
-        const geometry = assembleTileGeometry(tile, { batching: msg.batching });
+        const geometry = assembleTileGeometry(tile, {
+          batching: msg.batching,
+          vertexAttributeDescript: msg.vertexAttributeDescript,
+        });
         ctx.postMessage(
           { id, ok: true, tile, geometry } satisfies ParseResponse,
           [...collectTransferables(tile), ...collectTransferables(geometry)]

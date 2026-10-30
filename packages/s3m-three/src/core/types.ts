@@ -201,6 +201,7 @@ export interface ParsedTile {
   materials: unknown;
   pickInfo: unknown;
   extensions?: unknown;
+  vertexAttributeDescript?: unknown;
   /**
    * 解析成功、但渲染能力不完整的项（机器可读）。
    *
