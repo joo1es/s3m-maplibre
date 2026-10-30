@@ -619,8 +619,8 @@ export async function buildTileObjects(
     const matrix =
       prim.matrix && prim.matrix.length === 16 ? new THREE.Matrix4().fromArray(prim.matrix) : null;
 
-    // 棱线包：线段，不是三角面。默认隐藏，等 setEdges(true) 再显示
-    if (isLinePrimitive(prim.primitiveType)) {
+    // 棱线包（13）：线段，不是三角面。默认隐藏，等 setEdges(true) 再显示
+    if (prim.primitiveType === LINE_PRIMITIVE) {
       const lines = new THREE.LineSegments(geometry, edgeLineMaterial);
       lines.visible = options.edges === true;
       lines.renderOrder = EDGE_LINES_RENDER_ORDER;
@@ -633,6 +633,41 @@ export async function buildTileObjects(
       group.add(lines);
       objects.push(lines);
       group.userData.hasNativeEdges = true;
+      continue;
+    }
+
+    // 实体线段 / 折线几何（2=线段，3=折线，如 3D-pipe 管线）：实体几何，默认可见并取材质色
+    if (prim.primitiveType === 2 || prim.primitiveType === 3) {
+      const entry = materialList.find((e) => materialName(unwrapMaterial(e)) === prim.passNames[0]);
+      const m = unwrapMaterial(entry);
+      const diff = m?.diffuse;
+      const lineColor = diff
+        ? new THREE.Color(diff.r ?? 1, diff.g ?? 1, diff.b ?? 1)
+        : new THREE.Color(0xffffff);
+      const hasVertColor = !!geometry.getAttribute('aColor') || !!geometry.getAttribute('color');
+      if (hasVertColor && !geometry.getAttribute('color')) {
+        geometry.setAttribute('color', geometry.getAttribute('aColor')!);
+      }
+      const lineMaterial = new THREE.LineBasicMaterial({
+        color: lineColor,
+        vertexColors: hasVertColor,
+        transparent: diff?.a !== undefined && diff.a < 1,
+        opacity: diff?.a ?? 1,
+      });
+      const lines = prim.primitiveType === 3
+        ? new THREE.Line(geometry, lineMaterial)
+        : new THREE.LineSegments(geometry, lineMaterial);
+      lines.visible = true;
+      lines.userData.skeletonName = prim.skeletonName;
+      lines.userData.geoRef = geoRef;
+      lines.userData.tileRef = tile;
+      lines.userData.primitiveType = prim.primitiveType;
+      if (matrix && !matrix.equals(IDENTITY)) {
+        matrix.decompose(lines.position, lines.quaternion, lines.scale);
+      }
+      group.add(lines);
+      objects.push(lines);
+      stats.meshes++;
       continue;
     }
 
