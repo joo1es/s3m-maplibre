@@ -132,7 +132,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。手机上 1024 即可，显存降到 1/4；图集与 DXT 直传不受影响 |
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限，1024² RGBA 约 4MB / 条。低端设备 32~48，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型，`lambert` 片元约省一半。图层级设置，同页多个图层各用各的、互不覆盖；只影响之后创建的材质 |
-| `motionBlur` | `{ mode?: 'afterimage' \| 'velocity'; damp?: number \| 'auto' }` | 不传 = 关闭 | 可选运动模糊后处理，**默认关闭**。低端设备低帧率时用帧间残影在感知层面填补卡顿：`afterimage`（缺省）几乎零边际成本、`velocity` 按相机运动方向模糊；`damp: 'auto'` 按实时 FPS 自适应。运行时 `setMotionBlur(null)` 关闭，详见[s3m-three 构造函数选项](../s3m-three/docs/API.md#构造函数)。仅 WebGL2 |
+| `motionBlur` | `{ mode?: 'afterimage' \| 'velocity'; damp?: number \| 'auto'; maxOffset?: number }` | 不传 = 关闭 | 可选运动模糊后处理，**默认关闭**。低端设备低帧率时用帧间残影在感知层面填补卡顿：`afterimage`（缺省）几乎零边际成本、`velocity` 按相机运动方向模糊；`damp: 'auto'` 按实时 FPS 自适应；`maxOffset`（仅 velocity）为拖影上限（屏宽百分比，缺省 0.05）。运行时 `setMotionBlur(null)` 关闭，详见[s3m-three 构造函数选项](../s3m-three/docs/API.md#构造函数)。仅 WebGL2 |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 业务字段章节](../s3m-three/docs/API.md#业务字段锚点在库内对应关系在外部) |
 | `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
 | `nearPlaneScale` | `number` | `1` | 近裁剪面缩放系数（`0 < scale < 1`，1 = 不改）。MapLibre 的 near 是硬编码的 `canvasHeight/50`，zoom 16.5 时约合 13 米，相机贴近模型会把楼面整片裁掉；缩放后 fov / far 不变，见[近裁剪面](#近裁剪面贴脸看时不消失) |

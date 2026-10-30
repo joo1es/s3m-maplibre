@@ -177,7 +177,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限。一条 = 一张已解码的瓦片纹理，1024² RGBA 约 4MB，128 条即约 512MB 显存；低端设备 32~48。LRU，降下来下次淘汰时释放 |
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型。`lambert` 用 `MeshLambertMaterial` 替换 PBR，去掉 GGX 与环境球谐，片元约省一半；白模 / 纯色 / 按高度着色几乎无差。**图层级**：同页多个图层各用各的，互不覆盖；不传则跟随模块级默认（`setMaterialQuality`）。只影响之后创建的材质 |
 | `colorPipeline` | `'linear' \| 'direct'` | `'linear'` | 颜色管线。`direct` = 官方 iClient3D 的 sRGB 直乘（同时关掉纹理解码），`lightingPreset: 'supermap'` 会选它。**图层级**：同页多图层各用各的；已加载瓦片可运行时 `setColorPipeline(q, { duration })` 走 fade-through 平滑切过去（重建材质 + 重传纹理，不重下瓦片） |
-| `motionBlur` | `{ mode?: 'afterimage' \| 'velocity'; damp?: number \| 'auto' }` | 不传 = 关闭 | 可选的运动模糊后处理（**默认关闭**，不传时渲染路径与旧版逐字一致）。低端 / 移动设备低帧率下，用帧间残影在感知层面填补卡顿与边缘闪烁。`afterimage`（缺省）= 当前帧 + 上一帧全屏混合，几乎零边际 GPU 成本；`velocity` = 按上一帧 ↔ 当前帧相机矩阵逐像素反推屏幕速度、沿速度方向 8 tap 采样（方向感知，只覆盖相机运动）。`damp` 为拖尾长度（仅 afterimage），`'auto'`（缺省）按实时 FPS 收敛（`0.55^(fps/60)` 封顶 0.92），数值钳 [0, 0.98]。运行时 `setMotionBlur(null)` 关闭并释放 RT。仅 WebGL2（WebGL1 静默回退直渲）；已知限制：拖影只在当前帧几何覆盖范围内（合成 quad 依赖本帧深度保住遮挡正确性） |
+| `motionBlur` | `{ mode?: 'afterimage' \| 'velocity'; damp?: number \| 'auto'; maxOffset?: number }` | 不传 = 关闭 | 可选的运动模糊后处理（**默认关闭**，不传时渲染路径与旧版逐字一致）。低端 / 移动设备低帧率下，用帧间残影在感知层面填补卡顿与边缘闪烁。`afterimage`（缺省）= 当前帧 + 上一帧全屏混合，几乎零边际 GPU 成本；`velocity` = 按上一帧 ↔ 当前帧相机矩阵逐像素反推屏幕速度、沿速度方向 8 tap 采样（方向感知，只覆盖相机运动）。`damp` 为拖尾长度（仅 afterimage），`'auto'`（缺省）按实时 FPS 收敛（`0.55^(fps/60)` 封顶 0.92），数值钳 [0, 0.98]；`maxOffset` 为拖影上限（仅 velocity），速度向量的最大屏幕偏移按绘图缓冲宽度的百分比计，缺省 `0.05`，数值钳 [0, 1]。运行时 `setMotionBlur(null)` 关闭并释放 RT。仅 WebGL2（WebGL1 静默回退直渲）；已知限制：拖影只在当前帧几何覆盖范围内（合成 quad 依赖本帧深度保住遮挡正确性）；RT 用 HalfFloatType 存线性值（高光不被 clamp，代价是三张全屏纹理显存 ×2） |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 可选的 iServer 数据服务配置，配了才能用 `colorByField()` 等便利方法；不配就自己取数 + `setFeaturesStyle()`，见[业务字段](#业务字段锚点在库内对应关系在外部) |
 | `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
@@ -1444,7 +1444,7 @@ buildAttributes({ smid, box, triangles, floorHeight })  // → S3MFeatureAttribu
 | `maxTextureSize` | 纹理长边像素上限，默认不限制。手机上 1024 即可，显存降到 1/4 |
 | `maxImageCache` | 纹理缓存条数，默认 128。低端机 32~48，和 `maxTextureSize` 一起管显存 |
 | `materialQuality: 'lambert'` | 换成 Lambert 光照，片元约省一半。白模 / 按高度配色看不出差别，贴图模式会略平。图层级设置，同页其它图层不受影响 |
-| `motionBlur: { mode: 'afterimage' }` | 运动模糊后处理（默认关闭）。低端机低帧率下用帧间残影填卡顿：`afterimage` 每帧只多两次全屏混合，`damp: 'auto'` 按实时 FPS 自适应拖尾长度。建议与上面的预算开关搭配用 |
+| `motionBlur: { mode: 'afterimage' }` | 运动模糊后处理（默认关闭）。低端机低帧率下用帧间残影填卡顿：`afterimage` 每帧只多两次全屏混合，`damp: 'auto'` 按实时 FPS 自适应拖尾长度。建议与上面的预算开关搭配用。注意 RT 为 HalfFloat（半精度浮点，显存 / 带宽 ×2），显存极度吃紧时权衡是否开启 |
 | `maxImageCache` | 原始图集与 leaf 段图像记录的 LRU 缓存容量上限（默认 128），超限自动淘汰旧缓存，防止漫游时内存不断累积 |
 | 纹理引用计数 | 瓦片淘汰时按引用计数释放未被其他瓦片复用的 `Texture` 并调用 `dispose()`，真正归还 GPU 显存 |
 | 几何/材质深度释放 | 瓦片注销时深度遍历对象树，彻底释放 `Mesh`、`Points`（点云/高斯泼溅）以及 `LineSegments`（棱线包）的 `BufferGeometry` 与材质 |
