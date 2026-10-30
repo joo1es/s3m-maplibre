@@ -69,6 +69,8 @@ import { applyPointCloudStyle, isOwnedPointCloudMaterial } from './PointCloudMat
 import type { DegradationKind, UnsupportedPolicy } from '../core/degradations.js';
 import { Picker } from './Picker.js';
 import { GpuEdgePass } from './GpuEdgePass.js';
+import { MotionBlurPass, normalizeMotionBlur, autoMotionBlurDamp } from './MotionBlurPass.js';
+import type { MotionBlurOptions, MotionBlurConfig } from './MotionBlurPass.js';
 import { Animator } from '../anim/Animator.js';
 import {
   buildClipPlanes,
@@ -175,6 +177,7 @@ export type {
   PickableRef,
   PathFollowOptions,
 } from './viewer/types.js';
+export type { MotionBlurOptions, MotionBlurConfig } from './MotionBlurPass.js';
 
 function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
   const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
@@ -393,6 +396,12 @@ export class S3MViewer {
   private readonly _unsupported: UnsupportedPolicy;
   /** LOD 判定屏幕高度的 DPR 上限。Infinity = 不截断（默认，行为同旧版） */
   private _lodPixelRatioCap = Infinity;
+  /**
+   * 运动模糊配置（默认 null = 关闭）。归一化后的形状见 `normalizeMotionBlur`；
+   * pass 延迟到首帧才建（构造期 renderer 都还没有）。
+   */
+  private _motionBlurCfg: MotionBlurConfig | null = null;
+  private _motionBlur: MotionBlurPass | null = null;
 
   /** 宿主请求重画（MapLibre 传 triggerRepaint，纯 three 宿主传自己的渲染循环） */
   private _requestRepaint(): void {
@@ -410,6 +419,8 @@ export class S3MViewer {
     this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
+    // 运动模糊：默认关闭；开了也只在 renderFrame 里按需接管「场景→屏幕」这一步
+    this._motionBlurCfg = normalizeMotionBlur(options.motionBlur);
     // 只记本层的档位，**不写模块级全局**：以前这里 setMaterialQuality(...) 会把全局
     // 改掉，于是同页后创建的图层顺手把先创建的图层也打回去了（多层互相覆盖的根因）。
     this._materialQuality = normalizeMaterialQuality(options.materialQuality);
@@ -665,6 +676,8 @@ export class S3MViewer {
     this._lights.dispose();
     this.outlineMaterial.dispose();
     this._edges.disposeGpuEdge();
+    this._motionBlur?.dispose();
+    this._motionBlur = null;
     this.edgeMaterial.dispose();
     this.selectionEdgeMaterial.dispose();
     this.scene?.clear();
@@ -2192,6 +2205,28 @@ export class S3MViewer {
   }
 
   /**
+   * 运行时开关运动模糊后处理；`null` / 非法入参 = 关闭并立即释放 RT 显存。
+   *
+   * 这是纯视觉补偿（见 `motionBlur` 选项），对渲染管线唯一的结构性影响是开启期间
+   * 「场景 → 屏幕」改走 RT 中转（合成 quad 会补回色调映射 / sRGB / 深度）。
+   * WebGL1 上开了也自动回退直渲。`damp: 'auto'` 每帧按实时 FPS 重新解析。
+   */
+  setMotionBlur(cfg: MotionBlurOptions | null | undefined): void {
+    this._motionBlurCfg = normalizeMotionBlur(cfg);
+    if (!this._motionBlurCfg) {
+      this._motionBlur?.dispose();
+      this._motionBlur = null;
+    }
+    // 走公共 triggerRepaint：宿主 / 单测会覆盖前者来观察重绘（同其它 setter 的观测点）
+    this.triggerRepaint();
+  }
+
+  /** 当前运动模糊配置（归一化后的副本）；null = 关闭 */
+  get motionBlur(): MotionBlurOptions | null {
+    return this._motionBlurCfg ? { ...this._motionBlurCfg } : null;
+  }
+
+  /**
    * 运行时切换**本图层**的颜色管线（`'linear'` | `'direct'`）。
    *
    * `'direct'` = 官方 iClient3D 的 sRGB 直乘管线（配合纹理解码关 sRGB），
@@ -2970,6 +3005,30 @@ export class S3MViewer {
    * @param canvasHeight 绘图缓冲高度（像素），LOD 判定用
    * @returns 是否需要宿主继续驱动下一帧（动态着色 / 瓦片加载中 / LOD 发生变化）
    */
+  /**
+   * 运动模糊路径（`_motionBlurCfg` 非空时接管「场景 → 屏幕」）。
+   *
+   * 返回 false = 不能用（WebGL1 / 尺寸非法），调用方回退直渲 —— 配置保留不丢，
+   * 上下文恢复成 WebGL2 后下一帧自动生效。
+   * `damp: 'auto'` 在这里按实时 FPS 解析（fps 为 0 的启动阶段按 60fps 保守取值）。
+   */
+  private _renderMotionBlur(width: number, height: number): boolean {
+    const renderer = this.renderer;
+    const scene = this.scene;
+    const camera = this.camera;
+    const cfg = this._motionBlurCfg;
+    if (!renderer || !scene || !camera || !cfg) return false;
+    this._motionBlur ||= new MotionBlurPass();
+    if (!this._motionBlur.supported(renderer)) return false;
+    this._motionBlur.render(renderer, scene, camera, width, height, {
+      mode: cfg.mode,
+      damp: cfg.damp === 'auto' ? autoMotionBlurDamp(this.fps) : cfg.damp,
+      mvp: this._frameMvp,
+      mvpInverse: camera.projectionMatrixInverse,
+    });
+    return true;
+  }
+
   renderFrame(opts: {
     mvp: ArrayLike<number>;
     cameraEnu: [number, number, number];
@@ -3061,7 +3120,11 @@ export class S3MViewer {
     // 这里跳过的是「本层的绘制」，宿主自己的清屏 / 底图照旧。
     if ((this.uniforms.uOpacity?.value ?? 1) > OPACITY_EPS) {
       this._sortSplats();
-      this.renderer.render(this.scene, this.camera);
+      if (this._motionBlurCfg && this._renderMotionBlur(canvas.width, canvas.height)) {
+        // 运动模糊接管了「场景 → 屏幕」：场景进 RT，合成 quad 补回色调映射 / sRGB / 深度
+      } else {
+        this.renderer.render(this.scene, this.camera);
+      }
       // GPU 描边必须画在主场景之后：它的全屏 quad 参与宿主深度测试，
       // 依赖本帧已经写好的深度（被地形挡住的地方不该描边）
       this._edges.renderGpuEdges(canvas);
