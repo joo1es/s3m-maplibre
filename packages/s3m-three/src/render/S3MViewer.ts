@@ -518,9 +518,18 @@ export class S3MViewer {
       styleTarget: this._styleTarget,
       animator: this.animator,
       pickables: this._picks.pickables,
-      scene: this.scene,
-      renderer: this.renderer,
-      camera: this.camera,
+      // mount() / restoreContext() 都会换掉 scene / renderer / camera，这里必须用
+      // getter 拿「当下」的实例 —— 拆分 EdgeDecorator 时曾误写成值快照，mount 之后
+      // host.renderer 恒为 null，GPU 描边（和 loadCreases 挂线）静默失效
+      get scene() {
+        return self.scene;
+      },
+      get renderer() {
+        return self.renderer;
+      },
+      get camera() {
+        return self.camera;
+      },
       authenticate: this._authenticate,
       requestRepaint: () => this.triggerRepaint(),
     });
