@@ -110,3 +110,42 @@ test('pixelFormatOfBpp：压缩纹理密度判定含 mipmap 链与边界值', ()
   // 未知档位回退 rawFormat
   expect(pixelFormatOfBpp(2.5, 99)).toBe(99);
 });
+
+test('S3M 1.x 倾斜摄影（3D-srsb）：从属性段中提取真实 UV 坐标，贴图不再落于单像素纯黑', async () => {
+  const tile = await parseS3M1(ab('s3m1-srsb.s3m'), { inflate });
+  expect(tile.version).toBe(1);
+
+  const geos = Object.values(tile.geoPackage);
+  expect(geos.length).toBe(1);
+
+  const g = geos[0]!;
+  expect(g.vertexPackage.verticesCount).toBe(1894);
+  expect(g.indexPackages[0]!.primitiveType).toBe(4); // TRIANGLES
+
+  // 纹理格式被正确判定为 DXT1 (17)
+  const texKeys = Object.keys(tile.textures);
+  expect(texKeys.length).toBe(1);
+  const tex = tile.textures[texKeys[0]!]!;
+  expect(tex.pixelFormat).toBe(17);
+  expect(tex.width).toBe(128);
+  expect(tex.height).toBe(64);
+
+  // 提取的 UV 属性不能全为 0
+  const uvAttr = g.vertexPackage.vertexAttributes.find((a) => a.semantic === 'uv')!;
+  expect(uvAttr).toBeTruthy();
+  const uvs = new Float32Array(uvAttr.data.buffer, uvAttr.data.byteOffset, 1894 * 2);
+  let hasNonZero = false;
+  for (let i = 0; i < uvs.length; i++) {
+    if (uvs[i] !== 0) {
+      hasNonZero = true;
+      break;
+    }
+  }
+  expect(hasNonZero).toBe(true);
+
+  // 验证 UV 坐标在合理的纹理坐标范围 [0, 1] 附近
+  expect(uvs[0]).toBeGreaterThan(0);
+  expect(uvs[0]).toBeLessThanOrEqual(1);
+  expect(uvs[1]).toBeGreaterThan(0);
+  expect(uvs[1]).toBeLessThanOrEqual(1);
+});

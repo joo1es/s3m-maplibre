@@ -416,6 +416,39 @@ function applyQuantBox(position: Float32Array, box: Float32Array): boolean {
   return true;
 }
 
+/**
+ * 从版本 1 属性块中尝试提取 UV 坐标：
+ * 倾斜摄影（OSGB）等数据中，UV 块通常紧贴在索引头前：
+ *   头: [count: u32, dim: u32 = 2]
+ *   数据: V * 8 字节 float32 (u, v)
+ */
+function findV1UV(view: DataView, from: number, to: number, V: number): Float32Array | null {
+  const head = to - V * 8 - 8;
+  if (head >= from && view.getUint32(head, true) === V && view.getUint32(head + 4, true) === 2) {
+    let uv = new Float32Array(V * 2);
+    for (let i = 0; i < V * 2; i++) {
+      uv[i] = view.getFloat32(head + 8 + i * 4, true);
+    }
+    return uv;
+  }
+  for (let p = to - V * 8 - 8; p >= from; p -= 4) {
+    if (view.getUint32(p, true) === V && view.getUint32(p + 4, true) === 2) {
+      let uv = new Float32Array(V * 2);
+      let ok = true;
+      for (let i = 0; i < V * 2; i++) {
+        const val = view.getFloat32(p + 8 + i * 4, true);
+        if (!Number.isFinite(val) || Math.abs(val) > 1e4) {
+          ok = false;
+          break;
+        }
+        uv[i] = val;
+      }
+      if (ok) return uv;
+    }
+  }
+  return null;
+}
+
 function readGeometry(
   br: BinaryReader,
   geoSize: number
@@ -460,7 +493,7 @@ function readGeometry(
       position[i * 3 + 2] = z;
     }
 
-    const uv = new Float32Array(V * 2);
+    let uv = new Float32Array(V * 2);
     let instances: Float32Array | undefined;
     if (v0UvAt16) {
       // 版本 0：UV 数组头 [0,0,0,kind=1,count=V,flag=2]
@@ -483,7 +516,12 @@ function readGeometry(
         throw new Error(`[s3m] S3M 1.x 属性段无法定位索引头：网格 ${geoName}（偏移 ${br.offset}/${geoSize}）`);
       }
       if (at !== br.offset) {
-        skippedAttrs++;
+        const foundUv = findV1UV(br.view, br.offset, at, V);
+        if (foundUv) {
+          uv = foundUv;
+        } else {
+          skippedAttrs++;
+        }
         // 优先认实例化：柱状图是真·实例化的（一份模板 + N 个变换矩阵），
         // 顶点本来就该保持单位盒，靠矩阵摆位/缩放/上色。
         const inst = readInstances(br.view, br.offset, at);
