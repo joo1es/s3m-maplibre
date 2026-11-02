@@ -3327,6 +3327,11 @@ export class S3MViewer {
       ? this.resolveDepthMode()
       : 'scene';
     if (effectiveDepthMode === 'clear' && gl) {
+      // gl.clear 受 depthMask 约束。上一帧若以 depthWrite=false 的材质收尾（棱线、半透明
+      // 地表覆盖、半透明点云、泼溅），GL 的 depthMask 会停在 false —— three 帧末不恢复它，
+      // 而 resetState 排在 clear 之后，救不了这一步。不自己打开就是一次静默的空操作：
+      // 画面上的 z-fighting 原样保留，且没有任何报错可查。
+      gl.depthMask(true);
       // 只清深度，不清颜色 —— 颜色是 MapLibre 已经画好的底图
       gl.clear(gl.DEPTH_BUFFER_BIT);
     }

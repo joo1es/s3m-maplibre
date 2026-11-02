@@ -114,6 +114,24 @@ describe('深度策略 depthMode (issue #13)', () => {
     expect(renderIdx).toBeGreaterThan(resetIdx);
   });
 
+  test('2b. clear 前必须先打开 depthMask：上一帧以 depthWrite=false 材质收尾时 gl.clear 会静默失效', () => {
+    const { v, calls, mockGl } = makeMockViewer({ depthMode: 'clear' });
+    // 模拟上一帧末尾：某个 depthWrite=false 的材质（棱线 / 半透明地表覆盖 / 半透明点云）
+    // 把 GL 的 depthMask 留在 false。three 在帧末不会恢复它，而 resetState 又排在 clear 之后，
+    // 所以清深度这一步必须自己把 mask 打开 —— 否则 gl.clear(DEPTH) 是空操作，
+    // 表现就是「开了 clear 但 z-fighting 原样还在」，且没有任何报错。
+    mockGl.depthMask(false);
+    calls.length = 0;
+
+    v.renderFrame(DUMMY_FRAME);
+
+    const maskOnIdx = calls.findIndex((c) => c.method === 'gl.depthMask' && c.args[0] === true);
+    const clearIdx = calls.findIndex((c) => c.method === 'gl.clear');
+    expect(clearIdx).toBeGreaterThanOrEqual(0);
+    expect(maskOnIdx).toBeGreaterThanOrEqual(0);
+    expect(maskOnIdx).toBeLessThan(clearIdx);
+  });
+
   test('3. normalizeDepthMode 稳健归一化', () => {
     expect(normalizeDepthMode('clear')).toBe('clear');
     expect(normalizeDepthMode('auto')).toBe('auto');
