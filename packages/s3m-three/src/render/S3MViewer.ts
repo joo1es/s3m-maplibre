@@ -439,6 +439,7 @@ export class S3MViewer {
     this._materialQuality = normalizeMaterialQuality(options.materialQuality);
     // 之后 addDataset 的数据集按这个默认建材质（数据集自己指定则用自己的）
     this._datasetManager.defaultMaterialQuality = this._materialQuality;
+    this._datasetManager.defaultBakeMercator = options.bakeMercator;
     if (options.totalMaxTiles) {
       this._datasetManager.totalMaxTiles = options.totalMaxTiles;
     }
@@ -815,7 +816,10 @@ export class S3MViewer {
         },
         onReady: (e) => {
           this.onReady(e);
-          this._heights.refreshAll();
+          if (this.uniforms.uInvMercScale && this.sceneAnchor?.meterInMercator) {
+      this.uniforms.uInvMercScale.value = 1.0 / this.sceneAnchor.meterInMercator;
+    }
+    this._heights.refreshAll();
           if (!this.groundManager.excavationBounds) {
             this.groundManager.autoFitExcavation(this.datasets.values());
           }
@@ -3173,6 +3177,7 @@ export class S3MViewer {
 
     const canvas = this.canvas;
     const s = this.sceneAnchor.meterInMercator;
+    if (this.uniforms.uInvMercScale) this.uniforms.uInvMercScale.value = 1.0 / s;
 
     // ENU → 世界坐标：x 向东，y 向北（墨卡托 y 朝南，所以取负），z 向上
     this._enuMatrix.set(

@@ -446,6 +446,11 @@ export function createSharedUniforms(): StyleUniforms {
   };
 }
 const VERT_PARS = /* glsl */ `
+  #ifdef S3M_BAKED_MERCATOR
+    attribute vec3 aMercatorOffset;
+    uniform int uUseMercator;
+    uniform float uInvMercScale;
+  #endif
   attribute float aBatchId;
   // vec4：alpha 是「材质不透明、顶点半透明」这类数据的唯一透明度来源（官方 baseColorWithAlpha = vColor）
   attribute vec4 aColor;
@@ -624,6 +629,11 @@ const VERT_SETUP = /* glsl */ `
 `;
 
 const VERT_ELEVATION = /* glsl */ `
+  #ifdef S3M_BAKED_MERCATOR
+    if ( uUseMercator > 0 ) {
+      transformed = vec3( aMercatorOffset.x * uInvMercScale, -aMercatorOffset.y * uInvMercScale, aMercatorOffset.z * uInvMercScale );
+    }
+  #endif
   float s3mBatchElev = s3mBatchRaw();
   if ( uBatchTexActive > 0 && s3mBatchElev >= 0.0 ) {
     float s3mU = ( s3mBatchElev + 0.5 ) / uBatchTexWidth;
@@ -1142,6 +1152,7 @@ export interface StyledMaterialOptions {
    * 与 `materialQuality` 同一套：图层把自己的 profile 透传进来，同页互不污染。
    */
   colorPipeline?: ColorPipeline;
+  bakeMercator?: boolean;
 }
 
 /**
@@ -1246,12 +1257,16 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   // supermap 完整版：官方 sRGB 直乘管线（配合 setSrgbTextureDecode(false)）
   const direct = (opts.colorPipeline ?? colorPipeline) === 'direct';
   if (direct) mat.defines = { ...mat.defines, S3M_DIRECT_COLOR: '' };
+  const bakeMercator = !!opts.bakeMercator;
+  if (bakeMercator) mat.defines = { ...(mat.defines as Record<string, string>), S3M_BAKED_MERCATOR: '' };
   // 官方 uTextureDim = (base宽, base高, bake宽, bake高)，取实际绑定纹理的像素尺寸
   const uAtlasDim = { value: new THREE.Vector2(opts.map?.image?.width || 1, opts.map?.image?.height || 1) };
   const uAtlasDim1 = { value: new THREE.Vector2(secMap?.image?.width || 1, secMap?.image?.height || 1) };
 
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms, {
+      uUseMercator: { value: bakeMercator ? 1 : 0 },
+      uInvMercScale: uniforms?.uInvMercScale ?? { value: 1.0 },
       uSelBatch,
       uSelWhole,
       uFlatShading,

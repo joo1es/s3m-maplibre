@@ -127,6 +127,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `light` | `LightOptions` | — | 场景光照配置（环境光、主光、方位角、高度角及 headlamp/fixed 模式） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
 | `perTilePlacement` | `boolean` | `true` | 瓦片级切平面放置与拾取反解（**默认开启**）。每块瓦片用自身中心纬度计算墨卡托比例并反解拾取，消除大跨度（距场景锚点 20 km 处约 26 m）下的累积尺度误差。可传 `false` 回退旧版行为 |
+| `bakeMercator` | `boolean` | `undefined`（自动） | 全球大尺度下逐顶点烘焙精确 Web 墨卡托偏移（Issue #15）。消除大范围单瓦片内因墨卡托纬度非线性缩放导致的视差游动与呼吸效应。默认 `undefined`：根半径 > 25 km 时自动启用，<= 25 km 保持关闭（顶点缓冲逐字节与旧版相同）。传 `true` / `false` 强制开关 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 DPR 上限（不截断）。默认按绘图缓冲物理像素算，3x DPR 手机上会显著多拉瓦片；传 `2` 即按「CSS 高度 × 2」截断，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = GPU 最大值，通常 16）。移动端 4 / 8 通常肉眼无差，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |

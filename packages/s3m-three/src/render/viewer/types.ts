@@ -156,6 +156,13 @@ export interface S3MViewerOptions {
    */
   perTilePlacement?: boolean;
   /**
+   * 是否对瓦片逐顶点烘焙精确 Web 墨卡托偏移（消除全球大尺度下的视差游动/呼吸效应）。
+   * - undefined（默认）：自动判定。当瓦片集根节点包围球半径 > 25 km 时自动启用，<= 25 km 时保持关闭（逐字节保持原有 ENU 顶点缓冲不变）。
+   * - true：强制开启。
+   * - false：强制关闭。
+   */
+  bakeMercator?: boolean;
+  /**
    * 每个数据集驻留三角形总数的软上限（默认不限制）。
    * 见 `S3MTilesetOptions.maxTriangles`：瓦片数管不住的场景（精模、大面片）用这条刹车。
    */

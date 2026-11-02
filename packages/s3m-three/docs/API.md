@@ -171,6 +171,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | （随 `useWorker`）几何组装 | `boolean` | `true` | 顶点解交错 / 法线计算 / 同材质合批合并（`core/TileGeometry.ts`）随解析在 Worker 完成，主线程只做 three 对象包装；Worker 不可用时主线程跑同一份实现，产物一致 |
 | （随 `useWorker`）DXT 压缩直传 | 自动 | 自动 | 宿主 GL 同时支持 `WEBGL_compressed_texture_s3tc`(+srgb) 时，dxt1/dxt5（含 CRN 转码产物）不解码直接 `CompressedTexture` 上传，显存与上传带宽降为 1/4~1/8；块长与 4×4 对齐公式不符、flipY 图集、移动端无扩展时自动回退 RGBA 解码 |
 | `perTilePlacement` | `boolean` | `true` | 瓦片级切平面放置与拾取反解（**默认开启**）。每块瓦片用自身中心纬度计算墨卡托比例与反解拾取，消除「全场景共用一个常量切平面」在大范围（距场景锚点 20 km 处 0.26% 误差，约 26 m；200 km 处 2.8 km）下的累积尺度误差与拾取偏移。逆矩阵自动缓存在瓦片 group 上避免拾取性能损耗。可显式传 `false` 回退旧版单一全场景切平面（下游若缓存了旧坐标或与旧数据对齐时使用） |
+| `bakeMercator` | `boolean` | `undefined`（自动） | 全球大尺度下逐顶点烘焙精确 Web 墨卡托偏移（Issue #15）。消除大范围单瓦片内因墨卡托纬度非线性缩放导致的视差游动与呼吸效应。默认 `undefined`：当瓦片集根节点包围球半径 > 25 km 时自动启用；<= 25 km 时保持关闭（顶点 buffer 逐字节与旧版相同）。传 `true` / `false` 强制开关 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 **DPR 上限**（不截断）。默认按 `canvasHeight` 物理像素算，与官方 `calcPixFromCam` 同口径；3x DPR 手机上由此会多细化、多拉瓦片，传 `2` 即按「CSS 高度 × 2」截断 |
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = 取 GPU 最大值，通常 16）。移动端封到 4 / 8 肉眼通常无差，采样成本明显下降。**图层级**：运行时 `setAnisotropyCap()` 会立刻应用到已上传纹理（改采样参数 + 重传，不重解码、不重载瓦片），图集纹理恒为 1 |

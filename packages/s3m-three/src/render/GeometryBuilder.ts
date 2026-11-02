@@ -18,6 +18,7 @@ import { createSharedUniforms, createStyledMaterial } from './StyleMaterial.js';
 import { isTransparentMaterial, minVertexAlpha } from './materialAlpha.js';
 import type { StyledMaterial } from './StyleMaterial.js';
 import { assembleTileGeometry, LINE_PRIMITIVE, POINT_PRIMITIVE } from '../core/TileGeometry.js';
+import { bakeMercatorOffsets } from '../core/BakeMercator.js';
 import type { TileGeometryData, PrimitiveData } from '../core/TileGeometry.js';
 import { decodeScale, decodeRotation } from '../core/GaussianSplat.js';
 import { createSplatMaterial, createQuadGeometry, splatRaycast } from './SplatMaterial.js';
@@ -378,6 +379,15 @@ export interface BuildTileOptions {
    * 不传 = 各自读模块级默认。同样由图层的渲染 profile 带下来。
    */
   textureOptions?: TextureCreateOptions;
+  /**
+   * 是否烘焙精确 Web 墨卡托偏移属性（消除全球尺度下的视差游动）。
+   * 透传给 assembleTileGeometry 和 createStyledMaterial。
+   */
+  bakeMercator?: boolean;
+  /** 瓦片锚点（经纬度），烘焙墨卡托时使用 */
+  tileAnchor?: { lon: number; lat: number; height?: number };
+  /** 瓦片中心偏移（ENU 米），烘焙墨卡托时使用 */
+  tileCenter?: { x: number; y: number; z?: number };
 }
 
 export interface BuildTileResult {
@@ -475,7 +485,8 @@ export async function buildTileObjects(
     code?: string,
     hasAtlasRect = false,
     hasTexCoordZ = false,
-    vertexAlphaMin = 1
+    vertexAlphaMin = 1,
+    hasMercator = false
   ): StyledMaterial => {
     const entry = materialList.find((e) => materialName(unwrapMaterial(e)) === code);
     const m = unwrapMaterial(entry);
@@ -562,6 +573,7 @@ export async function buildTileObjects(
       // 图层 / 数据集的档位；undefined 时 createStyledMaterial 自己回落到模块级默认
       materialQuality: options.materialQuality,
       colorPipeline: options.colorPipeline,
+      bakeMercator: hasMercator || options.bakeMercator,
     });
     // 用户配置的深度偏移（共面摩尔纹 / 重合面归属的人工定序，见 BuildTileOptions 注释）
     if (options.polygonOffset) {
@@ -574,11 +586,32 @@ export async function buildTileObjects(
 
   // 3) 纯数据几何组装：Worker 解析时已顺带产出就直接用，否则主线程现场组装
   //    （core/TileGeometry 的同一份实现，两条路径产物一致）
+  if (options.assembled && options.bakeMercator && options.tileAnchor) {
+    for (const prim of options.assembled.primitives) {
+      if (!prim.attributes.aMercatorOffset && prim.attributes.position) {
+        const { offsets } = bakeMercatorOffsets(
+          prim.attributes.position.array,
+          prim.vertexCount,
+          options.tileAnchor,
+          options.tileCenter,
+          prim.matrix
+        );
+        prim.attributes.aMercatorOffset = {
+          array: offsets,
+          components: 3,
+          normalized: false,
+        };
+      }
+    }
+  }
   const assembled =
     options.assembled ??
     assembleTileGeometry(tile, {
       batching: options.batching !== false,
       dedupeCoincident: options.dedupeCoincident,
+      bakeMercator: options.bakeMercator,
+      tileAnchor: options.tileAnchor,
+      tileCenter: options.tileCenter,
     });
   stats.vertices = assembled.stats.vertices;
   stats.edgeLines = assembled.stats.edgeLines;
@@ -610,11 +643,13 @@ export async function buildTileObjects(
     const geometry = packPrimitive(prim);
     const geoRef = tile.geoPackage[prim.geoNames[0]] ?? null;
     const vp = geoRef?.vertexPackage;
+    const hasMercator = !!prim.attributes.aMercatorOffset;
     const material = makeMaterial(
       prim.passNames[0],
       !!prim.attributes.aAtlasRect,
       !!prim.attributes.aTexCoordZ,
-      minVertexAlpha(prim.attributes.aColor)
+      minVertexAlpha(prim.attributes.aColor),
+      hasMercator
     );
     const matrix =
       prim.matrix && prim.matrix.length === 16 ? new THREE.Matrix4().fromArray(prim.matrix) : null;
