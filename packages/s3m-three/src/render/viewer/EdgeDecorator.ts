@@ -98,6 +98,7 @@ export interface EdgeHost {
   renderer: THREE.WebGLRenderer | null;
   camera: THREE.Camera | null;
   readonly authenticate: AuthenticateFn | undefined;
+  resolveDepthMode?(): 'scene' | 'clear';
   requestRepaint(): void;
 }
 
@@ -219,6 +220,8 @@ export class EdgeDecorator {
   /** 一帧的 GPU 描边，必须画在主场景之后（依赖本帧已写好的深度） */
   renderGpuEdges(canvas: HTMLCanvasElement): void {
     if (!this._modes.gpu) return;
+    // clear 深度模式下宿主深度已丢失，GPU 描边会穿透地形，必须跳过
+    if (this.host.resolveDepthMode?.() === 'clear') return;
     const renderer = this.host.renderer;
     const scene = this.host.scene;
     const camera = this.host.camera;

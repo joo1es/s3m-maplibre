@@ -178,6 +178,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型。`lambert` 用 `MeshLambertMaterial` 替换 PBR，去掉 GGX 与环境球谐，片元约省一半；白模 / 纯色 / 按高度着色几乎无差。**图层级**：同页多个图层各用各的，互不覆盖；不传则跟随模块级默认（`setMaterialQuality`）。只影响之后创建的材质 |
 | `colorPipeline` | `'linear' \| 'direct'` | `'linear'` | 颜色管线。`direct` = 官方 iClient3D 的 sRGB 直乘（同时关掉纹理解码），`lightingPreset: 'supermap'` 会选它。**图层级**：同页多图层各用各的；已加载瓦片可运行时 `setColorPipeline(q, { duration })` 走 fade-through 平滑切过去（重建材质 + 重传纹理，不重下瓦片） |
 | `motionBlur` | `{ mode?: 'afterimage' \| 'velocity'; damp?: number \| 'auto'; maxOffset?: number }` | 不传 = 关闭 | 可选的运动模糊后处理（**默认关闭**，不传时渲染路径与旧版逐字一致）。低端 / 移动设备低帧率下，用帧间残影在感知层面填补卡顿与边缘闪烁。`afterimage`（缺省）= 当前帧 + 上一帧全屏混合，几乎零边际 GPU 成本；`velocity` = 按上一帧 ↔ 当前帧相机矩阵逐像素反推屏幕速度、沿速度方向 8 tap 采样（方向感知，只覆盖相机运动）。`damp` 为拖尾长度（仅 afterimage），`'auto'`（缺省）按实时 FPS 收敛（`0.55^(fps/60)` 封顶 0.92），数值钳 [0, 0.98]；`maxOffset` 为拖影上限（仅 velocity），速度向量的最大屏幕偏移按绘图缓冲宽度的百分比计，缺省 `0.05`，数值钳 [0, 1]。运行时 `setMotionBlur(null)` 关闭并释放 RT。仅 WebGL2（WebGL1 静默回退直渲）；已知限制：拖影只在当前帧几何覆盖范围内（合成 quad 依赖本帧深度保住遮挡正确性）；RT 用 HalfFloatType 存线性值（高光不被 clamp，代价是三张全屏纹理显存 ×2） |
+| `depthMode` | `'scene' \| 'clear' \| 'auto'` | `'scene'` | 本层绘制前深度缓冲处理策略。`'scene'`（默认）：保留宿主深度，建筑/管线等离散对象受地形正常遮挡；`'clear'`：先清深度再画，贴地倾斜摄影/开挖地表/大范围 DEM 化模型消除共面 z-fighting；`'auto'`：按 ground 覆盖或数据集类型自动推断 |
 | `buildTile` | `BuildTileFn \| null` | — | 自定义瓦片构建器（测试 / 服务端渲染时注入） |
 | `attributes` | `AttributeQueryOptions` | — | 可选的 iServer 数据服务配置，配了才能用 `colorByField()` 等便利方法；不配就自己取数 + `setFeaturesStyle()`，见[业务字段](#业务字段锚点在库内对应关系在外部) |
 | `onRequestRepaint` | `() => void` | — | 宿主请求重画的信号：纯 three 宿主接自己的渲染循环 |
@@ -527,6 +528,8 @@ readonly anisotropyCap: number
 setMaxTextureSize(n: number): void            // Infinity = 不限制（默认）
 readonly maxTextureSize: number
 readonly maxImageCache: number
+setDepthMode(mode: DepthMode): void            // 运行时调整深度处理策略（'scene' | 'clear' | 'auto'）
+readonly depthMode: DepthMode                  // 当前深度策略
 setMotionBlur(cfg: MotionBlurOptions | null): void  // 运行时开关运动模糊；null = 关闭并释放 RT 显存
 readonly motionBlur: MotionBlurOptions | null       // 当前配置（归一化后的副本）
 readonly stats: Stats

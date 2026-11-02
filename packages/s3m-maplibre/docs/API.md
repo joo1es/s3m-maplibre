@@ -133,6 +133,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限，1024² RGBA 约 4MB / 条。低端设备 32~48，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型，`lambert` 片元约省一半。图层级设置，同页多个图层各用各的、互不覆盖；只影响之后创建的材质 |
 | `motionBlur` | `{ mode?: 'afterimage' \| 'velocity'; damp?: number \| 'auto'; maxOffset?: number }` | 不传 = 关闭 | 可选运动模糊后处理，**默认关闭**。低端设备低帧率时用帧间残影在感知层面填补卡顿：`afterimage`（缺省）几乎零边际成本、`velocity` 按相机运动方向模糊；`damp: 'auto'` 按实时 FPS 自适应；`maxOffset`（仅 velocity）为拖影上限（屏宽百分比，缺省 0.05）。运行时 `setMotionBlur(null)` 关闭，详见[s3m-three 构造函数选项](../s3m-three/docs/API.md#构造函数)。仅 WebGL2 |
+| `depthMode` | `'scene' \| 'clear' \| 'auto'` | `'scene'` | 本层绘制前深度缓冲处理策略。`'scene'` 保留宿主深度（建筑/管线等离散对象被地形正确遮挡）；`'clear'` 先清深度再画（贴地倾斜摄影/DEM化网格消除与宿主 DEM 的共面 z-fighting）；`'auto'` 按 ground 覆盖或倾斜摄影数据集自动推断。详见[深度策略](#深度策略按数据类型区分保留与清空) |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 业务字段章节](../s3m-three/docs/API.md#业务字段锚点在库内对应关系在外部) |
 | `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
 | `nearPlaneScale` | `number` | `1` | 近裁剪面缩放系数（`0 < scale < 1`，1 = 不改）。MapLibre 的 near 是硬编码的 `canvasHeight/50`，zoom 16.5 时约合 13 米，相机贴近模型会把楼面整片裁掉；缩放后 fov / far 不变，见[近裁剪面](#近裁剪面贴脸看时不消失) |
@@ -295,6 +296,8 @@ setColorPipeline(q: 'linear' | 'direct', opts?: { duration?: number; dim?: numbe
 readonly colorPipeline: 'linear' | 'direct'               // 图层级；duration > 0 走压暗过渡
 setMaterialQuality(q: 'pbr' | 'lambert'): void            // 图层级；原位重建本层材质
 readonly materialQuality: 'pbr' | 'lambert'
+setDepthMode(mode: 'scene' | 'clear' | 'auto'): void          // 运行时调整深度处理策略
+readonly depthMode: 'scene' | 'clear' | 'auto'
 setMotionBlur(cfg: MotionBlurOptions | null): void       // 运行时开关运动模糊；null = 关闭并释放 RT
 readonly motionBlur: MotionBlurOptions | null
 lngLatToPoint(p: LngLatAlt): [number, number, number]   // 经纬度 → 场景 ENU（画代理几何用）
@@ -603,6 +606,33 @@ n = ortho(-w/2, w/2, -h/2, h/2, …)        // 改成这个
 - **标签避让、地形高程、fog 仍按透视语义推导**。符号层用的是另一套 `labelPlaneMatrix` 系，正交下会有位置/避让偏差；地形（`terrain`）没有验证，建议正交时关掉。`queryRenderedFeatures` 的拾取已经一起重算，基本可用。
 - `map.setProjection()`（含 `vertical-perspective` / `globe`）会重建 transform 实例，patch 会丢，需要 `reinstall()`。监听 `projectiontransition` 事件后补装即可。
 - 切换开关时不会自动触发重算（MapLibre 的矩阵是惰性的），`setEnabled()` 内部已经主动调了一次 `_calcMatrices`，你不需要再手动 `triggerRepaint`。
+
+### 深度策略（按数据类型区分保留与清空）
+
+两类三维数据对深度缓冲的需求截然相反：
+
+| 数据类型 | 需求 | 推荐策略 | 说明 |
+|---|---|---|---|
+| 离散对象（建筑、管线、BIM） | 保留场景深度 | `'scene'`（默认） | 宿主地形能正确遮挡建筑底盘与山后结构 |
+| 地面类（贴地倾斜摄影、大范围 DEM 化模型、开挖地表） | 清空深度再画 | `'clear'` | 本层网格与宿主 DEM 为独立三角化网格，共面时微小深度差导致大范围严重 z-fighting 条纹；清深度后只与自己做测试，彻底消除条纹 |
+| 混合场景 / 自动判别 | 按数据特征推断 | `'auto'` | 若启用物理地表覆盖（`ground.mode !== 'none'`）或加载 OSGB 倾斜摄影、DEM 等地面类数据集，自动选用 `'clear'`；纯建筑模型则保持 `'scene'` |
+
+```ts
+// 贴地倾斜摄影图层：先清深度，消除与 MapLibre 地形网格的闪烁条纹
+const obliqueLayer = new S3MLayer({
+  id: 'oblique',
+  configUrl: 'https://host/realspace/datas/oblique/config',
+  depthMode: 'clear',
+});
+
+// 建筑图层：保持默认 'scene'，受地形正确遮挡
+const buildingLayer = new S3MLayer({
+  id: 'buildings',
+  configUrl: 'https://host/realspace/datas/building/config',
+});
+```
+
+同一场景中多图层互不干扰：`'clear'` 图层只在自己绘制前清空深度缓冲（不触碰底图颜色），后续 `'scene'` 图层正常基于已写好的深度进行遮挡测试。
 
 ### 近裁剪面（贴脸看时不消失）
 

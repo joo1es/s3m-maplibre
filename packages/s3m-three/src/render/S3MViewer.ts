@@ -41,6 +41,7 @@ import type {
   PickResult,
   PickableRef,
   PathFollowOptions,
+  DepthMode,
   MeshUserData,
 } from './viewer/types.js';
 import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
@@ -177,8 +178,16 @@ export type {
   S3MViewerOptions,
   PickableRef,
   PathFollowOptions,
+  DepthMode,
 } from './viewer/types.js';
 export type { MotionBlurOptions, MotionBlurConfig } from './MotionBlurPass.js';
+
+/** 稳健归一化 depthMode 入参，默认 'scene' */
+export function normalizeDepthMode(mode?: unknown): DepthMode {
+  if (mode === 'clear') return 'clear';
+  if (mode === 'auto') return 'auto';
+  return 'scene';
+}
 
 function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
   const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
@@ -414,6 +423,8 @@ export class S3MViewer {
    * 逐字一致；开时每块瓦片用自己的中心纬度算尺度，见 `tilePlacement.ts`。
    */
   private readonly _perTilePlacement: boolean;
+  /** 本层绘制前深度缓冲的处理策略：'scene' | 'clear' | 'auto'，默认 'scene' */
+  private _depthMode: DepthMode = 'scene';
 
   /** 宿主请求重画（MapLibre 传 triggerRepaint，纯 three 宿主传自己的渲染循环） */
   private _requestRepaint(): void {
@@ -431,6 +442,7 @@ export class S3MViewer {
     this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     this._perTilePlacement = options.perTilePlacement === true;
+    this._depthMode = normalizeDepthMode(options.depthMode);
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
     // 运动模糊：默认关闭；开了也只在 renderFrame 里按需接管「场景→屏幕」这一步
     this._motionBlurCfg = normalizeMotionBlur(options.motionBlur);
@@ -2338,6 +2350,54 @@ export class S3MViewer {
   }
 
   /** 当前运动模糊配置（归一化后的副本）；null = 关闭 */
+  /**
+   * 运行时修改深度处理策略（'scene' | 'clear' | 'auto'）。
+   */
+  setDepthMode(mode: DepthMode): void {
+    const next = normalizeDepthMode(mode);
+    if (this._depthMode !== next) {
+      this._depthMode = next;
+      this.triggerRepaint();
+    }
+  }
+
+  /** 当前深度策略（'scene' | 'clear' | 'auto'，默认 'scene'） */
+  get depthMode(): DepthMode {
+    return this._depthMode;
+  }
+
+  /**
+   * 当前帧实际生效的深度处理模式（'scene' | 'clear'）。
+   * - 'clear': 显式指定 clear，或 auto 模式下命中地面覆盖/倾斜摄影/DEM等地面类数据
+   * - 'scene': 显式指定 scene，或 auto 模式下无地面类数据
+   */
+  resolveDepthMode(): 'scene' | 'clear' {
+    if (this._depthMode === 'clear') return 'clear';
+    if (this._depthMode === 'scene') return 'scene';
+
+    // 'auto': 按数据集与地面覆盖特征推断
+    if (this.groundManager && this.groundManager.mode !== 'none') {
+      return 'clear';
+    }
+
+    for (const entry of this._datasetManager.datasets.values()) {
+      if (!entry.visible) continue;
+      if (entry.options.depthMode === 'clear') return 'clear';
+      if (entry.options.depthMode === 'scene') continue;
+      if (entry.tileset?.isS3MV1) return 'clear';
+      const cfg = entry.tileset?.config as Record<string, unknown> | null | undefined;
+      if (cfg) {
+        const typeStr = `${cfg.fileType ?? ''} ${cfg.dataType ?? ''} ${cfg.datasetType ?? ''} ${cfg.cacheType ?? ''} ${cfg.fileExtentName ?? ''}`;
+        if (/osgb|oblique|ground|dem|tin|terrain/i.test(typeStr)) return 'clear';
+      }
+      if (entry.options.configUrl && /osgb|oblique/i.test(entry.options.configUrl)) {
+        return 'clear';
+      }
+    }
+
+    return 'scene';
+  }
+
   get motionBlur(): MotionBlurOptions | null {
     return this._motionBlurCfg ? { ...this._motionBlurCfg } : null;
   }
@@ -3233,6 +3293,14 @@ export class S3MViewer {
     setSplatViewport(canvas.width, canvas.height);
 
     this.renderer.setViewport(0, 0, canvas.width, canvas.height);
+    const effectiveDepthMode = (this.uniforms.uOpacity?.value ?? 1) > OPACITY_EPS
+      ? this.resolveDepthMode()
+      : 'scene';
+    if (effectiveDepthMode === 'clear' && gl) {
+      // 只清深度，不清颜色 —— 颜色是 MapLibre 已经画好的底图
+      gl.clear(gl.DEPTH_BUFFER_BIT);
+    }
+    // 清完之后必须让 three 知道状态被外部改过，否则它的状态缓存会认为自己仍然正确
     this.renderer.resetState();
     // 完全透明时什么都不画：透明物体照样写深度，画了会在底图上挖出一个洞。
     // 这里跳过的是「本层的绘制」，宿主自己的清屏 / 底图照旧。
@@ -3245,7 +3313,10 @@ export class S3MViewer {
       }
       // GPU 描边必须画在主场景之后：它的全屏 quad 参与宿主深度测试，
       // 依赖本帧已经写好的深度（被地形挡住的地方不该描边）
-      this._edges.renderGpuEdges(canvas);
+      // clear 模式下宿主深度已清除，描边会穿透地形产生伪影，故只在非 clear 时画。
+      if (effectiveDepthMode !== 'clear') {
+        this._edges.renderGpuEdges(canvas);
+      }
     }
 
     this._frame++;
