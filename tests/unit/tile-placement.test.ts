@@ -267,3 +267,92 @@ describe('issue #12：默认路径必须逐字不变', () => {
     v.dispose();
   });
 });
+
+/**
+ * 拾取反解：命中点的世界坐标要还原成「数据本身的 ENU」。
+ *
+ * 开启瓦片级放置后几何是缩放过的，如果拾取直接拿世界坐标算经纬度，同一个屋顶
+ * 在 20 km 外就会比 1 km 内偏出几米——渲染对了、拾取反而错了。
+ */
+describe('issue #12：拾取反解瓦片级放置', () => {
+  const OFFSET: [number, number, number] = [500, -300, 20];
+
+  function setup(perTilePlacement?: boolean) {
+    const v = new S3MViewer({
+      canvas: null as never,
+      container: null as never,
+      perTilePlacement,
+    } as ConstructorParameters<typeof S3MViewer>[0]);
+    v.sceneAnchor = { x: SCENE.x, y: SCENE.y, z: SCENE.z, meterInMercator: S_SCENE };
+
+    const group = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), new THREE.MeshBasicMaterial());
+    group.add(mesh);
+    const entry = (
+      v as unknown as { _datasetManager: { registerDataset: (o: { id: string }) => unknown } }
+    )._datasetManager.registerDataset({ id: 'pick' }) as {
+      root: THREE.Group;
+      anchor: unknown;
+      offset: number[];
+    };
+    entry.anchor = ANCHOR;
+    entry.offset = [...OFFSET];
+    entry.root.position.set(OFFSET[0], OFFSET[1], OFFSET[2]);
+
+    (v as unknown as { _registerTile: (n: unknown, e: unknown) => void })._registerTile(
+      { group, tile: null, sphere: { center: { x: 0, y: 20000, z: 0 }, radius: 100 } },
+      entry,
+    );
+
+    const toCanonical = (p: THREE.Vector3) =>
+      (
+        v as unknown as { _toCanonicalScene: (p: THREE.Vector3, m: THREE.Object3D) => THREE.Vector3 }
+      )._toCanonicalScene(p, mesh);
+    return { v, group, mesh, toCanonical };
+  }
+
+  test('关闭时原样返回同一个对象（零运算、零分配）', () => {
+    const { v, toCanonical } = setup();
+    const p = new THREE.Vector3(1, 2, 3);
+    expect(toCanonical(p)).toBe(p);
+    v.dispose();
+  });
+
+  test('开启后：世界坐标 → 数据集 ENU → 规范场景 ENU，精确可逆', () => {
+    const { v, group, toCanonical } = setup(true);
+
+    // 取一个瓦片局部（数据集 ENU）点，算出它在世界里被画到哪
+    const local = new THREE.Vector3(800, 20600, 5);
+    const world = local.clone().applyMatrix4(group.matrix).add(new THREE.Vector3(...OFFSET));
+
+    // 反解应回到 local + OFFSET
+    const canonical = toCanonical(world);
+    expect(canonical.x).toBeCloseTo(local.x + OFFSET[0], 6);
+    expect(canonical.y).toBeCloseTo(local.y + OFFSET[1], 6);
+    expect(canonical.z).toBeCloseTo(local.z + OFFSET[2], 6);
+
+    // 距中心 1 km 处，修正量应在米级（旧口径下这段偏差会直接进到报出的经纬度里）
+    expect(canonical.distanceTo(world)).toBeGreaterThan(2);
+    v.dispose();
+  });
+
+  test('瓦片中心处反解结果不动（放置的枢轴点本来就在正确位置）', () => {
+    const { v, group, toCanonical } = setup(true);
+    const centerLocal = new THREE.Vector3(0, 20000, 0);
+    const world = centerLocal.clone().applyMatrix4(group.matrix).add(new THREE.Vector3(...OFFSET));
+    const canonical = toCanonical(world);
+    expect(canonical.x).toBeCloseTo(centerLocal.x + OFFSET[0], 6);
+    expect(canonical.y).toBeCloseTo(centerLocal.y + OFFSET[1], 6);
+    v.dispose();
+  });
+
+  test('网格不在已放置的瓦片里时原样返回', () => {
+    const { v, toCanonical, mesh } = setup(true);
+    // 换一个没有 tileCenter 的父级
+    const orphan = new THREE.Group();
+    orphan.add(mesh);
+    const p = new THREE.Vector3(1, 2, 3);
+    expect(toCanonical(p)).toBe(p);
+    v.dispose();
+  });
+});

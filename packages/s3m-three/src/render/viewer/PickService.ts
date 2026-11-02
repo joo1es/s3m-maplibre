@@ -54,6 +54,17 @@ export interface PickHost {
   readonly featureStyleManager: FeatureStyleManager;
   readonly smidMeshes: Map<number, Set<THREE.Mesh>>;
   lngLatFromWorld(x: number, y: number): [number, number];
+  /**
+   * 世界坐标 → **规范**场景 ENU（把瓦片级放置的缩放反解掉）。
+   *
+   * `perTilePlacement` 开启时瓦片几何是绕自身中心缩放 `k` 倍后摆到正确位置的，
+   * 命中点的世界坐标因此不再等于「数据本身的 ENU」。拾取要报的是坐标本身，
+   * 不能带渲染相对底图的缩放，否则同一个屋顶在 20 km 外会比 1 km 内偏出几米，
+   * 量算、贴地、外部标注全都跟着错。
+   *
+   * 未开启本功能、或网格不在已放置的瓦片里时**原样返回**（默认路径零副作用）。
+   */
+  toCanonicalScene(p: THREE.Vector3, mesh?: THREE.Object3D | null): THREE.Vector3;
   gpuPathPoseAt(smid: number): { pos: [number, number, number]; yaw: number } | null;
   isFeatureHidden(smid: number | null, batchId: number): boolean;
 }
@@ -219,8 +230,9 @@ export class PickService {
     if (box && this.host.sceneAnchor) {
       const v = new THREE.Vector3((box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2, (box.minZ + box.maxZ) / 2);
       v.applyMatrix4(ref.mesh.matrixWorld);
+      const c = this.host.toCanonicalScene(v, ref.mesh);
       const s = this.host.sceneAnchor.meterInMercator;
-      centerLngLat = this.host.lngLatFromWorld(v.x * s + this.host.sceneAnchor.x, -v.y * s + this.host.sceneAnchor.y);
+      centerLngLat = this.host.lngLatFromWorld(c.x * s + this.host.sceneAnchor.x, -c.y * s + this.host.sceneAnchor.y);
     }
 
     // 精确命中点求交计算
@@ -237,7 +249,8 @@ export class PickService {
       const off = smid != null ? this.host.featureStyleManager.getFeatureEffectiveOffset(smid) : {};
       const trans = off.translation;
       const elev = off.elevation;
-      const finalPos = hitPoint.clone();
+      // 先反解瓦片级放置，再叠单体位移 —— 位移是「米」，必须落在规范 ENU 里
+      const finalPos = this.host.toCanonicalScene(hitPoint, ref.mesh).clone();
 
       if (off.rotation) {
         const rotMat = resolveRotationMatrix(off.rotation);
@@ -328,9 +341,10 @@ export class PickService {
     let centerLngLat: [number, number] | null = null;
 
     if (hitPoint) {
-      point = [hitPoint.x, hitPoint.y, hitPoint.z];
-      lngLat = this.host.lngLatFromWorld(hitPoint.x * s + anchor.x, -hitPoint.y * s + anchor.y);
-      altitude = hitPoint.z + (anchor.altitude ?? 0);
+      const c = this.host.toCanonicalScene(hitPoint, mesh);
+      point = [c.x, c.y, c.z];
+      lngLat = this.host.lngLatFromWorld(c.x * s + anchor.x, -c.y * s + anchor.y);
+      altitude = c.z + (anchor.altitude ?? 0);
       // 泼溅命中的就是一个高斯，没有「单体中心」可言，用命中点当中心
       centerLngLat = lngLat;
     } else if (box) {
@@ -339,8 +353,9 @@ export class PickService {
         (box.minY + box.maxY) / 2,
         (box.minZ + box.maxZ) / 2
       ).applyMatrix4(mesh.matrixWorld);
-      centerLngLat = this.host.lngLatFromWorld(v.x * s + anchor.x, -v.y * s + anchor.y);
-      altitude = v.z + (anchor.altitude ?? 0);
+      const c = this.host.toCanonicalScene(v, mesh);
+      centerLngLat = this.host.lngLatFromWorld(c.x * s + anchor.x, -c.y * s + anchor.y);
+      altitude = c.z + (anchor.altitude ?? 0);
     }
 
     return {

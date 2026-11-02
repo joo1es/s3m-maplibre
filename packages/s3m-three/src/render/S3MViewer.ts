@@ -206,6 +206,12 @@ function clampOpacity(v: number | null | undefined): number {
 /** 低于这个透明度就当作完全不可见：跳过绘制，避免全透明物体写深度 */
 const OPACITY_EPS = 1e-3;
 
+/**
+ * 拾取反解瓦片级放置时的临时矩阵。命中点→规范 ENU 是一次独立查询（鼠标事件），
+ * 复用一个实例避免每次分配；不可重入（`_toCanonicalScene` 内部不递归调用）。
+ */
+const _tilePlacementInverse = new THREE.Matrix4();
+
 /* ------------------------------------------------------------------ 可动画的样式键 */
 
 /**
@@ -514,6 +520,7 @@ export class S3MViewer {
         return self._smidMeshes;
       },
       lngLatFromWorld: (x, y) => self._lngLatFromWorld(x, y),
+      toCanonicalScene: (p, mesh) => self._toCanonicalScene(p, mesh),
       gpuPathPoseAt: (smid) => self._gpuPathPoseAt(smid),
       isFeatureHidden: (smid, batchId) => self._isFeatureHidden(smid, batchId),
     });
@@ -1792,6 +1799,42 @@ export class S3MViewer {
       y: center.y,
       z: center.z,
     };
+  }
+
+  /**
+   * 世界坐标 → **规范**场景 ENU：把瓦片级放置的缩放反解掉。
+   *
+   * `perTilePlacement` 开启后，瓦片几何是「绕自身中心缩放 k 倍、再摆到精确位置」的，
+   * 所以命中点的世界坐标不再等于数据本身的 ENU。拾取要报的是**坐标本身**——
+   * 一个屋顶的经纬度不该因为我们怎么缩放它而改变，否则同一个点在 20 km 外会比
+   * 1 km 内偏出几米，量算、贴地、外部标注全都跟着漂。
+   *
+   * 反解只需要一次矩阵求逆：父级 `entry.root` 只有平移（`layoutDataset` 只写
+   * `position`），所以世界坐标 `p` 对应的瓦片局部坐标是
+   *
+   * ```
+   * v = group.matrix⁻¹ · (p − root.position)
+   * canonical = root.position + v
+   * ```
+   *
+   * 关掉本功能、或网格不在已放置的瓦片里时**原样返回同一个对象**，
+   * 默认路径一次矩阵运算都不做。
+   */
+  private _toCanonicalScene(p: THREE.Vector3, mesh?: THREE.Object3D | null): THREE.Vector3 {
+    if (!this._perTilePlacement || !mesh) return p;
+    // 网格直接挂在瓦片 group 下（`_registerTile` 就是遍历 node.group.children）；
+    // 往上找到第一个带 tileCenter 的祖先，避免依赖层级深度
+    let group: THREE.Object3D | null = mesh.parent;
+    while (group && !(group.userData as { tileCenter?: unknown }).tileCenter) group = group.parent;
+    if (!group) return p;
+    const root = group.parent;
+    if (!root) return p;
+
+    return p
+      .clone()
+      .sub(root.position)
+      .applyMatrix4(_tilePlacementInverse.copy(group.matrix).invert())
+      .add(root.position);
   }
 
   /**
