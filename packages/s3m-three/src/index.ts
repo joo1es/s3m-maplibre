@@ -110,8 +110,10 @@ export type {
   GroundOptions,
   LightOptions,
   PathFollowOptions,
+  DepthMode,
 } from './render/S3MViewer.js';
 
+export { normalizeDepthMode } from './render/S3MViewer.js';
 export { LIGHT_PRESETS, DEFAULT_LIGHT_PRESET, SUPERMAP_LIGHT_PRESET, resolveLightingPreset } from './render/lightingPreset.js';
 export type { LightingPreset, PresetLightIntensities } from './render/lightingPreset.js';
 

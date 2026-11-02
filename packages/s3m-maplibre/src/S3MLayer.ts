@@ -43,6 +43,7 @@ import type {
   LightOptions,
   LightingPreset,
   MotionBlurOptions,
+  DepthMode,
   TransitionOptions,
   Path,
   PathFollowOptions,
@@ -557,6 +558,19 @@ export class S3MLayer extends HostRenderer {
   }
 
   /** 当前运动模糊配置；null = 关闭 */
+  /**
+   * 运行时修改深度处理策略（'scene' | 'clear' | 'auto'）。
+   * 详见内核 `S3MViewer.setDepthMode`。
+   */
+  setDepthMode(mode: DepthMode): void {
+    this.viewer.setDepthMode(mode);
+  }
+
+  /** 当前深度处理策略（'scene' | 'clear' | 'auto'，默认 'scene'） */
+  get depthMode(): DepthMode {
+    return this.viewer.depthMode;
+  }
+
   get motionBlur(): MotionBlurOptions | null {
     return this.viewer.motionBlur;
   }

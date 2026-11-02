@@ -66,6 +66,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
 | DXT / WebP 纹理 | ✅ | |
 | 骨骼动画 | ❌ | 未实现：LODPackage 上的 animations JSON 直接跳过不解析，官方 JS SDK 同样只读偏移不驱动 |
+| 深度策略 | ✅ | `depthMode` 支持 `'scene'`（保留宿主深度，默认，离散建筑/管线被地形遮挡）、`'clear'`（先清深度再画，贴地倾斜摄影/开挖/大范围 DEM 化模型消除共面 z-fighting）、`'auto'`（按 ground / OSGB 倾斜摄影自动推断） |
 | 深度遮挡 | ✅ | **深度来源可替换**：本层全程不清深度缓冲（`autoClear = false`），谁写了更近的深度谁就遮挡建筑。地形只是其中一个来源（宿主 `setTerrain` + DEM，山体挡楼）；自带物理地表代理（`ground.occlude`）是另一个来源，能把地下结构真正切掉，两者可叠加 |
 | Draco 压缩几何 | ✅ 点云/网格 | v3.01 点云与三角网格（TRIANGULAR_MESH）分支已解码（内联 wasm、按需加载，点云解出分类码/强度/权重，网格逐面解出索引与法线交由 THREE.Mesh 渲染）；容器与规范描述对不上，按真实瓦片标定，见[核心格式标定说明](#核心格式逆向与标定说明) |
 | 高斯泼溅服务（`3DGaussianSplatting`） | ✅ 完整 | 已标定 gsScale / gsRotation 量化格式，支持各向异性高斯片、协方差计算、深度排序与点选拾取 |

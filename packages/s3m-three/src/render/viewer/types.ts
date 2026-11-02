@@ -77,7 +77,23 @@ export interface LightOptions {
   altitude?: number;
 }
 
+/**
+ * 本层绘制前如何处理宿主已有的深度缓冲。
+ * - `'scene'`  保留（默认）。地形能遮挡本层几何，适用于建筑、管线等离散对象。
+ * - `'clear'`  先清深度再画，本层只与自己做深度测试。适用于贴地地面类数据（倾斜摄影、大范围 DEM 化模型等），消除共面 z-fighting。
+ * - `'auto'`   按数据集类型推断：有 ground 覆盖 / OSGB 倾斜摄影 / 地面类网格 → `'clear'`，否则 `'scene'`。
+ */
+export type DepthMode = 'scene' | 'clear' | 'auto';
+
 export interface S3MViewerOptions {
+  /**
+   * 本层绘制前如何处理宿主已有的深度缓冲。
+   * - `'scene'`  保留（默认）。地形能遮挡本层几何，适用于建筑、管线等离散对象。
+   * - `'clear'`  先清深度再画，本层只与自己做深度测试。适用于贴地地面类数据。
+   * - `'auto'`   按数据集类型推断：有 ground 覆盖 / OSGB 倾斜摄影 / 地面类网格 → `'clear'`，否则 `'scene'`。
+   * 默认 `'scene'`，与改动前行为逐字一致。
+   */
+  depthMode?: DepthMode;
   /**
    * 光照预设：
    * - `'default'`（默认）：现有 PBR 打光，亮部线性总量 ≈ 2.55；

@@ -14,6 +14,7 @@ import type { Anchor } from '../core/types.js';
 import type { UnsupportedPolicy } from '../core/degradations.js';
 import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
+import type { DepthMode } from './viewer/types.js';
 
 export type DatasetAlignment = 'origin' | 'bottom' | 'top' | 'center';
 
@@ -42,6 +43,11 @@ export interface S3MDatasetOptions {
   heightOffset?: number;
   /** 是否用 Web Worker 解析经典 .s3mb 瓦片（默认开，崩溃自动降级主线程），见 S3MTilesetOptions.useWorker */
   useWorker?: boolean;
+  /**
+   * 本数据集推荐的深度模式（'scene' | 'clear' | 'auto'）。
+   * 当图层/Viewer 的 depthMode 为 'auto' 时，若任一可见数据集标注为 'clear'，则整层以 'clear' 绘制。
+   */
+  depthMode?: DepthMode;
   /** 三角面材质深度偏移（共面摩尔纹 / 重合面归属），见 BuildTileOptions.polygonOffset */
   polygonOffset?: { factor: number; units: number };
   /**

@@ -535,7 +535,7 @@ export class S3MTileset {
   /** 请求量的硬上限（软上限 maxTiles 的超额余量），见构造函数注释 */
   hardCap = 96;
   /** 本数据集是 S3M 1.x（SuperMapCache，.s3m）：子瓦地址规则与 3.x 不同 */
-  private isS3MV1 = false;
+  isS3MV1 = false;
   private _buildTile: BuildTileFn | null;
   private readonly _polygonOffset: { factor: number; units: number } | undefined;
   private _materialQuality: 'pbr' | 'lambert' | undefined;
