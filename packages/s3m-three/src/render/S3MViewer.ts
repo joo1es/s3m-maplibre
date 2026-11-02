@@ -114,6 +114,7 @@ import type {
 } from '../core/types.js';
 
 import { lngLatFromWorld, worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
+import { computeTilePlacement } from './tilePlacement.js';
 
 import {
   DatasetManager,
@@ -204,6 +205,12 @@ function clampOpacity(v: number | null | undefined): number {
 
 /** 低于这个透明度就当作完全不可见：跳过绘制，避免全透明物体写深度 */
 const OPACITY_EPS = 1e-3;
+
+/**
+ * 拾取反解瓦片级放置时的临时矩阵。命中点→规范 ENU 是一次独立查询（鼠标事件），
+ * 复用一个实例避免每次分配；不可重入（`_toCanonicalScene` 内部不递归调用）。
+ */
+const _tilePlacementInverse = new THREE.Matrix4();
 
 /* ------------------------------------------------------------------ 可动画的样式键 */
 
@@ -402,6 +409,11 @@ export class S3MViewer {
    */
   private _motionBlurCfg: MotionBlurConfig | null = null;
   private _motionBlur: MotionBlurPass | null = null;
+  /**
+   * 瓦片级放置（默认关）。关时 `_registerTile` 完全不碰瓦片矩阵，代码路径与改动前
+   * 逐字一致；开时每块瓦片用自己的中心纬度算尺度，见 `tilePlacement.ts`。
+   */
+  private readonly _perTilePlacement: boolean;
 
   /** 宿主请求重画（MapLibre 传 triggerRepaint，纯 three 宿主传自己的渲染循环） */
   private _requestRepaint(): void {
@@ -418,6 +430,7 @@ export class S3MViewer {
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
     this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
+    this._perTilePlacement = options.perTilePlacement === true;
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
     // 运动模糊：默认关闭；开了也只在 renderFrame 里按需接管「场景→屏幕」这一步
     this._motionBlurCfg = normalizeMotionBlur(options.motionBlur);
@@ -507,6 +520,7 @@ export class S3MViewer {
         return self._smidMeshes;
       },
       lngLatFromWorld: (x, y) => self._lngLatFromWorld(x, y),
+      toCanonicalScene: (p, mesh) => self._toCanonicalScene(p, mesh),
       gpuPathPoseAt: (smid) => self._gpuPathPoseAt(smid),
       isFeatureHidden: (smid, batchId) => self._isFeatureHidden(smid, batchId),
     });
@@ -828,6 +842,8 @@ export class S3MViewer {
   /** 当地图 CRS 投影切换或宿主 map 挂载后，重新计算场景锚点与各数据集 offset */
   recomputeAnchors(): void {
     this._datasetManager.recomputeAnchors(this.geo);
+    // 锚点变了 → 每块瓦片的 k 与 position 都要重算（关这项功能时是空转，一次遍历都不做）
+    if (this._perTilePlacement) this._reapplyTilePlacements();
     this._heights.refreshAll();
     this._requestRepaint();
   }
@@ -1665,6 +1681,10 @@ export class S3MViewer {
   /* ---------------------------------------------------------------- 瓦片注册 */
 
   private _registerTile(node: TileNode, entry: S3MDatasetEntry): void {
+    // 必须在 add / updateMatrixWorld 之前设置：后者会拿当前 matrix 算 matrixWorld 并缓存
+    if (this._perTilePlacement && node.sphere) {
+      this._applyTilePlacement(node.group, node.sphere.center, entry);
+    }
     entry.root.add(node.group);
     node.group.updateMatrixWorld(true);
 
@@ -1733,6 +1753,102 @@ export class S3MViewer {
       // 选中状态也要跟着继承：LOD 细化 / 瓦片重载会换掉 mesh，
       // 不重放就出现「点中的那栋楼一拉近就没高亮了」
       this._sel.replayOnto(mesh);
+    }
+  }
+
+  /**
+   * 把一块瓦片摆到「用它自己中心纬度算出的尺度」上（`perTilePlacement` 开启时才走）。
+   *
+   * 矩阵是 `T(position) · S(k) · T(-pivot)`，展开后即 `v ↦ position + k·(v - pivot)`。
+   * 直接用 `makeScale + setPosition` 一次写好，省掉两个临时矩阵：
+   * `T(t)·S(k)·T(-c)` 的元素其实就是对角 `k` 加平移 `t - k·c`。
+   *
+   * 只写 `matrix`，不碰 `rotation / position / scale` —— three 在
+   * `matrixAutoUpdate = false` 时直接使用 `matrix`，那些字段留着无害，
+   * 但别让 `updateMatrix()` 有机会覆盖回来。
+   */
+  private _applyTilePlacement(
+    group: THREE.Object3D,
+    center: { x: number; y: number; z: number },
+    entry: S3MDatasetEntry,
+  ): void {
+    const sceneAnchor = this.sceneAnchor;
+    if (!sceneAnchor || !entry.anchor) return;
+
+    const p = computeTilePlacement({
+      center,
+      datasetAnchor: entry.anchor,
+      sceneAnchor,
+      datasetOffset: entry.offset,
+      geo: this.geo,
+    });
+    if (!p) return;
+
+    const k = p.scale;
+    group.matrixAutoUpdate = false;
+    group.matrix.makeScale(k, k, k);
+    group.matrix.setPosition(
+      p.position[0] - k * p.pivot[0],
+      p.position[1] - k * p.pivot[1],
+      p.position[2] - k * p.pivot[2],
+    );
+    group.matrixWorldNeedsUpdate = true;
+    // 重锚点后要能重算：中心只属于注册那一刻，存到 group 上，不依赖 tileset 内部结构
+    (group.userData as { tileCenter?: { x: number; y: number; z: number } }).tileCenter = {
+      x: center.x,
+      y: center.y,
+      z: center.z,
+    };
+  }
+
+  /**
+   * 世界坐标 → **规范**场景 ENU：把瓦片级放置的缩放反解掉。
+   *
+   * `perTilePlacement` 开启后，瓦片几何是「绕自身中心缩放 k 倍、再摆到精确位置」的，
+   * 所以命中点的世界坐标不再等于数据本身的 ENU。拾取要报的是**坐标本身**——
+   * 一个屋顶的经纬度不该因为我们怎么缩放它而改变，否则同一个点在 20 km 外会比
+   * 1 km 内偏出几米，量算、贴地、外部标注全都跟着漂。
+   *
+   * 反解只需要一次矩阵求逆：父级 `entry.root` 只有平移（`layoutDataset` 只写
+   * `position`），所以世界坐标 `p` 对应的瓦片局部坐标是
+   *
+   * ```
+   * v = group.matrix⁻¹ · (p − root.position)
+   * canonical = root.position + v
+   * ```
+   *
+   * 关掉本功能、或网格不在已放置的瓦片里时**原样返回同一个对象**，
+   * 默认路径一次矩阵运算都不做。
+   */
+  private _toCanonicalScene(p: THREE.Vector3, mesh?: THREE.Object3D | null): THREE.Vector3 {
+    if (!this._perTilePlacement || !mesh) return p;
+    // 网格直接挂在瓦片 group 下（`_registerTile` 就是遍历 node.group.children）；
+    // 往上找到第一个带 tileCenter 的祖先，避免依赖层级深度
+    let group: THREE.Object3D | null = mesh.parent;
+    while (group && !(group.userData as { tileCenter?: unknown }).tileCenter) group = group.parent;
+    if (!group) return p;
+    const root = group.parent;
+    if (!root) return p;
+
+    return p
+      .clone()
+      .sub(root.position)
+      .applyMatrix4(_tilePlacementInverse.copy(group.matrix).invert())
+      .add(root.position);
+  }
+
+  /**
+   * 场景锚点变了（`recomputeAnchors`）之后，所有已注册瓦片的放置都要重算 ——
+   * `k` 与 `position` 都依赖场景锚点。没存 `tileCenter` 的（未开启本功能时注册的）
+   * 一律跳过，保证默认路径不产生任何副作用。
+   */
+  private _reapplyTilePlacements(): void {
+    for (const entry of this._datasetManager.values()) {
+      if (!entry.anchor) continue;
+      for (const child of entry.root.children) {
+        const c = (child.userData as { tileCenter?: { x: number; y: number; z: number } }).tileCenter;
+        if (c) this._applyTilePlacement(child, c, entry);
+      }
     }
   }
 
