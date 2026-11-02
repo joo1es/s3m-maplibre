@@ -430,7 +430,7 @@ export class S3MViewer {
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
     this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
-    this._perTilePlacement = options.perTilePlacement === true;
+    this._perTilePlacement = options.perTilePlacement !== false;
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
     // 运动模糊：默认关闭；开了也只在 renderFrame 里按需接管「场景→屏幕」这一步
     this._motionBlurCfg = normalizeMotionBlur(options.motionBlur);
@@ -1799,6 +1799,9 @@ export class S3MViewer {
       y: center.y,
       z: center.z,
     };
+    // 逆矩阵缓存：_toCanonicalScene 常态路径无需每次拾取反复求逆，失效点仅在瓦片放置或重锚点
+    const inv = ((group.userData as { placementInverse?: THREE.Matrix4 }).placementInverse ??= new THREE.Matrix4());
+    inv.copy(group.matrix).invert();
   }
 
   /**
@@ -1833,7 +1836,7 @@ export class S3MViewer {
     return p
       .clone()
       .sub(root.position)
-      .applyMatrix4(_tilePlacementInverse.copy(group.matrix).invert())
+      .applyMatrix4((group.userData as { placementInverse?: THREE.Matrix4 }).placementInverse ?? _tilePlacementInverse.copy(group.matrix).invert())
       .add(root.position);
   }
 

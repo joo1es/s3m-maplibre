@@ -135,7 +135,7 @@ export interface S3MViewerOptions {
    */
   lodPixelRatioCap?: number;
   /**
-   * 瓦片级放置（默认 `false`，行为与旧版逐字一致）。
+   * 瓦片级放置（默认 `true`）。
    *
    * 开启后每块瓦片用自己的中心纬度算 `meterInMercator`，几何绕自身中心缩放，
    * 修正「全场景共用一个切平面」在大范围下的尺度误差。

@@ -126,6 +126,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `totalMaxTiles` | `number` | — | 多数据集全局瓦片总预算，在可见数据集间动态均衡分配配额，防止多图层叠合爆显存 |
 | `light` | `LightOptions` | — | 场景光照配置（环境光、主光、方位角、高度角及 headlamp/fixed 模式） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
+| `perTilePlacement` | `boolean` | `true` | 瓦片级切平面放置与拾取反解（**默认开启**）。每块瓦片用自身中心纬度计算墨卡托比例并反解拾取，消除大跨度（距场景锚点 20 km 处约 26 m）下的累积尺度误差。可传 `false` 回退旧版行为 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 DPR 上限（不截断）。默认按绘图缓冲物理像素算，3x DPR 手机上会显著多拉瓦片；传 `2` 即按「CSS 高度 × 2」截断，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = GPU 最大值，通常 16）。移动端 4 / 8 通常肉眼无差，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |

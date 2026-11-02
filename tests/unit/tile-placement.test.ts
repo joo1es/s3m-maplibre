@@ -171,7 +171,7 @@ describe('issue #12：已知残差（球面 vs 椭球，另行跟踪）', () => 
   });
 });
 
-describe('issue #12：默认路径必须逐字不变', () => {
+describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () => {
   function makeViewer(perTilePlacement?: boolean): S3MViewer {
     const v = new S3MViewer({
       canvas: null as never,
@@ -207,13 +207,33 @@ describe('issue #12：默认路径必须逐字不变', () => {
     return { group, entry };
   }
 
-  test('不传 perTilePlacement：矩阵保持单位，matrixAutoUpdate 仍为 true', () => {
+    test('不传 perTilePlacement（默认开）：等价于 true，自动启用瓦片级放置并缓存逆矩阵', () => {
     const v = makeViewer();
+    const center = { x: 0, y: 20000, z: 0 };
+    const { group: g } = register(v, { center, radius: 100 });
+    expect(g.matrixAutoUpdate).toBe(false);
+    expect(g.matrix.equals(new THREE.Matrix4())).toBe(false);
+    expect(g.userData.tileCenter).toEqual(center);
+
+    // 逆矩阵缓存验证
+    const inv = g.userData.placementInverse as THREE.Matrix4 | undefined;
+    expect(inv).toBeDefined();
+    const product = new THREE.Matrix4().multiplyMatrices(inv!, g.matrix);
+    expect(product.elements[0]).toBeCloseTo(1, 5);
+    expect(product.elements[5]).toBeCloseTo(1, 5);
+    expect(product.elements[10]).toBeCloseTo(1, 5);
+    expect(product.elements[15]).toBeCloseTo(1, 5);
+    v.dispose();
+  });
+
+  test('显式传 perTilePlacement: false（回退旧行为）：矩阵保持单位，matrixAutoUpdate 仍为 true', () => {
+    const v = makeViewer(false);
     const { group: g } = register(v, { center: { x: 0, y: 20000, z: 0 }, radius: 100 });
     expect(g.matrixAutoUpdate).toBe(true);
     expect(g.matrix.equals(new THREE.Matrix4())).toBe(true);
     expect(g.position.y).toBe(0);
     expect(g.userData.tileCenter).toBeUndefined();
+    expect(g.userData.placementInverse).toBeUndefined();
     v.dispose();
   });
 
@@ -266,6 +286,50 @@ describe('issue #12：默认路径必须逐字不变', () => {
     expect(g.matrix.elements[0]).toBeCloseTo(1, 3);
     v.dispose();
   });
+  test('重锚点后已注册瓦片的逆矩阵缓存同步刷新', () => {
+    const v = makeViewer();
+    const center = { x: 0, y: 20000, z: 0 };
+    const { group: g } = register(v, { center, radius: 100 });
+    const inv1 = (g.userData.placementInverse as THREE.Matrix4).clone();
+
+    const SCENE2 = mercatorFromLngLat(ANCHOR.lon, 40.18, 0);
+    v.sceneAnchor = {
+      x: SCENE2.x,
+      y: SCENE2.y,
+      z: SCENE2.z,
+      meterInMercator: SCENE2.meterInMercator,
+    };
+    (v as unknown as { _reapplyTilePlacements: () => void })._reapplyTilePlacements();
+
+    const inv2 = g.userData.placementInverse as THREE.Matrix4;
+    expect(inv2.equals(inv1)).toBe(false);
+    const product = new THREE.Matrix4().multiplyMatrices(inv2, g.matrix);
+    expect(product.elements[0]).toBeCloseTo(1, 5);
+    v.dispose();
+  });
+
+  test('城市级大规模瓦片（2000 块）重锚点更新耗时 < 15ms', () => {
+    const v = makeViewer();
+    for (let i = 0; i < 2000; i++) {
+      register(v, { center: { x: (i % 50) * 100, y: 20000 + Math.floor(i / 50) * 100, z: 0 }, radius: 50 });
+    }
+    const SCENE2 = mercatorFromLngLat(ANCHOR.lon, 40.05, 0);
+    v.sceneAnchor = {
+      x: SCENE2.x,
+      y: SCENE2.y,
+      z: SCENE2.z,
+      meterInMercator: SCENE2.meterInMercator,
+    };
+
+    const t0 = performance.now();
+    (v as unknown as { _reapplyTilePlacements: () => void })._reapplyTilePlacements();
+    const elapsed = performance.now() - t0;
+
+    // 2000 块瓦片必须在 15ms 内完成（实测通常在 1~3ms），无需拆帧阻塞渲染
+    expect(elapsed).toBeLessThan(15);
+    v.dispose();
+  });
+
 });
 
 /**
@@ -311,10 +375,23 @@ describe('issue #12：拾取反解瓦片级放置', () => {
     return { v, group, mesh, toCanonical };
   }
 
-  test('关闭时原样返回同一个对象（零运算、零分配）', () => {
-    const { v, toCanonical } = setup();
+    test('显式传 false 关闭时原样返回同一个对象（零运算、零分配）', () => {
+    const { v, toCanonical } = setup(false);
     const p = new THREE.Vector3(1, 2, 3);
     expect(toCanonical(p)).toBe(p);
+    v.dispose();
+  });
+
+  test('不传 perTilePlacement（默认开）：走常态反解路径，复用 placementInverse 缓存', () => {
+    const { v, group, toCanonical } = setup();
+    expect(group.userData.placementInverse).toBeDefined();
+
+    const local = new THREE.Vector3(800, 20600, 5);
+    const world = local.clone().applyMatrix4(group.matrix).add(new THREE.Vector3(...OFFSET));
+    const canonical = toCanonical(world);
+    expect(canonical.x).toBeCloseTo(local.x + OFFSET[0], 6);
+    expect(canonical.y).toBeCloseTo(local.y + OFFSET[1], 6);
+    expect(canonical.z).toBeCloseTo(local.z + OFFSET[2], 6);
     v.dispose();
   });
 
