@@ -388,6 +388,18 @@ export interface S3MTilesetOptions {
    *   'silent' —— 只记录到 `stats.degradations`，由 UI 自己决定怎么提示。
    */
   unsupported?: UnsupportedPolicy;
+  /**
+   * LOD 细化过渡策略：
+   * - 'binary'（默认）：整节点二值切换。所有子瓦片全部就绪或失败后，父瓦片整块隐藏、子瓦片整块接替。
+   * - 'incremental'：增量细化（primary / fallback 双列表 + LEQUAL 深度推移）。
+   *   子瓦片就绪一个显示一个，未就绪区域由父级（fallback）兜底填充，消除整块跳变与慢 child 阻塞。
+   */
+  lodTransition?: 'binary' | 'incremental';
+  /**
+   * 增量细化模式下 fallback 兜底瓦片的材质深度偏移系数。
+   * 默认 { factor: 1, units: 2 }，通过向远处推移深度配合 gl.LEQUAL 消除共面 z-fighting。
+   */
+  fallbackOffset?: { factor?: number; units?: number };
 }
 
 /** 估算单个纹理占用的显存字节数 */
@@ -505,6 +517,10 @@ export class S3MTileset {
    */
   maxMemory: number;
   lodRangeScale: number;
+  lodTransition: 'binary' | 'incremental';
+  fallbackOffset: { factor: number; units: number };
+  readonly primaryNodes = new Set<string>();
+  readonly fallbackNodes = new Set<string>();
 
   /** 数据集配置声明的高度范围（米），若配置未声明则返回 null */
   get heightRange(): { min: number; max: number } | null {
@@ -550,6 +566,11 @@ export class S3MTileset {
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
     this.lodRangeScale = options.lodRangeScale ?? 3.0;
+    this.lodTransition = options.lodTransition ?? 'binary';
+    this.fallbackOffset = {
+      factor: options.fallbackOffset?.factor ?? 1,
+      units: options.fallbackOffset?.units ?? 2,
+    };
     this._onTile = options.onTile ?? (() => {});
     this._onTileRemoved = options.onTileRemoved ?? (() => {});
     this._onError = options.onError ?? ((e) => console.warn(e));
@@ -903,6 +924,9 @@ export class S3MTileset {
       if (refined !== allowRefined) continue;
       // 正在显示且没有可见子瓦接手 → 踢了就是洞
       if (!allowUncovered && node.group.visible) {
+        if (this.lodTransition === 'incremental') {
+          continue;
+        }
         const covered = childUrls.some((u) => {
           const c = this.nodes.get(u);
           return !!c && c.group.visible;
@@ -1570,10 +1594,21 @@ export class S3MTileset {
       if (!p || !this.nodes.has(p)) roots.add(url);
     }
 
-    for (const rootUrl of roots) {
-      if (this._updateNodeVisibility(rootUrl, true, visited)) {
+    if (this.lodTransition === 'incremental') {
+      if (this._updateVisibilityIncremental(roots, visited)) {
         hasChanges = true;
       }
+    } else {
+      for (const rootUrl of roots) {
+        if (this._updateNodeVisibility(rootUrl, true, visited)) {
+          hasChanges = true;
+        }
+      }
+      this.primaryNodes.clear();
+      for (const [url, node] of this.nodes) {
+        if (node.group.visible) this.primaryNodes.add(url);
+      }
+      this.fallbackNodes.clear();
     }
 
     // 防御：若有任何未被 root 树访问到的游离瓦片，全部隐藏
@@ -1582,6 +1617,9 @@ export class S3MTileset {
         if (node.group.visible) {
           node.group.visible = false;
           hasChanges = true;
+        }
+        if (this.lodTransition === 'incremental') {
+          this._restoreNodePolygonOffset(node);
         }
       }
     }
@@ -1674,6 +1712,169 @@ export class S3MTileset {
     return changed;
   }
 
+
+  getLodTransition(): 'binary' | 'incremental' {
+    return this.lodTransition;
+  }
+
+  setLodTransition(mode: 'binary' | 'incremental'): void {
+    if (this.lodTransition === mode) return;
+    this.lodTransition = mode;
+    if (mode === 'binary') {
+      for (const node of this.nodes.values()) {
+        this._restoreNodePolygonOffset(node);
+      }
+      this.fallbackNodes.clear();
+    }
+  }
+
+  private _applyNodeFallbackPolygonOffset(node: TileNode, depth: number): boolean {
+    const factor = this.fallbackOffset.factor;
+    const units = Math.max(2, (10 - Math.min(depth, 8)) * this.fallbackOffset.units);
+    let changed = false;
+
+    node.group.traverse((obj) => {
+      const target = obj as { isMesh?: boolean; isPoints?: boolean; isLine?: boolean; material?: any };
+      if ((target.isMesh || target.isPoints || target.isLine) && target.material) {
+        const materials = Array.isArray(target.material) ? target.material : [target.material];
+        for (const mat of materials) {
+          if (!mat) continue;
+          if (!mat.userData) mat.userData = {};
+          if (!mat.userData._basePolygonOffset) {
+            mat.userData._basePolygonOffset = {
+              polygonOffset: mat.polygonOffset === true,
+              factor: mat.polygonOffsetFactor ?? 0,
+              units: mat.polygonOffsetUnits ?? 0,
+            };
+          }
+          const base = mat.userData._basePolygonOffset;
+          const targetFactor = base.factor + factor;
+          const targetUnits = base.units + units;
+          if (
+            mat.polygonOffset !== true ||
+            mat.polygonOffsetFactor !== targetFactor ||
+            mat.polygonOffsetUnits !== targetUnits
+          ) {
+            mat.polygonOffset = true;
+            mat.polygonOffsetFactor = targetFactor;
+            mat.polygonOffsetUnits = targetUnits;
+            changed = true;
+          }
+        }
+      }
+    });
+    return changed;
+  }
+
+  private _restoreNodePolygonOffset(node: TileNode): boolean {
+    let changed = false;
+    node.group.traverse((obj) => {
+      const target = obj as { isMesh?: boolean; isPoints?: boolean; isLine?: boolean; material?: any };
+      if ((target.isMesh || target.isPoints || target.isLine) && target.material) {
+        const materials = Array.isArray(target.material) ? target.material : [target.material];
+        for (const mat of materials) {
+          if (mat?.userData?._basePolygonOffset) {
+            const base = mat.userData._basePolygonOffset;
+            if (
+              mat.polygonOffset !== base.polygonOffset ||
+              mat.polygonOffsetFactor !== base.factor ||
+              mat.polygonOffsetUnits !== base.units
+            ) {
+              mat.polygonOffset = base.polygonOffset;
+              mat.polygonOffsetFactor = base.factor;
+              mat.polygonOffsetUnits = base.units;
+              changed = true;
+            }
+          }
+        }
+      }
+    });
+    return changed;
+  }
+
+  private _updateVisibilityIncremental(roots: Iterable<string>, visited: Set<string>): boolean {
+    const nextPrimary = new Set<string>();
+    const nextFallback = new Set<string>();
+    const nodeDepths = new Map<string, number>();
+
+    const traverse = (url: string, depth: number) => {
+      if (visited.has(url)) return;
+      visited.add(url);
+      nodeDepths.set(url, depth);
+
+      const node = this.nodes.get(url);
+      if (!node) return;
+
+      const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+      const hasChildren = childUrls.length > 0;
+      const readyChildren = childUrls.filter((cUrl) => this.nodes.has(cUrl));
+      const missingChildren = childUrls.filter(
+        (cUrl) => !this.nodes.has(cUrl) && !this.failed.has(cUrl)
+      );
+
+      const canRefine = !!node.needRefine && hasChildren && readyChildren.length > 0;
+
+      if (canRefine) {
+        if (missingChildren.length > 0) {
+          nextFallback.add(url);
+        }
+        for (const cUrl of readyChildren) {
+          traverse(cUrl, depth + 1);
+        }
+      } else {
+        nextPrimary.add(url);
+      }
+    };
+
+    for (const rootUrl of roots) {
+      traverse(rootUrl, 0);
+    }
+
+    let changed = false;
+
+    for (const [url, node] of this.nodes) {
+      if (!visited.has(url)) continue;
+
+      if (nextPrimary.has(url)) {
+        if (!node.group.visible) {
+          node.group.visible = true;
+          changed = true;
+        }
+        const depth = nodeDepths.get(url) ?? 0;
+        const targetOrder = 100 + depth;
+        if (node.group.renderOrder !== targetOrder) {
+          node.group.renderOrder = targetOrder;
+          changed = true;
+        }
+        if (this._restoreNodePolygonOffset(node)) changed = true;
+      } else if (nextFallback.has(url)) {
+        if (!node.group.visible) {
+          node.group.visible = true;
+          changed = true;
+        }
+        const depth = nodeDepths.get(url) ?? 0;
+        const targetOrder = depth;
+        if (node.group.renderOrder !== targetOrder) {
+          node.group.renderOrder = targetOrder;
+          changed = true;
+        }
+        if (this._applyNodeFallbackPolygonOffset(node, depth)) changed = true;
+      } else {
+        if (node.group.visible) {
+          node.group.visible = false;
+          changed = true;
+        }
+        if (this._restoreNodePolygonOffset(node)) changed = true;
+      }
+    }
+
+    this.primaryNodes.clear();
+    for (const u of nextPrimary) this.primaryNodes.add(u);
+    this.fallbackNodes.clear();
+    for (const u of nextFallback) this.fallbackNodes.add(u);
+
+    return changed;
+  }
   dispose(): void {
     this._workerClient?.dispose();
     for (const node of this.nodes.values()) {

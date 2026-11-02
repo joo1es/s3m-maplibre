@@ -274,6 +274,13 @@ export interface S3MViewerOptions {
    * 编译着色器、卡一帧。预热在首帧之后异步做，期间跳一两帧渲染，肉眼不可见。
    */
   prewarmShading?: boolean;
+  /**
+   * LOD 细化过渡策略：
+   * - 'binary'（默认）：整节点二值切换
+   * - 'incremental'：增量细化（primary / fallback 双列表 + LEQUAL 深度推移）
+   */
+  lodTransition?: 'binary' | 'incremental';
+  fallbackOffset?: { factor?: number; units?: number };
 }
 
 /* ------------------------------------------------------------------ 内部类型 */

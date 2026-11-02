@@ -519,6 +519,16 @@ export class S3MLayer extends HostRenderer {
     this.viewer.setMaterialQuality(q);
   }
 
+  /** 当前 LOD 细化过渡策略（'binary' | 'incremental'） */
+  get lodTransition(): 'binary' | 'incremental' {
+    return this.viewer.lodTransition;
+  }
+
+  /** 运行时切换本图层的 LOD 细化过渡策略（'binary' | 'incremental'） */
+  setLodTransition(mode: 'binary' | 'incremental'): void {
+    this.viewer.setLodTransition(mode);
+  }
+
   /** 当前材质质感档位（本层没指定过就是模块级默认） */
   get materialQuality(): 'pbr' | 'lambert' {
     return this.viewer.materialQuality;
