@@ -32,6 +32,7 @@ import type {
 } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { TileGeometryData } from '../core/TileGeometry.js';
+import { AUTO_BAKE_RADIUS_THRESHOLD } from '../core/BakeMercator.js';
 import type { TextureCreateOptions } from '../render/TextureFactory.js';
 import type { Group, Texture } from 'three';
 
@@ -304,10 +305,14 @@ export type BuildTileFn = (
     colorPipeline?: 'linear' | 'direct';
     /** 纹理创建参数（透传给 buildTileObjects → createTexture） */
     textureOptions?: TextureCreateOptions;
+  bakeMercator?: boolean;
+    tileAnchor?: { lon: number; lat: number; height?: number };
+    tileCenter?: { x: number; y: number; z?: number };
   }
 ) => Promise<{ group: Group; stats: Partial<Stats> }>;
 
 export interface S3MTilesetOptions {
+  bakeMercator?: boolean;
   configUrl: string;
   maxTiles?: number;
   maxConcurrent?: number;
@@ -553,6 +558,14 @@ export class S3MTileset {
   /** 本数据集是 S3M 1.x（SuperMapCache，.s3m）：子瓦地址规则与 3.x 不同 */
   isS3MV1 = false;
   private _buildTile: BuildTileFn | null;
+  private _bakeMercator?: boolean;
+  rootRadius?: number;
+
+  shouldBakeMercator(radius?: number): boolean {
+    if (this._bakeMercator !== undefined) return this._bakeMercator;
+    const r = radius ?? this.rootRadius ?? 0;
+    return r > AUTO_BAKE_RADIUS_THRESHOLD;
+  }
   private readonly _polygonOffset: { factor: number; units: number } | undefined;
   private _materialQuality: 'pbr' | 'lambert' | undefined;
   private _colorPipeline: 'linear' | 'direct' | undefined;
@@ -581,6 +594,7 @@ export class S3MTileset {
 
     // 渲染层可注入：Node 环境下不需要 three，也能跑 URL / 解析链路
     this._buildTile = options.buildTile ?? null;
+    this._bakeMercator = options.bakeMercator;
     this._polygonOffset = options.polygonOffset;
     this._materialQuality = options.materialQuality;
     this._colorPipeline = options.colorPipeline;
@@ -1374,6 +1388,11 @@ export class S3MTileset {
       // 解析成功但能力不完整的（目前只有 3DGS），在花力气建几何之前先决定处置
       this._noteDegradations(tile);
 
+            const lodForBake = this._pickLod(tile);
+      if (this.rootRadius === undefined && lodForBake?.boundingSphere?.radius) {
+        this.rootRadius = lodForBake.boundingSphere.radius;
+      }
+      const shouldBake = this.shouldBakeMercator(lodForBake?.boundingSphere?.radius);
       const build = await this._builder();
       const buildRes = await build(tile, {
         textureCache: this.textureCache,
@@ -1383,6 +1402,9 @@ export class S3MTileset {
         materialQuality: this._materialQuality,
         colorPipeline: this._colorPipeline,
         textureOptions: this._textureOptions,
+        bakeMercator: shouldBake,
+        tileAnchor: this.anchor,
+        tileCenter: lodForBake?.boundingSphere?.center,
       });
       const { group, stats } = buildRes;
       const texKeys = (buildRes as any).textureKeys ?? (group.userData?.textureKeys as string[] | undefined) ?? Object.keys(tile.textures ?? {});

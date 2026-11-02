@@ -446,6 +446,11 @@ export function createSharedUniforms(): StyleUniforms {
   };
 }
 const VERT_PARS = /* glsl */ `
+  #ifdef S3M_BAKED_MERCATOR
+    attribute vec3 aMercatorOffset;
+    uniform vec3 uTilePivot;
+    uniform vec3 uInvTileScale;
+  #endif
   attribute float aBatchId;
   // vec4：alpha 是「材质不透明、顶点半透明」这类数据的唯一透明度来源（官方 baseColorWithAlpha = vColor）
   attribute vec4 aColor;
@@ -624,6 +629,13 @@ const VERT_SETUP = /* glsl */ `
 `;
 
 const VERT_ELEVATION = /* glsl */ `
+  #ifdef S3M_BAKED_MERCATOR
+    transformed = uTilePivot + vec3(
+      aMercatorOffset.x * uInvTileScale.x,
+      -aMercatorOffset.y * uInvTileScale.y,
+      aMercatorOffset.z * uInvTileScale.z
+    );
+  #endif
   float s3mBatchElev = s3mBatchRaw();
   if ( uBatchTexActive > 0 && s3mBatchElev >= 0.0 ) {
     float s3mU = ( s3mBatchElev + 0.5 ) / uBatchTexWidth;
@@ -1142,6 +1154,11 @@ export interface StyledMaterialOptions {
    * 与 `materialQuality` 同一套：图层把自己的 profile 透传进来，同页互不污染。
    */
   colorPipeline?: ColorPipeline;
+  bakeMercator?: boolean;
+  /** 瓦片变换中心在 object space 的位置，供烘焙着色器恢复绝对位置 */
+  tilePivot?: THREE.Vector3;
+  /** 逐瓦片逆尺度 (1 / sTileEast, 1 / sTileNorth, 1 / sTileUp)，供烘焙着色器抵消各向异性缩放 */
+  invTileScale?: THREE.Vector3;
 }
 
 /**
@@ -1246,12 +1263,19 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   // supermap 完整版：官方 sRGB 直乘管线（配合 setSrgbTextureDecode(false)）
   const direct = (opts.colorPipeline ?? colorPipeline) === 'direct';
   if (direct) mat.defines = { ...mat.defines, S3M_DIRECT_COLOR: '' };
+  const bakeMercator = !!opts.bakeMercator;
+  if (bakeMercator) mat.defines = { ...(mat.defines as Record<string, string>), S3M_BAKED_MERCATOR: '' };
   // 官方 uTextureDim = (base宽, base高, bake宽, bake高)，取实际绑定纹理的像素尺寸
   const uAtlasDim = { value: new THREE.Vector2(opts.map?.image?.width || 1, opts.map?.image?.height || 1) };
   const uAtlasDim1 = { value: new THREE.Vector2(secMap?.image?.width || 1, secMap?.image?.height || 1) };
 
+  const uTilePivot = { value: opts.tilePivot ? opts.tilePivot.clone() : new THREE.Vector3(0, 0, 0) };
+  const uInvTileScale = { value: opts.invTileScale ? opts.invTileScale.clone() : new THREE.Vector3(1, 1, 1) };
+
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms, {
+      uTilePivot,
+      uInvTileScale,
       uSelBatch,
       uSelWhole,
       uFlatShading,
@@ -1349,6 +1373,8 @@ export function createStyledMaterial(opts: StyledMaterialOptions): StyledMateria
   mat.userData.uTileFade = uTileFade;
   // 平面 / 平滑着色开关：S3MViewer._applyShading 翻它，不触发重编译
   mat.userData.uFlatShading = uFlatShading;
+  mat.userData.uTilePivot = uTilePivot;
+  mat.userData.uInvTileScale = uInvTileScale;
   // 记录创建参数：materialQuality 运行时切换时按原参数重建材质（换类不换外观）
   mat.userData.s3mOpts = opts;
   // 记录实际生效的档位：重建 / 排查时不用再猜当时读的是哪一层设置

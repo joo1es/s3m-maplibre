@@ -126,6 +126,8 @@ new S3MLayer(options?: S3MLayerOptions)
 | `totalMaxTiles` | `number` | — | 多数据集全局瓦片总预算，在可见数据集间动态均衡分配配额，防止多图层叠合爆显存 |
 | `light` | `LightOptions` | — | 场景光照配置（环境光、主光、方位角、高度角及 headlamp/fixed 模式） |
 | `maxConcurrent` | `number` | `4` | 每个数据集并发请求数 |
+| `perTilePlacement` | `boolean` | `true` | 瓦片级切平面放置与拾取反解（**默认开启**）。每块瓦片用自身中心纬度计算墨卡托比例并反解拾取，消除大跨度（距场景锚点 20 km 处约 26 m）下的累积尺度误差。可传 `false` 回退旧版行为 |
+| `bakeMercator` | `boolean` | `undefined`（自动） | 全球大尺度下逐顶点烘焙精确 Web 墨卡托偏移（Issue #15）。消除大范围单瓦片内因墨卡托纬度非线性缩放导致的视差游动与呼吸效应。默认 `undefined`：根半径 > 25 km 时自动启用，<= 25 km 保持关闭（顶点缓冲逐字节与旧版相同）。传 `true` / `false` 强制开关 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `lodTransition` | `'binary' \| 'incremental'` | `'binary'` | LOD 细化过渡策略。`'binary'`（默认）：整节点二值切换；`'incremental'`：增量细化（primary / fallback 双列表 + LEQUAL 深度推移），子瓦片就绪一个显示一个，未就绪区域由最近父瓦片（fallback）垫底填充，消除整块跳变与慢 child 阻塞 |
 | `fallbackOffset` | `{ factor?: number; units?: number }` | `{ factor: 1, units: 2 }` | 增量细化模式下 fallback 兜底瓦片的材质深度偏移系数，向远处推移深度配合 gl.LEQUAL 消除共面 z-fighting |
@@ -680,7 +682,7 @@ e[14] = -2 · far · near' / (far - near')
 - **物理地表（地下透视 / 基坑）**与 terrain 是两个维度但不是两套机制：前者表达模型自身的地上 / 地下结构覆盖关系，后者表达真实地面的起伏遮挡；两者只是都往同一个深度缓冲写深度。平面代理表达不了山体起伏，而地形已写入更近深度的像素上平面也写不进去，所以地铁站 / 基坑这类没有真实 DEM 的数据靠前者，有 DEM 的山地靠后者。
 - **正交投影**需要 MapLibre ≥ 5；v4 / v5 以下（含 Mapbox v2）只给合并矩阵，会告警一次并保持透视，见[投影](#投影)。
 - **贴近模型时整片消失**大概率是 MapLibre 的近裁剪面（默认离相机约 13 米）裁的，不是瓦片调度问题：用 `nearPlaneScale` 调，见[近裁剪面](#近裁剪面贴脸看时不消失)。另一条路是瓦片预算——相机贴近会让 LOD 深度暴涨、超过 `hardCap` 后可能强制淘汰正在显示的瓦片（开洞），表现为「局部空洞、过几秒补上」，与近裁剪的「整片空白、退回来立刻恢复」可区分。
-- **`layer.viewer.geo` 在 MapLibre 上经常是 `null`，这是正常的**：`createMapLibreGeoAdapter()` 只有从宿主拿到 `WorldCoordinateHelper`（`transform.worldCoordinateHelper` 等 4 个候选位置）时才生效，拿不到就返回 `null`，渲染层自动回退标准 Web 墨卡托——正是 MapLibre 的默认 CRS，数值完全一致。当前 MapLibre 5.24 的 dist 里并没有这个成员，所以在 MapLibre 上这条 adapter 分支实际是空跑的。**自己换算经纬度时不要用 `if (viewer.geo)` 当门槛**，直接用 `worldFromLngLat(viewer.geo, lng, lat)`（`s3m-three` 导出，内部自带兜底），否则会把本来能用的墨卡托路径挡掉。
+- **`layer.viewer.geo` 在 MapLibre 上经常是 `null`，这是正常的**：`createMapLibreGeoAdapter()` 只有从宿主拿到 `WorldCoordinateHelper`（`transform.worldCoordinateHelper` 等 4 个候选位置）时才生效，拿不到就返回 `null`，渲染层自动回退标准 Web 墨卡托（基于 WGS84 椭球高精度模型与各向异性尺度反推）。当宿主提供 `worldFromLngLat` 时，适配器会通过东向与北向各 1 米的大地线差分，精确获取各向异性米制尺度 `(meterInMercatorEast, meterInMercatorNorth, meterInMercatorUp)`。**自己换算经纬度时不要用 `if (viewer.geo)` 当门槛**，直接用 `worldFromLngLat(viewer.geo, lng, lat)`（`s3m-three` 导出，内部自带兜底），否则会把本来能用的墨卡托路径挡掉。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
 
 解析 / 几何 / 纹理 / 单体化相关的已知限制（实例化单体样式与拾取、切线流、骨骼动画等）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。

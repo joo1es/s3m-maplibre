@@ -170,6 +170,8 @@ new S3MViewer(options?: S3MViewerOptions)
 | （随 `useWorker`）纹理解码 | `boolean` | `true` | DXT / CRN / WEBP 纹理解码与 `.s3mb` 解析共用同一个 Worker（`core/TextureDecode.ts` 三方共用同一份实现，WEBP 走可 transfer 的 ImageBitmap）；失败自动回主线程，产物逐字节一致 |
 | （随 `useWorker`）几何组装 | `boolean` | `true` | 顶点解交错 / 法线计算 / 同材质合批合并（`core/TileGeometry.ts`）随解析在 Worker 完成，主线程只做 three 对象包装；Worker 不可用时主线程跑同一份实现，产物一致 |
 | （随 `useWorker`）DXT 压缩直传 | 自动 | 自动 | 宿主 GL 同时支持 `WEBGL_compressed_texture_s3tc`(+srgb) 时，dxt1/dxt5（含 CRN 转码产物）不解码直接 `CompressedTexture` 上传，显存与上传带宽降为 1/4~1/8；块长与 4×4 对齐公式不符、flipY 图集、移动端无扩展时自动回退 RGBA 解码 |
+| `perTilePlacement` | `boolean` | `true` | 瓦片级切平面放置与拾取反解（**默认开启**）。每块瓦片用自身中心纬度计算墨卡托比例与反解拾取，消除「全场景共用一个常量切平面」在大范围（距场景锚点 20 km 处 0.26% 误差，约 26 m；200 km 处 2.8 km）下的累积尺度误差与拾取偏移。逆矩阵自动缓存在瓦片 group 上避免拾取性能损耗。可显式传 `false` 回退旧版单一全场景切平面（下游若缓存了旧坐标或与旧数据对齐时使用） |
+| `bakeMercator` | `boolean` | `undefined`（自动） | 全球大尺度下逐顶点烘焙精确 Web 墨卡托偏移（Issue #15）。消除大范围单瓦片内因墨卡托纬度非线性缩放导致的视差游动与呼吸效应。默认 `undefined`：当瓦片集根节点包围球半径 > 25 km 时自动启用；<= 25 km 时保持关闭（顶点 buffer 逐字节与旧版相同）。传 `true` / `false` 强制开关 |
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `lodTransition` | `'binary' \| 'incremental'` | `'binary'` | LOD 细化过渡策略。`'binary'`（默认）：整节点二值切换，所有子瓦片全部就绪或失败后整块替换；`'incremental'`：增量细化（primary / fallback 双列表 + LEQUAL 深度推移），子瓦片就绪一个显示一个，未就绪区域由最近父瓦片（fallback）垫底填充，消除整块跳变与慢 child 阻塞，极端角度接缝无缝衔接且不出洞 |
 | `fallbackOffset` | `{ factor?: number; units?: number }` | `{ factor: 1, units: 2 }` | 增量细化模式下 fallback 兜底瓦片的材质深度偏移系数，向远处推移深度配合 gl.LEQUAL 消除共面 z-fighting |
@@ -210,6 +212,15 @@ prewarmShading(): Promise<void>        // 手动预热另一种 shading 变体�
 `mvp` 由宿主负责给出：地图宿主（如 s3m-maplibre）从 `render()` 入参提取；纯 three 宿主用自己的投影 × 视图矩阵。viewer 会在其后再乘 ENU → Mercator 矩阵，所以**传进来的 mvp 作用在 Mercator 归一化坐标上**，不是场景米制坐标。
 
 `geo` 是可写的 `GeoAdapter | null`：`null` 用内置的墨卡托兜底（`worldFromLngLat` / `lngLatFromWorld`），地图宿主注入适配器以支持任意 CRS / 自定义投影。
+
+内置兜底使用高精度 **WGS84 椭球模型**（$a=6378137, f=1/298.257223563$）：
+- `worldFromLngLat` 返回带有各向异性尺度的对象：`{ x, y, z, meterInMercatorEast, meterInMercatorNorth, meterInMercatorUp, meterInMercator, altitude }`
+  - 东西向尺度对应卯酉圈半径 $N(\varphi) = a / \sqrt{1 - e^2 \sin^2\varphi}$：$1 / (2\pi N \cos\varphi)$
+  - 南北向尺度对应子午圈半径 $M(\varphi) = a(1 - e^2) / (1 - e^2 \sin^2\varphi)^{3/2}$：$1 / (2\pi M \cos\varphi)$
+  - 竖直向高程尺度 `meterInMercatorUp` 取东向尺度（局部正圆保角）
+  - `meterInMercator` 保留作为向前兼容属性，取值从旧版球面近似 $1/(2\pi R\cos\varphi)$ 升级为真实的 WGS84 椭球东向尺度（属于精度修正，默认生效且更精准）
+  - 彻底消除传统单标量模型在南北/东西方向上 0.4%~0.67% 的各向异性拉伸与米级系统残差。
+- 包导出了高精度大地测量工具：`primeVerticalRadius`, `meridianRadius`, `enuToLngLat`, `lngLatToEnu` 及 `WGS84_A`, `WGS84_E2` 常量。
 
 ### 数据集管理
 

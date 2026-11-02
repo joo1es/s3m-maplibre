@@ -10,7 +10,7 @@
  * 纯 three 宿主不需要这个文件 —— 直接用 GeoAdapter 的墨卡托兜底，
  * 或自己实现一个 GeoAdapter 即可。
  */
-import type { GeoAdapter } from 's3m-three';
+import { primeVerticalRadius, meridianRadius, type GeoAdapter } from 's3m-three';
 
 /** MapLibre 默认垂直视场角（弧度） */
 export const DEFAULT_FOV = 0.6435011087932844;
@@ -92,23 +92,64 @@ export function createMapLibreGeoAdapter(map: MapLike | null): GeoAdapter | null
   return {
     worldFromLngLat(lng: number, lat: number, altitude = 0) {
       const coord = helper.worldFromLngLat(lng, lat, altitude);
-      let s = 0;
+      const latRad = (lat * Math.PI) / 180;
+      const N = primeVerticalRadius(latRad);
+      const M = meridianRadius(latRad);
+      const cosLat = Math.max(Math.abs(Math.cos(latRad)), 1e-12);
+
+      // 差分步长：东向与北向各 1 米对应的经纬度增量（度）
+      const dLon1m = (1 / (N * cosLat)) * (180 / Math.PI);
+      const dLat1m = (1 / M) * (180 / Math.PI);
+
+      let sEast = 0;
+      let sNorth = 0;
+
+      // 1. 优先尝试从宿主 metersPerWorldUnit 提取基准尺度
       if (typeof helper.metersPerWorldUnit === 'function') {
         const mpw = helper.metersPerWorldUnit(coord.x, coord.y);
-        if (Number.isFinite(mpw) && mpw > 0) s = 1 / mpw;
+        if (Number.isFinite(mpw) && mpw > 0) {
+          sEast = 1 / mpw;
+          const isPlanar = helper.name?.includes('planar');
+          sNorth = isPlanar ? sEast : sEast * (N / M);
+        }
       }
-      if (s === 0) {
-        // 用 +1 米的差分反推尺度；z 不动（某些 CRS 的 z 不是米）就退回墨卡托近似
+
+      // 2. 若未提供 metersPerWorldUnit，通过宿主 worldFromLngLat 差分 1 米反推真实世界单位尺度
+      if (sEast === 0 || sNorth === 0) {
+        try {
+          const cEast = helper.worldFromLngLat(lng + dLon1m, lat, altitude);
+          const de = Math.hypot(cEast.x - coord.x, cEast.y - coord.y);
+          if (Number.isFinite(de) && de > 0 && sEast === 0) sEast = de;
+
+          const cNorth = helper.worldFromLngLat(lng, lat + dLat1m, altitude);
+          const dn = Math.hypot(cNorth.x - coord.x, cNorth.y - coord.y);
+          if (Number.isFinite(dn) && dn > 0 && sNorth === 0) sNorth = dn;
+        } catch {
+          // 差分失败时继续下移
+        }
+      }
+
+      // 3. 兜底退回理论 WGS84 墨卡托尺度
+      if (sEast === 0) sEast = 1 / (2 * Math.PI * N * cosLat);
+      if (sNorth === 0) sNorth = 1 / (2 * Math.PI * M * cosLat);
+
+      let sUp = sEast;
+      try {
         const c1 = helper.worldFromLngLat(lng, lat, altitude + 1);
         const dz = Math.abs((c1.z ?? 0) - (coord.z ?? 0));
-        const sinLat = Math.sin((lat * Math.PI) / 180);
-        s = dz > 0 ? dz : 1 / (2 * Math.PI * 6378137) / Math.cos((lat * Math.PI) / 180);
+        if (dz > 0) sUp = dz;
+      } catch {
+        // 保持 sUp = sEast
       }
+
       return {
         x: coord.x,
         y: coord.y,
-        z: coord.z ?? altitude * s,
-        meterInMercator: s,
+        z: coord.z ?? altitude * sUp,
+        meterInMercatorEast: sEast,
+        meterInMercatorNorth: sNorth,
+        meterInMercatorUp: sUp,
+        meterInMercator: sEast,
         altitude,
       };
     },

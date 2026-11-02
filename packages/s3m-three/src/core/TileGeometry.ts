@@ -21,6 +21,7 @@ import type {
   VertexAttribute,
 } from './types.js';
 import { applyCustomAttributeSemantics } from './CustomAttributes.js';
+import { bakeMercatorOffsets, type TileAnchorLike, type TileCenterLike } from './BakeMercator.js';
 
 /**
  * S3M 规范里 `DrawPrimitiveType` 的两个特殊值（原住 GeometryBuilder，随组装层
@@ -249,6 +250,8 @@ export interface PrimitiveAttributes {
    * 只有存在该流时才产生；解码语义见 core/TexCoordZ.ts。
    */
   aTexCoordZ?: PlainAttribute;
+  /** 逐顶点精确 Web 墨卡托偏移（Issue #15） */
+  aMercatorOffset?: PlainAttribute;
 }
 
 export interface PrimitiveData {
@@ -298,6 +301,10 @@ export interface AssembleOptions {
    * `useWorker: false` 或 Worker 崩溃降级时它落在主线程上。
    */
   dedupeCoincident?: boolean;
+  /** 是否烘焙精确 Web 墨卡托偏移（Issue #15） */
+  bakeMercator?: boolean;
+  tileAnchor?: TileAnchorLike;
+  tileCenter?: TileCenterLike;
   vertexAttributeDescript?: unknown;
 }
 
@@ -902,6 +909,25 @@ export function assembleTileGeometry(tile: ParsedTile, options: AssembleOptions 
         p.indexCount = index.length;
         stats.deduped = (stats.deduped ?? 0) + dropped;
       }
+    }
+  }
+
+  // 逐顶点烘焙精确 Web 墨卡托（Issue #15）
+  if (options.bakeMercator && options.tileAnchor) {
+    for (const p of primitives) {
+      const positions = p.attributes.position?.array;
+      if (!positions || p.vertexCount === 0) continue;
+      const center = options.tileCenter ?? {
+        x: p.bounds.sphereCenter[0],
+        y: p.bounds.sphereCenter[1],
+        z: p.bounds.sphereCenter[2],
+      };
+      const offsets = bakeMercatorOffsets(positions, p.vertexCount, options.tileAnchor, center);
+      p.attributes.aMercatorOffset = {
+        array: offsets,
+        components: 3,
+        normalized: false,
+      };
     }
   }
 

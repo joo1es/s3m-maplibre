@@ -55,6 +55,7 @@ export interface S3MDatasetOptions {
    * 只影响该数据集**之后创建**的材质。
    */
   materialQuality?: 'pbr' | 'lambert';
+  bakeMercator?: boolean;
   /**
    * 是否对该数据集生成几何棱线（CPU 端 EdgesGeometry）。
    * - 不填：跟随全局 `style.edges`
@@ -110,7 +111,16 @@ export interface DatasetManagerCallbacks {
 
 export class DatasetManager {
   readonly datasets = new Map<string, S3MDatasetEntry>();
-  sceneAnchor: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null = null;
+  sceneAnchor: {
+    x: number;
+    y: number;
+    z: number;
+    meterInMercatorEast?: number;
+    meterInMercatorNorth?: number;
+    meterInMercatorUp?: number;
+    meterInMercator: number;
+    altitude?: number;
+  } | null = null;
   totalMaxTiles: number = 0;
   /**
    * 图层级默认光照模型档位（`undefined` = 跟随模块级默认）。
@@ -126,6 +136,7 @@ export class DatasetManager {
       entry.tileset?.setLodTransition(mode);
     }
   }
+  defaultBakeMercator: boolean | undefined = undefined;
 
   /**
    * 图层档位变更：同步给已存在的数据集（它们之后加载的瓦片才用新档位；
@@ -296,6 +307,7 @@ export class DatasetManager {
       colorPipeline: this.defaultColorPipeline,
       textureOptions: this.defaultTextureOptions,
       useWorker: ds.useWorker,
+      bakeMercator: ds.bakeMercator ?? this.defaultBakeMercator,
       authenticate: ds.authenticate ?? authenticate,
       unsupported: ds.unsupported,
       uniforms: uniforms,
@@ -383,12 +395,14 @@ export class DatasetManager {
     if (!this.sceneAnchor) {
       this.sceneAnchor = worldFromLngLat(geo, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     }
-    const s = this.sceneAnchor.meterInMercator;
+    const sEast = this.sceneAnchor.meterInMercatorEast ?? this.sceneAnchor.meterInMercator;
+    const sNorth = this.sceneAnchor.meterInMercatorNorth ?? this.sceneAnchor.meterInMercator;
+    const sUp = sEast;
     const a = worldFromLngLat(geo, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     entry.offset = [
-      (a.x - this.sceneAnchor.x) / s,
-      -(a.y - this.sceneAnchor.y) / s,
-      (a.z - this.sceneAnchor.z) / s + (entry.heightOffset ?? 0),
+      (a.x - this.sceneAnchor.x) / sEast,
+      -(a.y - this.sceneAnchor.y) / sNorth,
+      (a.z - this.sceneAnchor.z) / sUp + (entry.heightOffset ?? 0),
     ];
     entry.root.position.set(entry.offset[0], entry.offset[1], entry.offset[2]);
     entry.root.updateMatrixWorld(true);
