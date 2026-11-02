@@ -12,7 +12,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import * as THREE from 'three';
-import { mercatorFromLngLat } from '../../packages/s3m-three/src/render/GeoAdapter';
+import { mercatorFromLngLat, enuToLngLat } from '../../packages/s3m-three/src/render/GeoAdapter';
 import { computeTilePlacement } from '../../packages/s3m-three/src/render/tilePlacement';
 import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
 
@@ -25,11 +25,10 @@ const ANCHOR = { lon: 116, lat: 40, height: 0 };
 const SCENE = mercatorFromLngLat(ANCHOR.lon, ANCHOR.lat, ANCHOR.height);
 const S_SCENE = SCENE.meterInMercator;
 
-/** 球面 ENU → 真实墨卡托（真值：逐个顶点独立投影，不做任何线性缩放） */
+/** WGS84 椭球 ENU → 真实墨卡托（真值：逐个顶点独立投影，不做任何线性缩放） */
 function truthMercator(east: number, north: number, up = 0): { x: number; y: number } {
-  const latRad = ANCHOR.lat * DEG + north / R;
-  const lon = ANCHOR.lon + east / (R * Math.cos(latRad)) / DEG;
-  const w = mercatorFromLngLat(lon, latRad / DEG, ANCHOR.height + up);
+  const [lon, lat] = enuToLngLat(ANCHOR.lon, ANCHOR.lat, east, north);
+  const w = mercatorFromLngLat(lon, lat, ANCHOR.height + up);
   return { x: w.x, y: w.y };
 }
 
@@ -42,24 +41,41 @@ function mercErrorMetres(got: { x: number; y: number }, want: { x: number; y: nu
 
 /** 当前实现口径：整个场景共用一个常量 s */
 function placeLinear(east: number, north: number, offset: readonly [number, number, number] = [0, 0, 0]) {
+  const sEast = SCENE.meterInMercatorEast ?? S_SCENE;
+  const sNorth = SCENE.meterInMercatorNorth ?? S_SCENE;
   return {
-    x: SCENE.x + S_SCENE * (east + offset[0]),
-    y: SCENE.y - S_SCENE * (north + offset[1]),
+    x: SCENE.x + sEast * (east + offset[0]),
+    y: SCENE.y - sNorth * (north + offset[1]),
   };
 }
 
 /** 把 computeTilePlacement 的结果套到某个顶点上，回到墨卡托 */
-function placeWith(p: { position: readonly number[]; pivot: readonly number[]; scale: number }, east: number, north: number) {
-  const x = p.position[0] + p.scale * (east - p.pivot[0]);
-  const y = p.position[1] + p.scale * (north - p.pivot[1]);
-  return { x: SCENE.x + S_SCENE * x, y: SCENE.y - S_SCENE * y };
+function placeWith(
+  p: { position: readonly number[]; pivot: readonly number[]; scaleEast?: number; scaleNorth?: number; scale: number },
+  east: number,
+  north: number
+) {
+  const kEast = p.scaleEast ?? p.scale;
+  const kNorth = p.scaleNorth ?? p.scale;
+  const sEast = SCENE.meterInMercatorEast ?? S_SCENE;
+  const sNorth = SCENE.meterInMercatorNorth ?? S_SCENE;
+  const x = p.position[0] + kEast * (east - p.pivot[0]);
+  const y = p.position[1] + kNorth * (north - p.pivot[1]);
+  return { x: SCENE.x + sEast * x, y: SCENE.y - sNorth * y };
 }
 
 function placementAt(center: { x: number; y: number; z: number }, offset: readonly [number, number, number] = [0, 0, 0]) {
   return computeTilePlacement({
     center,
     datasetAnchor: ANCHOR,
-    sceneAnchor: { x: SCENE.x, y: SCENE.y, z: SCENE.z, meterInMercator: S_SCENE },
+    sceneAnchor: {
+      x: SCENE.x,
+      y: SCENE.y,
+      z: SCENE.z,
+      meterInMercatorEast: SCENE.meterInMercatorEast,
+      meterInMercatorNorth: SCENE.meterInMercatorNorth,
+      meterInMercator: S_SCENE,
+    },
     datasetOffset: offset,
     geo: null,
   });
@@ -151,14 +167,12 @@ describe('issue #12：单锚点切平面的尺度误差', () => {
  * `GeoAdapter` 的语义，会整体平移所有既有场景，所以单独跟踪。
  * 这里只把量级钉住，防止有人以为 PER-TILE 已经把精度做满了。
  */
-describe('issue #12：已知残差（球面 vs 椭球，另行跟踪）', () => {
+describe('issue #17 / #12：残差收敛（从球面升级为 WGS84 椭球）', () => {
   const E2 = 6.69437999014e-3;
   const N = R / Math.sqrt(1 - E2 * Math.sin(40 * DEG) ** 2);
 
-  test('东向 2 km 仍有约 0.14% 的比例误差（≈ 2.8 m）', () => {
+  test('东向 2 km 椭球残差已消除（< 0.01 m，旧球面约 2.8 m）', () => {
     const p = placementAt({ x: 0, y: 0, z: 0 })!;
-    // 球面口径下完全精确
-    expect(mercErrorMetres(placeWith(p, 2000, 0), truthMercator(2000, 0))).toBeLessThan(0.01);
 
     // 椭球口径下的真实东向位置
     const lonEllip = ANCHOR.lon + 2000 / (N * Math.cos(40 * DEG)) / DEG;
@@ -166,8 +180,8 @@ describe('issue #12：已知残差（球面 vs 椭球，另行跟踪）', () => 
     const got = placeWith(p, 2000, 0);
     const err = mercErrorMetres(got, wantEllip);
 
-    expect(err).toBeGreaterThan(2.5);
-    expect(err).toBeLessThan(3.2);
+    // 修复前在球面模型下为 2.8 m，修复后精确对齐（< 0.01 m）
+    expect(err).toBeLessThan(0.01);
   });
 });
 
@@ -178,7 +192,7 @@ describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () =>
       container: null as never,
       perTilePlacement,
     } as ConstructorParameters<typeof S3MViewer>[0]);
-    v.sceneAnchor = { x: SCENE.x, y: SCENE.y, z: SCENE.z, meterInMercator: S_SCENE };
+    v.sceneAnchor = SCENE;
     return v;
   }
 
@@ -251,9 +265,9 @@ describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () =>
     expect(landed.z).toBeCloseTo(p.position[2], 6);
 
     const e = g.matrix.elements;
-    expect(e[0]).toBeCloseTo(p.scale, 9);
-    expect(e[5]).toBeCloseTo(p.scale, 9);
-    expect(e[10]).toBeCloseTo(p.scale, 9);
+    expect(e[0]).toBeCloseTo(p.scaleEast, 9);
+    expect(e[5]).toBeCloseTo(p.scaleNorth, 9);
+    expect(e[10]).toBeCloseTo(p.scaleEast, 9);
     v.dispose();
   });
 
@@ -275,12 +289,7 @@ describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () =>
 
     // 把场景锚点挪到瓦片中心所在的纬线上：k 应回到 1
     const SCENE2 = mercatorFromLngLat(ANCHOR.lon, 40.18, 0);
-    v.sceneAnchor = {
-      x: SCENE2.x,
-      y: SCENE2.y,
-      z: SCENE2.z,
-      meterInMercator: SCENE2.meterInMercator,
-    };
+    v.sceneAnchor = SCENE2;
     (v as unknown as { _reapplyTilePlacements: () => void })._reapplyTilePlacements();
 
     expect(g.matrix.elements[0]).toBeCloseTo(1, 3);
@@ -293,12 +302,7 @@ describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () =>
     const inv1 = (g.userData.placementInverse as THREE.Matrix4).clone();
 
     const SCENE2 = mercatorFromLngLat(ANCHOR.lon, 40.18, 0);
-    v.sceneAnchor = {
-      x: SCENE2.x,
-      y: SCENE2.y,
-      z: SCENE2.z,
-      meterInMercator: SCENE2.meterInMercator,
-    };
+    v.sceneAnchor = SCENE2;
     (v as unknown as { _reapplyTilePlacements: () => void })._reapplyTilePlacements();
 
     const inv2 = g.userData.placementInverse as THREE.Matrix4;
@@ -314,12 +318,7 @@ describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () =>
       register(v, { center: { x: (i % 50) * 100, y: 20000 + Math.floor(i / 50) * 100, z: 0 }, radius: 50 });
     }
     const SCENE2 = mercatorFromLngLat(ANCHOR.lon, 40.05, 0);
-    v.sceneAnchor = {
-      x: SCENE2.x,
-      y: SCENE2.y,
-      z: SCENE2.z,
-      meterInMercator: SCENE2.meterInMercator,
-    };
+    v.sceneAnchor = SCENE2;
 
     const t0 = performance.now();
     (v as unknown as { _reapplyTilePlacements: () => void })._reapplyTilePlacements();
@@ -347,7 +346,7 @@ describe('issue #12：拾取反解瓦片级放置', () => {
       container: null as never,
       perTilePlacement,
     } as ConstructorParameters<typeof S3MViewer>[0]);
-    v.sceneAnchor = { x: SCENE.x, y: SCENE.y, z: SCENE.z, meterInMercator: S_SCENE };
+    v.sceneAnchor = SCENE;
 
     const group = new THREE.Group();
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), new THREE.MeshBasicMaterial());

@@ -98,7 +98,16 @@ export interface DatasetManagerCallbacks {
 
 export class DatasetManager {
   readonly datasets = new Map<string, S3MDatasetEntry>();
-  sceneAnchor: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null = null;
+  sceneAnchor: {
+    x: number;
+    y: number;
+    z: number;
+    meterInMercatorEast?: number;
+    meterInMercatorNorth?: number;
+    meterInMercatorUp?: number;
+    meterInMercator: number;
+    altitude?: number;
+  } | null = null;
   totalMaxTiles: number = 0;
   /**
    * 图层级默认光照模型档位（`undefined` = 跟随模块级默认）。
@@ -362,12 +371,14 @@ export class DatasetManager {
     if (!this.sceneAnchor) {
       this.sceneAnchor = worldFromLngLat(geo, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     }
-    const s = this.sceneAnchor.meterInMercator;
+    const sEast = this.sceneAnchor.meterInMercatorEast ?? this.sceneAnchor.meterInMercator;
+    const sNorth = this.sceneAnchor.meterInMercatorNorth ?? this.sceneAnchor.meterInMercator;
+    const sUp = sEast;
     const a = worldFromLngLat(geo, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     entry.offset = [
-      (a.x - this.sceneAnchor.x) / s,
-      -(a.y - this.sceneAnchor.y) / s,
-      (a.z - this.sceneAnchor.z) / s + (entry.heightOffset ?? 0),
+      (a.x - this.sceneAnchor.x) / sEast,
+      -(a.y - this.sceneAnchor.y) / sNorth,
+      (a.z - this.sceneAnchor.z) / sUp + (entry.heightOffset ?? 0),
     ];
     entry.root.position.set(entry.offset[0], entry.offset[1], entry.offset[2]);
     entry.root.updateMatrixWorld(true);

@@ -329,11 +329,32 @@ export class S3MViewer {
   }
 
   /** 场景主锚点（ENU 原点对应的世界坐标） */
-  get sceneAnchor(): { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null {
+  get sceneAnchor(): {
+    x: number;
+    y: number;
+    z: number;
+    meterInMercatorEast?: number;
+    meterInMercatorNorth?: number;
+    meterInMercatorUp?: number;
+    meterInMercator: number;
+    altitude?: number;
+  } | null {
     return this._datasetManager.sceneAnchor;
   }
-  set sceneAnchor(val: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null) {
+  set sceneAnchor(
+    val: {
+      x: number;
+      y: number;
+      z: number;
+      meterInMercatorEast?: number;
+      meterInMercatorNorth?: number;
+      meterInMercatorUp?: number;
+      meterInMercator: number;
+      altitude?: number;
+    } | null
+  ) {
     this._datasetManager.sceneAnchor = val;
+    this._reapplyTilePlacements();
   }
 
   /** 拾取表 / pickId 池 / 射线求交（见 viewer/PickService.ts） */
@@ -816,10 +837,7 @@ export class S3MViewer {
         },
         onReady: (e) => {
           this.onReady(e);
-          if (this.uniforms.uInvMercScale && this.sceneAnchor?.meterInMercator) {
-      this.uniforms.uInvMercScale.value = 1.0 / this.sceneAnchor.meterInMercator;
-    }
-    this._heights.refreshAll();
+          this._heights.refreshAll();
           if (!this.groundManager.excavationBounds) {
             this.groundManager.autoFitExcavation(this.datasets.values());
           }
@@ -847,7 +865,7 @@ export class S3MViewer {
   recomputeAnchors(): void {
     this._datasetManager.recomputeAnchors(this.geo);
     // 锚点变了 → 每块瓦片的 k 与 position 都要重算（关这项功能时是空转，一次遍历都不做）
-    if (this._perTilePlacement) this._reapplyTilePlacements();
+    this._reapplyTilePlacements();
     this._heights.refreshAll();
     this._requestRepaint();
   }
@@ -1688,6 +1706,15 @@ export class S3MViewer {
     // 必须在 add / updateMatrixWorld 之前设置：后者会拿当前 matrix 算 matrixWorld 并缓存
     if (this._perTilePlacement && node.sphere) {
       this._applyTilePlacement(node.group, node.sphere.center, entry);
+    } else {
+      const sceneAnchor = this.sceneAnchor;
+      if (sceneAnchor) {
+        const sEast = sceneAnchor.meterInMercatorEast ?? sceneAnchor.meterInMercator;
+        const sNorth = sceneAnchor.meterInMercatorNorth ?? sceneAnchor.meterInMercator;
+        const sUp = sceneAnchor.meterInMercatorUp ?? sEast;
+        const center = node.sphere ? ([node.sphere.center.x, node.sphere.center.y, node.sphere.center.z] as const) : ([0, 0, 0] as const);
+        this._updateTileUniforms(node.group, center, [1.0 / sEast, 1.0 / sNorth, 1.0 / sUp]);
+      }
     }
     entry.root.add(node.group);
     node.group.updateMatrixWorld(true);
@@ -1788,13 +1815,15 @@ export class S3MViewer {
     });
     if (!p) return;
 
-    const k = p.scale;
+    const kEast = p.scaleEast ?? p.scale;
+    const kNorth = p.scaleNorth ?? p.scale;
+    const kUp = kEast;
     group.matrixAutoUpdate = false;
-    group.matrix.makeScale(k, k, k);
+    group.matrix.makeScale(kEast, kNorth, kUp);
     group.matrix.setPosition(
-      p.position[0] - k * p.pivot[0],
-      p.position[1] - k * p.pivot[1],
-      p.position[2] - k * p.pivot[2],
+      p.position[0] - kEast * p.pivot[0],
+      p.position[1] - kNorth * p.pivot[1],
+      p.position[2] - kUp * p.pivot[2],
     );
     group.matrixWorldNeedsUpdate = true;
     // 重锚点后要能重算：中心只属于注册那一刻，存到 group 上，不依赖 tileset 内部结构
@@ -1806,6 +1835,35 @@ export class S3MViewer {
     // 逆矩阵缓存：_toCanonicalScene 常态路径无需每次拾取反复求逆，失效点仅在瓦片放置或重锚点
     const inv = ((group.userData as { placementInverse?: THREE.Matrix4 }).placementInverse ??= new THREE.Matrix4());
     inv.copy(group.matrix).invert();
+
+    const sSceneEast = sceneAnchor.meterInMercatorEast ?? sceneAnchor.meterInMercator;
+    const sSceneNorth = sceneAnchor.meterInMercatorNorth ?? sceneAnchor.meterInMercator;
+    const sSceneUp = sceneAnchor.meterInMercatorUp ?? sSceneEast;
+    const invScale = p.invTileScale ?? [1.0 / (sSceneEast * kEast), 1.0 / (sSceneNorth * kNorth), 1.0 / (sSceneUp * kUp)];
+    this._updateTileUniforms(group, p.pivot, invScale);
+  }
+
+  private _updateTileUniforms(
+    group: THREE.Object3D,
+    pivot: readonly [number, number, number],
+    invTileScale: readonly [number, number, number]
+  ): void {
+    group.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (((obj as any).isMesh || (obj as any).isPoints) && (obj as any).material) {
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const m of mats) {
+          const uPivot = (m as any).userData?.uTilePivot;
+          const uScale = (m as any).userData?.uInvTileScale;
+          if (uPivot?.value) {
+            uPivot.value.set(pivot[0], pivot[1], pivot[2]);
+          }
+          if (uScale?.value) {
+            uScale.value.set(invTileScale[0], invTileScale[1], invTileScale[2]);
+          }
+        }
+      }
+    });
   }
 
   /**
@@ -2653,10 +2711,11 @@ export class S3MViewer {
   private _sceneFromLngLat(p: LngLatAlt): Vec3 {
     const anchor = this.sceneAnchor;
     if (!anchor) return [0, 0, 0];
-    const s = anchor.meterInMercator;
+    const sEast = anchor.meterInMercatorEast ?? anchor.meterInMercator;
+    const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
     const w = worldFromLngLat(this.geo, p.lng, p.lat, p.altitude);
     // 注意 y 取反：three 的 y 向上，墨卡托 y 向下（与 PickService.pickPosition 互逆）
-    return [(w.x - anchor.x) / s, -(w.y - anchor.y) / s, p.altitude - (anchor.altitude ?? 0)];
+    return [(w.x - anchor.x) / sEast, -(w.y - anchor.y) / sNorth, p.altitude - (anchor.altitude ?? 0)];
   }
 
   /**
@@ -2679,8 +2738,9 @@ export class S3MViewer {
   private _lngLatFromScene(v: Vec3): LngLatAlt {
     const anchor = this.sceneAnchor;
     if (!anchor) return { lng: 0, lat: 0, altitude: v[2] };
-    const s = anchor.meterInMercator;
-    const [lng, lat] = lngLatFromWorld(this.geo, v[0] * s + anchor.x, -v[1] * s + anchor.y);
+    const sEast = anchor.meterInMercatorEast ?? anchor.meterInMercator;
+    const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
+    const [lng, lat] = lngLatFromWorld(this.geo, v[0] * sEast + anchor.x, -v[1] * sNorth + anchor.y);
     return { lng, lat, altitude: v[2] + (anchor.altitude ?? 0) };
   }
 
@@ -3176,14 +3236,15 @@ export class S3MViewer {
     this.flushOverrides();
 
     const canvas = this.canvas;
-    const s = this.sceneAnchor.meterInMercator;
-    if (this.uniforms.uInvMercScale) this.uniforms.uInvMercScale.value = 1.0 / s;
+    const sEast = this.sceneAnchor.meterInMercatorEast ?? this.sceneAnchor.meterInMercator;
+    const sNorth = this.sceneAnchor.meterInMercatorNorth ?? this.sceneAnchor.meterInMercator;
+    const sUp = this.sceneAnchor.meterInMercatorUp ?? sEast;
 
     // ENU → 世界坐标：x 向东，y 向北（墨卡托 y 朝南，所以取负），z 向上
     this._enuMatrix.set(
-      s, 0, 0, this.sceneAnchor.x,
-      0, -s, 0, this.sceneAnchor.y,
-      0, 0, s, this.sceneAnchor.z,
+      sEast, 0, 0, this.sceneAnchor.x,
+      0, -sNorth, 0, this.sceneAnchor.y,
+      0, 0, sUp, this.sceneAnchor.z,
       0, 0, 0, 1
     );
 

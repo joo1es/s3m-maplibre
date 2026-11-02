@@ -336,14 +336,16 @@ export class S3MLayer extends HostRenderer {
     }
 
     const canvas = map.getCanvas();
-    const s = anchor.meterInMercator;
+    const sEast = anchor.meterInMercatorEast ?? anchor.meterInMercator;
+    const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
+    const sUp = sEast;
 
     // 相机在场景 ENU 中的位置（FreeCamera 不可用时退回原点，只影响 LOD 精度）
     let camEnu: [number, number, number] = [0, 0, 0];
     try {
       const p = map.getFreeCameraOptions?.()?.position;
       if (p) {
-        camEnu = [(p.x - anchor.x) / s, -(p.y - anchor.y) / s, (p.z - anchor.z) / s];
+        camEnu = [(p.x - anchor.x) / sEast, -(p.y - anchor.y) / sNorth, (p.z - anchor.z) / sUp];
       }
     } catch {
       /* 忽略 */
@@ -1157,11 +1159,31 @@ export class S3MLayer extends HostRenderer {
   }
 
   /** 场景主锚点（ENU 原点对应的世界坐标） */
-  get sceneAnchor(): { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null {
+  get sceneAnchor(): {
+    x: number;
+    y: number;
+    z: number;
+    meterInMercatorEast?: number;
+    meterInMercatorNorth?: number;
+    meterInMercatorUp?: number;
+    meterInMercator: number;
+    altitude?: number;
+  } | null {
     return this.viewer.sceneAnchor;
   }
 
-  set sceneAnchor(val: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null) {
+  set sceneAnchor(
+    val: {
+      x: number;
+      y: number;
+      z: number;
+      meterInMercatorEast?: number;
+      meterInMercatorNorth?: number;
+    meterInMercatorUp?: number;
+      meterInMercator: number;
+      altitude?: number;
+    } | null
+  ) {
     this.viewer.sceneAnchor = val;
   }
 

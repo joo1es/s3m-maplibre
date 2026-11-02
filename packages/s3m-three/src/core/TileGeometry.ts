@@ -922,7 +922,7 @@ export function assembleTileGeometry(tile: ParsedTile, options: AssembleOptions 
         y: p.bounds.sphereCenter[1],
         z: p.bounds.sphereCenter[2],
       };
-      const { offsets } = bakeMercatorOffsets(positions, p.vertexCount, options.tileAnchor, center, p.matrix);
+      const offsets = bakeMercatorOffsets(positions, p.vertexCount, options.tileAnchor, center);
       p.attributes.aMercatorOffset = {
         array: offsets,
         components: 3,

@@ -19,6 +19,7 @@ import { isTransparentMaterial, minVertexAlpha } from './materialAlpha.js';
 import type { StyledMaterial } from './StyleMaterial.js';
 import { assembleTileGeometry, LINE_PRIMITIVE, POINT_PRIMITIVE } from '../core/TileGeometry.js';
 import { bakeMercatorOffsets } from '../core/BakeMercator.js';
+import { mercatorFromLngLat } from './GeoAdapter.js';
 import type { TileGeometryData, PrimitiveData } from '../core/TileGeometry.js';
 import { decodeScale, decodeRotation } from '../core/GaussianSplat.js';
 import { createSplatMaterial, createQuadGeometry, splatRaycast } from './SplatMaterial.js';
@@ -557,6 +558,19 @@ export async function buildTileObjects(
       ? Math.max((m?.alphaCutoff as number) ?? 0, 0.01)
       : 0;
 
+    let initialInvScale: [number, number, number] | undefined;
+    if (options.tileAnchor) {
+      const tileMerc = mercatorFromLngLat(
+        options.tileAnchor.lon,
+        options.tileAnchor.lat,
+        options.tileAnchor.height
+      );
+      const sEast = tileMerc.meterInMercatorEast ?? tileMerc.meterInMercator;
+      const sNorth = tileMerc.meterInMercatorNorth ?? tileMerc.meterInMercator;
+      const sUp = tileMerc.meterInMercatorUp ?? sEast;
+      initialInvScale = [1.0 / sEast, 1.0 / sNorth, 1.0 / sUp];
+    }
+
     const mat = createStyledMaterial({
       uniforms,
       map,
@@ -574,6 +588,8 @@ export async function buildTileObjects(
       materialQuality: options.materialQuality,
       colorPipeline: options.colorPipeline,
       bakeMercator: hasMercator || options.bakeMercator,
+      tilePivot: options.tileCenter ? new THREE.Vector3(options.tileCenter.x, options.tileCenter.y, options.tileCenter.z) : undefined,
+      invTileScale: initialInvScale ? new THREE.Vector3(...initialInvScale) : undefined,
     });
     // 用户配置的深度偏移（共面摩尔纹 / 重合面归属的人工定序，见 BuildTileOptions 注释）
     if (options.polygonOffset) {
@@ -589,12 +605,12 @@ export async function buildTileObjects(
   if (options.assembled && options.bakeMercator && options.tileAnchor) {
     for (const prim of options.assembled.primitives) {
       if (!prim.attributes.aMercatorOffset && prim.attributes.position) {
-        const { offsets } = bakeMercatorOffsets(
+        const offsets = bakeMercatorOffsets(
           prim.attributes.position.array,
           prim.vertexCount,
           options.tileAnchor,
-          options.tileCenter,
-          prim.matrix
+          options.tileCenter ?? { x: 0, y: 0, z: 0 }
+
         );
         prim.attributes.aMercatorOffset = {
           array: offsets,

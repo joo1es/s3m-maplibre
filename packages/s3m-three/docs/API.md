@@ -210,6 +210,15 @@ prewarmShading(): Promise<void>        // 手动预热另一种 shading 变体�
 
 `geo` 是可写的 `GeoAdapter | null`：`null` 用内置的墨卡托兜底（`worldFromLngLat` / `lngLatFromWorld`），地图宿主注入适配器以支持任意 CRS / 自定义投影。
 
+内置兜底使用高精度 **WGS84 椭球模型**（$a=6378137, f=1/298.257223563$）：
+- `worldFromLngLat` 返回带有各向异性尺度的对象：`{ x, y, z, meterInMercatorEast, meterInMercatorNorth, meterInMercatorUp, meterInMercator, altitude }`
+  - 东西向尺度对应卯酉圈半径 $N(\varphi) = a / \sqrt{1 - e^2 \sin^2\varphi}$：$1 / (2\pi N \cos\varphi)$
+  - 南北向尺度对应子午圈半径 $M(\varphi) = a(1 - e^2) / (1 - e^2 \sin^2\varphi)^{3/2}$：$1 / (2\pi M \cos\varphi)$
+  - 竖直向高程尺度 `meterInMercatorUp` 取东向尺度（局部正圆保角）
+  - `meterInMercator` 保留作为向前兼容属性，取值从旧版球面近似 $1/(2\pi R\cos\varphi)$ 升级为真实的 WGS84 椭球东向尺度（属于精度修正，默认生效且更精准）
+  - 彻底消除传统单标量模型在南北/东西方向上 0.4%~0.67% 的各向异性拉伸与米级系统残差。
+- 包导出了高精度大地测量工具：`primeVerticalRadius`, `meridianRadius`, `enuToLngLat`, `lngLatToEnu` 及 `WGS84_A`, `WGS84_E2` 常量。
+
 ### 数据集管理
 
 ```ts

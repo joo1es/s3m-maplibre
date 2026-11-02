@@ -49,7 +49,15 @@ export interface PickHost {
   readonly scene: THREE.Scene | null;
   readonly canvas: HTMLCanvasElement | null;
   readonly style: { floorHeight: number };
-  readonly sceneAnchor: { x: number; y: number; z: number; meterInMercator: number; altitude?: number } | null;
+  readonly sceneAnchor: {
+    x: number;
+    y: number;
+    z: number;
+    meterInMercatorEast?: number;
+    meterInMercatorNorth?: number;
+    meterInMercator: number;
+    altitude?: number;
+  } | null;
   readonly datasets: Map<string, { name: string }>;
   readonly featureStyleManager: FeatureStyleManager;
   readonly smidMeshes: Map<number, Set<THREE.Mesh>>;
@@ -231,8 +239,9 @@ export class PickService {
       const v = new THREE.Vector3((box.minX + box.maxX) / 2, (box.minY + box.maxY) / 2, (box.minZ + box.maxZ) / 2);
       v.applyMatrix4(ref.mesh.matrixWorld);
       const c = this.host.toCanonicalScene(v, ref.mesh);
-      const s = this.host.sceneAnchor.meterInMercator;
-      centerLngLat = this.host.lngLatFromWorld(c.x * s + this.host.sceneAnchor.x, -c.y * s + this.host.sceneAnchor.y);
+      const sEast = this.host.sceneAnchor.meterInMercatorEast ?? this.host.sceneAnchor.meterInMercator;
+      const sNorth = this.host.sceneAnchor.meterInMercatorNorth ?? this.host.sceneAnchor.meterInMercator;
+      centerLngLat = this.host.lngLatFromWorld(c.x * sEast + this.host.sceneAnchor.x, -c.y * sNorth + this.host.sceneAnchor.y);
     }
 
     // 精确命中点求交计算
@@ -269,8 +278,9 @@ export class PickService {
       else if (elev) finalPos.z += elev;
 
       point = [finalPos.x, finalPos.y, finalPos.z];
-      const s = this.host.sceneAnchor.meterInMercator;
-      lngLat = this.host.lngLatFromWorld(finalPos.x * s + this.host.sceneAnchor.x, -finalPos.y * s + this.host.sceneAnchor.y);
+      const sEast = this.host.sceneAnchor.meterInMercatorEast ?? this.host.sceneAnchor.meterInMercator;
+      const sNorth = this.host.sceneAnchor.meterInMercatorNorth ?? this.host.sceneAnchor.meterInMercator;
+      lngLat = this.host.lngLatFromWorld(finalPos.x * sEast + this.host.sceneAnchor.x, -finalPos.y * sNorth + this.host.sceneAnchor.y);
       altitude = finalPos.z + (this.host.sceneAnchor.altitude ?? 0);
     } else if (centerLngLat && box && this.host.sceneAnchor) {
       lngLat = centerLngLat;
@@ -334,7 +344,8 @@ export class PickService {
       floorHeight: this.host.style.floorHeight,
     });
 
-    const s = anchor.meterInMercator;
+    const sEast = anchor.meterInMercatorEast ?? anchor.meterInMercator;
+    const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
     let point: [number, number, number] | null = null;
     let lngLat: [number, number] | null = null;
     let altitude: number | null = null;
@@ -343,7 +354,7 @@ export class PickService {
     if (hitPoint) {
       const c = this.host.toCanonicalScene(hitPoint, mesh);
       point = [c.x, c.y, c.z];
-      lngLat = this.host.lngLatFromWorld(c.x * s + anchor.x, -c.y * s + anchor.y);
+      lngLat = this.host.lngLatFromWorld(c.x * sEast + anchor.x, -c.y * sNorth + anchor.y);
       altitude = c.z + (anchor.altitude ?? 0);
       // 泼溅命中的就是一个高斯，没有「单体中心」可言，用命中点当中心
       centerLngLat = lngLat;
@@ -354,7 +365,7 @@ export class PickService {
         (box.minZ + box.maxZ) / 2
       ).applyMatrix4(mesh.matrixWorld);
       const c = this.host.toCanonicalScene(v, mesh);
-      centerLngLat = this.host.lngLatFromWorld(c.x * s + anchor.x, -c.y * s + anchor.y);
+      centerLngLat = this.host.lngLatFromWorld(c.x * sEast + anchor.x, -c.y * sNorth + anchor.y);
       altitude = c.z + (anchor.altitude ?? 0);
     }
 
@@ -410,8 +421,9 @@ export class PickService {
     const target = new THREE.Vector3();
     const intersect = ray.intersectPlane(groundPlane, target);
     if (intersect) {
-      const s = this.host.sceneAnchor.meterInMercator;
-      const lngLat = this.host.lngLatFromWorld(intersect.x * s + this.host.sceneAnchor.x, -intersect.y * s + this.host.sceneAnchor.y);
+      const sEast = this.host.sceneAnchor.meterInMercatorEast ?? this.host.sceneAnchor.meterInMercator;
+      const sNorth = this.host.sceneAnchor.meterInMercatorNorth ?? this.host.sceneAnchor.meterInMercator;
+      const lngLat = this.host.lngLatFromWorld(intersect.x * sEast + this.host.sceneAnchor.x, -intersect.y * sNorth + this.host.sceneAnchor.y);
       const altitude = intersect.z + (this.host.sceneAnchor.altitude ?? 0);
       return {
         lngLat,
@@ -658,8 +670,9 @@ export class PickService {
           if (gpuPose) c.add(new THREE.Vector3(gpuPose.pos[0], gpuPose.pos[1], gpuPose.pos[2]));
 
           c.applyMatrix4(mesh.matrixWorld);
-          const s = this.host.sceneAnchor.meterInMercator;
-          const [lng, lat] = this.host.lngLatFromWorld(c.x * s + this.host.sceneAnchor.x, -c.y * s + this.host.sceneAnchor.y);
+          const sEast = this.host.sceneAnchor.meterInMercatorEast ?? this.host.sceneAnchor.meterInMercator;
+          const sNorth = this.host.sceneAnchor.meterInMercatorNorth ?? this.host.sceneAnchor.meterInMercator;
+          const [lng, lat] = this.host.lngLatFromWorld(c.x * sEast + this.host.sceneAnchor.x, -c.y * sNorth + this.host.sceneAnchor.y);
           if (lng < minLng) minLng = lng;
           if (lng > maxLng) maxLng = lng;
           if (lat < minLat) minLat = lat;

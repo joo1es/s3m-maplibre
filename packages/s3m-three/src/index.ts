@@ -51,13 +51,21 @@ export type {
 
 // —— 地理坐标适配（宿主无关接口 + 墨卡托兜底）
 export {
+  WGS84_A,
+  WGS84_B,
+  WGS84_F,
+  WGS84_E2,
   EARTH_RADIUS,
+  primeVerticalRadius,
+  meridianRadius,
+  enuToLngLat,
+  lngLatToEnu,
   mercatorFromLngLat,
   lngLatFromMercator,
   worldFromLngLat,
   lngLatFromWorld,
 } from './render/GeoAdapter.js';
-export type { GeoAdapter } from './render/GeoAdapter.js';
+export type { GeoAdapter, WorldCoordinateResult } from './render/GeoAdapter.js';
 
 // —— 瓦片层
 export { S3MTileset, parseConfigText, classifyDatasetKind } from './tileset/S3MTileset.js';
