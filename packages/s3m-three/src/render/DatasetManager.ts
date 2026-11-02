@@ -65,6 +65,13 @@ export interface S3MDatasetOptions {
    * 目前只有 3DGS：按点渲染，做不出泼溅。见 `S3MTilesetOptions.unsupported`。
    */
   unsupported?: UnsupportedPolicy;
+  /**
+   * LOD 细化过渡策略：
+   * - 'binary'（默认）：整节点二值切换
+   * - 'incremental'：增量细化（primary / fallback 双列表 + LEQUAL 深度推移）
+   */
+  lodTransition?: 'binary' | 'incremental';
+  fallbackOffset?: { factor?: number; units?: number };
 }
 
 export interface S3MDatasetEntry {
@@ -104,6 +111,15 @@ export class DatasetManager {
    * 数据集自己指定了 `materialQuality` 就用自己的。
    */
   defaultMaterialQuality: 'pbr' | 'lambert' | undefined = undefined;
+  defaultLodTransition: 'binary' | 'incremental' = 'binary';
+  defaultFallbackOffset?: { factor?: number; units?: number };
+
+  setDefaultLodTransition(mode: 'binary' | 'incremental'): void {
+    this.defaultLodTransition = mode;
+    for (const entry of this.datasets.values()) {
+      entry.tileset?.setLodTransition(mode);
+    }
+  }
 
   /**
    * 图层档位变更：同步给已存在的数据集（它们之后加载的瓦片才用新档位；
@@ -264,6 +280,8 @@ export class DatasetManager {
       maxMemory: ds.maxMemory ?? maxMemory,
       maxImageCache: ds.maxImageCache ?? maxImageCache,
       lodRangeScale: ds.lodRangeScale ?? defaultLodRangeScale,
+      lodTransition: ds.lodTransition ?? this.defaultLodTransition,
+      fallbackOffset: ds.fallbackOffset ?? this.defaultFallbackOffset,
       buildTile: buildTile ?? null,
       polygonOffset: ds.polygonOffset,
       // 数据集 > 图层 > 模块级默认（undefined 一路传下去，由 createStyledMaterial 回落）

@@ -304,6 +304,8 @@ export class S3MViewer {
    * 传了值就只认自己，多图层同页各用各的，互不覆盖。
    */
   private _materialQuality: MaterialQuality | undefined;
+  private _lodTransition: 'binary' | 'incremental';
+  private _fallbackOffset?: { factor?: number; units?: number };
   /**
    * 本图层的颜色管线。
    *
@@ -439,6 +441,10 @@ export class S3MViewer {
     this._materialQuality = normalizeMaterialQuality(options.materialQuality);
     // 之后 addDataset 的数据集按这个默认建材质（数据集自己指定则用自己的）
     this._datasetManager.defaultMaterialQuality = this._materialQuality;
+    this._lodTransition = options.lodTransition ?? 'binary';
+    this._fallbackOffset = options.fallbackOffset;
+    this._datasetManager.defaultLodTransition = this._lodTransition;
+    this._datasetManager.defaultFallbackOffset = this._fallbackOffset;
     if (options.totalMaxTiles) {
       this._datasetManager.totalMaxTiles = options.totalMaxTiles;
     }
@@ -776,7 +782,15 @@ export class S3MViewer {
         .filter((d) => !!d?.configUrl)
         .map((d) => ({ ...d, polygonOffset: d.polygonOffset ?? options.polygonOffset }));
     if (options.configUrl)
-      return [{ id: 'default', name: '默认数据集', configUrl: options.configUrl, useWorker: options.useWorker, polygonOffset: options.polygonOffset }];
+      return [{
+        id: 'default',
+        name: '默认数据集',
+        configUrl: options.configUrl,
+        useWorker: options.useWorker,
+        polygonOffset: options.polygonOffset,
+        lodTransition: options.lodTransition,
+        fallbackOffset: options.fallbackOffset,
+      }];
     return [];
   }
 
@@ -784,7 +798,12 @@ export class S3MViewer {
   async addDataset(ds: S3MDatasetOptions): Promise<S3MDatasetEntry> {
     if (!this.scene) throw new Error('[s3m] 图层尚未 addLayer，不能添加数据集');
     // 图层级默认值：数据集自己指定了就用自己的，见 `S3MViewerOptions.unsupported`
-    const merged: S3MDatasetOptions = { ...ds, unsupported: ds.unsupported ?? this._unsupported };
+    const merged: S3MDatasetOptions = {
+      ...ds,
+      unsupported: ds.unsupported ?? this._unsupported,
+      lodTransition: ds.lodTransition ?? this._lodTransition,
+      fallbackOffset: ds.fallbackOffset ?? this._fallbackOffset,
+    };
     const entry = await this._datasetManager.addDataset(
       merged,
       this.scene,
@@ -2316,6 +2335,17 @@ export class S3MViewer {
   }
 
   /** 当前材质质感档位（本图层指定了就用本图层的，否则是模块级默认） */
+  get lodTransition(): 'binary' | 'incremental' {
+    return this._lodTransition;
+  }
+
+  setLodTransition(mode: 'binary' | 'incremental'): void {
+    if (this._lodTransition === mode) return;
+    this._lodTransition = mode;
+    this._datasetManager.setDefaultLodTransition(mode);
+    this.triggerRepaint();
+  }
+
   get materialQuality(): MaterialQuality {
     return this._materialQuality ?? getMaterialQuality();
   }
