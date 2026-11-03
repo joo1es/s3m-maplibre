@@ -62,6 +62,7 @@
  */
 import { BinaryReader } from './BinaryReader.js';
 import type {
+  Geode,
   GeoPackageEntry,
   GroupNode,
   IndexPackage,
@@ -124,7 +125,13 @@ interface XmlMaterial {
   addressMode?: { u: number; v: number };
 }
 
-interface XmlLod {
+export interface XmlGeode {
+  geoName: string;
+  matrix: number[];
+}
+
+export interface XmlLod {
+  geodes?: XmlGeode[];
   geoNames: string[];
   matrix: number[];
   childTile: string;
@@ -158,7 +165,7 @@ function rangeModeOf(text: string | null): number {
   return 1;
 }
 
-function parseXmlLods(xml: string): XmlLod[] {
+export function parseXmlLods(xml: string): XmlLod[] {
   const blocks = [...xml.matchAll(/<(?:[A-Za-z0-9_-]+:)?PagedLOD[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?PagedLOD>/gi)];
   const out: XmlLod[] = [];
   for (const b of blocks) {
@@ -180,6 +187,39 @@ function parseXmlLods(xml: string): XmlLod[] {
       radius: num(tag(sphere, 'radius')),
     });
   }
+  // 兜底：S3M 1.x 叶子瓦片没有 <PagedLOD>，<PageLods> 内部直接是 <Geode>
+  if (out.length === 0) {
+    const pageLodsBlock = /<(?:[A-Za-z0-9_-]+:)?PageLods[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?PageLods>/i.exec(xml);
+    const scope = pageLodsBlock ? pageLodsBlock[1] : xml;
+    const geodeBlocks = [...scope.matchAll(/<(?:[A-Za-z0-9_-]+:)?Geode[^>]*>([\s\S]*?)<\/(?:[A-Za-z0-9_-]+:)?Geode>/gi)];
+    if (geodeBlocks.length > 0) {
+      const geodes: XmlGeode[] = [];
+      for (const gb of geodeBlocks) {
+        const gs = gb[1];
+        const gName = tag(gs, "GeoName") ?? "";
+        const matStr = tag(gs, "GeoDeModMatrix");
+        const mat = (matStr ?? "1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1")
+          .split(",")
+          .map((x) => parseFloat(x.trim()))
+          .filter((x) => Number.isFinite(x));
+        geodes.push({
+          geoName: gName,
+          matrix: mat.length === 16 ? mat : [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+        });
+      }
+      out.push({
+        geoNames: geodes.map((g) => g.geoName).filter(Boolean),
+        matrix: geodes[0]?.matrix ?? [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1],
+        geodes,
+        childTile: "",
+        rangeMode: rangeModeOf(null), // 1 = 屏幕像素
+        rangeValue: 0,
+        center: { x: 0, y: 0, z: 0 },
+        radius: 0,
+      });
+    }
+  }
+
   return out;
 }
 
@@ -645,6 +685,108 @@ function readTextures(br: BinaryReader, texSize: number): Record<string, S3MText
 let warnedV1Attrs = false;
 let warnedQuantBox = false;
 
+function computeLodBoundingSphere(
+  geodes: { matrix: number[]; skeletonNames: string[] }[],
+  meshes: MeshRecord[]
+): { center: { x: number; y: number; z: number }; radius: number } | null {
+  const meshMap = new Map(meshes.map((m) => [`SuperMapCache#${m.geoName}`, m]));
+  let minX = Infinity, maxX = -Infinity;
+  let minY = Infinity, maxY = -Infinity;
+  let minZ = Infinity, maxZ = -Infinity;
+  let totalPoints = 0;
+
+  for (const geode of geodes) {
+    const mat = geode.matrix;
+    const isIdentity =
+      !mat ||
+      (mat[0] === 1 && mat[1] === 0 && mat[2] === 0 && mat[3] === 0 &&
+       mat[4] === 0 && mat[5] === 1 && mat[6] === 0 && mat[7] === 0 &&
+       mat[8] === 0 && mat[9] === 0 && mat[10] === 1 && mat[11] === 0 &&
+       mat[12] === 0 && mat[13] === 0 && mat[14] === 0 && mat[15] === 1);
+
+    for (const name of geode.skeletonNames) {
+      const mesh = meshMap.get(name);
+      if (!mesh || !mesh.position) continue;
+      const pos = mesh.position;
+      totalPoints += pos.length / 3;
+
+      if (isIdentity) {
+        for (let i = 0; i < pos.length; i += 3) {
+          const x = pos[i]!, y = pos[i + 1]!, z = pos[i + 2]!;
+          if (x < minX) minX = x; if (x > maxX) maxX = x;
+          if (y < minY) minY = y; if (y > maxY) maxY = y;
+          if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+        }
+      } else {
+        const m0 = mat[0]!, m1 = mat[1]!, m2 = mat[2]!;
+        const m4 = mat[4]!, m5 = mat[5]!, m6 = mat[6]!;
+        const m8 = mat[8]!, m9 = mat[9]!, m10 = mat[10]!;
+        const m12 = mat[12]!, m13 = mat[13]!, m14 = mat[14]!;
+        for (let i = 0; i < pos.length; i += 3) {
+          const x = pos[i]!, y = pos[i + 1]!, z = pos[i + 2]!;
+          const tx = m0 * x + m4 * y + m8 * z + m12;
+          const ty = m1 * x + m5 * y + m9 * z + m13;
+          const tz = m2 * x + m6 * y + m10 * z + m14;
+          if (tx < minX) minX = tx; if (tx > maxX) maxX = tx;
+          if (ty < minY) minY = ty; if (ty > maxY) maxY = ty;
+          if (tz < minZ) minZ = tz; if (tz > maxZ) maxZ = tz;
+        }
+      }
+    }
+  }
+
+  if (totalPoints === 0 || !Number.isFinite(minX)) return null;
+
+  const cx = (minX + maxX) * 0.5;
+  const cy = (minY + maxY) * 0.5;
+  const cz = (minZ + maxZ) * 0.5;
+
+  let maxR2 = 0;
+  for (const geode of geodes) {
+    const mat = geode.matrix;
+    const isIdentity =
+      !mat ||
+      (mat[0] === 1 && mat[1] === 0 && mat[2] === 0 && mat[3] === 0 &&
+       mat[4] === 0 && mat[5] === 1 && mat[6] === 0 && mat[7] === 0 &&
+       mat[8] === 0 && mat[9] === 0 && mat[10] === 1 && mat[11] === 0 &&
+       mat[12] === 0 && mat[13] === 0 && mat[14] === 0 && mat[15] === 1);
+
+    for (const name of geode.skeletonNames) {
+      const mesh = meshMap.get(name);
+      if (!mesh || !mesh.position) continue;
+      const pos = mesh.position;
+
+      if (isIdentity) {
+        for (let i = 0; i < pos.length; i += 3) {
+          const dx = pos[i]! - cx, dy = pos[i + 1]! - cy, dz = pos[i + 2]! - cz;
+          const r2 = dx * dx + dy * dy + dz * dz;
+          if (r2 > maxR2) maxR2 = r2;
+        }
+      } else {
+        const m0 = mat[0]!, m1 = mat[1]!, m2 = mat[2]!;
+        const m4 = mat[4]!, m5 = mat[5]!, m6 = mat[6]!;
+        const m8 = mat[8]!, m9 = mat[9]!, m10 = mat[10]!;
+        const m12 = mat[12]!, m13 = mat[13]!, m14 = mat[14]!;
+        for (let i = 0; i < pos.length; i += 3) {
+          const x = pos[i]!, y = pos[i + 1]!, z = pos[i + 2]!;
+          const tx = m0 * x + m4 * y + m8 * z + m12;
+          const ty = m1 * x + m5 * y + m9 * z + m13;
+          const tz = m2 * x + m6 * y + m10 * z + m14;
+          const dx = tx - cx, dy = ty - cy, dz = tz - cz;
+          const r2 = dx * dx + dy * dy + dz * dz;
+          if (r2 > maxR2) maxR2 = r2;
+        }
+      }
+    }
+  }
+
+  const radius = Math.sqrt(maxR2);
+  return {
+    center: { x: cx, y: cy, z: cz },
+    radius: radius > 0 ? radius : 0.001,
+  };
+}
+
 export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Options = {}): Promise<ParsedTile> {
   const inflate = options.inflate ?? defaultInflate;
   const r = new BinaryReader(arrayBuffer);
@@ -770,17 +912,45 @@ export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Opti
   const xmlLods = parseXmlLods(xml);
   const pageLods: PageLOD[] = [];
   xmlLods.forEach((lod, i) => {
-    const named = lod.geoNames.map((n) => keyOf.get(n)).filter((k): k is string => !!k);
-    // 名字对不上时退回位置匹配，并让上层有机会发现（宁可少一个 LOD 也不要挂错球）
-    const fallback = meshes[i] ? [`SuperMapCache#${meshes[i].geoName}`] : [];
-    const skeletonNames = named.length ? [...new Set(named)] : fallback;
-    if (!skeletonNames.length) return;
+    let geodes: Geode[];
+    if (lod.geodes && lod.geodes.length > 0) {
+      geodes = lod.geodes
+        .map((g, gi) => {
+          const key = keyOf.get(g.geoName);
+          const fallback = meshes[gi] ? [`SuperMapCache#${meshes[gi].geoName}`] : [];
+          const skeletonNames = key ? [key] : fallback;
+          return {
+            matrix: g.matrix,
+            skeletonNames,
+          };
+        })
+        .filter((g) => g.skeletonNames.length > 0);
+    } else {
+      const named = lod.geoNames.map((n) => keyOf.get(n)).filter((k): k is string => !!k);
+      // 名字对不上时退回位置匹配，并让上层有机会发现（宁可少一个 LOD 也不要挂错球）
+      const fallback = meshes[i] ? [`SuperMapCache#${meshes[i].geoName}`] : [];
+      const skeletonNames = named.length ? [...new Set(named)] : fallback;
+      geodes = skeletonNames.length ? [{ matrix: lod.matrix, skeletonNames }] : [];
+    }
+    if (!geodes.length) return;
+
+    let center = { ...lod.center };
+    let radius = lod.radius;
+    // 缺包围球（如叶子瓦片）时，从网格顶点实时计算真实几何包围球
+    if (radius <= 0) {
+      const computed = computeLodBoundingSphere(geodes, meshes);
+      if (computed) {
+        center = computed.center;
+        radius = computed.radius;
+      }
+    }
+
     pageLods.push({
       rangeValue: lod.rangeValue,
       rangeMode: lod.rangeMode,
-      boundingSphere: { center: { ...lod.center }, radius: lod.radius },
+      boundingSphere: { center, radius },
       childTile: lod.childTile,
-      geodes: [{ matrix: lod.matrix, skeletonNames }],
+      geodes,
     });
   });
   const groupNode: GroupNode = { pageLods };
