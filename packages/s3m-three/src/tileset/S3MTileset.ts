@@ -951,6 +951,15 @@ export class S3MTileset {
         victim = node;
         continue;
       }
+      // 可见性优先于时间戳：没有包围球的瓦片算不出距离，`lastSeen` 天然比别的瓦片旧，
+      // 只看时间戳会把「正在显示」的那块先踢掉（开洞 → 回补 → 再踢 = 闪）。
+      // 只有不可见的候选分不出来时，才轮到 lastSeen / distance 决定。
+      const nodeVisible = node.group.visible ? 1 : 0;
+      const victimVisible = victim.group.visible ? 1 : 0;
+      if (nodeVisible !== victimVisible) {
+        if (nodeVisible < victimVisible) victim = node;
+        continue;
+      }
       const a = node.lastSeen ?? -1;
       const b = victim.lastSeen ?? -1;
       if (a < b || (a === b && (node.distance ?? 0) > (victim.distance ?? 0))) victim = node;
@@ -1513,6 +1522,11 @@ export class S3MTileset {
 
     for (const node of this.nodes.values()) {
       if (!node.sphere) {
+        // 没有包围球（S3M 1.x 叶子瓦片：XML 是 `<PageLods><Geode>`，没有 PagedLOD）时
+        // 算不出距离，但**仍要记「最近用过」**：`lastSeen` 恒为 undefined 会让它在
+        // `_pickVictim` 里永远排最前（`?? -1`），硬上限一触发 `allowUncovered`，
+        // 第一块被踢掉的就是正在显示的那块 —— 画面立刻一个洞，下一帧又加载回来。
+        node.lastSeen = this._frame;
         node.needRefine = false;
         continue;
       }

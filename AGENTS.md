@@ -131,10 +131,23 @@ NODE_OPTIONS= bun test                   # 含 e2e，需要网络
 ## 4. 本地开发
 
 ```bash
-NODE_OPTIONS= bun run dev      # site 源码热更新
-NODE_OPTIONS= bun run build    # 全量：three → maplibre → docs → demo
+NODE_OPTIONS= bun run dev      # 一条命令起开发：首次整编 + tsc -w + vite dev
+NODE_OPTIONS= bun run build    # 只在要更新 demo/ docs/ 产物时用，日常开发不需要
 NODE_OPTIONS= bun run serve    # 静态服务，http://localhost:8123/s3m-maplibre/...
 ```
+
+### 构建是自动的，日常开发不用 `build`
+
+`dev` 启动时先整编一遍两个包，随后常驻 `tsc -w` 增量编译；vite 解析 workspace 包走的是 `dist/`，所以改 `packages/*/src` 下的 `.ts`、存盘、刷新页面，看到的就是新代码。
+
+**别在改了源码之后等 `bun run build`。** 它做的是「整编 + 打包 + 生成 demo/docs 产物」，是发布链路的一步，不是刷新页面的一步。要它的时候只有两种：
+
+- 准备提交 `demo/` `docs/` 产物（线上 Pages 用的是仓库里已提交的那份）；
+- 没跑 `dev`、直接用 `bun run serve` 看 `demo/` 的旧产物，想让它跟上源码。
+
+发版更不用单独跑：`node tools/release.mjs --push` 内部第一步就是 `bun run build`（见第 5.2 节）。
+
+判断依据只有一条：**`dev` 常驻着就不用 build**。`tsc -w` 只编 `.ts`，`src/vendor/` 下的第三方 `.js` 是 `dev` 首次启动时由 `tools/copy-assets.mjs` 拷的——换了那几个文件，重跑一次 `dev` 比 build 快得多。
 
 常用 URL 参数（demo 里内置的调试开关）：
 
@@ -168,7 +181,7 @@ https://joo1es.github.io/s3m-maplibre/docs/index.html
 https://joo1es.github.io/s3m-maplibre/demo/index.html
 ```
 
-**注意**：Pages 用的是仓库里**已提交的** `demo/` 与 `docs/`（CI 虽然会重新 build，但落地页拷的是工作区里那份）。所以改完源码要：
+**注意**：Pages 用的是仓库里**已提交的** `demo/` 与 `docs/`（CI 虽然会重新 build，但落地页拷的是工作区里那份）。所以**要更新线上页面**时才需要重建产物（日常开发开着 `dev` 就够，见第 4 节）：
 
 ```bash
 NODE_OPTIONS= bun run build      # 重建 demo/ 与 docs/
@@ -325,6 +338,7 @@ node tools/release.mjs patch --push    # 一条命令发版（改版本 + 构建
 | `replace('#include <…>')` 静默失效 | three 改了 chunk 名，材质照样渲染但注入没生效 |
 | 正交模式下底图与模型差一个楼高/相机距 | 只有 S3M 层正交，MapLibre 仍是透视；要全对齐得用 `enableMapLibreOrtho`（beta） |
 | `bun` / `pnpm` 毫无输出地失败 | 本机 `NODE_OPTIONS` 注入，加 `NODE_OPTIONS=` 前缀 |
+| 改完 `packages/*/src` 看不到变化，以为要 `bun run build` | `dev` 常驻的 `tsc -w` 已经增量编译好了，刷新页面即可；build 只用于更新 `demo/` `docs/` 产物 |
 | push 超时 / 要用户名密码 | 全局 `git config http.proxy` 丢了（正常是 `127.0.0.1:10809`）；临时用 `git -c http.proxy=... push`。**不要**手加 `-c credential.helper=!...PortableGit/...`，那个路径不存在 |
 | 发布 CI 报「标签与版本不一致」 | tag 版本 ≠ `package.json` version |
 | CI 报「两个包的 x/y 不同步」 | 手改了版本或漏了 `bun install`：跑 `node tools/release.mjs --align` 或 `patch --align` |

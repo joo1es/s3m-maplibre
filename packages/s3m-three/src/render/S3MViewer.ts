@@ -1737,16 +1737,29 @@ export class S3MViewer {
 
   private _registerTile(node: TileNode, entry: S3MDatasetEntry): void {
     // 必须在 add / updateMatrixWorld 之前设置：后者会拿当前 matrix 算 matrixWorld 并缓存
-    if (this._perTilePlacement && node.sphere) {
-      this._applyTilePlacement(node.group, node.sphere.center, entry);
-    } else {
+    //
+    // ★ 触发条件**不能**是「有没有包围球」。S3M 1.x 的叶子瓦片 XML 是
+    //   `<PageLods><Geode>`（外面没有 `<PagedLOD>` 包装），`parseXmlLods` 解析出来
+    //   pageLods 为空 → sphere 为 null。而 `entry.root` 上挂着 align 算出来的整体偏移
+    //   （索菲亚教堂是 heightRange.min = 119.84），那个偏移是靠 placement 里的
+    //   `- datasetOffset` 抵消的。少摆一块，这块就带着偏移显示 —— 实测 L23 整层
+    //   因此沉到地下 120 m，且 `localZ - worldZ` 恒等于偏移量。
+    //   缺球时用几何包围盒中心兜底；连几何都没有就退回旧口径。
+    const center = node.sphere?.center ?? this._localCenterOf(node.group);
+    if (this._perTilePlacement && center) {
+      this._applyTilePlacement(node.group, center, entry);
+    }
+    // 上面没摆成（关掉本功能 / 缺锚点 / 几何为空）时 matrixAutoUpdate 仍是 true，走旧口径
+    if (node.group.matrixAutoUpdate) {
       const sceneAnchor = this.sceneAnchor;
       if (sceneAnchor) {
         const sEast = sceneAnchor.meterInMercatorEast ?? sceneAnchor.meterInMercator;
         const sNorth = sceneAnchor.meterInMercatorNorth ?? sceneAnchor.meterInMercator;
         const sUp = sceneAnchor.meterInMercatorUp ?? sEast;
-        const center = node.sphere ? ([node.sphere.center.x, node.sphere.center.y, node.sphere.center.z] as const) : ([0, 0, 0] as const);
-        this._updateTileUniforms(node.group, center, [1.0 / sEast, 1.0 / sNorth, 1.0 / sUp]);
+        const c = node.sphere
+          ? ([node.sphere.center.x, node.sphere.center.y, node.sphere.center.z] as const)
+          : ([0, 0, 0] as const);
+        this._updateTileUniforms(node.group, c, [1.0 / sEast, 1.0 / sNorth, 1.0 / sUp]);
       }
     }
     entry.root.add(node.group);
@@ -1818,6 +1831,22 @@ export class S3MViewer {
       // 不重放就出现「点中的那栋楼一拉近就没高亮了」
       this._sel.replayOnto(mesh);
     }
+  }
+
+  /**
+   * 瓦片几何在**数据集局部 ENU** 里的包围盒中心，给没有包围球的瓦片兜底。
+   *
+   * 调用时机固定在 `entry.root.add()` 之前：此时 group 还没挂到 root 上、matrix 还是
+   * 单位阵，`setFromObject` 得到的就是顶点自己的坐标系，正好是摆放要的枢轴。
+   * 挂上 root 之后再算会带上 root 的 offset，枢轴就偏了。
+   */
+  private _localCenterOf(group: THREE.Object3D): { x: number; y: number; z: number } | null {
+    if (!group.children.length) return null;
+    const box = new THREE.Box3().setFromObject(group);
+    if (box.isEmpty()) return null;
+    const c = box.getCenter(new THREE.Vector3());
+    if (!Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) return null;
+    return { x: c.x, y: c.y, z: c.z };
   }
 
   /**
