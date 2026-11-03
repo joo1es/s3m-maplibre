@@ -120,3 +120,45 @@ test('父瓦被淘汰后，子孙必须还能显示（不能整片消失）', ()
   expect(ts.nodes.get('A').group.visible).toBe(true);
   expect(ts.nodes.get('B').group.visible).toBe(true);
 });
+
+/**
+ * S3M 1.x 的叶子瓦片（XML 是 `<PageLods><Geode>`，没有 `<PagedLOD>`）解析出来
+ * `pageLods` 为空 → `node.sphere === null`。这类瓦片算不出距离，但仍要参与淘汰决策，
+ * 否则「可见性」和「最近使用」两条信息都是空的，硬上限一来就先踢它们。
+ */
+test('没有包围球的瓦片也要记 lastSeen（否则硬上限下永远第一个被踢）', () => {
+  const ts = mk(100, 4);
+  ts.rootUrls.push('leaf');
+  const leaf = node('leaf');
+  leaf.sphere = null as never;
+  leaf.lastSeen = 0;
+  ts.nodes.set('leaf', leaf);
+
+  ts.update([0, 0, 5], 0.6, 1080);
+
+  // 修复前这里一直是 0：`update()` 在 `!node.sphere` 就 continue 了
+  expect(leaf.lastSeen).toBe(ts._frame);
+  expect(leaf.needRefine).toBe(false);
+});
+
+test('淘汰优先挑不可见的：可见的即使 lastSeen 更旧也要保住', () => {
+  const ts = mk(1, 1);
+  const removed: string[] = [];
+  ts._onTileRemoved = (n: any) => removed.push(n.url);
+  ts.rootUrls.push('vis', 'hid');
+
+  const vis = node('vis', { visible: true });
+  vis.lastSeen = 1; // 正在显示，但时间戳很旧（无球瓦片的典型状态）
+  ts.nodes.set('vis', vis);
+
+  const hid = node('hid', { visible: false });
+  hid.lastSeen = 999; // 没在用，但时间戳很新
+  ts.nodes.set('hid', hid);
+
+  ts.hardCap = 0; // 强制走 allowUncovered 分支
+  ts._trimBudget();
+
+  // 修复前按 lastSeen 排序会先踢 vis（1 < 999），正在显示的块当场开洞
+  expect(removed).toEqual(['hid']);
+  expect(ts.nodes.has('vis')).toBe(true);
+});
