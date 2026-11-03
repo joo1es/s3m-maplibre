@@ -271,12 +271,76 @@ describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () =>
     v.dispose();
   });
 
-  test('没有包围球 / 没有数据集锚点时不动矩阵', () => {
+  test('没有数据集锚点时不动矩阵；没有包围球但有几何时仍要摆（否则跟着 root 偏移沉下去）', () => {
     const v = makeViewer(true);
-    expect(register(v, null).group.matrixAutoUpdate).toBe(true);
     expect(
       register(v, { center: { x: 0, y: 20000, z: 0 }, radius: 1 }, null).group.matrixAutoUpdate,
     ).toBe(true);
+    expect(register(v, null).group.matrixAutoUpdate).toBe(false);
+    v.dispose();
+  });
+
+  /**
+   * S3M 1.x 的叶子瓦片（XML 是 `<PageLods><Geode>`，没有 `<PagedLOD>`）解析出来
+   * `pageLods` 为空，于是 `node.sphere` 是 null。旧实现靠 `node.sphere` 决定要不要
+   * 摆放，这批瓦片就被跳过——但 `entry.root` 上挂着 align 算出来的整体垂直偏移
+   * （索菲亚教堂是 heightRange.min = 119.84），别的瓦片靠 placement 的
+   * `- datasetOffset` 把它抵消掉，它们没有，结果整层沉到地下 120 m。
+   */
+  test('没有包围球时仍要摆放：用几何中心兜底，抵消 root 的垂直偏移', () => {
+    const v = makeViewer(true);
+    const group = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), new THREE.MeshBasicMaterial());
+    mesh.position.set(26, -6, 122); // 顶点是数据集绝对坐标（实测 L23 叶子就是这样）
+    group.add(mesh);
+
+    const entry = (
+      v as unknown as { _datasetManager: { registerDataset: (o: { id: string }) => unknown } }
+    )._datasetManager.registerDataset({ id: 'leaf' }) as {
+      root: THREE.Group;
+      anchor: unknown;
+      offset: number[];
+    };
+    entry.anchor = ANCHOR;
+    entry.offset = [0, 0, -120]; // align:'bottom' → heightRange.min
+    entry.root.position.set(0, 0, -120);
+
+    (v as unknown as { _registerTile: (n: unknown, e: unknown) => void })._registerTile(
+      { group, tile: null, sphere: null },
+      entry,
+    );
+
+    // 摆了：matrixAutoUpdate 关掉、枢轴记下来了
+    expect(group.matrixAutoUpdate).toBe(false);
+    expect(group.userData.tileCenter).toEqual({ x: 26, y: -6, z: 122 });
+
+    // 关键：世界高度要留在 122 附近。不摆放的话是 122 + (-120) = 2（沉到地下）
+    const landed = new THREE.Vector3(26, -6, 122)
+      .applyMatrix4(group.matrix)
+      .add(new THREE.Vector3(0, 0, -120));
+    expect(landed.z).toBeCloseTo(122, 3);
+    v.dispose();
+  });
+
+  test('几何为空时拿不到中心，退回旧口径（不能让瓦片消失）', () => {
+    const v = makeViewer(true);
+    const group = new THREE.Group(); // 没有任何 mesh
+    const entry = (
+      v as unknown as { _datasetManager: { registerDataset: (o: { id: string }) => unknown } }
+    )._datasetManager.registerDataset({ id: 'empty' }) as {
+      root: THREE.Group;
+      anchor: unknown;
+      offset: number[];
+    };
+    entry.anchor = ANCHOR;
+    entry.offset = [0, 0, -120];
+
+    (v as unknown as { _registerTile: (n: unknown, e: unknown) => void })._registerTile(
+      { group, tile: null, sphere: null },
+      entry,
+    );
+
+    expect(group.matrixAutoUpdate).toBe(true);
     v.dispose();
   });
 
