@@ -58,6 +58,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 单体三维平移 | ✅ | `FeatureStyle.translation` 存 `[dx, dy, dz]`（米），与着色器 / 拾取 / 描边全链路同步 |
 | LOD 细化倍率 | ✅ | `lodRangeScale` 运行时动态调节粗细模判定阈值 |
 | LOD 过渡细化 | ✅ | 支持 'binary'（整节点二值切换，默认）与 'incremental'（primary/fallback 双列表 + LEQUAL 深度推移增量细化，慢 child 不阻塞其它子瓦，平滑过渡不出洞） |
+| 视锥细化剔除 | ✅ | 可选开关（`cullRefine: true`，默认关闭），视野外瓦片跳过进一步请求与细化，大幅减少转头与大范围场景下的无效下载、Worker 解析与显存占用，带 15% 边界余量保障无闪烁 |
 | 实例化几何 | ✅ | `instanceMode` 16 / 17 |
 | 正交投影 | ✅ | 可选开关（`projection: 'orthographic'`），默认透视；需 MapLibre ≥ 5，正交时底图 / 地形 / marker 需 App 退出，见[正交投影](#正交投影) |
 | 可调光照 | ✅ | `setLight()` / `getLight()` 支持动态调整环境光与主平行光的颜色、强度、方位角与高度角，支持 `headlamp`（跟随视角）与 `fixed`（太阳固定世界方位）模式 |

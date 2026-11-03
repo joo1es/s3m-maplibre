@@ -289,6 +289,13 @@ export interface TileNode {
   stats?: { meshes: number; vertices: number; triangles: number; memory?: number };
 }
 
+/** 视锥可见性判定回调（返回 false 表示瓦片完全在视锥外，应跳过进一步细化） */
+export type TileVisibilityTest = (
+  center: { x: number; y: number; z: number },
+  radius: number,
+  node?: TileNode
+) => boolean;
+
 /** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
 export type BuildTileFn = (
   tile: ParsedTile,
@@ -1516,7 +1523,12 @@ export class S3MTileset {
    * @param screenHeight 视口像素高度
    * @returns 瓦片加载队列或可见性是否发生变化
    */
-  update(camEnu: [number, number, number], fovRad: number, screenHeight: number): boolean {
+  update(
+    camEnu: [number, number, number],
+    fovRad: number,
+    screenHeight: number,
+    isVisible?: TileVisibilityTest
+  ): boolean {
     this._frame++;
     let hasChanges = false;
 
@@ -1590,10 +1602,13 @@ export class S3MTileset {
             })
           : null;
 
-      const needRefine = splat
+      let needRefine = splat
         ? splat.needRefine
         : childUrls.length > 0 &&
           (byDistance ? metric < threshold * hFactor : metric > threshold * hFactor);
+      if (needRefine && isVisible && !isVisible(c, node.sphere.radius, node)) {
+        needRefine = false;
+      }
       node.needRefine = needRefine;
 
       const dbgSeen = ((globalThis as { __S3M_LOD_SEEN?: Set<string> }).__S3M_LOD_SEEN ??= new Set<string>());

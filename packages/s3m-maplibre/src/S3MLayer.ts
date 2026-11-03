@@ -1054,6 +1054,19 @@ export class S3MLayer extends HostRenderer {
     this.viewer.setLodRangeScale(scale, datasetId);
   }
 
+  /** 当前是否开启细化视锥剔除（第一期，issue #25） */
+  get cullRefine(): boolean {
+    return this.viewer.cullRefine;
+  }
+
+  set cullRefine(enabled: boolean) {
+    this.viewer.cullRefine = enabled;
+  }
+
+  setCullRefine(enabled: boolean): void {
+    this.viewer.setCullRefine(enabled);
+  }
+
   /** 当前 LOD 判定屏幕高度的 DPR 上限。Infinity = 不截断 */
   get lodPixelRatioCap(): number {
     return this.viewer.lodPixelRatioCap;
