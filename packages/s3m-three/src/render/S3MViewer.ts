@@ -430,7 +430,9 @@ export class S3MViewer {
   private _getBearing: (() => number) | undefined;
   /** 鉴权适配（全局默认），构造时注入 */
   private readonly _authenticate: AuthenticateFn | undefined;
+  /** 视锥细化剔除开关，默认 false（issue #25 第一期） */
   private _cullRefine = false;
+  /** 逐帧复用：视锥与球心测试用的临时向量，避免每帧 new */
   private _frustum?: THREE.Frustum;
   private _cullTestVec?: THREE.Vector3;
   private _lodRangeScale = 1.0;
@@ -467,9 +469,10 @@ export class S3MViewer {
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
     this._unsupported = options.unsupported ?? 'warn';
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
+    // 视锥剔除细化默认关闭：这是可选策略不是 bug 修复，不传就走全向加载的老路径
+    this._cullRefine = options.cullRefine === true || options.frustumCullRefine === true;
     // 瓦片级放置默认开启：旧行为是拿单一常量切平面拟合随纬度变化的墨卡托比例，属于 bug 修复，
     // 所以默认值跟着改（见 AGENTS.md 不变式 ①）。显式传 false 仍可回退。
-    this._cullRefine = options.cullRefine === true || (options as any).frustumCullRefine === true;
     this._perTilePlacement = options.perTilePlacement !== false;
     this._depthMode = normalizeDepthMode(options.depthMode);
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
@@ -3276,10 +3279,6 @@ export class S3MViewer {
     this._requestRepaint();
   }
 
-  /**
-   * 动态调整 LOD 切换范围缩放系数。
-   * scale > 1 时倾向保留粗模（降低瓦片请求与面数）；scale < 1 时提前细化加载高精瓦片。
-   */
   /** 当前是否开启细化视锥剔除（第一期，issue #25） */
   get cullRefine(): boolean {
     return this._cullRefine;
@@ -3289,6 +3288,12 @@ export class S3MViewer {
     this.setCullRefine(enabled);
   }
 
+  /**
+   * 开关细化视锥剔除（第一期，issue #25）。
+   *
+   * 只影响「要不要继续细化」：视野外的瓦片不再 `_enqueue` 子瓦片，
+   * 已加载的瓦片、`lastSeen` 刷新、淘汰与显存预算都不动。
+   */
   setCullRefine(enabled: boolean): void {
     const val = !!enabled;
     if (this._cullRefine === val) return;
@@ -3296,7 +3301,11 @@ export class S3MViewer {
     this._requestRepaint();
   }
 
-    setLodRangeScale(scale: number, datasetId?: string): void {
+  /**
+   * 动态调整 LOD 切换范围缩放系数。
+   * scale > 1 时倾向保留粗模（降低瓦片请求与面数）；scale < 1 时提前细化加载高精瓦片。
+   */
+  setLodRangeScale(scale: number, datasetId?: string): void {
     if (scale <= 0) return;
     if (datasetId) {
       const entry = this.datasets.get(datasetId);
