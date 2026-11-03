@@ -170,6 +170,14 @@ export interface S3MViewerOptions {
    *
    * 见 `render/tilePlacement.ts` 的文件头。
    */
+  /**
+   * 视锥剔除细化（第一期，默认 false，见 issue #25）。
+   * 开启后视野外的瓦片不再继续请求/细化子瓦片，大幅减少转头时的无效下载、解析与上传。
+   * 默认 false（不变式 ①，保持原有全向加载行为）。
+   */
+  cullRefine?: boolean;
+  /** 视锥剔除细化的别名，同 cullRefine */
+  frustumCullRefine?: boolean;
   perTilePlacement?: boolean;
   /**
    * 是否对瓦片逐顶点烘焙精确 Web 墨卡托偏移（消除全球大尺度下的视差游动/呼吸效应）。

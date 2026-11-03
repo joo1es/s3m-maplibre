@@ -22,7 +22,7 @@
  */
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
-import type { BuildTileFn, TileNode } from '../tileset/S3MTileset.js';
+import type { BuildTileFn, TileNode, TileVisibilityTest } from '../tileset/S3MTileset.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap, applyAnisotropyCap } from './TextureFactory.js';
@@ -430,6 +430,9 @@ export class S3MViewer {
   private _getBearing: (() => number) | undefined;
   /** 鉴权适配（全局默认），构造时注入 */
   private readonly _authenticate: AuthenticateFn | undefined;
+  private _cullRefine = false;
+  private _frustum?: THREE.Frustum;
+  private _cullTestVec?: THREE.Vector3;
   private _lodRangeScale = 1.0;
   /** 图层级降级策略，数据集可覆盖，见 `S3MViewerOptions.unsupported` */
   private readonly _unsupported: UnsupportedPolicy;
@@ -466,6 +469,7 @@ export class S3MViewer {
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     // 瓦片级放置默认开启：旧行为是拿单一常量切平面拟合随纬度变化的墨卡托比例，属于 bug 修复，
     // 所以默认值跟着改（见 AGENTS.md 不变式 ①）。显式传 false 仍可回退。
+    this._cullRefine = options.cullRefine === true || (options as any).frustumCullRefine === true;
     this._perTilePlacement = options.perTilePlacement !== false;
     this._depthMode = normalizeDepthMode(options.depthMode);
     setTextureSizeCap(options.maxTextureSize ?? Infinity);
@@ -3276,7 +3280,23 @@ export class S3MViewer {
    * 动态调整 LOD 切换范围缩放系数。
    * scale > 1 时倾向保留粗模（降低瓦片请求与面数）；scale < 1 时提前细化加载高精瓦片。
    */
-  setLodRangeScale(scale: number, datasetId?: string): void {
+  /** 当前是否开启细化视锥剔除（第一期，issue #25） */
+  get cullRefine(): boolean {
+    return this._cullRefine;
+  }
+
+  set cullRefine(enabled: boolean) {
+    this.setCullRefine(enabled);
+  }
+
+  setCullRefine(enabled: boolean): void {
+    const val = !!enabled;
+    if (this._cullRefine === val) return;
+    this._cullRefine = val;
+    this._requestRepaint();
+  }
+
+    setLodRangeScale(scale: number, datasetId?: string): void {
     if (scale <= 0) return;
     if (datasetId) {
       const entry = this.datasets.get(datasetId);
@@ -3393,6 +3413,15 @@ export class S3MViewer {
     // LOD 判定高度：默认就是绘图缓冲高度（物理像素，与官方口径一致）；
     // 配了 lodPixelRatioCap 才按 CSS 高度截断，默认状态下这两行不产生任何开销。
     const lodScreenHeight = this._lodScreenHeight(opts.canvasHeight);
+
+    let frustum: THREE.Frustum | null = null;
+    let cullTestVec: THREE.Vector3 | null = null;
+    if (this._cullRefine) {
+      frustum = this._frustum ??= new THREE.Frustum();
+      frustum.setFromProjectionMatrix(mvp);
+      cullTestVec = this._cullTestVec ??= new THREE.Vector3();
+    }
+
     for (const entry of this.datasets.values()) {
       if (!entry.visible || !entry.tileset) continue;
       const local: [number, number, number] = [
@@ -3400,7 +3429,45 @@ export class S3MViewer {
         camEnu[1] - entry.offset[1],
         camEnu[2] - entry.offset[2],
       ];
-      if (entry.tileset.update(local, opts.fovRad, lodScreenHeight)) {
+
+      let isVisible: TileVisibilityTest | undefined;
+      if (frustum && cullTestVec) {
+        const f = frustum;
+        const v = cullTestVec;
+        const entryOffset = entry.offset;
+        isVisible = (center, radius, node) => {
+          let worldX: number;
+          let worldY: number;
+          let worldZ: number;
+          let worldRadius = radius;
+
+          if (node?.group && node.group.parent) {
+            v.set(center.x, center.y, center.z).applyMatrix4(node.group.matrixWorld);
+            worldX = v.x;
+            worldY = v.y;
+            worldZ = v.z;
+            worldRadius *= node.group.matrixWorld.getMaxScaleOnAxis();
+          } else {
+            worldX = center.x + entryOffset[0];
+            worldY = center.y + entryOffset[1];
+            worldZ = center.z + entryOffset[2];
+          }
+
+          // 边界余量：按球半径的 15% 且至少保留 10 米余量，避免视野边缘临界抖动与转头瞬间缺块
+          const margin = Math.max(worldRadius * 0.15, 10);
+          const limit = -(worldRadius + margin);
+
+          const planes = f.planes;
+          for (let i = 0; i < 6; i++) {
+            const p = planes[i];
+            const dist = p.normal.x * worldX + p.normal.y * worldY + p.normal.z * worldZ + p.constant;
+            if (dist < limit) return false;
+          }
+          return true;
+        };
+      }
+
+      if (entry.tileset.update(local, opts.fovRad, lodScreenHeight, isVisible)) {
         tilesetChanged = true;
       }
     }
