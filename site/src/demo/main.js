@@ -876,8 +876,14 @@ function setVectorBasemap(on) {
       map.addSource('ofm', src);
       vectorSourceSig = sig;
     }
-    // 插在 S3M 自定义层之前：矢量底图在下，模型在上
-    const s3mLayerId = map.getStyle().layers.find((l) => l.type === 'custom')?.id;
+    // 插在 S3M 自定义层之前：矢量底图在下，模型在上。
+    // 不能用 map.getStyle().layers 找 type === 'custom'：序列化样式时 custom 层会被跳过
+    // （Style._serializedAllLayers 里只有 type !== 'custom' 才 serialize，custom 层自己的
+    // serialize() 直接抛错），那里永远查不到。查不到就等于 beforeId 是 undefined，
+    // 矢量层被追加到模型之后；而 cutoff 正好落在 S3M 上（它是第一个 3D 层），
+    // 排在它之后的 2D 层 getDepthModeForSublayer 直接返回 DepthMode.disabled，
+    // 于是道路/水面不做深度测试、平铺盖在模型上。getLayersOrder() 才是含 custom 层的。
+    const s3mLayerId = map.getLayersOrder().includes(layer.id) ? layer.id : undefined;
 
     if (!map.getLayer('ofm-water')) {
       map.addLayer(

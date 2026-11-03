@@ -338,6 +338,7 @@ node tools/release.mjs patch --push    # 一条命令发版（改版本 + 构建
 | `replace('#include <…>')` 静默失效 | three 改了 chunk 名，材质照样渲染但注入没生效 |
 | 正交模式下底图与模型差一个楼高/相机距 | 只有 S3M 层正交，MapLibre 仍是透视；要全对齐得用 `enableMapLibreOrtho`（beta） |
 | `bun` / `pnpm` 毫无输出地失败 | 本机 `NODE_OPTIONS` 注入，加 `NODE_OPTIONS=` 前缀 |
+| 矢量底图的线/面盖在模型上 | `map.getStyle().layers` **不含** custom 层（`Style._serializedAllLayers` 只序列化非 custom，custom 的 `serialize()` 直接抛错），拿它找 S3M 层永远失败，`beforeId` 变 `undefined` 把图层追加到模型之后；而 cutoff 落在 S3M（第一个 3D 层）上，排在它后面的 2D 层 `getDepthModeForSublayer` 返回 `DepthMode.disabled`。找层 id 用 `map.getLayersOrder()` |
 | 改完 `packages/*/src` 看不到变化，以为要 `bun run build` | `dev` 常驻的 `tsc -w` 已经增量编译好了，刷新页面即可；build 只用于更新 `demo/` `docs/` 产物 |
 | push 超时 / 要用户名密码 | 全局 `git config http.proxy` 丢了（正常是 `127.0.0.1:10809`）；临时用 `git -c http.proxy=... push`。**不要**手加 `-c credential.helper=!...PortableGit/...`，那个路径不存在 |
 | 发布 CI 报「标签与版本不一致」 | tag 版本 ≠ `package.json` version |
