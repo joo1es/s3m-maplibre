@@ -268,6 +268,7 @@ export class S3MTileset {
         useWorker: () => self._useWorker,
         vertexAttributeDescript: () => self.config?.vertexAttributeDescript,
         classicParser: (buffer) => self._parseClassicTile(buffer),
+        blockParser: (buffer) => self._parseBlockGroups(buffer),
       },
       options.buildTile ?? null,
     );
@@ -491,6 +492,11 @@ export class S3MTileset {
   /** 经典 `.s3mb` 解析（测试直接调用），实现在 tileset/TileSource.ts */
   private _parseClassicTile(buffer: ArrayBuffer): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
     return this._source.parseClassicTile(buffer);
+  }
+
+  /** S3MBLOCK 容器解析（测试直接调用），实现在 tileset/TileSource.ts */
+  private _parseBlockGroups(buffer: ArrayBuffer): Promise<S3MBlockGroupSet> {
+    return this._source.parseBlockGroups(buffer);
   }
 
   /**

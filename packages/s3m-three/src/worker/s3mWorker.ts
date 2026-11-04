@@ -3,6 +3,7 @@
  *
  * 职责：把 CPU 密集的解码搬离主线程——
  *   - parse：`.s3mb`（含 S3M 1.x / Draco / MeshOpt 内联 wasm 解码）整块解析；
+ *   - block：`.s3mblock` 容器（一整棵 LOD 子树，逐组 inflate + 图集解码）；
  *   - tex：  纹理解码（DXT 解块 / CRN wasm 转码 / WEBP createImageBitmap），
  *            与主线程共用 core/TextureDecode.ts 的同一份实现。
  * 抓取（fetch）仍由 S3MTileset 在主线程做——重试、退避、content-type 检查这些
@@ -10,11 +11,14 @@
  *
  * 协议：
  *   { type:'parse', id, buffer } → { id, ok:true, tile } | { id, ok:false, message, permanent }
+ *   { type:'block', id, buffer } → { id, ok:true, set  } | { id, ok:false, message, permanent }
  *   { type:'tex',  id, tex }     → { id, ok:true, data } | { id, ok:false, message }
  *
  * 线程安全：两个入口都无模块级可变状态；每次调用用独立的 reader / 解码器实例。
  */
 import { parseS3MB } from '../core/S3MBParser.js';
+import { parseS3MBlockGroups } from '../core/S3MBlockParser.js';
+import type { S3MBlockGroupSet } from '../core/S3MBlockParser.js';
 import { decodeTextureData } from '../core/TextureDecode.js';
 import { assembleTileGeometry } from '../core/TileGeometry.js';
 import type { ParsedTile, S3MTexture } from '../core/types.js';
@@ -30,11 +34,16 @@ type ParseRequest = {
   batching?: boolean;
   vertexAttributeDescript?: unknown;
 };
+type BlockRequest = { type: 'block'; id: number; buffer: ArrayBuffer };
 type TexRequest = { type: 'tex'; id: number; tex: S3MTexture; compressed?: boolean; maxSize?: number };
-type Request = ParseRequest | TexRequest;
+type Request = ParseRequest | BlockRequest | TexRequest;
 
 type ParseResponse =
   | { id: number; ok: true; tile: ParsedTile; geometry?: TileGeometryData }
+  | { id: number; ok: false; message: string; permanent: boolean };
+
+type BlockResponse =
+  | { id: number; ok: true; set: S3MBlockGroupSet }
   | { id: number; ok: false; message: string; permanent: boolean };
 
 type TexResponse = { id: number; ok: true; data: Awaited<ReturnType<typeof decodeTextureData>> };
@@ -68,6 +77,11 @@ ctx.onmessage = async (e: MessageEvent<Request>) => {
         // 响应整体过线（零拷贝）；请求 buffer 是主线程 structured clone 过来的副本，无需回传
         ctx.postMessage({ id, ok: true, tile } satisfies ParseResponse, collectTransferables(tile));
       }
+    } else if (msg.type === 'block') {
+      // 整个 .s3mblock 容器在这里解析：inflate（DecompressionStream）+ 逐组段目录 +
+      // 图集解码全在 Worker，主线程只接纯数据结果。
+      const set = await parseS3MBlockGroups(msg.buffer);
+      ctx.postMessage({ id, ok: true, set } satisfies BlockResponse, collectTransferables(set));
     } else {
       const data = await decodeTextureData(msg.tex, { compressed: msg.compressed, maxSize: msg.maxSize });
       ctx.postMessage({ id, ok: true, data } satisfies TexResponse, texTransferList(data));

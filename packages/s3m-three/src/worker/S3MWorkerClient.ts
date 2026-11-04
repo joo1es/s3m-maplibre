@@ -11,6 +11,7 @@
 import type { ParsedTile, S3MTexture } from '../core/types.js';
 import type { DecodedTextureData } from '../core/TextureDecode.js';
 import type { TileGeometryData } from '../core/TileGeometry.js';
+import type { S3MBlockGroupSet } from '../core/S3MBlockParser.js';
 
 /** Worker 崩溃 / 不可用 —— 与「瓦片数据本身有问题」区分开，调用方据此决定降级还是重试 */
 export class WorkerDeadError extends Error {
@@ -33,6 +34,13 @@ interface TexOkResponse {
   data: DecodedTextureData;
 }
 
+/** S3MBLOCK 容器：一整棵 LOD 子树的全部组（#35） */
+interface BlockOkResponse {
+  id: number;
+  ok: true;
+  set: S3MBlockGroupSet;
+}
+
 interface ErrResponse {
   id: number;
   ok: false;
@@ -40,7 +48,7 @@ interface ErrResponse {
   permanent: boolean;
 }
 
-type Response = ParseOkResponse | TexOkResponse | ErrResponse;
+type Response = ParseOkResponse | TexOkResponse | BlockOkResponse | ErrResponse;
 
 export class S3MWorkerClient {
   private readonly _worker: Worker;
@@ -76,6 +84,8 @@ export class S3MWorkerClient {
         waiter.reject(err);
       } else if ('tile' in msg) {
         waiter.resolve({ tile: msg.tile, geometry: msg.geometry });
+      } else if ('set' in msg) {
+        waiter.resolve(msg.set);
       } else {
         waiter.resolve(msg.data);
       }
@@ -99,6 +109,20 @@ export class S3MWorkerClient {
     return new Promise<{ tile: ParsedTile; geometry?: TileGeometryData }>((resolve, reject) => {
       this._pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
       this._worker.postMessage({ type: 'parse', id, buffer, assemble, batching, vertexAttributeDescript });
+    });
+  }
+
+  /**
+   * 解析一个 `.s3mblock` 容器里的全部 LOD 组（#35）。
+   * buffer 结构化克隆过去（不 transfer），主线程保留原 buffer 以便 Worker 崩溃后降级重解；
+   * 回程的 typed array buffer 由 Worker 侧 collectTransferables 零拷贝传回。
+   */
+  parseBlock(buffer: ArrayBuffer): Promise<S3MBlockGroupSet> {
+    if (this.dead) return Promise.reject(new WorkerDeadError('s3m 解析 Worker 已终止'));
+    const id = ++this._seq;
+    return new Promise<S3MBlockGroupSet>((resolve, reject) => {
+      this._pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      this._worker.postMessage({ type: 'block', id, buffer });
     });
   }
 

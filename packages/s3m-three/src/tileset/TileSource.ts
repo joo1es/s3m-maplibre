@@ -1,5 +1,5 @@
 /**
- * 瓦片取源与解析：URL 解引用、字节抓取、S3MBLOCK 组缓存、经典 `.s3mb` 的 Worker 解析。
+ * 瓦片取源与解析：URL 解引用、字节抓取、S3MBLOCK 组缓存、两类瓦片的 Worker 解析。
  *
  * 从 `S3MTileset.ts` 搬出来（issue #27 的 P5 阶段），行为逐字未变。
  *
@@ -53,6 +53,12 @@ export interface TileSourceHost {
    * 绕过去测试当场变瞎。默认实现就是宿主那次转发，最终仍是本类的 `parseClassicTile`。
    */
   classicParser(buffer: ArrayBuffer): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }>;
+  /**
+   * S3MBLOCK 容器解析入口，同样**由宿主回注**而不是直接调 `parseBlockGroups`。
+   * 与 classicParser 一个理由：单测要把 `tileset._parseBlockGroups` 整个替换成 stub
+   * 喂假瓦片，走内部方法会绕过这个替换点（AGENTS.md「单测的接缝不能被绕开」）。
+   */
+  blockParser(buffer: ArrayBuffer): Promise<S3MBlockGroupSet>;
 }
 
 export class TileSource {
@@ -104,7 +110,7 @@ export class TileSource {
 
     // S3MBLOCK（TextureSharing / 单文件存储）走专用解析：容器 + 内嵌 v2 瓦片体 + 图集纹理
     if (isBlock) {
-      const set = await parseS3MBlockGroups(buffer);
+      const set = await this.host.blockParser(buffer);
       this.rememberGroups(baseUrl, set);
       return {
         tile: set.tiles[groupIndex] ?? set.tiles[0]!,
@@ -128,18 +134,25 @@ export class TileSource {
   }
 
   /**
+   * 共享的解析 Worker：与纹理解码共用进程级单例，避免每个数据集各起一个 Worker。
+   * undefined = 还没试过创建；null = 环境不可用或已崩溃，永久降级不再重试。
+   */
+  private _worker(): S3MWorkerClient | null {
+    if (!this.host.useWorker()) return null;
+    if (this._workerClient === undefined) this._workerClient = getSharedS3MWorker();
+    return this._workerClient ?? null;
+  }
+
+  /**
    * 经典 `.s3mb` 瓦片解析：优先走 Worker（inflate / Draco / MeshOpt / 几何组装
    * 全在 Worker 做，一次往返带回 tile + 纯数据几何），Worker 不可用或已崩溃时
    * 主线程兜底，两条路径输出完全一致。
    */
   async parseClassicTile(buffer: ArrayBuffer): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
-    if (this.host.useWorker() && this._workerClient === undefined) {
-      // 与纹理解码共用进程级单例，避免每个数据集各起一个 Worker
-      this._workerClient = getSharedS3MWorker();
-    }
-    if (this._workerClient) {
+    const client = this._worker();
+    if (client) {
       try {
-        return await this._workerClient.parseTile(buffer, true, true, this.host.vertexAttributeDescript());
+        return await client.parseTile(buffer, true, true, this.host.vertexAttributeDescript());
       } catch (e) {
         if (e instanceof WorkerDeadError) {
           // 脚本加载失败 / 崩溃属于环境问题，永久退回主线程；瓦片本身的问题照常抛
@@ -150,6 +163,30 @@ export class TileSource {
       }
     }
     return { tile: await parseS3MB(buffer, { vertexAttributeDescript: this.host.vertexAttributeDescript() }) };
+  }
+
+  /**
+   * S3MBLOCK 容器解析（#35）：容器 + 逐组 inflate + 段目录 + 内嵌图集解码
+   * 整块在 Worker 里跑，主线程只接 S3MBlockGroupSet 纯数据结果。
+   * 一个块最多 4096 组，之前这段全压在主线程，加载新块时会顿一下。
+   *
+   * Worker 不可用 / 崩溃时退回主线程，与经典路径共用同一套永久降级语义：
+   * 脚本问题降级，瓦片字节问题原样抛给上层重试。
+   */
+  async parseBlockGroups(buffer: ArrayBuffer): Promise<S3MBlockGroupSet> {
+    const client = this._worker();
+    if (client) {
+      try {
+        return await client.parseBlock(buffer);
+      } catch (e) {
+        if (e instanceof WorkerDeadError) {
+          this._workerClient = null;
+        } else {
+          throw e;
+        }
+      }
+    }
+    return parseS3MBlockGroups(buffer);
   }
 
   /**
