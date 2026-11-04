@@ -40,6 +40,12 @@ demo/  docs/     构建产物，**已纳入 git**
 | `EdgeDecorator` | 棱线 / 外扩轮廓 / GPU 描边 | `_modes`、`_nativeLines`、`_gpuEdge`、外观 uniform |
 | `PickService` | 拾取表、pickId 池、射线求交 | `pickables`、`_pickSeq`、`_freePickIds` |
 | `SelectionDecorator` | 选中高亮、轮廓装饰、跨瓦片重放 | `selection`、`selectedMeshes`、装饰引用 |
+| `AnalysisService` | 量算 / 通视 / 裁剪 / 天际线 / 可视域 | `_clip` |
+| `TilePlacement` | 瓦片级放置、逆矩阵缓存、重锚点重摆、拾取反解 | `group.userData.tileCenter` / `placementInverse` |
+| `StyleController` | 样式补间 / uniform 下发 / 动画通道 / 不透明度 / 材质档位重建 | `_colorScratch` |
+| `TileRegistry` | 瓦片注册 / 注销 / 淡入 / 样式继承 | 淡入通道序号 |
+| `PathFollow` | 沿路径运动（CPU 补间 + GPU 实例化） | `_pathScratch` / `_pathScratch2` |
+| `materialHelpers` | 两边都要用的材质判定小工具 | 无（纯函数） |
 
 两条硬规矩：
 
@@ -48,9 +54,54 @@ demo/  docs/     构建产物，**已纳入 git**
 2. **子模块不要 `import` `S3MViewer` 的值**，只允许 `import type`。ESM 循环引用在 bun / vite 下
    不报错，运行时才拿到 `undefined`。
 
-`TileRegistry` / `StyleController` / `FrameRenderer` **故意没拆**：`_registerTile` 是 8 个模块的
-汇合点（要改成事件才值得拆）；`style` 是公共实例字段（`viewer-api-surface.test.ts` 钉住了）；
-`renderFrame` 没有自己的状态，是唯一编排点。
+`FrameRenderer` **故意没拆**：`renderFrame` 没有自己的状态，是唯一编排点，依赖 34 个宿主成员，
+搬出去只会让「一帧发生了什么」散到两个文件。
+
+两条曾经写在这里、后来被证伪的判断，留个记录免得再推一遍：
+
+- ~~`TileRegistry` 拆了不划算~~（issue #27 第二轮拆了）。当时的理由是「`_registerTile` 是 8 个
+  模块的汇合点，抽成类要向宿主回调 10 个以上方法」。实际上那 20 多项**全是宿主持有的容器
+  引用**，一个回调都不需要 → 注册顺序仍然一眼看完，只是换了个文件。
+- ~~`StyleController` 收益为负~~（同一轮拆了）。当时的理由是「`style` 是公共实例字段，移进
+  子模块只能给 getter，快照会红」。实际上 `style` 和 `_styleTarget` 只在构造函数里赋值一次
+  （`{...DEFAULT_STYLE}` 与 `{...this.style}`），之后全是原地改 —— 模块持有引用就能改，
+  公共字段留在主类不动，快照完全不受影响。
+
+---
+
+## 1.2 `tileset/` 的模块边界
+
+`S3MTileset` 同样是 facade，五件事分在 `tileset/` 下（issue #27）。和 `render/viewer/` 一样按
+**状态归属**切，规矩也一样（重绘 / 事件走宿主，子模块只 `import type`）：
+
+| 模块 | 负责 | 状态 |
+|---|---|---|
+| `types.ts` | 公共类型面（`TileNode` / `S3MTilesetOptions` / `BuildTileFn` / `TileVisibilityTest` …） | 无 |
+| `url.ts` | 目录拼接、绝对化、路径编码修补、S3M 1.x 子瓦寻址 | 无（纯函数） |
+| `config.ts` | `.scp` 解析、数据集类别判别、经纬度范围、锚点定位 | 无（纯函数） |
+| `TileSource` | 取字节 + 解析（`#N` 组解引用、块缓存 LRU 24、Worker 解析与永久降级） | `_workerClient`、`_buildTile` |
+| `BlockAtlas` | `.texblock` 子请求、图集 LRU、整图替换的等比/色差验证 | `_leafPending` |
+| `TileBudget` | 三条软上限、淘汰候选、make-before-break 裁剪、纹理引用计数 | `_textureRefs`、`_tileTextureKeys` |
+| `TileVisibility` | `update()` 判定主体、两套可见性递归、fallback 深度推移 | 仅帧号（宿主持有） |
+
+三个**故意没拆**的点，以及两个搬出来的坑：
+
+- **公共字段决定谁能搬。** `leafRequestCache` / `externalAtlasCache` / `atlasUpgraded` /
+  `atlasUpgradeSkipped` 是对外可见字段（单测直接读写），所以缓存实例留在 `S3MTileset`，
+  `BlockAtlas` 只操作注入进来的同一份引用。`maxImageCache` 用取值函数而不是快照，因为运行时可调。
+- **`maxTriangles` / `maxMemory` 的 setter 留在主类。** 它们只是写公共字段，搬到 `TileBudget`
+  等于多一层回调，收益为负。
+- **`update()` 是唯一编排点，但可以搬。** 它只需要 8 个活引用 + 5 个取值函数，没有把控制流
+  变成回调，所以 `TileVisibility` 站得住。
+
+两个坑（都踩过）：
+
+1. **单测的接缝不能被绕开。** `degradations.test.ts` 是把 `tileset._parseClassicTile` 整个替换成
+   stub 来喂假瓦片的，所以 `TileSource.load` 走宿主的 `classicParser` 回注、而不是直接调本类
+   方法 —— 走内部方法测试当场变瞎。和上面 `triggerRepaint` 是同一条规矩。
+2. **机械搬代码时切点会被上一阶段的转发污染。** 用「签名 → 往前找最近的 `/**`」定切点时，
+   如果上一个提交刚在同一位置插过转发方法，`rindex` 会停在转发的注释上，把转发一起搬走。
+   切完要断言「本段只含预期成员」，而不是只看首尾行。
 
 ---
 
@@ -122,7 +173,7 @@ NODE_OPTIONS= bun test ./tests/unit/xxx.test.ts   # 单个文件，写测试时�
 NODE_OPTIONS= bun test                   # 含 e2e，需要网络
 ```
 
-**交付标准**：`typecheck` 通过 + `bun test ./tests/unit` 全绿（当前基线 449 pass / 0 fail —— 这个数字只会涨，别拿它当断言，以本地实跑为准）。有一条红就不算完成，也不要在报告里说「基本通过」。
+**交付标准**：`typecheck` 通过 + `bun test ./tests/unit` 全绿（当前基线 899 pass / 0 fail —— 这个数字只会涨，别拿它当断言，以本地实跑为准）。有一条红就不算完成，也不要在报告里说「基本通过」。
 
 样例数据是可选的：`tests/helpers/sample.ts` 会去 `../s3m-spec/S3M_SDK/S3M_JS/data/` 找官方 `.s3mb`，找不到就 skip 整组解析断言。CI 里设了 `S3M_REQUIRE_SAMPLES=1`，样例没拉下来直接判失败——因为静默 skip 比失败更危险。
 

@@ -14,9 +14,35 @@ import type { Anchor } from '../core/types.js';
 import type { UnsupportedPolicy } from '../core/degradations.js';
 import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
-import type { DepthMode } from './viewer/types.js';
+import type { DepthMode, S3MViewerOptions } from './viewer/types.js';
 
 export type DatasetAlignment = 'origin' | 'bottom' | 'top' | 'center';
+
+/**
+ * 把 `S3MViewerOptions` 里的数据集声明归一成 `S3MDatasetOptions[]`。
+ *
+ * 两种写法：`datasets: [...]` 多数据集（只留带 configUrl 的），或单个 `configUrl`
+ * （合成一个 id = 'default' 的数据集）。`polygonOffset` 是图层级默认值，数据集自己
+ * 指定了就用自己的。纯函数，不碰任何状态 —— 从 `S3MViewer` 搬过来（issue #27 第二轮）。
+ */
+export function normalizeDatasetOptions(options: S3MViewerOptions): S3MDatasetOptions[] {
+  if (Array.isArray(options.datasets))
+    return options.datasets
+      .filter((d) => !!d?.configUrl)
+      .map((d) => ({ ...d, polygonOffset: d.polygonOffset ?? options.polygonOffset }));
+  if (options.configUrl)
+    return [{
+      id: 'default',
+      name: '默认数据集',
+      configUrl: options.configUrl,
+      useWorker: options.useWorker,
+      polygonOffset: options.polygonOffset,
+      lodTransition: options.lodTransition,
+      fallbackOffset: options.fallbackOffset,
+    }];
+  return [];
+}
+
 
 export interface S3MDatasetOptions {
   id: string;
