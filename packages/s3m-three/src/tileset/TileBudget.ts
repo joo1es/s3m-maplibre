@@ -14,6 +14,7 @@
 import type { Texture } from 'three';
 import type { Stats } from '../core/types.js';
 import type { TileNode } from './types.js';
+import { getNodeChildUrls } from './TileVisibility.js';
 
 /** `TileBudget` 需要的宿主状态。全是活引用或取值函数，没有控制流回调 */
 export interface TileBudgetHost {
@@ -172,7 +173,7 @@ export class TileBudget {
     if (!victim) return false;
 
     const parentUrl = victim.parentUrl ?? this.host.parentOf.get(victim.url);
-    const childUrls = victim.childUrls ?? (victim.childUrl ? [victim.childUrl] : []);
+    const childUrls = getNodeChildUrls(victim);
     const isLeaf = !childUrls.some((u) => u !== victim.url && this.host.nodes.has(u));
 
     const fp = this.evictTileNode(victim);
@@ -314,7 +315,7 @@ export class TileBudget {
   pickVictim(allowRefined: boolean, allowUncovered = false): TileNode | null {
     let victim: TileNode | null = null;
     for (const node of this.host.nodes.values()) {
-      const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+      const childUrls = getNodeChildUrls(node);
       const refined = childUrls.length > 0 && childUrls.some((u) => u !== node.url && this.host.nodes.has(u));
       if (refined !== allowRefined) continue;
       // 正在显示且没有可见子瓦接手 → 踢了就是洞
