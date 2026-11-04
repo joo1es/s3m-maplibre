@@ -42,6 +42,10 @@ demo/  docs/     构建产物，**已纳入 git**
 | `SelectionDecorator` | 选中高亮、轮廓装饰、跨瓦片重放 | `selection`、`selectedMeshes`、装饰引用 |
 | `AnalysisService` | 量算 / 通视 / 裁剪 / 天际线 / 可视域 | `_clip` |
 | `TilePlacement` | 瓦片级放置、逆矩阵缓存、重锚点重摆、拾取反解 | `group.userData.tileCenter` / `placementInverse` |
+| `StyleController` | 样式补间 / uniform 下发 / 动画通道 / 不透明度 / 材质档位重建 | `_colorScratch` |
+| `TileRegistry` | 瓦片注册 / 注销 / 淡入 / 样式继承 | 淡入通道序号 |
+| `PathFollow` | 沿路径运动（CPU 补间 + GPU 实例化） | `_pathScratch` / `_pathScratch2` |
+| `materialHelpers` | 两边都要用的材质判定小工具 | 无（纯函数） |
 
 两条硬规矩：
 
@@ -50,9 +54,18 @@ demo/  docs/     构建产物，**已纳入 git**
 2. **子模块不要 `import` `S3MViewer` 的值**，只允许 `import type`。ESM 循环引用在 bun / vite 下
    不报错，运行时才拿到 `undefined`。
 
-`TileRegistry` / `StyleController` / `FrameRenderer` **故意没拆**：`_registerTile` 是 8 个模块的
-汇合点（要改成事件才值得拆）；`style` 是公共实例字段（`viewer-api-surface.test.ts` 钉住了）；
-`renderFrame` 没有自己的状态，是唯一编排点。
+`FrameRenderer` **故意没拆**：`renderFrame` 没有自己的状态，是唯一编排点，依赖 34 个宿主成员，
+搬出去只会让「一帧发生了什么」散到两个文件。
+
+两条曾经写在这里、后来被证伪的判断，留个记录免得再推一遍：
+
+- ~~`TileRegistry` 拆了不划算~~（issue #27 第二轮拆了）。当时的理由是「`_registerTile` 是 8 个
+  模块的汇合点，抽成类要向宿主回调 10 个以上方法」。实际上那 20 多项**全是宿主持有的容器
+  引用**，一个回调都不需要 → 注册顺序仍然一眼看完，只是换了个文件。
+- ~~`StyleController` 收益为负~~（同一轮拆了）。当时的理由是「`style` 是公共实例字段，移进
+  子模块只能给 getter，快照会红」。实际上 `style` 和 `_styleTarget` 只在构造函数里赋值一次
+  （`{...DEFAULT_STYLE}` 与 `{...this.style}`），之后全是原地改 —— 模块持有引用就能改，
+  公共字段留在主类不动，快照完全不受影响。
 
 ---
 
