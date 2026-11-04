@@ -136,6 +136,9 @@ export class TileSource {
   /**
    * 共享的解析 Worker：与纹理解码共用进程级单例，避免每个数据集各起一个 Worker。
    * undefined = 还没试过创建；null = 环境不可用或已崩溃，永久降级不再重试。
+   *
+   * `useWorker()` 在这里统一判定：开关关闭时，即便已经创建过 client 也不再使用。
+   * 旧写法只在「还没创建过」时看开关，先开 Worker 再关掉时仍会继续复用，等于开关不生效。
    */
   private _worker(): S3MWorkerClient | null {
     if (!this.host.useWorker()) return null;
