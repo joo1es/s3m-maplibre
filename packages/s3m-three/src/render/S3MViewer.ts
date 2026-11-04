@@ -37,6 +37,8 @@ import { PickService } from './viewer/PickService.js';
 import { SelectionDecorator } from './viewer/SelectionDecorator.js';
 import { AnalysisService } from './viewer/AnalysisService.js';
 import { TilePlacement } from './viewer/TilePlacement.js';
+import { PathFollow } from './viewer/PathFollow.js';
+import type { PathSpec } from './viewer/PathFollow.js';
 import type {
   LightOptions,
   S3MViewerOptions,
@@ -377,11 +379,12 @@ export class S3MViewer {
   /** 预热进行中：期间跳过渲染，避免把「翻转后的变体」画到屏幕上 */
   private _prewarming = false;
   /** 路径运动的规格表：通道 key → 路径 + 偏移 */
-  private readonly _pathSpecs = new Map<string, { path: Path; offset: [number, number, number] }>();
+  /** `feature.<smid>.path` → 路径规格（unmount 与移除样式时都要清，所以留在宿主） */
+  private readonly _pathSpecs = new Map<string, PathSpec>();
+  /** 沿路径运动（CPU 补间 + GPU 实例化），见 viewer/PathFollow.ts */
+  private readonly _paths: PathFollow;
   /** 路径采样临时对象，避免每帧 new */
-  private readonly _pathScratch = new Float32Array(3);
   /** 求切线用的第二个采样点（包围盒换算 GPU 路径朝向时用） */
-  private readonly _pathScratch2 = new Float32Array(3);
 
   /** 点云对象集合：透明度动画时只刷它们，避免每帧遍历全部 pickables */
   private readonly _pointClouds = new Set<THREE.Points>();
@@ -631,6 +634,17 @@ export class S3MViewer {
       renderer: () => this.renderer,
       scene: () => this.scene,
       camera: () => this.camera,
+    });
+    this._paths = new PathFollow({
+      animator: this.animator,
+      gpuPathManager: this.gpuPathManager,
+      uniforms: this.uniforms,
+      styles: this._featureStyleManager,
+      pathSpecs: this._pathSpecs,
+      meshesOf: (smids) => this._meshesOf(smids),
+      setCustomPathTime: (custom) => {
+        this._customPathTime = custom;
+      },
     });
     this._placement = new TilePlacement({
       perTilePlacement: () => self._perTilePlacement,
@@ -1135,219 +1149,81 @@ export class S3MViewer {
     });
   }
 
+  /* ---------------------------------------------------------------- 路径运动 */
+  // 实现在 viewer/PathFollow.ts；主类只留同签名转发，公共面不变。
+
   /**
-   * 让单体沿折线运动。
+   * 让单体沿折线运动（CPU 路径，逐帧写 `translation`）。
    *
-   * 路径先做**弧长参数化**（见 anim/Path.ts）：缓动作用在「已走距离」上，而不是
-   * 顶点索引上，所以顶点疏密不均也不会忽快忽慢。
-   *
-   * 实现上没有引入新的 track 类型——把「进度 0→1」当成一条普通补间，通道的 write
-   * 把进度映射成弧长再查表得位置。这样打断、循环、缓动、预算全部复用现有调度器。
-   *
-   * 注意：不要和 `moveFeature` 同时驱动同一个单体，两者都写 `translation`。
+   * 路径先做弧长参数化（见 `anim/Path.ts`）：缓动作用在「已走距离」上而不是顶点索引上，
+   * 所以顶点疏密不均也不会忽快忽慢。注意不要和 `moveFeature` 同时驱动同一个单体 ——
+   * 两者都写 `translation`。
    */
   followPath(
     smid: number,
     points: Path | ArrayLike<number> | Array<[number, number, number]>,
     opts: PathFollowOptions = {}
   ): void {
-    const path = points instanceof Path ? points : new Path(points, { closed: opts.closed });
-    if (path.length <= 0) return;
-
-    const offset = opts.offset ?? [0, 0, 0];
-    const duration =
-      opts.duration ??
-      (opts.speed && opts.speed > 0 ? (path.length / opts.speed) * 1000 : 2000);
-
-    const key = `feature.${smid}.path`;
-    this._pathSpecs.set(key, { path, offset });
-    if (!this.animator.has(key)) {
-      this.animator.register(key, {
-        dim: 1,
-        // 每次都从起点开始：进度通道没有「当前值」的概念，循环时正好重置
-        read: (out) => {
-          out[0] = 0;
-        },
-        write: (v) => {
-          const spec = this._pathSpecs.get(key);
-          if (!spec) return;
-          spec.path.sampleAt(v[0], this._pathScratch);
-          const meshes = this._meshesOf([smid]);
-          const cur = this._featureStyleManager.getFeatureStyle(smid) ?? {};
-          this._featureStyleManager.setFeatureStyle(
-            smid,
-            {
-              ...cur,
-              translation: [
-                spec.offset[0] + this._pathScratch[0],
-                spec.offset[1] + this._pathScratch[1],
-                spec.offset[2] + this._pathScratch[2],
-              ],
-            },
-            meshes
-          );
-          // 轨迹可能跑到原始包围球外，关掉视锥剔除免得整块瓦片被剔掉
-          for (const mesh of meshes) mesh.frustumCulled = false;
-        },
-      });
-    }
-
-    const run = (): void => {
-      this.animator.to(key, 1, {
-        duration,
-        easing: opts.easing ?? 'linear',
-        onComplete: () => {
-          if (opts.loop) run();
-          else opts.onComplete?.();
-        },
-      });
-    };
-    run();
+    this._paths.followPath(smid, points, opts);
   }
 
   /** 停下路径运动（停在当前位置，不回弹） */
   stopPath(smid: number): void {
-    const key = `feature.${smid}.path`;
-    this.animator.cancel(key);
-    this.animator.unregister(key);
-    this._pathSpecs.delete(key);
+    this._paths.stopPath(smid);
   }
 
-  /**
-   * 换算 GPU 路径单体在**当前时间**的位置与朝向。
-   *
-   * 位移发生在顶点着色器里，JS 侧要拿到「屏幕上现在在哪」只能按同一套公式在 CPU 复算：
-   * `t = phase + uPathTime * speed`，再按 loop 模式夹到 0~1，最后查弧长表。
-   * 与 StyleMaterial 的 row5 分支逐行对应，改那边时这里必须同步。
-   */
+  /** @internal CPU/GPU 路径单体在当前时间的位姿，见 viewer/PathFollow.ts */
   private _gpuPathPoseAt(smid: number): { pos: [number, number, number]; yaw: number } | null {
-    const gp = this._featureStyleManager.getFeatureStyle(smid)?.gpuPath;
-    if (!gp) return null;
-    const path = this.gpuPathManager.getPath(gp.pathId);
-    if (!path || path.length <= 0) return null;
-
-    const time = this.uniforms.uPathTime?.value ?? 0;
-    let t = (gp.phase ?? 0) + time * (gp.speed ?? 0);
-    const loop = gp.loop;
-    if (loop === 'clamp' || loop === false) {
-      t = Math.min(1, Math.max(0, t));
-    } else if (loop === 'pingpong') {
-      t = t % 2;
-      if (t < 0) t += 2;
-      t = t > 1 ? 2 - t : t;
-    } else {
-      t = t - Math.floor(t);
-    }
-
-    path.sampleAt(t, this._pathScratch);
-    const pos: [number, number, number] = [this._pathScratch[0], this._pathScratch[1], this._pathScratch[2]];
-
-    let yaw = 0;
-    if (gp.autoHeading !== false) {
-      const d = 1e-3;
-      path.sampleAt(Math.min(1, t + d), this._pathScratch2);
-      let dx = this._pathScratch2[0] - pos[0];
-      let dy = this._pathScratch2[1] - pos[1];
-      if (dx * dx + dy * dy < 1e-8) {
-        // 已经在终点：退回用「后一点减前一点」求切线
-        path.sampleAt(Math.max(0, t - d), this._pathScratch2);
-        dx = pos[0] - this._pathScratch2[0];
-        dy = pos[1] - this._pathScratch2[1];
-      }
-      if (dx * dx + dy * dy >= 1e-8) yaw = Math.atan2(dy, dx);
-    }
-    return { pos, yaw };
+    return this._paths.gpuPathPoseAt(smid);
   }
 
-  /**
-   * 注册 GPU 路径到路径库
-   * @param points 折线点数组或 Path 实例
-   * @param opts 选项（可指定路径 ID 或闭合）
-   * @returns 路径 ID
-   */
+  /** 注册 GPU 路径到路径库，返回路径 ID */
   registerGPUPath(
     points: Path | ArrayLike<number> | Array<[number, number, number]>,
     opts: { id?: number; name?: string; closed?: boolean } = {}
   ): number {
-    const id = this.gpuPathManager.registerPath(points, opts);
-    this.gpuPathManager.updateUniforms(this.uniforms);
-    return id;
+    return this._paths.registerGPUPath(points, opts);
   }
 
-  /**
-   * 注销 GPU 路径
-   */
+  /** 注销 GPU 路径 */
   unregisterGPUPath(id: number): boolean {
-    const res = this.gpuPathManager.unregisterPath(id);
-    this.gpuPathManager.updateUniforms(this.uniforms);
-    return res;
+    return this._paths.unregisterGPUPath(id);
   }
 
-  /**
-   * 获取 GPUPathManager 实例
-   */
+  /** 获取 GPUPathManager 实例 */
   getGPUPathManager(): GPUPathManager {
     return this.gpuPathManager;
   }
 
-  /**
-   * 将单体绑定到 GPU 路径动画（智慧交通车流 / 大批量巡检无人机）
-   * @param smid 单体 ID
-   * @param path 路径 ID 或新的路径折线
-   * @param options 动画配置（速度、相位、循环模式、自动朝向等）
-   */
+  /** 将单体绑定到 GPU 路径动画（智慧交通车流 / 大批量巡检无人机） */
   bindGPUPath(
     smid: number,
     path: number | Path | ArrayLike<number> | Array<[number, number, number]>,
     options: Omit<GPUPathOptions, 'pathId'> = {}
   ): number {
-    let pathId: number;
-    if (typeof path === 'number') {
-      pathId = path;
-    } else {
-      pathId = this.registerGPUPath(path);
-    }
-    const meshes = this._meshesOf([smid]);
-    this._featureStyleManager.bindGPUPath(smid, pathId, options, meshes);
-    for (const mesh of meshes) mesh.frustumCulled = false;
-    this.gpuPathManager.updateUniforms(this.uniforms);
-    return pathId;
+    return this._paths.bindGPUPath(smid, path, options);
   }
 
-  /**
-   * 解绑单体的 GPU 路径动画
-   */
+  /** 解绑单体的 GPU 路径动画 */
   unbindGPUPath(smid: number): void {
-    const meshes = this._meshesOf([smid]);
-    this._featureStyleManager.unbindGPUPath(smid, meshes);
-    this.gpuPathManager.updateUniforms(this.uniforms);
+    this._paths.unbindGPUPath(smid);
   }
 
-  /**
-   * 手动设置单体在 GPU 路径上的归一化进度（0.0 ~ 1.0）
-   */
+  /** 手动设置单体在 GPU 路径上的归一化进度（0.0 ~ 1.0） */
   setGPUPathProgress(smid: number, progress: number): void {
-    const meshes = this._meshesOf([smid]);
-    this._featureStyleManager.setGPUPathProgress(smid, progress, meshes);
-    for (const mesh of meshes) mesh.frustumCulled = false;
+    this._paths.setGPUPathProgress(smid, progress);
   }
 
-  /**
-   * 设置全局 GPU 路径时间（秒）
-   */
+  /** 设置全局 GPU 路径时间（秒） */
   setGPUPathTime(time: number, autoAdvance = false): void {
-    if (this.uniforms.uPathTime) {
-      this.uniforms.uPathTime.value = time;
-    }
-    this._customPathTime = !autoAdvance;
+    this._paths.setGPUPathTime(time, autoAdvance);
   }
 
-  /**
-   * 获取全局 GPU 路径时间（秒）
-   */
+  /** 获取全局 GPU 路径时间（秒） */
   getGPUPathTime(): number {
-    return this.uniforms.uPathTime?.value ?? 0;
+    return this._paths.getGPUPathTime();
   }
+
   /**
    * 单体样式过渡：颜色 / 抬高 / 透明度 / 平移可以任意组合。
    *
