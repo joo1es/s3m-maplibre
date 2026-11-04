@@ -36,383 +36,34 @@ import { AUTO_BAKE_RADIUS_THRESHOLD } from '../core/BakeMercator.js';
 import type { TextureCreateOptions } from '../render/TextureFactory.js';
 import type { Group, Texture } from 'three';
 
-function dirOf(url: string): string {
-  return url.slice(0, url.lastIndexOf('/') + 1);
-}
+import { dirOf, fixPathEncoding, resolveUrl, s3m1ChildUrl, toAbsolute } from './url.js';
+import {
+  classifyDatasetKind,
+  configTypeHint,
+  datasetNameOf,
+  parseConfigText,
+  resolveAnchor,
+} from './config.js';
+import type {
+  BuildTileFn,
+  DatasetKind,
+  GeoBounds,
+  S3MTilesetOptions,
+  TileNode,
+  TileVisibilityTest,
+} from './types.js';
 
-/**
- * 把任意 URL 转成绝对地址。
- * 关键：configUrl 常常是相对路径（如 '../../data/cbd.scp'），
- * 而 new URL(rel, 相对基准) 会抛异常，导致后续 childTile 全部解析错误。
- * 所以进 init 前必须先锚定到 document.baseURI。
- */
-function toAbsolute(url: string): string {
-  if (!url) return url;
-  try {
-    const base = typeof document !== 'undefined' ? document.baseURI : undefined;
-    return base ? new URL(url, base).href : new URL(url).href;
-  } catch {
-    return url;
-  }
-}
-
-function resolveUrl(base: string, rel: string | null | undefined): string | null {
-  if (!rel) return null;
-  try {
-    return fixPathEncoding(new URL(rel, base).href);
-  } catch {
-    // base 不是合法绝对地址时，退化为手工拼接，避免静默拿到错误路径
-    return fixPathEncoding(`${dirOf(base)}${rel}`);
-  }
-}
-
-/**
- * 修补路径里没被编码、但会被服务端改写的字符。
- *
- * 最典型的是 `+`：OSGB 转 S3M 的缓存瓦片名就是 `Tile_+002_+001`，而 iServer 的 Java 侧
- * 按 URLDecoder 解路径，未编码的 `+` 会变成空格 → 404「瓦片数据不存在」。
- * new URL() 的序列化器认为 `+` 在 path 里是合法字符，所以不会替我们编码，必须自己补上。
- * 只动 path，不动 query/hash：query 里的 `+` 本来就是空格的约定，改了反而换味。
- */
-export function fixPathEncoding(url: string): string {
-  if (!/[+ ]/.test(url)) return url;
-  const hashAt = url.indexOf('#');
-  const hash = hashAt < 0 ? '' : url.slice(hashAt);
-  const body = hashAt < 0 ? url : url.slice(0, hashAt);
-  const queryAt = body.indexOf('?');
-  const path = queryAt < 0 ? body : body.slice(0, queryAt);
-  const query = queryAt < 0 ? '' : body.slice(queryAt);
-  return `${path.replace(/\+/g, '%2B').replace(/ /g, '%20')}${query}${hash}`;
-}
-
-/** 每度对应的米数（等距圆柱近似），与 demo 里量测瓦片尺寸用的是同一套系数 */
-const METERS_PER_DEG_LAT = 110540;
-const METERS_PER_DEG_LON_EQUATOR = 111320;
-
-/** 配置文件里的经纬度范围 */
-export interface GeoBounds {
-  left: number;
-  bottom: number;
-  right: number;
-  top: number;
-}
-
-/**
- * 判断 config.geoBounds 是不是一张「真的能用」的经纬度范围。
- *
- * 挡掉三种情况：字段缺失 / 非有限值；超出经纬度量级（OSGB 那类只给米制局部坐标的，
- * 反算不出来就是这种）；以及退化成一条线或一个点的全 0 框。
- * 退化框尤其危险：拿它去 fitBounds 会把视角甩到几内亚湾 (0,0)，
- * 拿它去校验 position 又会把唯一正确的 position 判成异常。
- */
-export function usableGeoBounds(b: unknown): GeoBounds | null {
-  if (!b || typeof b !== 'object') return null;
-  const g = b as Partial<GeoBounds>;
-  const v = [g.left, g.bottom, g.right, g.top];
-  if (!v.every((n) => typeof n === 'number' && Number.isFinite(n))) return null;
-  const { left, bottom, right, top } = g as GeoBounds;
-  if (Math.abs(left) > 180 || Math.abs(right) > 180 || Math.abs(top) > 90 || Math.abs(bottom) > 90) return null;
-  if (right === left && top === bottom) return null;
-  return { left, bottom, right, top };
-}
-
-/**
- * S3M 1.x（SuperMapCache）的子瓦地址。
- *
- * XML 的 RangeDataList 写的是切片时的原始文件名（`Tile_+002_+001_L16_0.osgb`），
- * 而 iServer 实际发布的是**同名换 .s3m 后缀**、并且插在 `datas/<数据源>/data/path/` 下：
- *   .../datas/Config/Tile_+002_+001/Tile_+002_+001.s3m                     ← 根
- *   .../datas/Config/data/path/Tile_+002_+001/Tile_+002_+001_L16_0.s3m     ← 子
- * 实测 L16/L17/L18 都是 200，`?sceneName=` 不参与寻址。
- */
-export function s3m1ChildUrl(tileUrl: string, child: string | null | undefined): string | null {
-  if (!child) return null;
-  const name = child.replace(/\.(osgb|s3mb|s3m)$/i, '.s3m');
-  // 根瓦地址：  <前缀>/datas/<数据源>/<瓦片目录>/<文件名>.s3m
-  // 子瓦地址：  <前缀>/datas/<数据源>/data/path/<瓦片目录>/<子瓦名>.s3m
-  const parts = tileUrl.split('/');
-  const file = parts.pop() ?? '';
-  const dir = parts.pop() ?? '';
-  const datasIdx = parts.lastIndexOf('datas');
-  if (!file || !dir || datasIdx < 1) {
-    // 不像 datas/<ds>/<dir>/<file> 的结构，退回按父目录解析
-    return resolveUrl(dirOf(tileUrl), name);
-  }
-  // 父瓦自己就已经在 data/path 下面了（再往下细化），那只换文件名，别再插一层
-  const alreadyPath = parts[parts.length - 1] === 'path' && parts[parts.length - 2] === 'data';
-  const base = alreadyPath ? `${parts.join('/')}/${dir}` : `${parts.join('/')}/data/path/${dir}`;
-  return fixPathEncoding(`${base}/${name}`);
-}
-
-/** 兼容解析 JSON 与 XML 格式的 SuperMap .scp / config 配置文件（导出以便单测与自建数据集列表复用） */
-export function parseConfigText(text: string): Record<string, unknown> {
-  const trimmed = text.trim();
-  if (trimmed.startsWith('<')) {
-    const tagVal = (tag: string): string | null => {
-      const m = new RegExp(`<(?:[a-zA-Z0-9_-]+:)?${tag}[^>]*>([^<]+)<\\/`, 'i').exec(trimmed);
-      return m ? m[1].trim() : null;
-    };
-    const num = (tag: string): number => parseFloat(tagVal(tag) ?? '');
-    const posX = num('X') || 0;
-    const posY = num('Y') || 0;
-    const posZ = num('Z') || 0;
-
-    let left = num('Left');
-    let right = num('Right');
-    let top = num('Top');
-    let bottom = num('Bottom');
-
-    // SuperMapCache（OSGB 转出来的那类 XML）压根不给经纬度范围，只给
-    // 「以 Position 为原点、局部 ENU 米制」的 BoundingBox。不反算的话 geoBounds 就是
-    // 全 0：getBounds() 会把视角甩到几内亚湾，_resolveAnchor 还会反过来把正确的
-    // position 判成「与 geoBounds 不一致」而退回 (0,0)，位置错得彻彻底底。
-    if (![left, right, top, bottom].every(Number.isFinite)) {
-      const minX = num('MinX');
-      const maxX = num('MaxX');
-      const minY = num('MinY');
-      const maxY = num('MaxY');
-      if ([minX, maxX, minY, maxY].every(Number.isFinite) && posX && posY) {
-        const kx = METERS_PER_DEG_LON_EQUATOR * Math.cos((posY * Math.PI) / 180);
-        if (kx > 1e-6) {
-          left = posX + minX / kx;
-          right = posX + maxX / kx;
-          bottom = posY + minY / METERS_PER_DEG_LAT;
-          top = posY + maxY / METERS_PER_DEG_LAT;
-        }
-      }
-    }
-
-    const fileMatches = trimmed.matchAll(/<(?:[a-zA-Z0-9_-]+:)?FileName[^>]*>([^<]+)<\//gi);
-    const tiles: Array<{ url: string }> = [];
-    for (const m of fileMatches) {
-      tiles.push({ url: m[1].trim() });
-    }
-
-    // SuperMapCache 用 MinHeight/MaxHeight 声明成果的高程范围（米）。
-    // 不读出来的话 align: 'bottom' 无从计算 —— 这类 OSGB 数据的 z 是从 120m 起飞的，
-    // 不贴地就会整片悬在地图上方，斜视下看起来像散在别处的碎片。
-    const minH = num('MinHeight');
-    const maxH = num('MaxHeight');
-
-    return {
-      fileType: tagVal('FileType') ?? undefined,
-      // 地形/影像缓存的判别字段（见 classifyDatasetKind）：FileExtentName=Terrainz 是地形，
-      // <sml:Type>Image</sml:Type> 是影像（影像的 FileExtentName 是 jpg_png 这种扩展名样式，不可靠）
-      fileExtentName: tagVal('FileExtentName') ?? undefined,
-      cacheType: tagVal('Type') ?? undefined,
-      position: { x: posX, y: posY, z: posZ, units: 'Degree' },
-      geoBounds: { left, right, top, bottom },
-      heightRange: Number.isFinite(minH) || Number.isFinite(maxH) ? { min: minH, max: maxH } : undefined,
-      rootTiles: tiles,
-      tiles,
-    };
-  }
-  return JSON.parse(trimmed) as Record<string, unknown>;
-}
-
-/** config 能认出的数据集类别（判别规则见 classifyDatasetKind） */
-export type DatasetKind = 'model' | 'terrain' | 'imagery';
-
-/**
- * 按 config 的类型标记识别数据集类别。
- *
- * 同一个 `…/datas/<名>/config` URL 底下可能是模型、地形、影像三种完全不同的缓存
- * （FORMAT-NOTES 第二章）。地形/影像是按 Level0 金字塔寻址的栅格缓存，**没有瓦片清单**，
- * 当模型加载只会一路走到「配置中缺少 root tile」，把「类型不支持」伪装成「配置缺字段」
- * （issue #7：混合服务第一个数据集 beijingdem 是 Terrainz 地形缓存）。
- *
- * 判别字段取自实测（supermapol 3D-OlympicGreen_Plan，2026-10-30）：
- *   地形 XML： FileExtentName = Terrainz
- *   影像 XML： FileExtentName = jpg_png（扩展名样式，不可靠）+ Type = Image
- *   模型 XML： FileType = OSGBFile / OSGBCacheFile，无 FileExtentName / Type
- *
- * 保守原则：只有认出确凿的非模型标记才判 terrain / imagery，其余（含 JSON 配置、
- * 无标记的 XML）一律 'model' —— 保证「认不出」时行为与旧版一致（不变式 ①）。
- */
-export function classifyDatasetKind(config: Record<string, unknown> | null | undefined): DatasetKind {
-  if (!config || typeof config !== 'object') return 'model';
-  if (String(config.fileExtentName ?? '').trim().toLowerCase() === 'terrainz') return 'terrain';
-  if (String(config.cacheType ?? '').trim().toLowerCase() === 'image') return 'imagery';
-  return 'model';
-}
-
-/** 拼一句能区分 config 形态的上下文（FileExtentName / Type / fileType / dataType），供报错使用 */
-function configTypeHint(config: Record<string, unknown>): string {
-  const parts: string[] = [];
-  if (config.fileExtentName) parts.push(`FileExtentName=${config.fileExtentName}`);
-  if (config.cacheType) parts.push(`Type=${config.cacheType}`);
-  if (config.fileType) parts.push(`fileType=${config.fileType}`);
-  if (config.dataType) parts.push(`dataType=${config.dataType}`);
-  return parts.length ? parts.join(', ') : '无类型标记';
-}
-
-/** 从 configUrl 里抠出数据集名（…/datas/<名>/config）；抠不出就原样返回，报错时能对上服务里的数据集 */
-function datasetNameOf(configUrl: string): string {
-  const m = /\/datas\/([^/?#]+)/i.exec(configUrl);
-  if (!m) return configUrl;
-  try {
-    return decodeURIComponent(m[1]!);
-  } catch {
-    return m[1]!;
-  }
-}
-
-export interface TileNode {
-  url: string;
-  tile: ParsedTile;
-  group: Group;
-  sphere: { center: { x: number; y: number; z: number }; radius: number } | null;
-  rangeValue: number;
-  rangeMode: number;
-  childUrl: string | null;
-  childUrls?: string[];
-  state: string;
-  /** 最近一次 update() 到相机的距离（米），淘汰时按它排序 */
-  distance?: number;
-  /** 最近一次「在有效范围内」的帧号，越小越该被淘汰 */
-  lastSeen?: number;
-  /** 上一级瓦片的 URL（淘汰到最细一级时，要把上一级找回来补洞） */
-  parentUrl?: string;
-  /** 当前帧是否满足细化条件 */
-  needRefine?: boolean;
-  /**
-   * 该瓦片高斯的最长轴中位长度（米）。非泼溅瓦片为 undefined。
-   * 有值时细化判据改走 core/SplatLod.ts —— 点云的各层 σ 恒定，
-   * 包围球像素误差那套判据对它无效（见该文件头部）。
-   */
-  splatSigma?: number;
-  /** 该瓦片的高斯实例数（泼溅瓦片才有） */
-  splatCount?: number;
-  /** 该瓦片引用的纹理 key 清单，用于引用计数与显存释放 */
-  textureKeys?: string[];
-  /** 瓦片构建产生的统计信息，用于淘汰时准确扣减 stats */
-  stats?: { meshes: number; vertices: number; triangles: number; memory?: number };
-}
-
-/** 视锥可见性判定回调（返回 false 表示瓦片完全在视锥外，应跳过进一步细化） */
-export type TileVisibilityTest = (
-  center: { x: number; y: number; z: number },
-  radius: number,
-  node?: TileNode
-) => boolean;
-
-/** 瓦片构建器可注入，用于测试 / 服务端渲染（此时不需要 three） */
-export type BuildTileFn = (
-  tile: ParsedTile,
-  options: {
-    textureCache: Map<string, Texture>;
-    uniforms: StyleUniforms | null;
-    /** Worker 侧已完成的纯数据几何组装（经典 .s3mb 路径），构建器直接包装成 three 对象 */
-    assembled?: TileGeometryData;
-    /** 深度偏移配置（透传给 buildTileObjects），见 BuildTileOptions.polygonOffset */
-    polygonOffset?: { factor: number; units: number };
-    /** 光照模型档位（透传给 buildTileObjects），见 BuildTileOptions.materialQuality */
-    materialQuality?: 'pbr' | 'lambert';
-    /** 颜色管线（透传给 buildTileObjects），见 BuildTileOptions.colorPipeline */
-    colorPipeline?: 'linear' | 'direct';
-    /** 纹理创建参数（透传给 buildTileObjects → createTexture） */
-    textureOptions?: TextureCreateOptions;
-  bakeMercator?: boolean;
-    tileAnchor?: { lon: number; lat: number; height?: number };
-    tileCenter?: { x: number; y: number; z?: number };
-  }
-) => Promise<{ group: Group; stats: Partial<Stats> }>;
-
-export interface S3MTilesetOptions {
-  bakeMercator?: boolean;
-  configUrl: string;
-  maxTiles?: number;
-  maxConcurrent?: number;
-  /** 原始图像/子图集缓存上限（LRU），默认 128 */
-  maxImageCache?: number;
-  buildTile?: BuildTileFn | null;
-  /** 三角面材质深度偏移（共面摩尔纹 / 重合面归属），透传给 buildTileObjects */
-  polygonOffset?: { factor: number; units: number };
-  /**
-   * 光照模型档位，透传给 buildTileObjects。不传 = 读模块级默认。
-   * 由 DatasetManager 从图层 / 数据集设置带下来。
-   */
-  materialQuality?: 'pbr' | 'lambert';
-  /** 颜色管线，透传给 buildTileObjects。不传 = 读模块级默认。由图层的渲染 profile 带下来 */
-  colorPipeline?: 'linear' | 'direct';
-  /** 纹理创建参数（sRGB 解码 / 尺寸上限 / 各向异性上限），透传给 createTexture */
-  textureOptions?: TextureCreateOptions;
-  /**
-   * 是否用 Web Worker 解析经典 `.s3mb` 瓦片（默认开）。
-   *
-   * Worker 里跑 parseS3MB 全链路（inflate / Draco / MeshOpt 内联 wasm 解码），
-   * 主线程只做 fetch 与几何组装，消除加载阶段的解析卡顿。
-   * Worker 创建失败或崩溃时自动**永久**降级回主线程解析，行为与关闭时完全一致。
-   * S3MBLOCK 路径（图集补齐与主线程缓存强耦合）暂不进 Worker，仍主线程解析。
-   */
-  useWorker?: boolean;
-  uniforms?: StyleUniforms | null;
-  onTile?: (node: TileNode) => void;
-  /** 超过 maxTiles 被淘汰时回调，调用方要自己把场景里的对象和拾取表清掉 */
-  onTileRemoved?: (node: TileNode) => void;
-  onProgress?: (stats: Stats) => void;
-  onError?: (error: unknown) => void;
-  /** 单块瓦片加载失败后的重试次数，默认 2（退避 0.8s / 1.6s） */
-  maxRetries?: number;
-  /** LOD 切换范围缩放系数（默认 1.0），> 1 更倾向保留粗模，< 1 提前换细模 */
-  lodRangeScale?: number;
-  /**
-   * 本数据集**驻留三角形总数**的软上限（默认不限制）。
-   *
-   * `maxTiles` 只数瓦片个数：一块精模瓦片几十万面，64 块照样能把差设备压垮，
-   * 所以在瓦片数之外再给一条按面数的刹车。超了走同一套 make-before-break 淘汰
-   * （只踢「当前不显示」或「位置已被可见子瓦接管」的瓦片），不在画面上开洞。
-   *
-   * 不传 = 不限制，行为与旧版完全一致。运行时可用 `setMaxTriangles()` 调整。
-   */
-  maxTriangles?: number;
-  /**
-   * 本数据集**驻留显存/内存字节数**的软上限（默认不限制）。
-   * 包含几何顶点缓冲（精确字节）与纹理显存估计。超限时按同一套 make-before-break
-   * 主动淘汰非显示瓦片及其独占纹理。
-   *
-   * 不传 = 不限制（Infinity），行为与旧版完全一致。运行时可用 `setMaxMemory()` 调整。
-   */
-  maxMemory?: number;
-  /**
-   * 是否请求 `.texblock` 子图集（S3MBLOCK 根图集的清晰版）。**默认关**。
-   *
-   * 不是没实现，而是「换图不换归一化 rect」这条规则只在部分链上成立：实测三对样本里
-   * 有一对的比例是 2.000×1.579（不成比例），打开后整场景建筑会碎成满屏空洞
-   * （错裁到 alpha=0 的区域被 alphaTest 丢弃）。要安全启用必须先做逐图集一致性自检
-   * （把子图集按归一化 rect 裁回来与根槽位比 alpha 轮廓 IoU + 色差），通过才换。
-   * 度量方式见 `_tmp/atlas/rule2.mts`。
-   */
-  atlasLod?: boolean;
-  /**
-   * 鉴权适配函数（默认不传 = 行为与旧版一致）。每个请求（配置 scp / 瓦片 /
-   * 子图集）发出前过一遍，可改写 URL（加 `?token=`）或附加请求头。见 `AuthenticateFn`。
-   */
-  authenticate?: AuthenticateFn;
-  /**
-   * 遇到「解析得了但画不出该有的样子」的数据时怎么办。**默认 `'warn'`**。
-   *
-   * 目前只有一类：3DGS 数据按点渲染（`gsScale` / `gsRotation` 的量化格式未标定）。
-   *   'warn'   —— 首次遇到告警一次，照常出图。旧版没有这个开关，但也不告警，
-   *               所以这里的差异只有多一条日志，不传参时的渲染路径逐字未变。
-   *   'throw'  —— 直接拒绝这类瓦片（标 `permanent`，不重试）。给「宁可不显示，
-   *               也不要显示一个看不出是错的画面」的场景。
-   *   'silent' —— 只记录到 `stats.degradations`，由 UI 自己决定怎么提示。
-   */
-  unsupported?: UnsupportedPolicy;
-  /**
-   * LOD 细化过渡策略：
-   * - 'binary'（默认）：整节点二值切换。所有子瓦片全部就绪或失败后，父瓦片整块隐藏、子瓦片整块接替。
-   * - 'incremental'：增量细化（primary / fallback 双列表 + LEQUAL 深度推移）。
-   *   子瓦片就绪一个显示一个，未就绪区域由父级（fallback）兜底填充，消除整块跳变与慢 child 阻塞。
-   */
-  lodTransition?: 'binary' | 'incremental';
-  /**
-   * 增量细化模式下 fallback 兜底瓦片的材质深度偏移系数。
-   * 默认 { factor: 1, units: 2 }，通过向远处推移深度配合 gl.LEQUAL 消除共面 z-fighting。
-   */
-  fallbackOffset?: { factor?: number; units?: number };
-}
+// 公共面原样保留：这些符号过去就从这个模块导出，引用方不用改一行
+export { fixPathEncoding, s3m1ChildUrl } from './url.js';
+export { classifyDatasetKind, parseConfigText, usableGeoBounds } from './config.js';
+export type {
+  BuildTileFn,
+  DatasetKind,
+  GeoBounds,
+  S3MTilesetOptions,
+  TileNode,
+  TileVisibilityTest,
+} from './types.js';
 
 /** 估算单个纹理占用的显存字节数 */
 export function estimateTextureBytes(tex: any): number {
@@ -646,7 +297,7 @@ export class S3MTileset {
       throw err;
     }
 
-    this.anchor = this._resolveAnchor(config);
+    this.anchor = resolveAnchor(config);
 
     // iServer 的 realspace 配置用 rootTiles（可多棵树），桌面导出的用 tiles
     const roots = (config.rootTiles ?? config.tiles ?? []) as Array<{ url: string }>;
@@ -992,51 +643,6 @@ export class S3MTileset {
         this._pump();
       });
     }
-  }
-
-  /**
-   * 定位锚点。规范里 position 是局部 ENU 坐标系原点，
-   * 但实际数据里 position 偶尔是生产时的占位值（与 geoBounds 不符），
-   * 所以这里做一次一致性检查，不一致就退回 geoBounds 中心。
-   *
-   * 前提是 geoBounds 真的可用：OSGB/SuperMapCache 这类配置只给米制局部包围盒，
-   * 全 0 的退化框不能反过来否定一个正常的 position —— 那等于把模型甩到 (0,0)。
-   */
-  private _resolveAnchor(config: Record<string, unknown>): Anchor {
-    const raw = config.position as
-      | {
-          point3D?: { x: number; y: number; z?: number };
-          x?: number;
-          y?: number;
-          z?: number;
-          units?: string;
-          unit?: string;
-        }
-      | undefined;
-    const p = raw?.point3D ?? (raw as { x: number; y: number; z?: number } | undefined);
-    const okP = !!p && Number.isFinite(p.x) && Number.isFinite(p.y);
-    const b = usableGeoBounds(config.geoBounds);
-    const centerLon = b ? (b.left + b.right) / 2 : undefined;
-    const centerLat = b ? (b.bottom + b.top) / 2 : undefined;
-    // ENU 原点在椭球面上，position.z 就是它的高度；用 heightRange.min 会引入垂直偏移
-    const z = p?.z ?? 0;
-
-    if (!okP) return { lon: centerLon ?? 0, lat: centerLat ?? 0, height: 0 };
-
-    // 两种写法都得认：老数据是 position.units，v3.01 起改成了 position.unit
-    const units = raw?.units ?? raw?.unit ?? 'Degree';
-    if (units !== 'Degree') return { lon: p!.x!, lat: p!.y!, height: z };
-
-    const offLon = centerLon === undefined ? 0 : Math.abs(p!.x! - centerLon);
-    const offLat = centerLat === undefined ? 0 : Math.abs(p!.y! - centerLat);
-    if (offLon > 0.5 || offLat > 0.5) {
-      console.warn('[s3m] position 与 geoBounds 不一致，改用 geoBounds 中心作为锚点', {
-        position: p,
-        geoBounds: b,
-      });
-      return { lon: centerLon!, lat: centerLat!, height: z };
-    }
-    return { lon: p!.x!, lat: p!.y!, height: z };
   }
 
   private _pickLod(tile: ParsedTile) {
