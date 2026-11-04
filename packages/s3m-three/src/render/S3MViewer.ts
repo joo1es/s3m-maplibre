@@ -1387,11 +1387,13 @@ export class S3MViewer {
                 { ...cur, translation: [v[0], v[1], v[2]] },
                 meshes
               );
-              // 有位移或旋转就关掉视锥剔除，否则移出原始包围球后整块瓦片会凭空消失
+              // 位移 / 旋转后几何跑出了原始包围球，拾取粗筛必须退回全量。
+              // three 的剔除已经由 GeometryBuilder 统一关掉（#36），这里只维护可信标记。
               const transMoving = Math.abs(v[0]) > 1e-6 || Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6;
               const rotEuler = extractEulerAngles(cur.rotation);
               const rotMoving = Math.abs(rotEuler[0]) > 1e-6 || Math.abs(rotEuler[1]) > 1e-6 || Math.abs(rotEuler[2]) > 1e-6;
-              for (const mesh of meshes) mesh.frustumCulled = !(transMoving || rotMoving);
+              const sphereTrusted = !(transMoving || rotMoving);
+              for (const mesh of meshes) (mesh.userData as Record<string, unknown>).sphereTrusted = sphereTrusted;
             } else if (prop === 'rotation') {
               this._featureStyleManager.setFeatureStyle(
                 smid,
@@ -1401,7 +1403,8 @@ export class S3MViewer {
               const rotMoving = Math.abs(v[0]) > 1e-6 || Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6;
               const t = cur.translation ?? [0, 0, 0];
               const transMoving = Math.abs(t[0]) > 1e-6 || Math.abs(t[1]) > 1e-6 || Math.abs(t[2]) > 1e-6;
-              for (const mesh of meshes) mesh.frustumCulled = !(rotMoving || transMoving);
+              const sphereTrusted = !(rotMoving || transMoving);
+              for (const mesh of meshes) (mesh.userData as Record<string, unknown>).sphereTrusted = sphereTrusted;
             } else {
               const c = this._colorScratch.setRGB(v[0], v[1], v[2]);
               this._featureStyleManager.setFeatureStyle(
@@ -2515,13 +2518,13 @@ export class S3MViewer {
     // 配了 lodPixelRatioCap 才按 CSS 高度截断，默认状态下这两行不产生任何开销。
     const lodScreenHeight = this._lodScreenHeight(opts.canvasHeight);
 
-    let frustum: THREE.Frustum | null = null;
-    let cullTestVec: THREE.Vector3 | null = null;
-    if (this._cullRefine) {
-      frustum = this._frustum ??= new THREE.Frustum();
-      frustum.setFromProjectionMatrix(mvp);
-      cullTestVec = this._cullTestVec ??= new THREE.Vector3();
-    }
+    // 视锥始终按宿主 MVP 算，不再受 `cullRefine` 开关控制。
+    // three 自己的视锥是错的：`camera.projectionMatrix` 被换成完整 MVP、`matrixWorldInverse`
+    // 只是相机平移的逆，两者相乘得到的视锥整体平移了「相机到锚点」的距离（#36 实测平面常数差
+    // 恰好等于该距离）。所以「画不画」和「要不要细化」都只信这一份。
+    const frustum = (this._frustum ??= new THREE.Frustum());
+    frustum.setFromProjectionMatrix(mvp);
+    const cullTestVec = (this._cullTestVec ??= new THREE.Vector3());
 
     for (const entry of this.datasets.values()) {
       if (!entry.visible || !entry.tileset) continue;
@@ -2531,12 +2534,11 @@ export class S3MViewer {
         camEnu[2] - entry.offset[2],
       ];
 
-      let isVisible: TileVisibilityTest | undefined;
-      if (frustum && cullTestVec) {
+      const isVisible: TileVisibilityTest = (() => {
         const f = frustum;
         const v = cullTestVec;
         const entryOffset = entry.offset;
-        isVisible = (center, radius, node) => {
+        return (center, radius, node) => {
           let worldX: number;
           let worldY: number;
           let worldZ: number;
@@ -2566,9 +2568,15 @@ export class S3MViewer {
           }
           return true;
         };
-      }
+      })();
 
-      if (entry.tileset.update(local, opts.fovRad, lodScreenHeight, isVisible)) {
+      if (
+        entry.tileset.update(local, opts.fovRad, lodScreenHeight, isVisible, {
+          // cullRefine 只管「要不要为视野外瓦片请求子瓦片」；画不画一律按宿主 MVP 的视锥来
+          refineCull: this._cullRefine,
+          visibleCull: true,
+        })
+      ) {
         tilesetChanged = true;
       }
     }

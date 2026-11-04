@@ -30,7 +30,8 @@ function registerMesh(viewer: S3MViewer, smid: number, batchId = 0): THREE.Mesh 
   const geo = new THREE.BoxGeometry(10, 10, 10);
   geo.setAttribute('aBatchId', new THREE.BufferAttribute(new Float32Array(geo.attributes.position.count), 1));
   const mesh = new THREE.Mesh(geo, createStyledMaterial({ uniforms: viewer.uniforms }));
-  mesh.userData = { geoRef: { pickInfo: { [smid]: { batchId } } } };
+  // sphereTrusted 由 GeometryBuilder 打在普通瓦片网格上，这里手动补一份
+  mesh.userData = { geoRef: { pickInfo: { [smid]: { batchId } } }, sphereTrusted: true };
   group.add(mesh);
   (viewer as unknown as { _registerTile: (n: unknown, e: unknown) => void })._registerTile(
     { group, tile: null },
@@ -127,19 +128,19 @@ describe('P2. 单体姿态旋转 (5 行状态纹理与 3x3 矩阵)', () => {
     expect(data[r4 + 3]).toBe(30); // pivot.z
   });
 
-  test('rotateFeature 逐帧动画推进与视锥剔除控制', () => {
+  test('rotateFeature 逐帧动画推进与包围球可信标记控制', () => {
     const v = makeViewer();
     const mesh = registerMesh(v, 301, 0);
 
-    expect(mesh.frustumCulled).toBe(true);
+    expect(mesh.userData.sphereTrusted).toBe(true);
 
     // 启动旋转动画：从 0 到 Math.PI，时长 100ms
     v.rotateFeature(301, Math.PI, [0, 0, 0], { duration: 100, easing: 'linear' });
 
-    // 旋转中：自动关闭视锥剔除
+    // 旋转中：几何跑出原始包围球，拾取粗筛退回全量
     stepTo(v, 50);
     v.flushOverrides();
-    expect(mesh.frustumCulled).toBe(false);
+    expect(mesh.userData.sphereTrusted).toBe(false);
 
     const midSt = v.getFeatureStyle(301);
     expect(midSt?.rotation).toBeTruthy();
@@ -152,11 +153,11 @@ describe('P2. 单体姿态旋转 (5 行状态纹理与 3x3 矩阵)', () => {
     const endEuler = extractEulerAngles(v.getFeatureStyle(301)?.rotation);
     expect(endEuler[2]).toBeCloseTo(Math.PI, 4);
 
-    // 旋转回 0 时恢复视锥剔除
+    // 旋转回 0 时恢复可信标记
     v.rotateFeature(301, 0, undefined, { duration: 50, easing: 'linear' });
     stepTo(v, 150);
     v.flushOverrides();
-    expect(mesh.frustumCulled).toBe(true);
+    expect(mesh.userData.sphereTrusted).toBe(true);
   });
 
   test('rotateFeatureBy 便捷增量旋转', () => {

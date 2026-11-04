@@ -14,8 +14,8 @@
  * 那一趟逐像素一致，只是只有一个像素落在目标上。原来那句「每次点击全屏渲染一趟」
  * 的代价（移动端尤其明显）就没了。
  *
- * 片元之外还有 draw call：瓦片网格一律 frustumCulled = false，整场景每个 mesh 都会
- * 提交一遍。#29 再加一层粗筛——包围球投影确定盖不到点击像素的网格不进这一趟，
+ * 片元之外还有 draw call：瓦片的 three 视锥剔除已被关掉（原因见 #36），整场景每个 mesh
+ * 都会提交一遍。#29 再加一层粗筛——包围球投影确定盖不到点击像素的网格不进这一趟，
  * 判据与保守边界见 PickCulling.ts。命中结果不变，有 shader 位移的网格自动退回原路径。
  */
 import * as THREE from 'three';
@@ -291,7 +291,7 @@ export class Picker {
     // ---- 拾取粗筛（#29）
     // 只把「包围球投影可能盖住这个像素」的网格送进 ID pass，其余的这一趟不画。
     // 1×1 目标已经把片元压到最小，剩下能省的就是整场景的 draw call 与顶点处理
-    // （瓦片网格一律 frustumCulled = false，three 自己一个都不会剔）。
+    // （瓦片的 three 剔除已统一关掉，它自己一个都不会剔）。
     //
     // 矩阵口径：直接用宿主喂进来的 world→clip，不能走 three 的 project/unproject ——
     // 这个相机的 projectionMatrix 已经是完整 MVP，再乘 matrixWorldInverse 会重复一次视图变换。
@@ -306,9 +306,10 @@ export class Picker {
 
     /** true = 确定画不到点击像素，这一趟可以跳过（连材质都不用换） */
     const canSkip = (mesh: THREE.Mesh, prev: THREE.Material | THREE.Material[]): boolean => {
-      // frustumCulled 被关掉是项目里「包围球已不可信」的现成标记：
-      // moveFeature / rotation 动画、GPU 路径、实例化、泼溅都走这条路
-      if (mesh.frustumCulled === false) return false;
+      // 「包围球可信」由 GeometryBuilder 打标（`sphereTrusted`）。不能再读 frustumCulled：
+      // #36 之后所有瓦片都关掉了 three 的剔除，那个字段恒为 false，读了等于永不粗筛。
+      // 单体平移 / 旋转会让几何跑出原始包围球，那两处会把标记清掉。
+      if ((mesh.userData as PickUserData & { sphereTrusted?: boolean }).sphereTrusted !== true) return false;
       if ((mesh as THREE.InstancedMesh).isInstancedMesh) return false;
       if ((mesh.userData as PickUserData).isGaussianSplat === true) return false;
       // 状态纹理 / GPU 路径 / 交叉淡化 / 选中拔高会在 vertex shader 里搬动顶点

@@ -897,6 +897,21 @@ export async function buildTileObjects(
   }
   stats.memory = totalGeoBytes;
 
+  // 视锥剔除统一交给 tileset 按宿主 MVP 做，这里把 three 自己那套关掉。
+  // 两个原因：① three 算视锥用的是 `projectionMatrix × matrixWorldInverse`，本项目把
+  // `projectionMatrix` 换成了完整 MVP、`matrixWorldInverse` 只是相机平移的逆，两者相乘
+  // 得到的视锥整体平移了「相机到锚点」的距离（#36 有实测），剔谁纯看运气；
+  // ② 包围球也覆盖不住 shader 里的位移（单体平移、泼溅的 iCenter）。
+  // 不关的话，两头都在剔，会出现「明明在视野里却整块消失」的随机缺块。
+  for (const obj of objects) {
+    obj.frustumCulled = false;
+    // `frustumCulled` 从此只表示「three 别剔我」，不再兼任「包围球可信」的标记。
+    // 拾取粗筛（#29）原本拿它当判据，改读这个显式字段：普通网格可信，实例化 / 泼溅不可信。
+    if ((obj as THREE.Mesh).isMesh && !(obj as THREE.InstancedMesh).isInstancedMesh) {
+      (obj.userData as Record<string, unknown>).sphereTrusted = true;
+    }
+  }
+
   group.userData.textureKeys = usedTextureKeys;
   return { group, stats, objects, textureKeys: usedTextureKeys };
 }

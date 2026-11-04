@@ -15,6 +15,7 @@ import type { TileGeometryData } from '../core/TileGeometry.js';
 import { BlockAtlas } from './BlockAtlas.js';
 import { TileBudget, estimateObjectGeometryBytes } from './TileBudget.js';
 import { TileVisibility } from './TileVisibility.js';
+import type { TileVisibilityOptions } from './TileVisibility.js';
 import { TileSource } from './TileSource.js';
 import { AUTO_BAKE_RADIUS_THRESHOLD } from '../core/BakeMercator.js';
 import type { TextureCreateOptions } from '../render/TextureFactory.js';
@@ -659,9 +660,10 @@ export class S3MTileset {
     camEnu: [number, number, number],
     fovRad: number,
     screenHeight: number,
-    isVisible?: TileVisibilityTest
+    isVisible?: TileVisibilityTest,
+    options?: TileVisibilityOptions
   ): boolean {
-    return this._visibility.update(camEnu, fovRad, screenHeight, isVisible);
+    return this._visibility.update(camEnu, fovRad, screenHeight, isVisible, options);
   }
 
   getLodTransition(): 'binary' | 'incremental' {
