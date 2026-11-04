@@ -25,7 +25,7 @@ import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { BuildTileFn, TileNode, TileVisibilityTest } from '../tileset/S3MTileset.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
-import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap, applyAnisotropyCap } from './TextureFactory.js';
+import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
 import { getMaterialQuality, normalizeMaterialQuality, getColorPipeline, normalizeColorPipeline } from './StyleMaterial.js';
 import type { LightingPreset } from './lightingPreset.js';
@@ -40,6 +40,7 @@ import { OPACITY_EPS, clampOpacity, isPointCloudObject, styledMaterialOf } from 
 import { TilePlacement } from './viewer/TilePlacement.js';
 import { PathFollow } from './viewer/PathFollow.js';
 import { TileRegistry } from './viewer/TileRegistry.js';
+import { StyleController } from './viewer/StyleController.js';
 import type { PathSpec } from './viewer/PathFollow.js';
 import type {
   LightOptions,
@@ -54,10 +55,8 @@ import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
   STYLE_LABELS,
-  SELECT_MODE,
   DEFAULT_STYLE,
   createSharedUniforms,
-  createStyledMaterial,
   createOutlineMaterial,
   restoreBaseBlendState,
 } from './StyleMaterial.js';
@@ -190,45 +189,6 @@ export function normalizeDepthMode(mode?: unknown): DepthMode {
 
 /* ------------------------------------------------------------------ 可动画的样式键 */
 
-/**
- * 能逐帧插值的标量样式键。
- *
- * 判据：写一次只是「改一个 uniform 或一个字段」，不重建几何、不换 program。
- * `mode` / `shading` / `edges` 不在此列——它们是结构变更，只能编排不能插值。
- */
-const STYLE_SCALAR_KEYS = [
-  'opacity',
-  'floorHeight',
-  'selectOpacity',
-  'selectEmissive',
-  'selectElevation',
-  'dimFactor',
-  'texMix',
-  'roofThreshold',
-  'ambientGain',
-  'metalness',
-  'roughness',
-  'edgeWidth',
-  'edgeOpacity',
-  'edgeOffset',
-  'edgeHullWidth',
-  'outlineWidth',
-] as const;
-
-/**
- * 标量样式键在「用户还没设过」时的动画起点。
- *
- * 只对 `metalness` / `roughness` 有意义：它们的 uniform 默认是 -1（不覆盖，保持数据
- * 自身的值），从 -1 插值没意义 —— 取数据侧常见值当起点，过渡才不会先跳到 0。
- * 其余键缺省仍是 0（与旧行为一致）。
- */
-const SCALAR_ANIM_START: Partial<Record<(typeof STYLE_SCALAR_KEYS)[number], number>> = {
-  metalness: 0, // S3M 数据的 metalness 恒为 0
-  roughness: 0.95, // shininess 映射后的常见值，见 GeometryBuilder 的 roughness
-};
-
-/** 能逐帧插值的颜色键（在线性空间插值，与 shader 消费端一致） */
-const STYLE_COLOR_KEYS = ['colorA', 'colorB', 'colorC', 'selectColor', 'edgeColor'] as const;
 
 /** 可动画的单体属性 */
 const FEATURE_PROPS = ['translation', 'elevation', 'opacity', 'color', 'rotation'] as const;
@@ -362,6 +322,8 @@ export class S3MViewer {
   private readonly _paths: PathFollow;
   /** 瓦片注册 / 注销，见 viewer/TileRegistry.ts */
   private readonly _tiles: TileRegistry;
+  /** 图层视觉状态（样式补间 / uniform / 不透明度 / 材质档位），见 viewer/StyleController.ts */
+  private readonly _styles: StyleController;
   /** 路径采样临时对象，避免每帧 new */
   /** 求切线用的第二个采样点（包围盒换算 GPU 路径朝向时用） */
 
@@ -436,6 +398,81 @@ export class S3MViewer {
   }
 
   constructor(options: S3MViewerOptions = {}) {
+    // 视觉状态控制器最先建：构造期就要用它下发渲染 profile（此时 style 还没赋值，
+    // 所以 host 成员一律写成 getter，用的时候才读）
+    const self2 = this;
+    this._styles = new StyleController({
+      get animator() {
+        return self2.animator;
+      },
+      get uniforms() {
+        return self2.uniforms;
+      },
+      get style() {
+        return self2.style;
+      },
+      get styleTarget() {
+        return self2._styleTarget;
+      },
+      get outlineMaterial() {
+        return self2.outlineMaterial;
+      },
+      get edgeMaterial() {
+        return self2.edgeMaterial;
+      },
+      get groundManager() {
+        return self2.groundManager;
+      },
+      get datasetManager() {
+        return self2._datasetManager;
+      },
+      get featureStyles() {
+        return self2._featureStyleManager;
+      },
+      get picks() {
+        return self2._picks;
+      },
+      get sel() {
+        return self2._sel;
+      },
+      get edges() {
+        return self2._edges;
+      },
+      get pointClouds() {
+        return self2._pointClouds;
+      },
+      get datasets() {
+        return self2.datasets;
+      },
+      get options() {
+        return self2.options;
+      },
+      camera: () => this.camera,
+      renderer: () => this.renderer,
+      scene: () => this.scene,
+      opacityTransparent: () => this._opacityTransparent,
+      setOpacityTransparent: (val) => {
+        this._opacityTransparent = val;
+      },
+      nextPipelineGen: () => ++this._pipelineGen,
+      shadingPrewarmed: () => this._shadingPrewarmed,
+      setShadingPrewarmed: (val) => {
+        this._shadingPrewarmed = val;
+      },
+      prewarming: () => this._prewarming,
+      setPrewarming: (val) => {
+        this._prewarming = val;
+      },
+      colorPipeline: () => this.colorPipeline,
+      setColorPipeline: (val) => {
+        this._colorPipeline = val;
+      },
+      materialQuality: () => this.materialQuality,
+      setEdges: (edges, transition) => this.setEdges(edges, transition),
+      select: (r, opts) => this.select(r, opts),
+      requestRepaint: () => this.triggerRepaint(),
+    });
+
     this.options = options;
     this.pickable = options.pickable !== false;
     this._lodRangeScale = options.lodRangeScale ?? 1.0;
@@ -1654,329 +1691,70 @@ export class S3MViewer {
    */
   /* ---------------------------------------------------------------- 样式 */
 
+  /* ---------------------------------------------------------------- 样式 */
+  // 实现在 viewer/StyleController.ts；主类只留同签名转发，公共面不变。
+
   /** 动态设置图层整体透明度 (0.0 ~ 1.0) */
   setOpacity(opacity: number, transition?: TransitionOptions): void {
-    this.setStyle({ opacity }, transition);
+    this._styles.setOpacity(opacity, transition);
   }
 
-  /**
-   * 合并并应用样式。
-   *
-   * 只改 uniform 的项不会触发几何 / 着色器重建。带 `transition` 时，能插值的项
-   * 交给动画调度器逐帧推进；不能插值的项（`mode` / `shading` / `edges`）走各自的
-   * 编排逻辑（`edges` 由 setEdges 做淡入淡出，`mode` 建议配 fade-through）。
-   */
+  /** 改图层样式（写的是「用户想要的」那份，动画朝它收敛） */
   setStyle(patch: Partial<S3MStyle> = {}, transition?: TransitionOptions): void {
-    Object.assign(this._styleTarget, patch);
-
-    const duration = transition?.duration ?? 0;
-    const wantAnim = duration > 0 || !!transition?.spring;
-
-    // 棱线开关是结构变更，不是插值：交给 setEdges 编排
-    let rest = patch;
-    if ('edges' in patch) {
-      const { edges, ...others } = patch;
-      rest = others;
-      this.setEdges(edges as EdgesOption, wantAnim ? transition : undefined);
-      if (Object.keys(rest).length === 0) {
-        this._requestRepaint();
-        return;
-      }
-    }
-
-    const animated: string[] = [];
-    const immediate: Record<string, unknown> = {};
-    for (const key of Object.keys(rest) as (keyof S3MStyle)[]) {
-      if (wantAnim && this.animator.has(`style.${String(key)}`)) animated.push(String(key));
-      else immediate[key] = rest[key];
-    }
-
-    if (Object.keys(immediate).length > 0) {
-      Object.assign(this.style, immediate);
-      this._applyStyleEffects(immediate as Partial<S3MStyle>);
-    }
-
-    for (const key of animated) {
-      this.animator.to(`style.${key}`, this._animTargetOf(key, rest), {
-        ...transition,
-        duration,
-      });
-    }
-
-    this._requestRepaint();
+    this._styles.setStyle(patch, transition);
   }
 
+  /** 当前样式（叠加模式标签） */
   getStyle(): S3MStyle & { modeLabel: string } {
-    return { ...this._styleTarget, modeLabel: STYLE_LABELS[this._styleTarget.mode] };
+    return this._styles.getStyle();
   }
 
-  /** 把某个样式键的取值转成动画通道能吃的形状（标量 or 线性 RGB 三元组） */
-  private _animTargetOf(key: string, patch: Partial<S3MStyle>): number | number[] {
-    const value = (patch as Record<string, unknown>)[key];
-    const dim = this._animDimOf(key);
-    if (dim === 1) return Number(value);
-    this._colorScratch.set(String(value));
-    return [this._colorScratch.r, this._colorScratch.g, this._colorScratch.b];
+  /** @internal 按当前档位 / 管线重建全场材质，见 viewer/StyleController.ts */
+  private _rebuildStyledMaterials(): void {
+    this._styles.rebuildStyledMaterials();
   }
 
-  /** 该样式键的动画维度：3 = 颜色，1 = 标量 */
-  private _animDimOf(key: string): 1 | 3 {
-    return STYLE_COLOR_KEYS.includes(key as (typeof STYLE_COLOR_KEYS)[number]) ? 3 : 1;
+  /** @internal 本图层此刻该用的纹理创建参数，见 viewer/StyleController.ts */
+  private _textureOptions(): TextureCreateOptions {
+    return this._styles.textureOptions();
   }
 
-  /**
-   * 注册样式动画通道。
-   *
-   * 每个通道的 write 都是 O(1)：只改 `this.style` 的一个字段 + 一次 uniform 赋值。
-   * 这里不注册 `mode` / `shading` / `edges`——它们不可插值，见类文档。
-   */
+  /** @internal 给可插值样式键注册动画通道，见 viewer/StyleController.ts */
   private _registerAnimChannels(): void {
-    for (const key of STYLE_SCALAR_KEYS) {
-      this.animator.register(`style.${key}`, {
-        dim: 1,
-        read: (out) => {
-          // 金属度 / 粗糙度没设过时 uniform 是 -1（= 不覆盖，保持数据自身的值），
-          // 动画起点不能取 0：那会让 roughness 从 0.95 先跳到 0 再爬回去。
-          // 这里给的是数据侧的常见值（S3M 的 shininess 映射后 ≈0.95、metalness 恒 0），
-          // 过渡起点因此是连续的。
-          out[0] = Number(
-            (this.style as unknown as Record<string, number>)[key] ?? SCALAR_ANIM_START[key] ?? 0
-          );
-        },
-        write: (v) => {
-          (this.style as unknown as Record<string, number>)[key] = v[0];
-          this._onStyleChannelWrote(key);
-        },
-      });
-    }
-
-    for (const key of STYLE_COLOR_KEYS) {
-      this.animator.register(`style.${key}`, {
-        dim: 3,
-        read: (out) => {
-          const c = this._uniformColorOf(key);
-          out[0] = c.r;
-          out[1] = c.g;
-          out[2] = c.b;
-        },
-        write: (v) => {
-          const c = this._uniformColorOf(key);
-          // 直接写线性分量：shader 消费的就是线性值，端点严格吻合
-          c.setRGB(v[0], v[1], v[2]);
-          (this.style as unknown as Record<string, string>)[key] = `#${c.getHexString()}`;
-          this._onStyleChannelWrote(key);
-        },
-      });
-    }
-
-    // 棱线淡入淡出乘子：不属于 S3MStyle，单独一条通道
-    this.animator.register('style.edgeFade', {
-      dim: 1,
-      read: (out) => {
-        out[0] = this.uniforms.uEdgeFade?.value ?? 1;
-      },
-      write: (v) => {
-        if (this.uniforms.uEdgeFade) this.uniforms.uEdgeFade.value = v[0];
-        this._edges.syncStyle();
-      },
-    });
-
-    // 整体压暗乘子：setMode 的 fade-through 用它，也不是 S3MStyle 字段
-    this.animator.register('style.fade', {
-      dim: 1,
-      read: (out) => {
-        out[0] = this.uniforms.uFade?.value ?? 1;
-      },
-      write: (v) => {
-        if (this.uniforms.uFade) this.uniforms.uFade.value = v[0];
-        this._requestRepaint();
-      },
-    });
+    this._styles.registerAnimChannels();
   }
 
-  /** 通道写完一个样式键后的最小副作用（全部 O(1)） */
-  private _onStyleChannelWrote(key: string): void {
-    if (key === 'opacity') {
-      this._applyOpacity();
-      return;
-    }
-    this._applyStyleUniforms();
-    if (
-      key === 'edgeColor' ||
-      key === 'edgeWidth' ||
-      key === 'edgeOpacity' ||
-      key === 'edgeOffset' ||
-      key === 'edgeHullWidth'
-    ) {
-      this._edges.refreshLines();
-    }
+  /** 提前编译着色器（`prewarmShading: false` 可关闭） */
+  prewarmShading(): Promise<void> {
+    return this._styles.prewarmShading();
   }
 
-  /** 取某个颜色键对应的共享 uniform Color 对象 */
-  private _uniformColorOf(key: string): THREE.Color {
-    const u = this.uniforms;
-    switch (key) {
-      case 'colorA':
-        return u.uColorA.value;
-      case 'colorB':
-        return u.uColorB.value;
-      case 'colorC':
-        return u.uColorC.value;
-      case 'selectColor':
-        return u.uSelColor.value;
-      case 'edgeColor':
-        return this.edgeMaterial.uniforms.uColor.value;
-      default:
-        return u.uColorA.value;
-    }
+  /** @internal 点云 / 泼溅网格的样式继承，见 viewer/StyleController.ts */
+  private _applyPointCloudStyle(points: THREE.Points, selected = false): void {
+    this._styles.applyPointCloudStyle(points, selected);
   }
 
-  /** 应用一批样式键带来的副作用（uniform / 材质 / 棱线 / 选中态） */
-  private _applyStyleEffects(patch: Partial<S3MStyle>): void {
-    this._applyStyleUniforms();
-    if ('opacity' in patch || 'depthWrite' in patch) this._applyOpacity();
-    // 点云不走 StyleMaterial 的 uMode，模式切换要单独同步它的材质
-    if ('mode' in patch) this._applyPointCloudStyles();
-    if ('shading' in patch) this._applyShading();
-    // 临界角变了要重建 CPU 棱线（EdgesGeometry 的参数），开 / 关走 setEdges 整体刷新。
-    // 必须先 _disposeEdges()：setEdges 只挑「还没有棱线」的网格来建，
-    // 不先拆掉的话已经建好的会被全部跳过，临界角改了等于没改。
-    if (('edgeThreshold' in patch || 'forceCpuEdges' in patch) && this._edges.enabled) {
-      this._edges.disposeEdgeGeometry();
-      this.setEdges(this.style.edges);
-    } else if (
-      'edgeColor' in patch ||
-      'edgeWidth' in patch ||
-      'opacity' in patch ||
-      'edgeOpacity' in patch ||
-      'edgeOffset' in patch ||
-      'edgeHullWidth' in patch
-    ) {
-      // 颜色 / 粗细 / 外推距离 / 外扩厚度都只是 uniform，拖着滑块逐帧改也不重建几何
-      this._edges.refreshLines();
-    }
-    if (this._sel.selection) {
-      // 换描边画法要重建几何；颜色 / 粗细 / 拔高只是 uniform，拖着滑块也不卡
-      if ('outline' in patch || 'outlineStyle' in patch) this.select(this._sel.selection, { silent: true });
-      else this._sel.syncStyle();
-    }
-  }
-
+  /** @internal 写回共享 uniform，见 viewer/StyleController.ts */
   private _applyStyleUniforms(): void {
-    const u = this.uniforms;
-    const s = this.style;
-    u.uMode.value = s.mode;
-    u.uColorA.value.set(s.colorA);
-    u.uColorB.value.set(s.colorB);
-    u.uColorC.value.set(s.colorC);
-    u.uSelColor.value.set(s.selectColor);
-    u.uFloorHeight.value = s.floorHeight;
-
-    const selMode = s.selectMode ?? SELECT_MODE.OVERLAY;
-    if (u.uSelMode) {
-      u.uSelMode.value =
-        selMode === SELECT_MODE.REPLACE
-          ? 0
-          : selMode === SELECT_MODE.MULTIPLY
-            ? 2
-            : selMode === SELECT_MODE.GLOW_ONLY
-              ? 3
-              : 1;
-    }
-    if (u.uSelOpacity && s.selectOpacity != null) u.uSelOpacity.value = s.selectOpacity;
-    if (u.uSelEmissive && s.selectEmissive != null) u.uSelEmissive.value = s.selectEmissive;
-    if (u.uSelElevation && s.selectElevation != null) u.uSelElevation.value = s.selectElevation;
-    if (u.uDimFactor && s.dimFactor != null) u.uDimFactor.value = s.dimFactor;
-
-    if (u.uRoofThreshold && s.roofThreshold != null) {
-      u.uRoofThreshold.value = s.roofThreshold;
-    }
-    if (u.uTexMix && s.texMix != null) {
-      u.uTexMix.value = s.texMix;
-    }
-    if (u.uAmbientGain && s.ambientGain != null) {
-      u.uAmbientGain.value = s.ambientGain;
-    }
-    // 金属度 / 粗糙度：负值 = 不覆盖，保持材质（数据）自身的值
-    if (u.uMetalness) u.uMetalness.value = s.metalness ?? -1;
-    if (u.uRoughness) u.uRoughness.value = s.roughness ?? -1;
-    if (u.uOpacity && s.opacity != null) {
-      u.uOpacity.value = clampOpacity(s.opacity);
-    }
-    if (this.outlineMaterial) {
-      if (this.outlineMaterial.uniforms.uElevation && s.selectElevation != null) {
-        this.outlineMaterial.uniforms.uElevation.value = s.selectElevation;
-      }
-      if (s.outlineWidth != null) this.outlineMaterial.uniforms.uWidth.value = s.outlineWidth;
-      if (s.outlineColor != null) {
-        this.outlineMaterial.uniforms.uColor.value.set(s.outlineColor);
-      } else {
-        this.outlineMaterial.uniforms.uColor.value.set(s.selectColor);
-      }
-    }
+    this._styles.applyStyleUniforms();
   }
 
-  /**
-   * 透明度：写共享 uniform，**不再逐 mesh 改材质**。
-   *
-   * 原来的写法每次都要遍历全部 pickables 改 `material.opacity` + `material.transparent`，
-   * 是 O(meshes)；而且 `opaque` 参与 three 的 program 缓存键，跨 0.999 会换一次 program。
-   * 拖滑块时一秒钟几十次调用，几十万面的场景就是明显掉帧。
-   *
-   * 现在逐帧只写一个 float（`uOpacity`），混合开关只在**真正跨过阈值**时切一次。
-   */
+  /** @internal 按当前样式重算不透明度，见 viewer/StyleController.ts */
   private _applyOpacity(): void {
-    const o = clampOpacity(this.style.opacity);
-    if (this.uniforms.uOpacity) this.uniforms.uOpacity.value = o;
-
-    const transparent = o < 0.999;
-    if (transparent !== this._opacityTransparent) {
-      this._opacityTransparent = transparent;
-      // 关键：若 depthWrite 开启（默认开启），即使半透明也保持深度写入，完美遮挡背面棱线，防止背面线条透出
-      const keepDepth = this.style.depthWrite !== false;
-      for (const p of this._picks.pickables.values()) {
-        if (isPointCloudObject(p.mesh)) continue;
-        const m = styledMaterialOf(p.mesh);
-        if (!m) continue;
-        // 有单体淡化 / 正在淡入的材质，transparent 由各自的流程管，这里不要抢
-        if (m.userData.uBatchTexActive?.value) continue;
-        if ((m.userData.uTileFade?.value ?? 1) < 1) continue;
-        // 材质自身可能是 blend / 顶点 alpha 透明（s3mOpts.transparent），
-        // 关全局混合时不能把它一刀切成不透明
-        restoreBaseBlendState(m, transparent, keepDepth);
-      }
-    }
-
-    // 点云不走 StyleMaterial，自己有一套 uOpacity，逐帧刷的只有这几个对象
-    for (const pc of this._pointClouds) this._applyPointCloudStyle(pc);
-
-    this._edges.syncStyle();
-    this._requestRepaint();
+    this._styles.applyOpacity();
   }
 
-  /** 单个点云对象同步当前样式（着色模式 + 不透明度 + 选中高亮） */
-  private _applyPointCloudStyle(points: THREE.Points, selected = this._sel.selectedMeshes.includes(points)): void {
-    applyPointCloudStyle(points, this.style, this.uniforms, selected);
-  }
-
-  /** 全部点云刷新：着色模式切换时用（uniform 是共享引用，改色不用走这里） */
-  private _applyPointCloudStyles(): void {
-    for (const pc of this._pointClouds) this._applyPointCloudStyle(pc);
-    this._requestRepaint();
-  }
-
-  /** 平面/平滑着色：FLAT_SHADED 是编译期宏，改它必须重编译 */
+  /** @internal 按当前样式重算着色方式，见 viewer/StyleController.ts */
   private _applyShading(): void {
-    // shading 现在是共享 uniform（uFlatShading）驱动的运行期分支，不再是
-    // flatShading define：翻一个 float 就完成切换，零重编译、零卡顿。
-    const target = this.style.shading !== 'smooth' ? 1 : 0;
-    for (const p of this._picks.pickables.values()) {
-      const m = styledMaterialOf(p.mesh);
-      const u = m?.userData.uFlatShading;
-      if (!u || u.value === target) continue;
-      u.value = target;
-    }
-    this._requestRepaint();
+    this._styles.applyShading();
+  }
+
+  /** @internal 把当前样式下发到全部数据集，见 viewer/StyleController.ts */
+  private _applyRenderProfile(
+    patch: { colorPipeline?: ColorPipeline; anisotropyCap?: number },
+    initial = false
+  ): void {
+    this._styles.applyRenderProfile(patch, initial);
   }
 
   /**
@@ -2129,138 +1907,6 @@ export class S3MViewer {
   /** 当前颜色管线（本图层指定了就用本图层的，否则是模块级默认） */
   get colorPipeline(): ColorPipeline {
     return this._colorPipeline ?? getColorPipeline();
-  }
-
-  /** 本图层此刻该用的纹理创建参数（图层的渲染 profile 就落在这里） */
-  private _textureOptions(): TextureCreateOptions {
-    return {
-      // direct 管线的前提是贴图字节值不解码，两者必须一起切
-      srgbDecode: this.colorPipeline !== 'direct',
-      maxSize: this.options.maxTextureSize ?? Infinity,
-      anisotropyCap: this.options.anisotropyCap ?? Infinity,
-    };
-  }
-
-  /**
-   * 应用图层渲染 profile（颜色管线 / 各向异性上限）。
-   *
-   * `initial` = 构造期：只记状态并推给数据集管理器，不重建材质、不重传纹理
-   * （那时还没有瓦片）。
-   */
-  private _applyRenderProfile(
-    patch: { colorPipeline?: ColorPipeline; anisotropyCap?: number },
-    initial = false
-  ): void {
-    const prev = this.colorPipeline;
-    if (patch.colorPipeline !== undefined) {
-      this._colorPipeline = normalizeColorPipeline(patch.colorPipeline) ?? 'linear';
-    }
-    if (patch.anisotropyCap !== undefined) this.options.anisotropyCap = patch.anisotropyCap;
-
-    const textureOptions = this._textureOptions();
-    // 之后加载的瓦片按新参数走（已建好的数据集也要跟着换）
-    this._datasetManager.setRenderProfile({ colorPipeline: this.colorPipeline, textureOptions });
-    if (initial) return;
-
-    // 管线变了才需要换 program；只改各向异性时重建纯属浪费
-    if (this.colorPipeline !== prev) this._rebuildStyledMaterials();
-    this._syncCachedTextures(textureOptions);
-    this._requestRepaint();
-  }
-
-  /**
-   * 把纹理解码方式 / 各向异性同步到**已上传**的纹理上。
-   *
-   * 两者都不需要重新解码：`colorSpace` 改了 + `needsUpdate` 让 three 重传一次像素，
-   * `anisotropy` 同理。所以切管线不用重拉瓦片，代价只有一次纹理上传。
-   */
-  private _syncCachedTextures(opts: TextureCreateOptions): void {
-    const want = opts.srgbDecode ? THREE.SRGBColorSpace : THREE.NoColorSpace;
-    for (const entry of this.datasets.values()) {
-      const cache = entry.tileset?.textureCache;
-      if (!cache) continue;
-      for (const tex of cache.values()) {
-        if (tex.colorSpace === want) continue;
-        tex.colorSpace = want;
-        tex.needsUpdate = true;
-      }
-      applyAnisotropyCap(cache.values(), opts.anisotropyCap ?? Infinity);
-    }
-  }
-
-  /** 按创建参数原位重建所有 styled 材质（materialQuality 切换用） */
-  private _rebuildStyledMaterials(): void {
-    // 逐材质 own uniform 的状态要在重建时搬过去，否则选中高亮 / 瓦片淡入会闪没
-    const PRESERVED = [
-      'uSelBatch',
-      'uSelWhole',
-      'uBatchTex',
-      'uBatchTex2',
-      'uBatchTexWidth',
-      'uBatchTexActive',
-      'uTileFade',
-    ] as const;
-    for (const p of this._picks.pickables.values()) {
-      const mesh = p.mesh;
-      const raw = mesh.material;
-      if (Array.isArray(raw)) continue; // styled 材质恒为单材质；数组材质（点云等）不归这里管
-      const old = raw as StyledMaterial | undefined;
-      if (!old?.userData?.isStyled || !old.userData?.s3mOpts) continue;
-      const opts = old.userData.s3mOpts as StyledMaterialOptions;
-      // 显式传本层档位与管线：s3mOpts 里记的是创建时的参数，可能是 undefined（跟随全局），
-      // 重建时必须钉成本层当前值，否则「别处改了全局」会把这一层带跑。
-      const fresh = createStyledMaterial({
-        ...opts,
-        uniforms: this.uniforms,
-        materialQuality: this.materialQuality,
-        colorPipeline: this.colorPipeline,
-      });
-      for (const key of PRESERVED) {
-        const src = old.userData[key] as { value: unknown } | undefined;
-        const dst = fresh.userData[key] as { value: unknown } | undefined;
-        if (src && dst) dst.value = src.value;
-      }
-      mesh.material = fresh;
-      old.dispose();
-    }
-  }
-
-  /**
-   * 预热着色 program，避免首帧同步编译。
-   *
-   * shading 改为 `uFlatShading` 共享 uniform 驱动后（见 `_applyShading`），
-   * flat / smooth 共用同一个 program，不再存在「另一种变体」，也不需要
-   * 「翻变体 → 编译 → 翻回来」的那套流程与 `_prewarming` 跳帧。这里只把当前
-   * 唯一的 program 编一次（优先 `compileAsync`，KHR_parallel_shader_compile）。
-   */
-  async prewarmShading(): Promise<void> {
-    if (this._shadingPrewarmed || this._prewarming) return;
-    const r = this.renderer;
-    const scene = this.scene;
-    const camera = this.camera;
-    if (!r || !scene || !camera) return;
-
-    // 场上还没有材质就没必要预热：program 会在首个材质出现时编译
-    let hasMaterial = false;
-    for (const p of this._picks.pickables.values()) {
-      if (styledMaterialOf(p.mesh)) {
-        hasMaterial = true;
-        break;
-      }
-    }
-    if (!hasMaterial) return;
-
-    this._shadingPrewarmed = true;
-    try {
-      const anyR = r as unknown as {
-        compileAsync?: (s: THREE.Object3D, c: THREE.Camera) => Promise<unknown>;
-      };
-      if (typeof anyR.compileAsync === 'function') await anyR.compileAsync(scene, camera);
-      else r.compile(scene, camera);
-    } catch {
-      // 预热失败不影响主流程：最坏情况退回「首次渲染时编译一次」
-    }
-    this._requestRepaint();
   }
 
   /**
