@@ -110,6 +110,7 @@ import { computeTilePlacement } from './tilePlacement.js';
 
 import {
   DatasetManager,
+  normalizeDatasetOptions,
   type DatasetAlignment,
   type S3MDatasetOptions,
   type S3MDatasetEntry,
@@ -837,22 +838,9 @@ export class S3MViewer {
 
   /* ---------------------------------------------------------------- 数据集 */
 
+  /** 数据集 options 归一，实现在 DatasetManager.normalizeDatasetOptions */
   private _normalizeDatasets(options: S3MViewerOptions): S3MDatasetOptions[] {
-    if (Array.isArray(options.datasets))
-      return options.datasets
-        .filter((d) => !!d?.configUrl)
-        .map((d) => ({ ...d, polygonOffset: d.polygonOffset ?? options.polygonOffset }));
-    if (options.configUrl)
-      return [{
-        id: 'default',
-        name: '默认数据集',
-        configUrl: options.configUrl,
-        useWorker: options.useWorker,
-        polygonOffset: options.polygonOffset,
-        lodTransition: options.lodTransition,
-        fallbackOffset: options.fallbackOffset,
-      }];
-    return [];
+    return normalizeDatasetOptions(options);
   }
 
   /** 追加一个数据集。图层 addLayer 之前调用会抛错。 */
