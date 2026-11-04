@@ -62,6 +62,8 @@ const INTERNAL_USED = [
   '_ambientLight', '_fillLight', '_keyLight', '_updateLights',
   '_lodScreenHeight', '_registerTile', '_unregisterTile',
   '_selection', '_selectedMeshes',
+  // 既有单测直接用（tile-placement：重锚点重摆 / 拾取反解）
+  '_reapplyTilePlacements', '_toCanonicalScene',
 ];
 
 describe('S3MViewer 公共 API 表面', () => {
