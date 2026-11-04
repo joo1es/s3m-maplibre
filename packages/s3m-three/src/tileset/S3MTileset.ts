@@ -6,18 +6,16 @@
  *   Distance_From_EyePoint(0) —— 直接用相机到包围球中心的距离
  *   命中阈值就请求 childTile，实现渐进式细化。
  */
-import { parseS3MB } from '../core/S3MBParser.js';
 import { planDegradations } from '../core/degradations.js';
 import type { UnsupportedPolicy } from '../core/degradations.js';
 import { authFetch, type AuthenticateFn } from '../core/AuthFetch.js';
-import { getSharedS3MWorker, S3MWorkerClient, WorkerDeadError } from '../worker/S3MWorkerClient.js';
-import { parseS3MBlockGroups } from '../core/S3MBlockParser.js';
 import type { S3MBlockAtlasImage, S3MBlockGroupSet } from '../core/S3MBlockParser.js';
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { TileGeometryData } from '../core/TileGeometry.js';
 import { BlockAtlas } from './BlockAtlas.js';
 import { TileBudget, estimateObjectGeometryBytes } from './TileBudget.js';
 import { TileVisibility } from './TileVisibility.js';
+import { TileSource } from './TileSource.js';
 import { AUTO_BAKE_RADIUS_THRESHOLD } from '../core/BakeMercator.js';
 import type { TextureCreateOptions } from '../render/TextureFactory.js';
 import type { Group, Texture } from 'three';
@@ -72,8 +70,6 @@ export class S3MTileset {
   atlasLod: boolean;
   /** 根图集 id → 已拉到的清晰版子图集；null = 正在请求或确认没有，避免重复发请求 */
   readonly atlasLodCache = new Map<string, S3MBlockAtlasImage | null>();
-  /** 块 URL → 该文件里的全部 LOD 组（一个 .s3mblock 是一棵子树，不是一块瓦片） */
-  private readonly _groupCache = new Map<string, S3MBlockGroupSet>();
   /** 独立 `.texblock` 图集缓存：id → 图像；null 表示正在请求或确认不可用 */
   readonly externalAtlasCache = new Map<string, S3MBlockAtlasImage | null>();
   /**
@@ -151,7 +147,6 @@ export class S3MTileset {
   hardCap = 96;
   /** 本数据集是 S3M 1.x（SuperMapCache，.s3m）：子瓦地址规则与 3.x 不同 */
   isS3MV1 = false;
-  private _buildTile: BuildTileFn | null;
   private _bakeMercator?: boolean;
   rootRadius?: number;
 
@@ -165,8 +160,6 @@ export class S3MTileset {
   private _colorPipeline: 'linear' | 'direct' | undefined;
   private _textureOptions: TextureCreateOptions | undefined;
   private readonly _uniforms: StyleUniforms | null;
-  /** 经典 .s3mb 的 Worker 解析客户端；undefined = 尚未尝试创建，null = 不可用/已降级 */
-  private _workerClient: S3MWorkerClient | null | undefined;  private readonly _useWorker: boolean;
   private _queue: string[] = [];
   private _active = 0;
   /** 图集补齐（leaf / texblock 请求 + LRU + 整图替换验证），见 tileset/BlockAtlas.ts */
@@ -175,6 +168,12 @@ export class S3MTileset {
   private readonly _budget: TileBudget;
   /** LOD 可见性与细化判定，见 tileset/TileVisibility.ts */
   private readonly _visibility: TileVisibility;
+  /** 瓦片取源与解析，见 tileset/TileSource.ts */
+  private readonly _source: TileSource;
+  /** 块 URL → 该文件里的全部 LOD 组（一个 .s3mblock 是一棵子树，不是一块瓦片） */
+  private readonly _groupCache = new Map<string, S3MBlockGroupSet>();
+  /** 是否允许走 Worker 解析经典 .s3mb（`useWorker` 选项，默认开） */
+  private readonly _useWorker: boolean;
 
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
@@ -192,8 +191,9 @@ export class S3MTileset {
     this.authenticate = options.authenticate;
     this._unsupported = options.unsupported ?? 'warn';
 
+    // Worker 解析开关：构造期快照，运行中不变
+    this._useWorker = options.useWorker !== false;
     // 渲染层可注入：Node 环境下不需要 three，也能跑 URL / 解析链路
-    this._buildTile = options.buildTile ?? null;
     this._bakeMercator = options.bakeMercator;
     this._polygonOffset = options.polygonOffset;
     this._materialQuality = options.materialQuality;
@@ -201,7 +201,6 @@ export class S3MTileset {
     this._textureOptions = options.textureOptions;
     // 着色器共享 uniform，由 S3MLayer 持有并传进来
     this._uniforms = options.uniforms ?? null;
-    this._useWorker = options.useWorker !== false;
 
     // 并发与总量限制：iServer 公开服务上别把人家打爆
     this.maxConcurrent = options.maxConcurrent ?? 4;
@@ -261,6 +260,17 @@ export class S3MTileset {
       enqueue: (url, parentUrl) => self._enqueue(url, parentUrl),
       trimBudget: () => self._budget.trimBudget(),
     });
+
+    this._source = new TileSource(
+      {
+        authenticate: this.authenticate,
+        groupCache: this._groupCache,
+        useWorker: () => self._useWorker,
+        vertexAttributeDescript: () => self.config?.vertexAttributeDescript,
+        classicParser: (buffer) => self._parseClassicTile(buffer),
+      },
+      options.buildTile ?? null,
+    );
   }
 
   async init(): Promise<this> {
@@ -478,53 +488,9 @@ export class S3MTileset {
     return lods.find((l) => l.childTile && l.rangeValue > 0) ?? lods[0];
   }
 
-  private async _builder(): Promise<BuildTileFn> {
-    if (!this._buildTile) {
-      const mod = await import('../render/GeometryBuilder.js');
-      this._buildTile = mod.buildTileObjects as unknown as BuildTileFn;
-    }
-    return this._buildTile;
-  }
-
-  /**
-   * 经典 `.s3mb` 瓦片解析：优先走 Worker（inflate / Draco / MeshOpt / 几何组装
-   * 全在 Worker 做，一次往返带回 tile + 纯数据几何），Worker 不可用或已崩溃时
-   * 主线程兜底，两条路径输出完全一致。
-   */
-  private async _parseClassicTile(buffer: ArrayBuffer): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
-    if (this._useWorker && this._workerClient === undefined) {
-      // 与纹理解码共用进程级单例，避免每个数据集各起一个 Worker
-      this._workerClient = getSharedS3MWorker();
-    }
-    if (this._workerClient) {
-      try {
-        return await this._workerClient.parseTile(buffer, true, true, this.config?.vertexAttributeDescript);
-      } catch (e) {
-        if (e instanceof WorkerDeadError) {
-          // 脚本加载失败 / 崩溃属于环境问题，永久退回主线程；瓦片本身的问题照常抛
-          this._workerClient = null;
-        } else {
-          throw e;
-        }
-      }
-    }
-    return { tile: await parseS3MB(buffer, { vertexAttributeDescript: this.config?.vertexAttributeDescript }) };
-  }
-
-  /**
-   * 记住一个块文件里解析出来的全部 LOD 组。
-   *
-   * 一棵 LOD 子树的几层几何加图集动辄好几 MB，全数据集都留着会把内存吃光，
-   * 所以只保留最近 24 个块（LRU 足够：相机在附近移动时命中的永远是同几个块）。
-   */
-  private _rememberGroups(baseUrl: string, set: S3MBlockGroupSet): void {
-    this._groupCache.delete(baseUrl);
-    this._groupCache.set(baseUrl, set);
-    while (this._groupCache.size > 24) {
-      const oldest = this._groupCache.keys().next().value;
-      if (oldest === undefined) break;
-      this._groupCache.delete(oldest);
-    }
+  /** 经典 `.s3mb` 解析（测试直接调用），实现在 tileset/TileSource.ts */
+  private _parseClassicTile(buffer: ArrayBuffer): Promise<{ tile: ParsedTile; geometry?: TileGeometryData }> {
+    return this._source.parseClassicTile(buffer);
   }
 
   /**
@@ -550,43 +516,8 @@ export class S3MTileset {
     this.stats.loading++;
 
     try {
-      // URL 里的 `#N` 表示「同一个 .s3mblock 文件里的第 N 个 LOD 组」。
-      // 一个块文件打包的是一整棵 LOD 子树（6_01 → 6_0100 → 6_010000 → …），
-      // 这些下层瓦片**不是独立文件**，用 `#N` 直接命中已缓存的组，不再发请求。
-      const hashAt = url.indexOf('#');
-      const baseUrl = hashAt >= 0 ? url.slice(0, hashAt) : url;
-      const groupIndex = hashAt >= 0 ? Number(url.slice(hashAt + 1)) || 0 : 0;
-      const isBlock = /\.s3mblock($|\?)/i.test(baseUrl);
-
-      let tile: ParsedTile;
-      let assembled: TileGeometryData | undefined;
-      let groupNames: string[] = [];
-      const cachedSet = this._groupCache.get(baseUrl);
-      if (cachedSet) {
-        groupNames = cachedSet.names;
-        tile = cachedSet.tiles[groupIndex] ?? cachedSet.tiles[0]!;
-      } else {
-        const res = await authFetch(baseUrl, this.authenticate, 'tile');
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status} 加载瓦片失败: ${baseUrl}`);
-        }
-        const ctype = res.headers.get('content-type') || '';
-        if (ctype.includes('text/html')) {
-          throw new Error(`瓦片请求返回了 HTML 页面（通常为 404/500 服务端拦截）: ${baseUrl}`);
-        }
-        const buffer = await res.arrayBuffer();
-        // S3MBLOCK（TextureSharing / 单文件存储）走专用解析：容器 + 内嵌 v2 瓦片体 + 图集纹理
-        if (isBlock) {
-          const set = await parseS3MBlockGroups(buffer);
-          this._rememberGroups(baseUrl, set);
-          groupNames = set.names;
-          tile = set.tiles[groupIndex] ?? set.tiles[0]!;
-        } else {
-          const parsed = await this._parseClassicTile(buffer);
-          tile = parsed.tile;
-          assembled = parsed.geometry;
-        }
-      }
+      // 取源与解析全在 tileset/TileSource.ts：`#N` 组引用、块缓存、Worker 降级都在那里
+      const { tile, geometry: assembled, groupNames, baseUrl, isBlock } = await this._source.load(url);
       if (isBlock) {
         // 子瓦片的图集像素在独立 .texblock 里，必须先补齐，否则整块无贴图
         await this._fillExternalAtlases(tile, baseUrl);
@@ -601,7 +532,7 @@ export class S3MTileset {
         this.rootRadius = lodForBake.boundingSphere.radius;
       }
       const shouldBake = this.shouldBakeMercator(lodForBake?.boundingSphere?.radius);
-      const build = await this._builder();
+      const build = await this._source.builder();
       const buildRes = await build(tile, {
         textureCache: this.textureCache,
         uniforms: this._uniforms,
@@ -738,7 +669,7 @@ export class S3MTileset {
   }
 
   dispose(): void {
-    this._workerClient?.dispose();
+    this._source.dispose();
     for (const node of this.nodes.values()) {
       node.group.traverse((o) => {
         const mesh = o as {
