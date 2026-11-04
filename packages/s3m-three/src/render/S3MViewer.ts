@@ -35,6 +35,7 @@ import { SplatLayer } from './viewer/SplatLayer.js';
 import { EdgeDecorator } from './viewer/EdgeDecorator.js';
 import { PickService } from './viewer/PickService.js';
 import { SelectionDecorator } from './viewer/SelectionDecorator.js';
+import { AnalysisService } from './viewer/AnalysisService.js';
 import type {
   LightOptions,
   S3MViewerOptions,
@@ -73,16 +74,6 @@ import { GpuEdgePass } from './GpuEdgePass.js';
 import { MotionBlurPass, normalizeMotionBlur, autoMotionBlurDamp } from './MotionBlurPass.js';
 import type { MotionBlurOptions, MotionBlurConfig } from './MotionBlurPass.js';
 import { Animator } from '../anim/Animator.js';
-import {
-  buildClipPlanes,
-  lineOfSight as computeLineOfSight,
-  measureSegment,
-  polygonArea,
-  polygonAreaHorizontal,
-  polygonPerimeter,
-  polylineLength,
-  polylineLengthHorizontal,
-} from '../analysis/index.js';
 import type {
   ClipOptions,
   LineOfSightOptions,
@@ -93,10 +84,7 @@ import type {
   Vec3,
   ViewshedResult,
 } from '../analysis/index.js';
-import { skylineFromDepth } from '../analysis/skyline.js';
-import { computeViewshed, makeCubeDistanceSampler } from '../analysis/viewshed.js';
-import { captureRadialCube, captureSkylineDepth } from './analysis/DepthPass.js';
-import type { DepthCaptureContext } from './analysis/DepthPass.js';import type { Channel, TransitionOptions } from '../anim/Animator.js';
+import type { Channel, TransitionOptions } from '../anim/Animator.js';
 import { Path } from '../anim/Path.js';
 import type { EasingFn, EasingName } from '../anim/easing.js';
 import type { LineSharedUniforms, ThickLineMaterial } from './EdgeLines.js';
@@ -326,8 +314,8 @@ export class S3MViewer {
   private _colorPipeline: ColorPipeline | undefined;
   /** fade-through 编排的代次：中途再切一次，旧编排作废（与 setMode 同一套） */
   private _pipelineGen = 0;
-  /** 当前裁剪配置；renderer 就绪前后都要能设，所以单独存一份（见 `_applyClipping`） */
-  private _clip: ClipOptions | null = null;
+  /** 空间分析（量算 / 通视 / 裁剪 / 天际线 / 可视域），见 viewer/AnalysisService.ts */
+  private readonly _analysis: AnalysisService;
   /** 单体样式、专题着色与状态纹理管理器 */
   private readonly _featureStyleManager: FeatureStyleManager;
   /** GPU 路径动画管理器 */
@@ -634,6 +622,14 @@ export class S3MViewer {
 
     this._fps.last = performance.now();
     this._datasetQueue = this._normalizeDatasets(options);
+    this._analysis = new AnalysisService({
+      sceneFromLngLat: (p) => this._sceneFromLngLat(p),
+      raycastDistance: (origin, dir, maxDistance) => this._picks.raycastDistance(origin, dir, maxDistance),
+      requestRepaint: () => this.triggerRepaint(),
+      renderer: () => this.renderer,
+      scene: () => this.scene,
+      camera: () => this.camera,
+    });
     if (options.attributes)
       this.attributeQuery = new AttributeQuery({
         ...options.attributes,
@@ -675,7 +671,7 @@ export class S3MViewer {
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
     this._syncTextureCapabilities(gl);
     // 裁剪是构造期就能设的（还没 mount 时 `_applyClipping` 会先跳过），这里补挂一次
-    this._applyClipping();
+    this._analysis.applyClipping();
 
     this.scene = new THREE.Scene();
     this.scene.add(this.groundManager.group);
@@ -719,7 +715,7 @@ export class S3MViewer {
     setMaxAnisotropy(this.renderer.capabilities.getMaxAnisotropy(), this.options.anisotropyCap ?? Infinity);
     this._syncTextureCapabilities(gl);
     // 新 renderer 的 clippingPlanes 是空的，裁剪状态要重新挂上去
-    this._applyClipping();
+    this._analysis.applyClipping();
     this.picker?.dispose();
     this.picker = new Picker(this.renderer);
     // GPU 描边的 RT / 材质绑定在旧上下文上，整体丢弃，下一帧按需重建
@@ -2872,164 +2868,63 @@ export class S3MViewer {
     return { lng, lat, altitude: v[2] + (anchor.altitude ?? 0) };
   }
 
-  /**
-   * 两点量算：三维距离 / 水平距离 / 高差。
-   *
-   * 输入是经纬度 + 绝对高程（`pickPosition` 的返回值直接能用），
-   * 内部换算到 ENU 米再算，所以不会受投影单位影响。
-   */
+  /* ---------------------------------------------------------------- 空间分析 */
+  // 实现在 viewer/AnalysisService.ts；主类只留同签名转发，公共面不变。
+
+  /** 两点量算：三维距离 / 水平距离 / 高差 */
   measureDistance(a: LngLatAlt, b: LngLatAlt): MeasureResult {
-    return measureSegment(this._sceneFromLngLat(a), this._sceneFromLngLat(b));
+    return this._analysis.measureDistance(a, b);
   }
 
   /** 折线长度（三维 + 水平投影两套口径） */
   measurePolyline(points: readonly LngLatAlt[]): { length3D: number; lengthHorizontal: number } {
-    const scene = points.map((p) => this._sceneFromLngLat(p));
-    return { length3D: polylineLength(scene), lengthHorizontal: polylineLengthHorizontal(scene) };
+    return this._analysis.measurePolyline(points);
   }
 
-  /**
-   * 多边形量算：坡面真实面积 / 水平投影面积 / 周长。
-   *
-   * 建筑面积、用地面积按 `areaHorizontal` 算；坡面覆盖面积按 `area3D`。
-   */
+  /** 多边形量算：坡面真实面积 / 水平投影面积 / 周长 */
   measurePolygon(points: readonly LngLatAlt[]): {
     area3D: number;
     areaHorizontal: number;
     perimeter: number;
   } {
-    const scene = points.map((p) => this._sceneFromLngLat(p));
-    return {
-      area3D: polygonArea(scene),
-      areaHorizontal: polygonAreaHorizontal(scene),
-      perimeter: polygonPerimeter(scene),
-    };
+    return this._analysis.measurePolygon(points);
   }
 
-  /**
-   * 通视分析：两点之间是否被已加载的 S3M 几何挡住。
-   *
-   * 走 CPU 射线求交（`Raycaster` 打全部 pickable mesh），几十万面量级是几十毫秒，
-   * 适合点击式查询；要拖拽时逐帧刷新，得等深度图版本的批量采样。
-   *
-   * 注意范围：**只认 S3M 场景里的几何**。MapLibre 底图地形与 MVT 建筑不在这个场景里，
-   * 它们不参与遮挡（见 `docs/API.md` 的「分析范围」）。
-   */
+  /** 通视分析：两点之间是否被已加载的 S3M 几何挡住 */
   lineOfSight(a: LngLatAlt, b: LngLatAlt, opts: LineOfSightOptions = {}): LineOfSightResult {
-    const from = this._sceneFromLngLat(a);
-    const to = this._sceneFromLngLat(b);
-    return computeLineOfSight(from, to, (origin, dir, maxDistance) => {
-      const hit = this._picks.raycastDistance(origin, dir, maxDistance);
-      if (!hit) return null;
-      return { distance: hit.distance, point: hit.point };
-    }, opts);
+    return this._analysis.lineOfSight(a, b, opts);
   }
 
-  /**
-   * 裁剪 / 剖切（平面、Box、十字）。
-   *
-   * 平面列表挂在**本图层的 renderer** 上（每个 `S3MLayer` 一个 `WebGLRenderer`），
-   * 所以天然是图层级：同页别的图层不受影响。传 `null` 取消裁剪。
-   *
-   * 已知边界：只做「切掉」，不做**封口**——剖开后看到的是空壳/背面；
-   * 凹多边形裁剪需要多组半空间并集，three 的 `clippingPlanes` 表达不了（只能凸）。
-   */
+  /** 裁剪 / 剖切（平面、Box、十字）。传 `null` 取消裁剪 */
   setClipping(opt: ClipOptions | null): void {
-    this._clip = opt;
-    this._applyClipping();
-    this._requestRepaint();
+    this._analysis.setClipping(opt);
   }
 
   /** 当前裁剪配置（`null` = 未裁剪） */
   get clipping(): ClipOptions | null {
-    return this._clip;
+    return this._analysis.clipping;
   }
 
-  private _applyClipping(): void {
-    const r = this.renderer;
-    if (!r) return; // mount 前先记着，`_createRenderer` 之后会补一次
-    if (!this._clip) {
-      r.clippingPlanes = [];
-      return;
-    }
-    r.clippingPlanes = buildClipPlanes(this._clip).map(
-      (p) => new THREE.Plane(new THREE.Vector3(p.normal[0], p.normal[1], p.normal[2]), p.constant)
-    );
-  }
-
-  /** 分析用的离屏采集上下文（renderer / scene / camera 都可能在 mount 前为空） */
-  private _depthCtx(): DepthCaptureContext {
-    return {
-      renderer: () => this.renderer,
-      scene: () => this.scene,
-      camera: () => this.camera,
-    };
-  }
-
-  /**
-   * 天际线分析：用当前视角渲染一张深度图，按列抽出「方位角 → 仰角」曲线。
-   *
-   * 一次调用 = 一趟额外渲染 + 一次全图回读，**不要每帧调**。
-   * 典型用法是相机停下来（`moveend`）后算一次。
-   *
-   * @param opts.width 采集分辨率（默认 640）。精度由它决定：
-   *   640 宽 ≈ 0.56°/列，1280 宽 ≈ 0.28°/列。
-   */
+  /** 天际线分析：按列抽出「方位角 → 仰角」曲线 */
   skyline(opts: {
     width?: number;
     height?: number;
     step?: number;
-    /** 额外参与遮挡的代理几何（底图建筑 / 地形网格），只在这一趟深度渲染里存在 */
     include?: readonly THREE.Object3D[];
   } = {}): SkylineResult | null {
-    const cap = captureSkylineDepth(
-      this._depthCtx(),
-      opts.width ?? 640,
-      opts.height ?? 360,
-      opts.include
-    );
-    if (!cap) return null;
-    return skylineFromDepth({
-      rgba: cap.rgba,
-      width: cap.width,
-      height: cap.height,
-      inverseViewProj: cap.inverseViewProj,
-      cameraPos: cap.cameraPos,
-      step: opts.step,
-    });
+    return this._analysis.skyline(opts);
   }
 
-  /**
-   * 360° 可视域（地面栅格版）：从观察点朝 6 个方向各渲染一次深度，
-   * 再在 CPU 上对地面网格逐格判定可见性。
-   *
-   * 一次调用 = 6 趟额外渲染 + 6 次回读，成本明显高于天际线，
-   * 只在点击/松手时算。返回的 `raster` 可以直接当贴图画在地面上。
-   */
+  /** 360° 可视域（地面栅格版） */
   viewshed(opts: {
-    /** 观察点（经纬度 + 地面高程；眼高由 `eyeHeight` 另加） */
     origin: LngLatAlt;
-    /** 分析半径（米） */
     radius: number;
-    /** 栅格边长（默认 96） */
     grid?: number;
-    /** 眼高（米，默认 1.7） */
     eyeHeight?: number;
-    /** 立方体深度图分辨率（默认 128；越大边缘越准，回读越慢） */
     size?: number;
-    /** 额外参与遮挡的代理几何（底图建筑 / 地形网格），只在这一趟深度渲染里存在 */
     include?: readonly THREE.Object3D[];
   }): ViewshedResult | null {
-    const eye = opts.eyeHeight ?? 1.7;
-    const origin = this._sceneFromLngLat({ ...opts.origin, altitude: opts.origin.altitude + eye });
-    const size = opts.size ?? 128;
-    const faces = captureRadialCube(this._depthCtx(), origin, size, opts.radius, opts.include);
-    if (!faces) return null;
-    return computeViewshed(origin, makeCubeDistanceSampler(faces, size, opts.radius), {
-      radius: opts.radius,
-      grid: opts.grid,
-      groundZ: 0,
-    });
+    return this._analysis.viewshed(opts);
   }
 
   /** @internal 见 viewer/PickService.ts */
