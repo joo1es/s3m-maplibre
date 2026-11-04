@@ -175,7 +175,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `lodRangeScale` | `number` | `1.0` | LOD 切换距离缩放系数，> 1 更倾向保留粗模，< 1 提前细化 |
 | `lodTransition` | `'binary' \| 'incremental'` | `'binary'` | LOD 细化过渡策略。`'binary'`（默认）：整节点二值切换，所有子瓦片全部就绪或失败后整块替换；`'incremental'`：增量细化（primary / fallback 双列表 + LEQUAL 深度推移），子瓦片就绪一个显示一个，未就绪区域由最近父瓦片（fallback）垫底填充，消除整块跳变与慢 child 阻塞，极端角度接缝无缝衔接且不出洞 |
 | `fallbackOffset` | `{ factor?: number; units?: number }` | `{ factor: 1, units: 2 }` | 增量细化模式下 fallback 兜底瓦片的材质深度偏移系数，向远处推移深度配合 gl.LEQUAL 消除共面 z-fighting |
-| `cullRefine` | `boolean` | `false` | 细化视锥剔除（第一期，Issue #25）。开启后视野外的瓦片不再请求与细化子瓦片，大幅减少转头与大范围场景下的无效下载、Worker 解码与显存上传。默认 `false`（不变式 ①，保持全向加载） |
+| `cullRefine` | `boolean` | `false` | **细化**视锥剔除（Issue #25）：开启后视野外的瓦片不再请求与细化子瓦片，减少转头与大范围场景下的无效下载、Worker 解码与显存上传。默认 `false`（不变式 ①，保持全向加载）。**它只管请求，不管绘制**——「画不画」由 `S3MViewer` 每帧按宿主 MVP 算正确视锥后剔除（Issue #36，默认生效），两者互相独立 |
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 **DPR 上限**（不截断）。默认按 `canvasHeight` 物理像素算，与官方 `calcPixFromCam` 同口径；3x DPR 手机上由此会多细化、多拉瓦片，传 `2` 即按「CSS 高度 × 2」截断 |
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = 取 GPU 最大值，通常 16）。移动端封到 4 / 8 肉眼通常无差，采样成本明显下降。**图层级**：运行时 `setAnisotropyCap()` 会立刻应用到已上传纹理（改采样参数 + 重传，不重解码、不重载瓦片），图集纹理恒为 1 |
 | `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。非图集的 RGBA / WebP 产物按 2× 盒式滤波减半到上限内；DXT 压缩直传与图集不受影响。**图层级**，但只影响之后解码的纹理（已解码的不重解） |
@@ -1322,6 +1322,7 @@ tileset.update(
 | 贴地与经纬度 | 没有地图就没有墨卡托那一步，只有局部米制坐标 |
 | 拾取 / 描边 / 样式 UI | `Picker`、等宽棱线、`setStyle` 都在 `S3MViewer` 上，裸用法要直接操作 `uniforms` 和 Mesh |
 | 瓦片卸载 | 超出 `maxTiles` 时按「最久没进有效范围」淘汰，同帧再比距离 |
+| 视锥剔除 | 瓦片的 three 剔除已统一关闭（three 拿 `projectionMatrix × matrixWorldInverse` 算视锥，与本库的相机口径不一致，见 Issue #36）。走 `S3MViewer` 会自动按宿主 MVP 剔除；裸用法自己给 `update()` 传 `isVisible` 与 `{ visibleCull: true }`，否则视野外的瓦片也会提交 draw call |
 
 ---
 

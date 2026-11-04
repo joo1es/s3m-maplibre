@@ -167,6 +167,9 @@ function pickMesh(id: number, x: number, y: number): THREE.Mesh {
   const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial());
   mesh.position.set(x, y, -10);
   mesh.userData.pickId = id;
+  // #36 之后所有瓦片都关掉了 three 的剔除（frustumCulled=false），「包围球可信」
+  // 改由这个显式标记表示，粗筛只认它
+  mesh.userData.sphereTrusted = true;
   return mesh;
 }
 
@@ -206,9 +209,9 @@ describe('#29 拾取粗筛 · Picker 集成', () => {
     expect(far.material).toBeInstanceOf(THREE.MeshBasicMaterial);
   });
 
-  test('包围球不可信的网格一律保留：frustumCulled=false / 无包围球 / 墨卡托偏移', () => {
+  test('包围球不可信的网格一律保留：未打可信标记 / 无包围球 / 墨卡托偏移', () => {
     const noCull = pickMesh(2, 0.9, 0.9);
-    noCull.frustumCulled = false;
+    noCull.userData.sphereTrusted = false; // 位移 / 旋转会这样清掉标记
     const noSphere = pickMesh(3, 0.9, 0.9);
     noSphere.geometry.boundingSphere = null;
     const mercator = pickMesh(4, 0.9, 0.9);

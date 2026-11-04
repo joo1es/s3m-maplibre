@@ -82,7 +82,8 @@ function registerMesh(viewer: S3MViewer, smid: number): THREE.Mesh {
   const geo = new THREE.BoxGeometry(10, 10, 10);
   geo.setAttribute('aBatchId', new THREE.BufferAttribute(new Float32Array(geo.attributes.position.count), 1));
   const mesh = new THREE.Mesh(geo, createStyledMaterial({ uniforms: viewer.uniforms }));
-  mesh.userData = { geoRef: { pickInfo: { [smid]: { batchId: 0 } } } };
+  // sphereTrusted 由 GeometryBuilder 打在普通瓦片网格上，这里手动补一份
+  mesh.userData = { geoRef: { pickInfo: { [smid]: { batchId: 0 } } }, sphereTrusted: true };
   group.add(mesh);
   (viewer as unknown as { _registerTile: (n: unknown, e: unknown) => void })._registerTile(
     { group, tile: null },
@@ -482,17 +483,17 @@ describe('6. 单体平移动画', () => {
     expect(end?.[0]).toBeCloseTo(10, 5);
   });
 
-  test('平移中的网格关闭视锥剔除，归零后恢复', () => {
+  test('平移中的网格清掉包围球可信标记，归零后恢复', () => {
     const v = makeViewer();
     const mesh = registerMesh(v, 602);
 
     v.moveFeature(602, [200, 0, 0], { duration: 100 });
     stepTo(v, 100);
-    expect(mesh.frustumCulled).toBe(false);
+    expect(mesh.userData.sphereTrusted).toBe(false);
 
     v.moveFeature(602, [0, 0, 0], { duration: 100 });
     stepTo(v, 200);
-    expect(mesh.frustumCulled).toBe(true);
+    expect(mesh.userData.sphereTrusted).toBe(true);
   });
 
   test('getFeatureBounds 反映平移后的位置', () => {

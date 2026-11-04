@@ -65,6 +65,24 @@ export interface TileVisibilityHost {
   trimBudget(): boolean;
 }
 
+/** `update()` 的可选行为开关 */
+export interface TileVisibilityOptions {
+  /**
+   * 用 `isVisible` 限制「要不要为视野外瓦片请求子瓦片」。默认等于 `isVisible` 是否传入，
+   * 保持旧口径（传了回调就参与细化判定）。对应公开的 `cullRefine`。
+   */
+  refineCull?: boolean;
+  /**
+   * 用 `isVisible` 决定 `group.visible`。默认 `false`——不传时行为与改动前逐字一致。
+   *
+   * 为什么必须独立于 `refineCull`：`cullRefine` 省的是下载与解码，画不画是另一回事。
+   * three 自己的视锥是错的（`projectionMatrix` 被换成完整 MVP、`matrixWorldInverse`
+   * 只是相机平移的逆，两者相乘把视锥整体平移了「相机到锚点」的距离，见 #36），
+   * 所以瓦片的绘制可见性必须由这里按宿主 MVP 判定。
+   */
+  visibleCull?: boolean;
+}
+
 export class TileVisibility {
   /** 内部 Set/Map 容器复用，避免每帧 update 产生大量短命对象引起 GC 抖动（Issue #31） */
   private readonly _visited = new Set<string>();
@@ -77,6 +95,18 @@ export class TileVisibility {
 
   constructor(private readonly host: TileVisibilityHost) {}
 
+  /** 本帧的视锥判定回调（由 `update` 注入，只在本次 update 内有效） */
+  private _visibleTest?: TileVisibilityTest;
+  /** 本次 update 是否按视锥决定绘制 */
+  private _visibleCull = false;
+
+  /** 节点是否被视锥剔除；没有包围球时判不了，一律保留 */
+  private _culled(node: TileNode): boolean {
+    const test = this._visibleTest;
+    if (!this._visibleCull || !test || !node.sphere) return false;
+    return !test(node.sphere.center, node.sphere.radius, node);
+  }
+
   /**
    * @param camEnu 相机在该数据集局部 ENU 坐标系中的位置（米）
    * @param fovRad 垂直视场角（弧度）
@@ -87,11 +117,17 @@ export class TileVisibility {
     camEnu: [number, number, number],
     fovRad: number,
     screenHeight: number,
-    isVisible?: TileVisibilityTest
+    isVisible?: TileVisibilityTest,
+    options?: TileVisibilityOptions
   ): boolean {
     this.host.beginFrame();
     let hasChanges = false;
     const debugLod = Boolean((globalThis as { __S3M_LOD_DEBUG?: boolean }).__S3M_LOD_DEBUG);
+
+    this._visibleTest = isVisible;
+    this._visibleCull = options?.visibleCull === true;
+    // 旧口径：传了回调就参与细化判定；显式给了 refineCull 才以它为准
+    const refineCull = options?.refineCull ?? isVisible !== undefined;
 
     for (const node of this.host.nodes.values()) {
       if (!node.sphere) {
@@ -167,7 +203,7 @@ export class TileVisibility {
         ? splat.needRefine
         : childUrls.length > 0 &&
           (byDistance ? metric < threshold * hFactor : metric > threshold * hFactor);
-      if (needRefine && isVisible && !isVisible(c, node.sphere.radius, node)) {
+      if (needRefine && refineCull && isVisible && !isVisible(c, node.sphere.radius, node)) {
         needRefine = false;
       }
       node.needRefine = needRefine;
@@ -258,7 +294,8 @@ export class TileVisibility {
         break;
       }
     }
-    if (!anyVisible && this.host.nodes.size > 0) {
+    // 视锥剔除生效时允许空场：镜头转开就是要什么都不画，此时点亮会被上面的剔除抵消。
+    if (!anyVisible && this.host.nodes.size > 0 && !this._visibleCull) {
       for (const node of this.host.nodes.values()) {
         const childUrls = getNodeChildUrls(node);
         let covered = false;
@@ -276,6 +313,11 @@ export class TileVisibility {
       }
     }
 
+    // 视锥回调只在本次 update 内有效：`updateVisibility` / `updateIncremental` 是公开方法，
+    // 被单独调用时不该沿用上一帧的判定
+    this._visibleTest = undefined;
+    this._visibleCull = false;
+
     return hasChanges;
   }
 
@@ -292,6 +334,19 @@ export class TileVisibility {
     const childUrls = getNodeChildUrls(node);
 
     if (!parentInBranch) {
+      if (node.group.visible) {
+        node.group.visible = false;
+        changed = true;
+      }
+      for (let i = 0; i < childUrls.length; i++) {
+        if (this.updateVisibility(childUrls[i]!, false, visited)) changed = true;
+      }
+      return changed;
+    }
+
+    // 视锥外：子瓦的包围球不会超出父瓦的包围球，父的包围球整个在视锥外时子树必然也不可见，
+    // 整棵一起隐藏。这里只管「画不画」，要不要继续请求子瓦由 refineCull 单独控制。
+    if (this._culled(node)) {
       if (node.group.visible) {
         node.group.visible = false;
         changed = true;
@@ -432,6 +487,13 @@ export class TileVisibility {
       if (!node) return;
 
       const childUrls = getNodeChildUrls(node);
+
+      // 视锥外：不进 primary/fallback，收尾循环会把整棵子树隐藏（子包围球在父之内）
+      if (this._culled(node)) {
+        for (let i = 0; i < childUrls.length; i++) traverse(childUrls[i]!, depth + 1);
+        return;
+      }
+
       if (!node.needRefine || childUrls.length === 0) {
         this._nextPrimary.add(url);
         return;
