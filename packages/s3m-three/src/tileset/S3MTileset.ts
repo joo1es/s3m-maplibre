@@ -17,6 +17,7 @@ import type { S3MBlockAtlasImage, S3MBlockGroupSet } from '../core/S3MBlockParse
 import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { TileGeometryData } from '../core/TileGeometry.js';
 import { BlockAtlas } from './BlockAtlas.js';
+import { TileBudget, estimateObjectGeometryBytes } from './TileBudget.js';
 import { AUTO_BAKE_RADIUS_THRESHOLD } from '../core/BakeMercator.js';
 import type { TextureCreateOptions } from '../render/TextureFactory.js';
 import type { Group, Texture } from 'three';
@@ -50,54 +51,6 @@ export type {
   TileVisibilityTest,
 } from './types.js';
 
-/** 估算单个纹理占用的显存字节数 */
-export function estimateTextureBytes(tex: any): number {
-  if (!tex) return 0;
-  if (Array.isArray(tex.mipmaps) && tex.mipmaps.length > 0) {
-    let bytes = 0;
-    for (const m of tex.mipmaps) {
-      if (m?.data?.byteLength) bytes += m.data.byteLength;
-    }
-    if (bytes > 0) return bytes;
-  }
-  const img = tex.image;
-  if (!img) return 0;
-  if (img.data && typeof img.data.byteLength === 'number') {
-    return img.data.byteLength;
-  }
-  const w = img.width ?? 0;
-  const h = img.height ?? 0;
-  if (w > 0 && h > 0) {
-    const factor = tex.generateMipmaps ? 1.3333333333333333 : 1;
-    return Math.round(w * h * 4 * factor);
-  }
-  return 0;
-}
-
-/** 估算三维对象树中包含的几何缓冲字节数 */
-export function estimateObjectGeometryBytes(obj: any): number {
-  let bytes = 0;
-  if (!obj) return 0;
-  obj.traverse?.((child: any) => {
-    const geo = child.geometry;
-    if (geo) {
-      if (geo.attributes) {
-        for (const attr of Object.values(geo.attributes) as any[]) {
-          if (attr?.array?.byteLength) bytes += attr.array.byteLength;
-        }
-      }
-      if (geo.index?.array?.byteLength) {
-        bytes += geo.index.array.byteLength;
-      }
-    }
-    if (child.isInstancedMesh) {
-      if (child.instanceMatrix?.array?.byteLength) bytes += child.instanceMatrix.array.byteLength;
-      if (child.instanceColor?.array?.byteLength) bytes += child.instanceColor.array.byteLength;
-    }
-  });
-  return bytes;
-}
-
 export class S3MTileset {
   configUrl: string;
   config: Record<string, unknown> | null = null;
@@ -114,8 +67,6 @@ export class S3MTileset {
   readonly failed = new Set<string>();
   readonly textureCache = new Map<string, Texture>();
   maxImageCache: number;
-  private readonly _textureRefs = new Map<string, number>();
-  private readonly _tileTextureKeys = new Map<string, string[]>();
   readonly pending = new Set<string>();
   /** 是否请求 `.texblock` 子图集，默认关，见 S3MTilesetOptions.atlasLod */
   atlasLod: boolean;
@@ -220,6 +171,8 @@ export class S3MTileset {
   private _active = 0;
   /** 图集补齐（leaf / texblock 请求 + LRU + 整图替换验证），见 tileset/BlockAtlas.ts */
   private readonly _atlas: BlockAtlas;
+  /** 驻留预算与淘汰，见 tileset/TileBudget.ts */
+  private readonly _budget: TileBudget;
 
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
@@ -274,6 +227,20 @@ export class S3MTileset {
       leafRequestCache: this.leafRequestCache,
       atlasUpgraded: this.atlasUpgraded,
       atlasUpgradeSkipped: this.atlasUpgradeSkipped,
+    });
+
+    this._budget = new TileBudget({
+      nodes: this.nodes,
+      pending: this.pending,
+      textureCache: this.textureCache,
+      stats: this.stats,
+      parentOf: this._parentOf,
+      onTileRemoved: (node) => self._onTileRemoved(node),
+      maxTiles: () => self.maxTiles,
+      maxTriangles: () => self.maxTriangles,
+      maxMemory: () => self.maxMemory,
+      hardCap: () => self.hardCap,
+      lodTransition: () => self.lodTransition,
     });
   }
 
@@ -368,50 +335,14 @@ export class S3MTileset {
    * 两轮都按「最久没进有效范围」排，同帧再比距离。
    * 淘汰最细一级时，如果上一级也不在内存里，顺手把上一级排回队列补洞。
    */
-  /** 记录瓦片引用的纹理 key，并递增其引用计数 */
+    /** 记录瓦片引用的纹理 key，并递增其引用计数（实现在 tileset/TileBudget.ts） */
   registerTileTextures(url: string, textureKeys: string[]): void {
-    this._tileTextureKeys.set(url, textureKeys);
-    const node = this.nodes.get(url);
-    if (node) {
-      node.textureKeys = textureKeys;
-    }
-    for (const key of textureKeys) {
-      this._textureRefs.set(key, (this._textureRefs.get(key) ?? 0) + 1);
-    }
+    this._budget.registerTileTextures(url, textureKeys);
   }
 
-  /** 淘汰单块瓦片节点并释放专属纹理 */
+  /** 淘汰单块瓦片节点并释放专属纹理（实现在 tileset/TileBudget.ts） */
   _evictTileNode(victim: TileNode): void {
-    this.nodes.delete(victim.url);
-    victim.group?.parent?.remove(victim.group);
-    this._onTileRemoved(victim);
-    this._parentOf.delete(victim.url);
-
-    this.stats.tiles = Math.max(0, this.stats.tiles - 1);
-    if (victim.stats) {
-      this.stats.meshes = Math.max(0, this.stats.meshes - (victim.stats.meshes ?? 0));
-      this.stats.vertices = Math.max(0, this.stats.vertices - (victim.stats.vertices ?? 0));
-      this.stats.triangles = Math.max(0, this.stats.triangles - (victim.stats.triangles ?? 0));
-    }
-
-    // 释放此瓦片引用的纹理计数；引用归零时从 GPU / 缓存彻底 dispose
-    const keys = victim.textureKeys ?? this._tileTextureKeys.get(victim.url) ?? (victim.group?.userData?.textureKeys as string[] | undefined);
-    this._tileTextureKeys.delete(victim.url);
-    if (keys?.length) {
-      for (const key of keys) {
-        const ref = (this._textureRefs.get(key) ?? 1) - 1;
-        if (ref <= 0) {
-          this._textureRefs.delete(key);
-          const tex = this.textureCache.get(key);
-          if (tex) {
-            tex.dispose?.();
-            this.textureCache.delete(key);
-          }
-        } else {
-          this._textureRefs.set(key, ref);
-        }
-      }
-    }
+    this._budget.evictTileNode(victim);
   }
 
   /** 图集补齐全部委托给 tileset/BlockAtlas.ts；保留同名转发供既有单测调用 */
@@ -439,55 +370,19 @@ export class S3MTileset {
     return this._atlas.getLeafRecords(name);
   }
 
-  private _evictOne(allowUncovered = false): boolean {
-
-    // 只挑安全候选：叶子 → 已被子瓦接手的父瓦。allowUncovered 仅在超出硬上限时开启（内存兜底）
-    const victim = this._pickVictim(true, allowUncovered) ?? this._pickVictim(false, allowUncovered);
-    if (!victim) return false;
-
-    const parentUrl = victim.parentUrl ?? this._parentOf.get(victim.url);
-    const childUrls = victim.childUrls ?? (victim.childUrl ? [victim.childUrl] : []);
-    const isLeaf = !childUrls.some((u) => u !== victim.url && this.nodes.has(u));
-
-    this._evictTileNode(victim);
-
-    // 淘汰的是中间层时，把已加载的子孙改挂到它的父级上：
-    // 不然它们瞬间"无父"，父级那边还留着指向 victim 的 childUrls，
-    // 于是 allChildrenReady 永远为假 —— 既显示不对，也白占预算。
-    const kids = childUrls.filter((u) => u !== victim.url && this.nodes.has(u));
-    if (kids.length) {
-      for (const k of kids) {
-        const kn = this.nodes.get(k);
-        if (!kn) continue;
-        kn.parentUrl = parentUrl ?? undefined;
-        if (parentUrl) this._parentOf.set(k, parentUrl);
-        else this._parentOf.delete(k);
-      }
-      if (parentUrl) {
-        const pn = this.nodes.get(parentUrl);
-        if (pn) {
-          const merged = new Set<string>(pn.childUrls ?? []);
-          if (pn.childUrl) merged.add(pn.childUrl);
-          merged.delete(victim.url);
-          for (const k of kids) merged.add(k);
-          pn.childUrls = [...merged];
-          pn.childUrl = pn.childUrls[0] ?? null;
-        }
-      }
-    }
-
-    // 删的是最细一级、而上一级又不在内存里 → 把上一级排回去，别让那块地空着
-    if (false as boolean && isLeaf && parentUrl && !this.nodes.has(parentUrl) && !this.pending.has(parentUrl)) {
-      // 淘汰阶段不再重新入队父瓦，防止预算满载时引发父子死循环震荡（thrashing loop）
-    }
-    return true;
+    /** @internal 见 tileset/TileBudget.ts */
+  _evictOne(allowUncovered = false): boolean {
+    return this._budget.evictOne(allowUncovered);
   }
 
-  /** 当前驻留瓦片的三角形总数（只算已落地的；在途瓦片还没构建，统计不到） */
-  private _residentTriangles(): number {
-    let total = 0;
-    for (const node of this.nodes.values()) total += node.stats?.triangles ?? 0;
-    return total;
+  /** @internal 见 tileset/TileBudget.ts */
+  _pickVictim(allowRefined: boolean, allowUncovered = false): TileNode | null {
+    return this._budget.pickVictim(allowRefined, allowUncovered);
+  }
+
+  /** @internal 见 tileset/TileBudget.ts */
+  private _trimBudget(): boolean {
+    return this._budget.trimBudget();
   }
 
   /**
@@ -525,102 +420,16 @@ export class S3MTileset {
   }
 
   /**
-   * 当前数据集驻留的显存与内存总字节数（几何缓冲精确大小 + 纹理显存估计）
+   * 当前驻留的显存与内存总字节数（几何缓冲精确大小 + 纹理显存估计）
+   * 实现在 tileset/TileBudget.ts。
    */
   residentMemory(): number {
-    return this._residentGeometryBytes() + this._residentTextureBytes();
+    return this._budget.residentMemory();
   }
 
-  private _residentGeometryBytes(): number {
-    let total = 0;
-    for (const node of this.nodes.values()) {
-      if (node.stats && typeof node.stats.memory === 'number') {
-        total += node.stats.memory;
-      } else if (node.group) {
-        total += estimateObjectGeometryBytes(node.group);
-      }
-    }
-    return total;
-  }
-
-  private _residentTextureBytes(): number {
-    let total = 0;
-    for (const tex of this.textureCache.values()) {
-      total += estimateTextureBytes(tex);
-    }
-    return total;
-  }
-
-  /**
-   * 预算裁剪 —— 必须在可见性算完之后调用（make-before-break）：
-   * 新瓦片已经落地、也已经决定由谁负责显示，这时候才把没人依赖的那块裁掉。
-   * 只踢「当前不显示」或「位置已被可见子瓦接手」的瓦片；挑不出安全候选时允许
-   * 暂时超出预算，等下一帧再裁 —— 宁可多占一会儿内存，也不在画面上开洞。
-   *
-   * 三条预算并行：瓦片数（`maxTiles`）、三角形总数（`maxTriangles`）与显存字节（`maxMemory`）。
-   * `maxTriangles` / `maxMemory` 为 Infinity 时短路，行为与只有瓦片数预算时完全一致。
-   */
-  private _trimBudget(): boolean {
-    let removed = false;
-    let guard = 0;
-    // 在途的也算进"预期驻留数"：不然一批瓦片同时落地时会先把画面撑爆再疯狂裁
-    const overTiles = () => this.nodes.size + this.pending.size > this.maxTiles;
-    const overTriangles = () =>
-      Number.isFinite(this.maxTriangles) && this._residentTriangles() > this.maxTriangles;
-    const overMemory = () =>
-      Number.isFinite(this.maxMemory) && this.residentMemory() > this.maxMemory;
-    // 预算生效时可能要连踢多块，迭代上限跟着驻留规模走；不生效时根本进不了循环
-    const iterationCap = this.nodes.size + this.maxTiles + 16;
-    while ((overTiles() || overTriangles() || overMemory()) && guard++ <= iterationCap) {
-      if (!this._evictOne(this.nodes.size + this.pending.size > this.hardCap)) break;
-      removed = true;
-    }
-    return removed;
-  }
-
-  /**
-   * 挑淘汰候选。
-   * @param allowRefined false = 只挑叶子；true = 也允许挑「子节点已全部加载」的父瓦片
-   * @param allowUncovered true = 允许淘汰「正在显示、但位置还没被子瓦接手」的瓦片。
-   *   默认 false：这种瓦片一踢，画面上立刻是一个洞，下一帧调度又会把它请回来补洞，
-   *   于是「淘汰 → 开洞 → 回补 → 再淘汰」无限循环 = 屏幕不停闪烁。
-   *   只有在实在挑不出安全候选时才允许（否则预算满死锁、相机移到哪都不出图）。
-   */
-  private _pickVictim(allowRefined: boolean, allowUncovered = false): TileNode | null {
-    let victim: TileNode | null = null;
-    for (const node of this.nodes.values()) {
-      const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
-      const refined = childUrls.length > 0 && childUrls.some((u) => u !== node.url && this.nodes.has(u));
-      if (refined !== allowRefined) continue;
-      // 正在显示且没有可见子瓦接手 → 踢了就是洞
-      if (!allowUncovered && node.group.visible) {
-        if (this.lodTransition === 'incremental') {
-          continue;
-        }
-        const covered = childUrls.some((u) => {
-          const c = this.nodes.get(u);
-          return !!c && c.group.visible;
-        });
-        if (!covered) continue;
-      }
-      if (!victim) {
-        victim = node;
-        continue;
-      }
-      // 可见性优先于时间戳：没有包围球的瓦片算不出距离，`lastSeen` 天然比别的瓦片旧，
-      // 只看时间戳会把「正在显示」的那块先踢掉（开洞 → 回补 → 再踢 = 闪）。
-      // 只有不可见的候选分不出来时，才轮到 lastSeen / distance 决定。
-      const nodeVisible = node.group.visible ? 1 : 0;
-      const victimVisible = victim.group.visible ? 1 : 0;
-      if (nodeVisible !== victimVisible) {
-        if (nodeVisible < victimVisible) victim = node;
-        continue;
-      }
-      const a = node.lastSeen ?? -1;
-      const b = victim.lastSeen ?? -1;
-      if (a < b || (a === b && (node.distance ?? 0) > (victim.distance ?? 0))) victim = node;
-    }
-    return victim;
+  /** @internal 当前驻留瓦片的三角形总数，见 tileset/TileBudget.ts */
+  _residentTriangles(): number {
+    return this._budget.residentTriangles();
   }
 
   /** 把之前彻底失败的瓦片全部放回队列（网络恢复后手动调一次） */
@@ -1041,7 +850,7 @@ export class S3MTileset {
 
     // 显示职责已经分配完毕，现在才裁预算（make-before-break）：
     // 此时「谁在负责显示这块地」是确定的，只踢没人依赖的那块，不会开出洞来
-    if (this._trimBudget()) hasChanges = true;
+    if (this._budget.trimBudget()) hasChanges = true;
 
     // 兜底：绝不允许空场。
     // 可见性递归是按「先访问先决定」处理的，而 LOD 图不一定是严格的树 —— 同一个子瓦可能

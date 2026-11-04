@@ -41,7 +41,7 @@ const PUBLIC_FIELDS = [
  */
 const INTERNAL_USED = [
   '_enqueue', '_evictOne', '_evictTileNode', '_fillExternalAtlases',
-  '_load', '_pickVictim', '_trimBudget',
+  '_load', '_pickVictim', '_residentTriangles', '_trimBudget',
 ];
 
 function makeTileset(): S3MTileset {
