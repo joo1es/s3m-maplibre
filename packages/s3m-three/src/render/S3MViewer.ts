@@ -36,8 +36,10 @@ import { EdgeDecorator } from './viewer/EdgeDecorator.js';
 import { PickService } from './viewer/PickService.js';
 import { SelectionDecorator } from './viewer/SelectionDecorator.js';
 import { AnalysisService } from './viewer/AnalysisService.js';
+import { OPACITY_EPS, clampOpacity, isPointCloudObject, styledMaterialOf } from './viewer/materialHelpers.js';
 import { TilePlacement } from './viewer/TilePlacement.js';
 import { PathFollow } from './viewer/PathFollow.js';
+import { TileRegistry } from './viewer/TileRegistry.js';
 import type { PathSpec } from './viewer/PathFollow.js';
 import type {
   LightOptions,
@@ -180,32 +182,6 @@ export function normalizeDepthMode(mode?: unknown): DepthMode {
   if (mode === 'auto') return 'auto';
   return 'scene';
 }
-
-function styledMaterialOf(mesh: THREE.Mesh): StyledMaterial | null {
-  const m = Array.isArray(mesh.material) ? mesh.material[0] : mesh.material;
-  const styled = m as StyledMaterial | undefined;
-  return styled?.userData?.isStyled ? styled : null;
-}
-
-/** 点云是 THREE.Points 不是 Mesh，样式 / 拾取 / 卸载链路都靠这个判定放行 */
-function isPointCloudObject(o: THREE.Object3D): o is THREE.Points {
-  return (o as unknown as THREE.Points).isPoints === true;
-}
-
-/**
- * 全局透明度钳到 [0, 1]，**允许到 0**。
- *
- * 以前这里有个 0.05 下限，本意是「别让整层彻底看不见、又还在挡东西」。但那个问题
- * 真正的来源不是透明度，而是「透明物体仍然写深度」：全透明还写深度就会在底图上挖洞。
- * 现在到 0 时 `renderFrame()` 直接跳过绘制（不写颜色也不写深度），语义就干净了。
- */
-function clampOpacity(v: number | null | undefined): number {
-  const n = v ?? 1;
-  return n < 0 ? 0 : n > 1 ? 1 : n;
-}
-
-/** 低于这个透明度就当作完全不可见：跳过绘制，避免全透明物体写深度 */
-const OPACITY_EPS = 1e-3;
 
 /**
  * 拾取反解瓦片级放置时的临时矩阵。命中点→规范 ENU 是一次独立查询（鼠标事件），
@@ -384,6 +360,8 @@ export class S3MViewer {
   private readonly _pathSpecs = new Map<string, PathSpec>();
   /** 沿路径运动（CPU 补间 + GPU 实例化），见 viewer/PathFollow.ts */
   private readonly _paths: PathFollow;
+  /** 瓦片注册 / 注销，见 viewer/TileRegistry.ts */
+  private readonly _tiles: TileRegistry;
   /** 路径采样临时对象，避免每帧 new */
   /** 求切线用的第二个采样点（包围盒换算 GPU 路径朝向时用） */
 
@@ -652,6 +630,30 @@ export class S3MViewer {
       sceneAnchor: () => self.sceneAnchor,
       geo: () => self.geo,
       datasets: () => self._datasetManager.values(),
+    });
+    this._tiles = new TileRegistry({
+      animator: this.animator,
+      picks: this._picks,
+      edges: this._edges,
+      sel: this._sel,
+      heights: this._heights,
+      splats: this._splats,
+      placement: this._placement,
+      featureStyles: this._featureStyleManager,
+      pointClouds: this._pointClouds,
+      smidMeshes: this._smidMeshes,
+      style: this.style,
+      opacityTransparent: () => this._opacityTransparent,
+      perTilePlacement: () => this._perTilePlacement,
+      sceneAnchor: () => this.sceneAnchor,
+      select: (r) => this.select(r),
+      applyPointCloudStyle: (pc, selected) => this._applyPointCloudStyle(pc, selected),
+      indexMeshSmids: (mesh) => this._indexMeshSmids(mesh),
+      unindexMeshSmids: (mesh) => this._unindexMeshSmids(mesh),
+      allocPickId: () => this._picks.allocPickId(),
+      releasePickId: (id) => this._picks.releasePickId(id),
+      requestRepaint: () => this.triggerRepaint(),
+      nextTileFadeSeq: () => this._tileFadeSeq++,
     });
     if (options.attributes)
       this.attributeQuery = new AttributeQuery({
@@ -1609,103 +1611,16 @@ export class S3MViewer {
   }
 
   /* ---------------------------------------------------------------- 瓦片注册 */
+  // 实现在 viewer/TileRegistry.ts；主类只留同签名转发。
 
+  /** @internal 一块瓦片落地：写 userData / 拾取表 / SMID 索引 / 高度 / 棱线 / 样式继承 */
   private _registerTile(node: TileNode, entry: S3MDatasetEntry): void {
-    // 必须在 add / updateMatrixWorld 之前设置：后者会拿当前 matrix 算 matrixWorld 并缓存
-    //
-    // ★ 触发条件**不能**是「有没有包围球」。S3M 1.x 的叶子瓦片 XML 是
-    //   `<PageLods><Geode>`（外面没有 `<PagedLOD>` 包装），`parseXmlLods` 解析出来
-    //   pageLods 为空 → sphere 为 null。而 `entry.root` 上挂着 align 算出来的整体偏移
-    //   （索菲亚教堂是 heightRange.min = 119.84），那个偏移是靠 placement 里的
-    //   `- datasetOffset` 抵消的。少摆一块，这块就带着偏移显示 —— 实测 L23 整层
-    //   因此沉到地下 120 m，且 `localZ - worldZ` 恒等于偏移量。
-    //   缺球时用几何包围盒中心兜底；连几何都没有就退回旧口径。
-    const center = node.sphere?.center ?? this._placement.localCenterOf(node.group);
-    if (this._perTilePlacement && center) {
-      this._placement.apply(node.group, center, entry);
-    }
-    // 上面没摆成（关掉本功能 / 缺锚点 / 几何为空）时 matrixAutoUpdate 仍是 true，走旧口径
-    if (node.group.matrixAutoUpdate) {
-      const sceneAnchor = this.sceneAnchor;
-      if (sceneAnchor) {
-        const sEast = sceneAnchor.meterInMercatorEast ?? sceneAnchor.meterInMercator;
-        const sNorth = sceneAnchor.meterInMercatorNorth ?? sceneAnchor.meterInMercator;
-        const sUp = sceneAnchor.meterInMercatorUp ?? sEast;
-        const c = node.sphere
-          ? ([node.sphere.center.x, node.sphere.center.y, node.sphere.center.z] as const)
-          : ([0, 0, 0] as const);
-        this._placement.updateUniforms(node.group, c, [1.0 / sEast, 1.0 / sNorth, 1.0 / sUp]);
-      }
-    }
-    entry.root.add(node.group);
-    node.group.updateMatrixWorld(true);
+    this._tiles.registerTile(node, entry);
+  }
 
-    const hasNativeEdges = node.group.userData.hasNativeEdges === true;
-    // forceCpuEdges：无视数据自带的棱线包，改由 CPU 现算。native 是 1px 的
-    // LineBasicMaterial，edgeWidth / 外扩 / 单体跟随全都吃不上。
-    // gpu 画法由 shader 自己描边，native 线段包同样不能留
-    const useNativeEdges = this._edges.useNativeEdges(hasNativeEdges);
-
-    for (const child of node.group.children) {
-      // 数据自带的棱线包：只跟着 edges 开关显示，不参与拾取、不参与着色
-      if ((child as THREE.LineSegments).isLineSegments && (child.userData as MeshUserData).isEdgeLines) {
-        // 一律登记：forceCpuEdges 之后又关掉时还要能把它们放出来
-        this._edges.registerNativeLine(child as THREE.LineSegments, useNativeEdges && this._edges.enabled);
-        continue;
-      }
-
-      // 点云是 THREE.Points 不是 Mesh，但同样要进拾取表、吃不透明度、跟着着色模式走
-      const isPoints = isPointCloudObject(child);
-      const mesh = child as THREE.Mesh;
-      if (!mesh.isMesh && !isPoints) continue;
-      if (isPoints) this._pointClouds.add(child as THREE.Points);
-      // 新瓦片里的泼溅实例还没按当前视角排过，下一帧要重排
-      if (isPoints) this._splats.markDirty();
-      const ud = mesh.userData as MeshUserData;
-      ud.pickId = this._allocPickId();
-      ud.datasetId = entry.id;
-      ud.nativeEdges = useNativeEdges;
-      ud.nativeEdgesRaw = hasNativeEdges;
-      this._picks.pickables.set(ud.pickId, {
-        datasetId: entry.id,
-        mesh,
-        tile: node.tile,
-        skeletonName: ud.skeletonName ?? '',
-      });
-      this._indexMeshSmids(mesh);
-      this._heights.add(mesh);
-      // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义
-      // 点云没有「棱」：给一堆孤立点建 EdgesGeometry 又慢又没意义。
-      // 自动描边受三道开关控制：全局 style.edges / 数据集 enableEdges / 地形绿地等关键字跳过。
-      this._edges.autoDecorate(mesh, entry, useNativeEdges);
-
-      // 新瓦片要继承当前的不透明度与着色方式
-      if (isPoints) {
-        this._applyPointCloudStyle(child as THREE.Points);
-      } else {
-        const mat = styledMaterialOf(mesh);
-        if (mat) {
-          const o = clampOpacity(this.style.opacity);
-          // 不写 mat.opacity：全局透明度走共享 uOpacity，材质自身 opacity 保留模型自带 alpha
-          // 混合开关不能写成 `o < 0.999` 一刀切：材质自身可能是 blend / 顶点 alpha
-          // 透明（s3mOpts.transparent，如 SMID 4421），注册时就被这句踩掉，
-          // 表现为「刚进去没透明度，切换材质质感重建后才恢复」。
-          const keepDepth = this.style.depthWrite !== false;
-          restoreBaseBlendState(mat, o < 0.999, keepDepth);
-          // shading 走共享 uniform（uFlatShading），不写 mat.flatShading / needsUpdate——
-          // transparent / depthWrite 也不是 program 决定项，整套样式继承零重编译
-          if (mat.userData.uFlatShading) {
-            mat.userData.uFlatShading.value = this.style.shading !== 'smooth' ? 1 : 0;
-          }
-          this._featureStyleManager.applyOverridesToMesh(mesh);
-          this._startTileFade(mesh, mat);
-        }
-      }
-
-      // 选中状态也要跟着继承：LOD 细化 / 瓦片重载会换掉 mesh，
-      // 不重放就出现「点中的那栋楼一拉近就没高亮了」
-      this._sel.replayOnto(mesh);
-    }
+  /** @internal 瓦片被淘汰：从拾取表与场景里摘掉，并释放几何与材质显存 */
+  private _unregisterTile(node: TileNode, entry: S3MDatasetEntry): void {
+    this._tiles.unregisterTile(node, entry);
   }
 
   /**
@@ -1728,119 +1643,9 @@ export class S3MViewer {
     return this._placement.toCanonicalScene(p, mesh);
   }
 
-  /**
-   * 新瓦片淡入。
-   *
-   * 每块网格有自己的材质实例，所以给一个逐材质的 `uTileFade` 就够，不需要动共享
-   * uniform、也不需要重建任何东西。淡入期间该网格进透明队列（混合 + 排序），
-   * 淡完立刻把 `transparent` 还给图层状态，避免长期留在透明通道里。
-   *
-   * 通道 key 用自增序号而不是 pickId：pickId 会被回收复用，用它会串到新瓦片上。
-   */
-  private _startTileFade(mesh: THREE.Mesh, mat: StyledMaterial): void {
-    const duration = this.style.fadeIn ?? 0;
-    if (duration <= 0) return;
-    const uFade = mat.userData.uTileFade;
-    if (!uFade) return;
-
-    uFade.value = 0;
-    mat.transparent = true;
-    // 淡入期间保持深度写入：否则能透过正在淡入的楼看到后面的东西，像在「漏」
-    mat.depthWrite = true;
-
-    const key = `tile.${this._tileFadeSeq++}.fade`;
-    (mesh.userData as MeshUserData).tileFadeKey = key;
-    this.animator.register(key, {
-      dim: 1,
-      read: (out) => {
-        out[0] = uFade.value;
-      },
-      write: (v) => {
-        uFade.value = v[0];
-      },
-    });
-    this.animator.to(key, 1, {
-      duration,
-      easing: 'easeOutQuad',
-      onComplete: () => {
-        uFade.value = 1;
-        (mesh.userData as MeshUserData).tileFadeKey = undefined;
-        this.animator.unregister(key);
-        // 淡入期间强制开了 transparent + depthWrite，结束时不能自己拍板关掉——
-        // 先恢复「材质自身语义 || 图层透明度」的基础状态（材质可能是 blend /
-        // 顶点 alpha 透明，如 SMID 4421），再让单体淡化流程有需要时重新打开。
-        restoreBaseBlendState(mat, this._opacityTransparent, this.style.depthWrite !== false);
-        this._featureStyleManager.applyOverridesToMesh(mesh);
-        this._requestRepaint();
-      },
-    });
-  }
-
   /** @internal 把当前选中重放到新登记的 mesh 上，见 viewer/SelectionDecorator.ts */
   _replaySelectionOnto(mesh: THREE.Mesh): void {
     this._sel.replayOnto(mesh);
-  }
-
-  /** 瓦片被淘汰：从拾取表和场景里摘掉，并深度彻底释放所有几何体与材质显存 */
-  private _unregisterTile(node: TileNode, entry: S3MDatasetEntry): void {
-    node.group.traverse((child) => {
-      const obj = child as any;
-      if ((child as THREE.LineSegments).isLineSegments && obj.userData?.isEdgeLines) {
-        this._edges.unregisterNativeLine(child as THREE.LineSegments);
-      }
-      if (isPointCloudObject(child)) this._pointClouds.delete(child);
-      // 淡入还没结束就被淘汰：把通道收掉，否则会对着已释放的材质继续写
-      if (obj.userData?.tileFadeKey) {
-        this.animator.unregister(obj.userData.tileFadeKey);
-        obj.userData.tileFadeKey = undefined;
-      }
-      if (obj.userData?.pickId != null) {
-        this._picks.pickables.delete(obj.userData.pickId);
-        this._releasePickId(obj.userData.pickId);
-        obj.userData.pickId = undefined;
-      }
-      if (obj.isMesh) {
-        const wasSelected = this._sel.selectedMeshes.includes(obj);
-        if (wasSelected) {
-          this._sel.selectedMeshes = this._sel.selectedMeshes.filter((m) => m !== obj);
-        }
-        const currentSel = this._sel.selection;
-        if (currentSel && currentSel.mesh === obj) {
-          const smid = currentSel.smid;
-          const carrier = (
-            smid != null
-              ? [...(this._smidMeshes.get(smid) ?? [])].find((m) => m !== obj && m.parent)
-              : this._sel.selectedMeshes.find((m) => m !== obj && m.parent && (m.parent as any).visible) ??
-                this._sel.selectedMeshes.find((m) => m !== obj && m.parent)
-          ) as THREE.Mesh | undefined;
-          if (carrier) {
-            // 选中身份交给承载同一 smid 的另一块 mesh（通常是接替显示的子瓦）
-            this._sel.selection = { ...currentSel, mesh: carrier };
-            this._sel.replayOnto(carrier);
-          } else {
-            this.select(null);
-          }
-        }
-        this._unindexMeshSmids(obj);
-        this._heights.remove(obj);
-        this._featureStyleManager.disposeMesh(obj);
-        const styled = styledMaterialOf(obj);
-        styled?.dispose?.();
-      }
-      // 深度释放材质（点云、普通材质、材质数组）
-      if (isOwnedPointCloudMaterial(obj.material)) {
-        (obj.material as THREE.Material).dispose();
-      } else if (obj.material) {
-        if (Array.isArray(obj.material)) {
-          obj.material.forEach((m: any) => m?.dispose?.());
-        } else {
-          obj.material.dispose?.();
-        }
-      }
-      // 释放几何体显存缓冲
-      obj.geometry?.dispose?.();
-    });
-    entry.root.remove(node.group);
   }
 
   /**
