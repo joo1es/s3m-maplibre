@@ -18,6 +18,21 @@
 import { splatLodDecision } from '../core/SplatLod.js';
 import type { TileNode, TileVisibilityTest } from './types.js';
 
+const EMPTY_CHILD_URLS: readonly string[] = [];
+
+/**
+ * 稳定获取瓦片的子瓦片 URL 列表。
+ *
+ * 若节点未显式挂载 childUrls（如单测构造的 mock 节点），则按 `node.childUrls ?? (node.childUrl ? [node.childUrl] : [])`
+ * 的原有口径归一化后就地缓存到 node.childUrls 上，避免每帧每个节点判定时重复构造短命数组（Issue #31）。
+ */
+export function getNodeChildUrls(node: TileNode): readonly string[] {
+  if (node.childUrls !== undefined) return node.childUrls;
+  const list = node.childUrl ? [node.childUrl] : (EMPTY_CHILD_URLS as string[]);
+  node.childUrls = list;
+  return list;
+}
+
 /** `TileVisibility` 需要的宿主状态 */
 export interface TileVisibilityHost {
   /** 已落地的瓦片 */
@@ -51,6 +66,15 @@ export interface TileVisibilityHost {
 }
 
 export class TileVisibility {
+  /** 内部 Set/Map 容器复用，避免每帧 update 产生大量短命对象引起 GC 抖动（Issue #31） */
+  private readonly _visited = new Set<string>();
+  private readonly _roots = new Set<string>();
+  private readonly _nextPrimary = new Set<string>();
+  private readonly _nextFallback = new Set<string>();
+  private readonly _nodeDepths = new Map<string, number>();
+  /** 记录上一帧各 fallback 节点的深度，深度不变且保持 fallback 时无需重复遍历 */
+  private readonly _lastFallbackDepths = new Map<string, number>();
+
   constructor(private readonly host: TileVisibilityHost) {}
 
   /**
@@ -67,6 +91,7 @@ export class TileVisibility {
   ): boolean {
     this.host.beginFrame();
     let hasChanges = false;
+    const debugLod = Boolean((globalThis as { __S3M_LOD_DEBUG?: boolean }).__S3M_LOD_DEBUG);
 
     for (const node of this.host.nodes.values()) {
       if (!node.sphere) {
@@ -116,7 +141,7 @@ export class TileVisibility {
       const inRange = byDistance ? dist < threshold * 2 : metric > threshold * 0.5;
       if (inRange) node.lastSeen = this.host.frame();
 
-      const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+      const childUrls = getNodeChildUrls(node);
       // 加入 8% 迟滞区间（Hysteresis Band），防止相机在 LOD 临界距离处发生父子瓦片逐帧来回横跳闪烁
       const hFactor = node.needRefine ? (byDistance ? 1.08 : 0.92) : 1.0;
 
@@ -147,20 +172,23 @@ export class TileVisibility {
       }
       node.needRefine = needRefine;
 
-      const dbgSeen = ((globalThis as { __S3M_LOD_SEEN?: Set<string> }).__S3M_LOD_SEEN ??= new Set<string>());
-      if ((globalThis as { __S3M_LOD_DEBUG?: boolean }).__S3M_LOD_DEBUG && !dbgSeen.has(node.url) && dbgSeen.size < 260) {
-        dbgSeen.add(node.url);
-        // eslint-disable-next-line no-console
-        console.log('[LOD]', JSON.stringify({
-          url: node.url.split('/').pop(), mode: node.rangeMode, rangeValue: node.rangeValue,
-          radius: node.sphere.radius, dist: +dist.toFixed(1), metric: +metric.toFixed(1),
-          threshold: +threshold.toFixed(1), needRefine, childUrls: childUrls.map((u) => u.split('/').pop()),
-          parent: node.parentUrl ? node.parentUrl.split('/').pop() : null,
-        }));
+      if (debugLod) {
+        const dbgSeen = ((globalThis as { __S3M_LOD_SEEN?: Set<string> }).__S3M_LOD_SEEN ??= new Set<string>());
+        if (!dbgSeen.has(node.url) && dbgSeen.size < 260) {
+          dbgSeen.add(node.url);
+          // eslint-disable-next-line no-console
+          console.log('[LOD]', JSON.stringify({
+            url: node.url.split('/').pop(), mode: node.rangeMode, rangeValue: node.rangeValue,
+            radius: node.sphere.radius, dist: +dist.toFixed(1), metric: +metric.toFixed(1),
+            threshold: +threshold.toFixed(1), needRefine, childUrls: childUrls.map((u) => u.split('/').pop()),
+            parent: node.parentUrl ? node.parentUrl.split('/').pop() : null,
+          }));
+        }
       }
 
       if (needRefine) {
-        for (const childUrl of childUrls) {
+        for (let i = 0; i < childUrls.length; i++) {
+          const childUrl = childUrls[i]!;
           if (!this.host.failed.has(childUrl) && !this.host.nodes.has(childUrl) && !this.host.pending.has(childUrl)) {
             this.host.enqueue(childUrl, node.url);
             hasChanges = true;
@@ -170,24 +198,27 @@ export class TileVisibility {
     }
 
     // 树状递归更新所有瓦片的可见性（确保每个位置只渲染一层最适合的 LOD，避免父子瓦片重叠 Z-fighting）
-    const visited = new Set<string>();
+    this._visited.clear();
     // 根集合 = 配置里的入口瓦片 + 所有「父瓦已不在档」的瓦片。
     // 后者必须有：淘汰掉一块中间层瓦片后，它下面的子孙会瞬间变成"无父"状态，
     // 如果只按 rootUrls 走，它们全部不可达，会被下面那条防御规则一起隐藏 ——
     // 症状就是「进去先渲染出来，然后整片消失，偶尔闪一下」。
-    const roots = new Set<string>(this.host.rootUrls);
+    this._roots.clear();
+    for (let i = 0; i < this.host.rootUrls.length; i++) {
+      this._roots.add(this.host.rootUrls[i]!);
+    }
     for (const [url, node] of this.host.nodes) {
       const p = node.parentUrl ?? this.host.parentOf.get(url);
-      if (!p || !this.host.nodes.has(p)) roots.add(url);
+      if (!p || !this.host.nodes.has(p)) this._roots.add(url);
     }
 
     if (this.host.lodTransition() === 'incremental') {
-      if (this.updateIncremental(roots, visited)) {
+      if (this.updateIncremental(this._roots, this._visited)) {
         hasChanges = true;
       }
     } else {
-      for (const rootUrl of roots) {
-        if (this.updateVisibility(rootUrl, true, visited)) {
+      for (const rootUrl of this._roots) {
+        if (this.updateVisibility(rootUrl, true, this._visited)) {
           hasChanges = true;
         }
       }
@@ -200,12 +231,12 @@ export class TileVisibility {
 
     // 防御：若有任何未被 root 树访问到的游离瓦片，全部隐藏
     for (const [url, node] of this.host.nodes) {
-      if (!visited.has(url)) {
+      if (!this._visited.has(url)) {
         if (node.group.visible) {
           node.group.visible = false;
           hasChanges = true;
         }
-        if (this.host.lodTransition() === 'incremental') {
+        if (this.host.lodTransition() === 'incremental' && this.host.fallbackNodes.has(url)) {
           this.restorePolygonOffset(node);
         }
       }
@@ -229,11 +260,15 @@ export class TileVisibility {
     }
     if (!anyVisible && this.host.nodes.size > 0) {
       for (const node of this.host.nodes.values()) {
-        const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
-        const covered = childUrls.some((u) => {
-          const c = this.host.nodes.get(u);
-          return !!c && c !== node && c.group.visible;
-        });
+        const childUrls = getNodeChildUrls(node);
+        let covered = false;
+        for (let i = 0; i < childUrls.length; i++) {
+          const c = this.host.nodes.get(childUrls[i]!);
+          if (c && c !== node && c.group.visible) {
+            covered = true;
+            break;
+          }
+        }
         if (!covered && !node.group.visible) {
           node.group.visible = true;
           hasChanges = true;
@@ -244,7 +279,7 @@ export class TileVisibility {
     return hasChanges;
   }
 
-  updateVisibility(url: string, parentInBranch: boolean, visited: Set<string>): boolean {
+  updateVisibility(url: string, parentInBranch: boolean, visited: Set<string> = this._visited): boolean {
     const node = this.host.nodes.get(url);
     if (!node) return false;
     // 必须挡住重复访问：可见性图不是严格的树 —— 同一个子瓦可能被多个父瓦引用（不同 LOD 源
@@ -254,27 +289,37 @@ export class TileVisibility {
     visited.add(url);
 
     let changed = false;
-    const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
+    const childUrls = getNodeChildUrls(node);
 
     if (!parentInBranch) {
       if (node.group.visible) {
         node.group.visible = false;
         changed = true;
       }
-      for (const cUrl of childUrls) {
-        if (this.updateVisibility(cUrl, false, visited)) changed = true;
+      for (let i = 0; i < childUrls.length; i++) {
+        if (this.updateVisibility(childUrls[i]!, false, visited)) changed = true;
       }
       return changed;
     }
 
-    const hasChildren = childUrls.length > 0;
-    // 「就绪」= 已加载；失败的已经从 childUrls 里摘掉，剩下的只要都到了就能接手显示
-    const readyChildren = childUrls.filter((cUrl) => this.host.nodes.has(cUrl));
-    const allResolved = childUrls.every((cUrl) => this.host.nodes.has(cUrl) || this.host.failed.has(cUrl));
-
     // 细化前提：需要细化、至少有一个子瓦片就绪、且没有还在下载途中的子瓦片
     // （不等「全部就绪」是因为个别 childTile 在服务器上就是 404，等它等于永远不细化）
-    const shouldRefine = !!node.needRefine && hasChildren && readyChildren.length > 0 && allResolved;
+    // 单步循环短路避免产生 filter / every 临时数组与闭包（Issue #31）
+    let shouldRefine = false;
+    if (node.needRefine && childUrls.length > 0) {
+      let hasReady = false;
+      let allResolved = true;
+      for (let i = 0; i < childUrls.length; i++) {
+        const cUrl = childUrls[i]!;
+        if (this.host.nodes.has(cUrl)) {
+          hasReady = true;
+        } else if (!this.host.failed.has(cUrl)) {
+          allResolved = false;
+          break;
+        }
+      }
+      shouldRefine = hasReady && allResolved;
+    }
 
     if (shouldRefine) {
       // 子节点接替当前节点渲染，当前父节点隐藏
@@ -282,8 +327,8 @@ export class TileVisibility {
         node.group.visible = false;
         changed = true;
       }
-      for (const cUrl of childUrls) {
-        if (this.updateVisibility(cUrl, true, visited)) changed = true;
+      for (let i = 0; i < childUrls.length; i++) {
+        if (this.updateVisibility(childUrls[i]!, true, visited)) changed = true;
       }
     } else {
       // 当前节点即为最终展示的 LOD：当前节点显示，下层所有已加载子代瓦片隐藏
@@ -291,18 +336,19 @@ export class TileVisibility {
         node.group.visible = true;
         changed = true;
       }
-      for (const cUrl of childUrls) {
-        if (this.updateVisibility(cUrl, false, visited)) changed = true;
+      for (let i = 0; i < childUrls.length; i++) {
+        if (this.updateVisibility(childUrls[i]!, false, visited)) changed = true;
       }
     }
 
     return changed;
   }
 
-
   applyFallbackPolygonOffset(node: TileNode, depth: number): boolean {
     const factor = this.host.fallbackOffset.factor;
     const units = Math.max(2, (10 - Math.min(depth, 8)) * this.host.fallbackOffset.units);
+    const targetKey = `${factor}:${units}`;
+
     let changed = false;
 
     node.group.traverse((obj) => {
@@ -319,6 +365,9 @@ export class TileVisibility {
               units: mat.polygonOffsetUnits ?? 0,
             };
           }
+          if (mat.userData._fallbackOffsetKey === targetKey) {
+            continue;
+          }
           const base = mat.userData._basePolygonOffset;
           const targetFactor = base.factor + factor;
           const targetUnits = base.units + units;
@@ -332,6 +381,7 @@ export class TileVisibility {
             mat.polygonOffsetUnits = targetUnits;
             changed = true;
           }
+          mat.userData._fallbackOffsetKey = targetKey;
         }
       }
     });
@@ -346,6 +396,9 @@ export class TileVisibility {
         const materials = Array.isArray(target.material) ? target.material : [target.material];
         for (const mat of materials) {
           if (mat?.userData?._basePolygonOffset) {
+            if (mat.userData._fallbackOffsetKey === undefined) {
+              continue;
+            }
             const base = mat.userData._basePolygonOffset;
             if (
               mat.polygonOffset !== base.polygonOffset ||
@@ -357,6 +410,7 @@ export class TileVisibility {
               mat.polygonOffsetUnits = base.units;
               changed = true;
             }
+            delete mat.userData._fallbackOffsetKey;
           }
         }
       }
@@ -364,37 +418,49 @@ export class TileVisibility {
     return changed;
   }
 
-  updateIncremental(roots: Iterable<string>, visited: Set<string>): boolean {
-    const nextPrimary = new Set<string>();
-    const nextFallback = new Set<string>();
-    const nodeDepths = new Map<string, number>();
+  updateIncremental(roots: Iterable<string> = this._roots, visited: Set<string> = this._visited): boolean {
+    this._nextPrimary.clear();
+    this._nextFallback.clear();
+    this._nodeDepths.clear();
 
     const traverse = (url: string, depth: number) => {
       if (visited.has(url)) return;
       visited.add(url);
-      nodeDepths.set(url, depth);
+      this._nodeDepths.set(url, depth);
 
       const node = this.host.nodes.get(url);
       if (!node) return;
 
-      const childUrls = node.childUrls ?? (node.childUrl ? [node.childUrl] : []);
-      const hasChildren = childUrls.length > 0;
-      const readyChildren = childUrls.filter((cUrl) => this.host.nodes.has(cUrl));
-      const missingChildren = childUrls.filter(
-        (cUrl) => !this.host.nodes.has(cUrl) && !this.host.failed.has(cUrl)
-      );
+      const childUrls = getNodeChildUrls(node);
+      if (!node.needRefine || childUrls.length === 0) {
+        this._nextPrimary.add(url);
+        return;
+      }
 
-      const canRefine = !!node.needRefine && hasChildren && readyChildren.length > 0;
-
-      if (canRefine) {
-        if (missingChildren.length > 0) {
-          nextFallback.add(url);
+      // 避免 filter 产生临时数组与闭包
+      let hasReady = false;
+      let hasMissing = false;
+      for (let i = 0; i < childUrls.length; i++) {
+        const cUrl = childUrls[i]!;
+        if (this.host.nodes.has(cUrl)) {
+          hasReady = true;
+        } else if (!this.host.failed.has(cUrl)) {
+          hasMissing = true;
         }
-        for (const cUrl of readyChildren) {
-          traverse(cUrl, depth + 1);
+      }
+
+      if (hasReady) {
+        if (hasMissing) {
+          this._nextFallback.add(url);
+        }
+        for (let i = 0; i < childUrls.length; i++) {
+          const cUrl = childUrls[i]!;
+          if (this.host.nodes.has(cUrl)) {
+            traverse(cUrl, depth + 1);
+          }
         }
       } else {
-        nextPrimary.add(url);
+        this._nextPrimary.add(url);
       }
     };
 
@@ -407,43 +473,58 @@ export class TileVisibility {
     for (const [url, node] of this.host.nodes) {
       if (!visited.has(url)) continue;
 
-      if (nextPrimary.has(url)) {
+      if (this._nextPrimary.has(url)) {
         if (!node.group.visible) {
           node.group.visible = true;
           changed = true;
         }
-        const depth = nodeDepths.get(url) ?? 0;
+        const depth = this._nodeDepths.get(url) ?? 0;
         const targetOrder = 100 + depth;
         if (node.group.renderOrder !== targetOrder) {
           node.group.renderOrder = targetOrder;
           changed = true;
         }
-        if (this.restorePolygonOffset(node)) changed = true;
-      } else if (nextFallback.has(url)) {
+        // 仅在上一帧是 fallback 时，恢复为 primary 才需要 traverse 还原材质偏移
+        if (this.host.fallbackNodes.has(url)) {
+          if (this.restorePolygonOffset(node)) changed = true;
+        }
+      } else if (this._nextFallback.has(url)) {
         if (!node.group.visible) {
           node.group.visible = true;
           changed = true;
         }
-        const depth = nodeDepths.get(url) ?? 0;
+        const depth = this._nodeDepths.get(url) ?? 0;
         const targetOrder = depth;
         if (node.group.renderOrder !== targetOrder) {
           node.group.renderOrder = targetOrder;
           changed = true;
         }
-        if (this.applyFallbackPolygonOffset(node, depth)) changed = true;
+        // 若上一帧不是 fallback，或者深度发生了推移变化，才需要 traverse 应用
+        const prevDepth = this._lastFallbackDepths.get(url);
+        if (!this.host.fallbackNodes.has(url) || prevDepth !== depth) {
+          if (this.applyFallbackPolygonOffset(node, depth)) changed = true;
+        }
       } else {
         if (node.group.visible) {
           node.group.visible = false;
           changed = true;
         }
-        if (this.restorePolygonOffset(node)) changed = true;
+        if (this.host.fallbackNodes.has(url)) {
+          if (this.restorePolygonOffset(node)) changed = true;
+        }
       }
     }
 
     this.host.primaryNodes.clear();
-    for (const u of nextPrimary) this.host.primaryNodes.add(u);
+    for (const u of this._nextPrimary) this.host.primaryNodes.add(u);
     this.host.fallbackNodes.clear();
-    for (const u of nextFallback) this.host.fallbackNodes.add(u);
+    for (const u of this._nextFallback) this.host.fallbackNodes.add(u);
+    this._lastFallbackDepths.clear();
+    for (const [u, d] of this._nodeDepths) {
+      if (this._nextFallback.has(u)) {
+        this._lastFallbackDepths.set(u, d);
+      }
+    }
 
     return changed;
   }
@@ -451,13 +532,13 @@ export class TileVisibility {
   /**
    * 把所有瓦片的 fallback 深度偏移恢复原状，并清空 fallback 列表。
    *
-   * 切回 `binary` 模式时用；语义等价于原来 `setLodTransition` 里那段循环。
+   * 切回 `binary` 模式时用；遍历所有瓦片还原材质状态，杜绝任何残留。
    */
   restoreAllPolygonOffsets(): void {
     for (const node of this.host.nodes.values()) {
       this.restorePolygonOffset(node);
     }
     this.host.fallbackNodes.clear();
+    this._lastFallbackDepths.clear();
   }
-
 }
