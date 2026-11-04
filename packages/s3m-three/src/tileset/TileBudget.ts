@@ -89,6 +89,17 @@ export function estimateObjectGeometryBytes(obj: any): number {
   return bytes;
 }
 
+/**
+ * 淘汰一块瓦片后，驻留统计里应该扣掉的量。
+ * 三个字段的口径分别对应 residentTriangles / residentGeometryBytes / residentTextureBytes，
+ * 增量维护必须和实算逐字一致：扣多了会少裁（仍超额），扣少了会多裁（画面缺块）。
+ */
+export interface TileFootprint {
+  triangles: number;
+  geometryBytes: number;
+  textureBytes: number;
+}
+
 export class TileBudget {
   /** 纹理 key → 引用计数 */
   private readonly _textureRefs = new Map<string, number>();
@@ -109,8 +120,16 @@ export class TileBudget {
     }
   }
 
-  /** 淘汰单块瓦片节点并释放专属纹理 */
-  evictTileNode(victim: TileNode): void {
+  /** 淘汰单块瓦片节点并释放专属纹理；返回这一块的占用量，供 trimBudget 增量扣减 */
+  evictTileNode(victim: TileNode): TileFootprint {
+    // 摘节点之前按 resident* 的同一套口径算好：stats.memory 优先，没有才遍历对象树
+    const triangles = victim.stats?.triangles ?? 0;
+    const geometryBytes =
+      victim.stats && typeof victim.stats.memory === 'number'
+        ? victim.stats.memory
+        : estimateObjectGeometryBytes(victim.group);
+    let textureBytes = 0;
+
     this.host.nodes.delete(victim.url);
     victim.group?.parent?.remove(victim.group);
     this.host.onTileRemoved(victim);
@@ -133,6 +152,8 @@ export class TileBudget {
           this._textureRefs.delete(key);
           const tex = this.host.textureCache.get(key);
           if (tex) {
+            // 只有引用归零、真被 dispose 的那张才算释放；共享纹理还被别的瓦片引用时不扣
+            textureBytes += estimateTextureBytes(tex);
             tex.dispose?.();
             this.host.textureCache.delete(key);
           }
@@ -141,9 +162,10 @@ export class TileBudget {
         }
       }
     }
+    return { triangles, geometryBytes, textureBytes };
   }
 
-  evictOne(allowUncovered = false): boolean {
+  evictOne(allowUncovered = false, onEvicted?: (fp: TileFootprint) => void): boolean {
 
     // 只挑安全候选：叶子 → 已被子瓦接手的父瓦。allowUncovered 仅在超出硬上限时开启（内存兜底）
     const victim = this.pickVictim(true, allowUncovered) ?? this.pickVictim(false, allowUncovered);
@@ -153,7 +175,8 @@ export class TileBudget {
     const childUrls = victim.childUrls ?? (victim.childUrl ? [victim.childUrl] : []);
     const isLeaf = !childUrls.some((u) => u !== victim.url && this.host.nodes.has(u));
 
-    this.evictTileNode(victim);
+    const fp = this.evictTileNode(victim);
+    onEvicted?.(fp);
 
     // 淘汰的是中间层时，把已加载的子孙改挂到它的父级上：
     // 不然它们瞬间"无父"，父级那边还留着指向 victim 的 childUrls，
@@ -229,6 +252,8 @@ export class TileBudget {
    *
    * 三条预算并行：瓦片数（`maxTiles`）、三角形总数（`maxTriangles`）与显存字节（`maxMemory`）。
    * `maxTriangles` / `maxMemory` 为 Infinity 时短路，行为与只有瓦片数预算时完全一致。
+   * 有限上限下进循环前只统计一次驻留量，之后按淘汰的 footprint 增量扣（#30），
+   * 不再每轮重扫全表。
    */
   trimBudget(): boolean {
     let removed = false;
@@ -241,8 +266,38 @@ export class TileBudget {
       Number.isFinite(this.host.maxMemory()) && this.residentMemory() > this.host.maxMemory();
     // 预算生效时可能要连踢多块，迭代上限跟着驻留规模走；不生效时根本进不了循环
     const iterationCap = this.host.nodes.size + this.host.maxTiles() + 16;
-    while ((overTiles() || overTriangles() || overMemory()) && guard++ <= iterationCap) {
-      if (!this.evictOne(this.host.nodes.size + this.host.pending.size > this.host.hardCap())) break;
+
+    const triangleCap = this.host.maxTriangles();
+    const memoryCap = this.host.maxMemory();
+    const checkTriangles = Number.isFinite(triangleCap);
+    const checkMemory = Number.isFinite(memoryCap);
+
+    // 两条可选上限都没开（默认状态）：沿原路径，一次全表统计都不做
+    if (!checkTriangles && !checkMemory) {
+      while ((overTiles() || overTriangles() || overMemory()) && guard++ <= iterationCap) {
+        if (!this.evictOne(this.host.nodes.size + this.host.pending.size > this.host.hardCap())) break;
+        removed = true;
+      }
+      return removed;
+    }
+
+    // 开了有限上限：进循环前各算一次，之后按淘汰的 footprint 增量扣（#30）。
+    // 原来每轮 while 条件都重扫全表 —— 三角形 / 几何字节 / 纹理缓存各一趟，
+    // 连踢 K 块就是 K 轮三四次 O(N)。上限是运行时函数，一次调用内取快照即可。
+    let triangles = checkTriangles ? this.residentTriangles() : 0;
+    let memory = checkMemory ? this.residentMemory() : 0;
+    const onEvicted = (fp: TileFootprint): void => {
+      triangles -= fp.triangles;
+      memory -= fp.geometryBytes + fp.textureBytes;
+    };
+
+    while (
+      (overTiles() ||
+        (checkTriangles && triangles > triangleCap) ||
+        (checkMemory && memory > memoryCap)) &&
+      guard++ <= iterationCap
+    ) {
+      if (!this.evictOne(this.host.nodes.size + this.host.pending.size > this.host.hardCap(), onEvicted)) break;
       removed = true;
     }
     return removed;
