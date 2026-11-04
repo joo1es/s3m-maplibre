@@ -13,9 +13,14 @@
  * viewport 原点设成 (0 - px, 0 - (h-1-py))、尺寸仍是整块画布，于是光栅化结果和全屏
  * 那一趟逐像素一致，只是只有一个像素落在目标上。原来那句「每次点击全屏渲染一趟」
  * 的代价（移动端尤其明显）就没了。
+ *
+ * 片元之外还有 draw call：瓦片网格一律 frustumCulled = false，整场景每个 mesh 都会
+ * 提交一遍。#29 再加一层粗筛——包围球投影确定盖不到点击像素的网格不进这一趟，
+ * 判据与保守边界见 PickCulling.ts。命中结果不变，有 shader 位移的网格自动退回原路径。
  */
 import * as THREE from 'three';
 import { createSplatPickMaterial } from './SplatMaterial.js';
+import { hasPickDisplacement, sphereMayCoverNdcPoint } from './PickCulling.js';
 
 const PICK_VERT = /* glsl */ `
   attribute float aBatchId;
@@ -283,6 +288,41 @@ export class Picker {
     // viewport 尺寸仍是整块画布、原点平移，把 (px, ygl) 挪到目标的 (cx, cy)
     target.viewport.set(cx - px, cy - ygl, w, h);
 
+    // ---- 拾取粗筛（#29）
+    // 只把「包围球投影可能盖住这个像素」的网格送进 ID pass，其余的这一趟不画。
+    // 1×1 目标已经把片元压到最小，剩下能省的就是整场景的 draw call 与顶点处理
+    // （瓦片网格一律 frustumCulled = false，three 自己一个都不会剔）。
+    //
+    // 矩阵口径：直接用宿主喂进来的 world→clip，不能走 three 的 project/unproject ——
+    // 这个相机的 projectionMatrix 已经是完整 MVP，再乘 matrixWorldInverse 会重复一次视图变换。
+    // matrixWorld 沿用上一帧 renderer.render 更新过的值（PickService 也是这个约定），
+    // 这里不再额外遍历整棵树。
+    const ndcX = ((px + 0.5) / w) * 2 - 1;
+    const ndcY = ((ygl + 0.5) / h) * 2 - 1;
+    const cullMargin = 2 / Math.min(w, h); // 1 像素的 NDC 余量，只放大保留范围
+    const worldToClip = camera.projectionMatrix;
+    const cullCenter = new THREE.Vector3();
+    const toCull = new Set<THREE.Object3D>();
+
+    /** true = 确定画不到点击像素，这一趟可以跳过（连材质都不用换） */
+    const canSkip = (mesh: THREE.Mesh, prev: THREE.Material | THREE.Material[]): boolean => {
+      // frustumCulled 被关掉是项目里「包围球已不可信」的现成标记：
+      // moveFeature / rotation 动画、GPU 路径、实例化、泼溅都走这条路
+      if (mesh.frustumCulled === false) return false;
+      if ((mesh as THREE.InstancedMesh).isInstancedMesh) return false;
+      if ((mesh.userData as PickUserData).isGaussianSplat === true) return false;
+      // 状态纹理 / GPU 路径 / 交叉淡化 / 选中拔高会在 vertex shader 里搬动顶点
+      if (hasPickDisplacement(prev)) return false;
+      const geo = mesh.geometry;
+      const sphere = geo.boundingSphere;
+      if (!sphere || !Number.isFinite(sphere.radius) || sphere.radius < 0) return false;
+      // S3M_BAKED_MERCATOR：顶点由 aMercatorOffset 在 shader 里重算，position 不可信
+      if (geo.getAttribute('aMercatorOffset')) return false;
+      cullCenter.copy(sphere.center).applyMatrix4(mesh.matrixWorld);
+      const radius = sphere.radius * mesh.matrixWorld.getMaxScaleOnAxis();
+      return !sphereMayCoverNdcPoint(cullCenter, radius, worldToClip, ndcX, ndcY, cullMargin);
+    };
+
     // ---- 保存渲染器状态
     const prevTarget = renderer.getRenderTarget();
     const prevViewport = renderer.getViewport(new THREE.Vector4());
@@ -302,6 +342,12 @@ export class Picker {
       if (!mesh.isMesh && !isPointsObject(mesh)) return;
       const ud = mesh.userData as PickUserData;
       if (ud.pickId === undefined) return;
+      const prev = mesh.material;
+      // 粗筛：确定盖不到点击像素的网格这一趟不画，连材质都不用换
+      if (mesh.isMesh && canSkip(mesh, prev)) {
+        toCull.add(mesh);
+        return;
+      }
       // 泼溅走自己的拾取材质：通用拾取着色器只读 position，不知道 iCenter，
       // 交给它每个高斯都会塌在原点，点哪儿都没反应。见 SplatMaterial 里那段注释。
       const isSplat = ud.isGaussianSplat === true;
@@ -312,7 +358,6 @@ export class Picker {
       // instanceMatrix 那套单体表），报成 instanceIndex 只会让上层 `_instanceFeature`
       // 返回 null 把结果丢掉。泼溅整块瓦片当一个单体，命中点交给 splatRaycast。
       if (!isSplat && (mesh as THREE.InstancedMesh).isInstancedMesh) instancedPickIds.add(ud.pickId);
-      const prev = mesh.material;
       const pm = ud.pickMaterial as THREE.ShaderMaterial;
       // 泼溅没有单体状态纹理 / GPU 路径那一套 uniform，直接跳过抄写
       if (isSplat) {
@@ -356,11 +401,12 @@ export class Picker {
       swapped.push([mesh, prev]);
       mesh.material = pm;
     });
-    // 描边 / 棱线不参与拾取
+    // 描边 / 棱线不参与拾取；粗筛判定「盖不到点击像素」的网格这一趟也一起摘掉
     const hidden: THREE.Object3D[] = [];
     scene.traverseVisible((o) => {
       const mesh = o as THREE.Mesh;
-      if ((mesh.isMesh || isPointsObject(mesh)) && (mesh.userData as PickUserData).pickId === undefined) {
+      if (!mesh.isMesh && !isPointsObject(mesh)) return;
+      if ((mesh.userData as PickUserData).pickId === undefined || toCull.has(o)) {
         hidden.push(mesh);
         mesh.visible = false;
       }
