@@ -753,6 +753,57 @@ $('optCoverOpacity')?.addEventListener('input', (e) => {
   modelCover?.setOpacity(o / 100);
 });
 
+/* ---------------------------------------------------------------- 运动模糊 */
+
+/**
+ * 运动模糊是纯后处理，默认关闭。两种模式各有各的旋钮：
+ * afterimage 用 damp（上一帧保留比例），velocity 用 maxOffset（屏宽百分比）。
+ *
+ * 静止时两种都不产生拖影 —— 残影会收敛到当前帧，速度向量会趋近 0。
+ * 所以这个开关的效果只有在**动相机**的时候才看得出来。
+ */
+function applyMotionBlur() {
+  const mode = $('optBlurMode')?.value ?? 'off';
+  $('wrapBlurDamp').style.display = mode === 'afterimage' ? '' : 'none';
+  $('wrapBlurOffset').style.display = mode === 'velocity' ? '' : 'none';
+
+  if (mode === 'off') {
+    layer.setMotionBlur(null);
+    $('blurInfo').textContent = '关闭';
+    return;
+  }
+
+  if (mode === 'velocity') {
+    const maxOffset = Number($('optBlurMaxOffset').value) / 100;
+    layer.setMotionBlur({ mode: 'velocity', maxOffset });
+    $('blurInfo').textContent = `velocity · 拖影上限 ${Math.round(maxOffset * 100)}%（动相机才看得见）`;
+    return;
+  }
+
+  const auto = $('optBlurAuto').checked;
+  const damp = auto ? 'auto' : Number($('optBlurDamp').value) / 100;
+  layer.setMotionBlur({ mode: 'afterimage', damp });
+  $('blurInfo').textContent = auto
+    ? 'afterimage · 拖尾随帧率自适应（动相机才看得见）'
+    : `afterimage · 拖尾 ${damp.toFixed(2)}（动相机才看得见）`;
+}
+
+$('optBlurMode')?.addEventListener('change', applyMotionBlur);
+
+$('optBlurDamp')?.addEventListener('input', (e) => {
+  $('blurDampVal').textContent = (Number(e.target.value) / 100).toFixed(2);
+  // 拖了手动值就取消自适应，否则滑块推了没反应 —— 这类「拖了不动」最容易被当成 bug
+  $('optBlurAuto').checked = false;
+  applyMotionBlur();
+});
+
+$('optBlurAuto')?.addEventListener('change', applyMotionBlur);
+
+$('optBlurMaxOffset')?.addEventListener('input', (e) => {
+  $('blurMaxOffsetVal').textContent = `${e.target.value}%`;
+  applyMotionBlur();
+});
+
 function updateTerrainInfo(note) {
   const el = $('terrainInfo');
   if (!el) return;
