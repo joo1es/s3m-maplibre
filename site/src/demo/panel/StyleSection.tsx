@@ -200,6 +200,45 @@ export default function StyleSection() {
       </section>
 
       <section>
+        <h2>运动模糊</h2>
+        <select
+          id="optBlurMode"
+          class="form-select"
+          title="帧间残影在感知层面填补卡顿。afterimage 每帧只多做两次全屏混合，几乎零成本；velocity 按相机运动方向逐像素采样，贵一点。静止时两者都不产生拖影"
+        >
+          <option value="off" selected>
+            关闭（默认）
+          </option>
+          <option value="afterimage">帧间残影 (afterimage)</option>
+          <option value="velocity">方向模糊 (velocity)</option>
+        </select>
+        <div id="wrapBlurDamp" style="display:none">
+          <label
+            class="rng"
+            title="上一帧在结果里保留多少。拖这个滑块会自动取消「按帧率自适应」—— 手动拖了就该听手动值"
+          >
+            <span>拖尾</span>
+            <input type="range" id="optBlurDamp" min="0" max="98" step="1" value="60" />
+            <b id="blurDampVal">0.60</b>
+          </label>
+          <label
+            class="chk"
+            title="damp = 0.55^(fps/60) 封顶 0.92：60fps ≈ 0.55、30fps ≈ 0.74、15fps ≈ 0.86。帧率越低洞越大，才需要更长的拖影去填"
+          >
+            <input type="checkbox" id="optBlurAuto" checked /> 按帧率自适应
+          </label>
+        </div>
+        <div id="wrapBlurOffset" style="display:none">
+          <label class="rng" title="速度向量的最大屏幕偏移，按绘图缓冲宽度的百分比计。调太大整屏拉丝">
+            <span>拖影上限</span>
+            <input type="range" id="optBlurMaxOffset" min="1" max="20" step="1" value="5" />
+            <b id="blurMaxOffsetVal">5%</b>
+          </label>
+        </div>
+        <div id="blurInfo" style="font-size:10.5px;color:#64748b;margin-top:4px;">关闭</div>
+      </section>
+
+      <section>
         <h2>环境与投影</h2>
         <label class="chk">
           <input type="checkbox" id="optUnderground" /> 地下透视模式（半透明地表）
