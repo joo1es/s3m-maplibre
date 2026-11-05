@@ -599,6 +599,17 @@ export class S3MLayer extends HostRenderer {
   }
 
   /**
+   * 三维覆盖物底座。飞线、光柱、范围罩子、glb 模型都从这里挂。
+   *
+   * 它不预设图元形态，只负责把 three 对象锚到经纬度上、跟着锚点重锚、按需逐帧推进。
+   * 对象自己的 `position` 归使用者所有（锚点和 offset 走的是外层容器），
+   * 所以「跟随某个单体移动」这类逻辑可以在 `update` 里直接改 `position` 完成。
+   */
+  get overlay(): S3MViewer['overlay'] {
+    return this.viewer.overlay;
+  }
+
+  /**
    * 经纬度 + 绝对高程 → 场景 ENU 米制坐标。
    * 外围画自定义几何（例如给分析用的底图建筑代理）时要用它做换算。
    */

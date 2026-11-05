@@ -2,6 +2,7 @@ import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat, enableMapLibreOrtho, parseConfigText, classifyDatasetKind } from 's3m-maplibre';
 import pkg from 's3m-maplibre/package.json';
+import { addModelCover, datasetBaseHeight } from '../examples/model-cover';
 
 
 
@@ -506,6 +507,9 @@ async function loadSource(rawUrl) {
 
   // 定位镜头到图层范围（如预设指定了推荐倾角/偏航则应用）
   fitLayerBounds(matchedPreset ? { pitch: matchedPreset.pitch ?? 58, bearing: matchedPreset.bearing ?? -25 } : undefined);
+
+  // 数据集换了，罩子的包围盒也要跟着换
+  if ($('optCover')?.checked) refreshCover();
 }
 
 function updateDatasetTag(id) {
@@ -569,6 +573,7 @@ function renderDatasetUI() {
             });
             updateDatasetTag(id);
             fitLayerBounds();
+            if ($('optCover')?.checked) refreshCover();
           } catch (e) {
             $(`tag-${id}`).textContent = '失败';
             console.error(e);
@@ -576,6 +581,7 @@ function renderDatasetUI() {
         }
       } else {
         layer.setDatasetVisible(id, false);
+        if ($('optCover')?.checked) refreshCover();
       }
     });
   });
@@ -698,6 +704,54 @@ function clearTerrainSnap() {
     $('heightOffsetVal').textContent = '0m';
   }
 }
+
+/* ---------------------------------------------------------------- 模型遮罩 */
+
+/**
+ * 整模型遮罩：按 geoBounds 套一个方罩，尺寸与高程跟着数据集走。
+ *
+ * 用 `layer.getBounds()` 而不是遍历网格算 Box3 —— 后者拿到的是「已加载瓦片」的
+ * 包围盒，LOD 一变尺寸就跟着变，罩子会抖；geoBounds 来自数据集配置，稳定。
+ */
+let modelCover = null;
+
+function refreshCover() {
+  modelCover?.handle.remove();
+  modelCover = null;
+  if ($('optCover')?.checked) {
+    modelCover = addModelCover(layer, {
+      height: Number($('optCoverHeight')?.value ?? 200),
+      opacity: Number($('optCoverOpacity')?.value ?? 16) / 100,
+    });
+  }
+  updateCoverInfo();
+}
+
+function updateCoverInfo() {
+  const el = $('coverInfo');
+  if (!el) return;
+  if (!modelCover) {
+    el.textContent = $('optCover')?.checked ? '没有可罩的数据集' : '未开启';
+    return;
+  }
+  const { width, depth } = modelCover.size;
+  el.textContent = `底面 ${width.toFixed(0)}×${depth.toFixed(0)}m · 高 ${$('optCoverHeight').value}m`;
+}
+
+$('optCover')?.addEventListener('change', () => refreshCover());
+
+$('optCoverHeight')?.addEventListener('input', (e) => {
+  const h = Number(e.target.value);
+  $('coverHeightVal').textContent = `${h}m`;
+  modelCover?.setHeight(h);
+  updateCoverInfo();
+});
+
+$('optCoverOpacity')?.addEventListener('input', (e) => {
+  const o = Number(e.target.value);
+  $('coverOpacityVal').textContent = `${o}%`;
+  modelCover?.setOpacity(o / 100);
+});
 
 function updateTerrainInfo(note) {
   const el = $('terrainInfo');
@@ -1098,12 +1152,17 @@ $('optAlign')?.addEventListener('change', (e) => {
   $('optHeightOffset').value = currentTotal;
   $('heightOffsetVal').textContent = `${currentTotal > 0 ? '+' : ''}${currentTotal.toFixed(1)}m`;
   setStatus(`垂直对齐已设为：${align}`);
+  // 对齐换了基准，模型整体位移了，罩子得跟着重算
+  if ($('optCover')?.checked) refreshCover();
 });
 
 $('optHeightOffset').addEventListener('input', (e) => {
   const v = Number(e.target.value);
   $('heightOffsetVal').textContent = `${v > 0 ? '+' : ''}${v}m`;
   layer.setDatasetHeight(v);
+  // 高程滑块是连续的 input 事件，这里只平移罩子不重建几何。
+  // 读 heightOffset 而不是 v：它是「对齐基准 + 手动偏移」的和，直接拿 v 会漏掉基准
+  modelCover?.setBaseHeight(datasetBaseHeight(layer));
 });
 
 $('optSelMode').addEventListener('change', (e) => {

@@ -191,5 +191,6 @@ export async function buildPageData(page, renderer, rootDir) {
     switch: page.switch,
     repo: REPO_URL,
     demoHref: '../demo/index.html',
+    analysisHref: '../demo/analysis.html',
   };
 }

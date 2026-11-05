@@ -68,6 +68,29 @@ export function createLineSharedUniforms(): LineSharedUniforms {
   };
 }
 
+/**
+ * 等宽线的着色器注入点。
+ *
+ * 存在的意义：屏幕空间等宽、近平面裁剪、端点外延这套顶点逻辑调起来很啰嗦，
+ * 但飞线 / 光柱 / 流水纹理这些形态只有片元不一样。没有注入点，使用者只能
+ * 整段抄顶点着色器（抄完库一改就漂），或者干脆自己重写一遍（丢掉上面那些细节）。
+ *
+ * 三个钩子都是**在固定锚点后插入**，锚点找不到会 warn 而不是静默失效 ——
+ * 这类静默在 shader 里表现为「样式不生效但画面正常」，最难查。
+ */
+export interface ThickLineShaderExtras {
+  /** 追加到顶点着色器 attribute 声明之后 */
+  attributeDeclarations?: string;
+  /** 追加到两个着色器的全局区（`void main` 之前），放 varying 声明 */
+  varyingDeclarations?: string;
+  /** 插在顶点着色器 `gl_Position` 赋值之后，用来给 varying 赋值 */
+  vertexTail?: string;
+  /** 整体替换片元着色器。不传用内置的纯色 + uOpacity */
+  fragmentShader?: string;
+  /** 追加的 uniform，与内置的合并（同名会覆盖内置值） */
+  uniforms?: Record<string, THREE.IUniform>;
+}
+
 const VERT = /* glsl */ `
   attribute vec3 aOther;
   attribute float aSide;
@@ -233,7 +256,8 @@ export function createThickLineMaterial(
   shared: LineSharedUniforms,
   opts: { color?: THREE.ColorRepresentation; opacity?: number; width?: number; elevation?: number } = {},
   styleUniforms?: ThickLineStyleUniforms,
-  batchUniforms?: ThickLineBatchUniforms
+  batchUniforms?: ThickLineBatchUniforms,
+  extras?: ThickLineShaderExtras
 ): ThickLineMaterial {
   const style: ThickLineStyleUniforms = styleUniforms ?? {
     uColor: { value: new THREE.Color(opts.color ?? '#ffffff') },
@@ -276,9 +300,10 @@ export function createThickLineMaterial(
       uPathCount: batch.uPathCount,
       uPathTexActive: batch.uPathTexActive,
       uPathTime: batch.uPathTime,
+      ...(extras?.uniforms ?? {}),
     },
-    vertexShader: VERT,
-    fragmentShader: FRAG,
+    vertexShader: patchVertex(VERT, extras),
+    fragmentShader: extras?.fragmentShader ?? FRAG,
     transparent: true,
     depthWrite: false,
     side: THREE.DoubleSide,
@@ -289,6 +314,50 @@ export function createThickLineMaterial(
   }) as ThickLineMaterial;
   (mat.userData as Record<string, unknown>).isThickLine = true;
   return mat;
+}
+
+/** 在锚点之后插入代码；锚点不存在时 warn，不静默吞掉 */
+function insertAfter(src: string, anchor: string, text: string): string {
+  const i = src.indexOf(anchor);
+  if (i < 0) {
+    console.warn(`[s3m] 等宽线着色器注入失败：找不到锚点「${anchor}」，注入被忽略`);
+    return src;
+  }
+  return `${src.slice(0, i + anchor.length)}\n  ${text}${src.slice(i + anchor.length)}`;
+}
+
+/** 在锚点之前插入代码；锚点不存在时 warn */
+function insertBefore(src: string, anchor: string, text: string): string {
+  const i = src.indexOf(anchor);
+  if (i < 0) {
+    console.warn(`[s3m] 等宽线着色器注入失败：找不到锚点「${anchor}」，注入被忽略`);
+    return src;
+  }
+  return `${src.slice(0, i)}  ${text}\n  ${src.slice(i)}`;
+}
+
+/**
+ * 按注入点拼顶点着色器。
+ *
+ * 不传 extras 时**原样返回** —— 默认路径必须与改动前逐字一致，
+ * 这是 AGENTS.md 不变式①的要求，也让「没用到注入的使用者」完全不受影响。
+ */
+function patchVertex(src: string, extras?: ThickLineShaderExtras): string {
+  if (!extras) return src;
+  let out = src;
+
+  if (extras.attributeDeclarations) {
+    out = insertAfter(out, 'attribute vec3 aNormal;', extras.attributeDeclarations);
+  }
+  if (extras.varyingDeclarations) {
+    // 放在全局区：varying 声明必须在 main 之前
+    out = insertBefore(out, 'void main() {', extras.varyingDeclarations);
+  }
+  if (extras.vertexTail) {
+    // 放在 gl_Position 之后：此时 vAlong 之类的量已经有了确定的取值
+    out = insertAfter(out, 'gl_Position = vec4( ndc * clipA.w, clipA.z, clipA.w );', extras.vertexTail);
+  }
+  return out;
 }
 
 /**

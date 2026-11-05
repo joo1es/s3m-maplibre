@@ -31,10 +31,11 @@
 
       /* ---------- 左侧主控制面板 ---------- */
       #panel {
-        position: absolute; top: 16px; left: 16px; z-index: 5;
+        /* 56px 给顶部的演示切换栏让位 */
+        position: absolute; top: 56px; left: 16px; z-index: 5;
         width: 316px; padding: 16px;
         font-size: 12px; color: #cbd5e1;
-        max-height: calc(100% - 32px); overflow-y: auto;
+        max-height: calc(100% - 72px); overflow-y: auto;
       }
 
       /* 统一品牌顶栏 */
@@ -59,25 +60,7 @@
         border: 1px solid rgba(56, 189, 248, 0.25);
       }
 
-      /* 导航胶囊导航条 */
-      .nav-pills {
-        display: flex; gap: 5px; margin-bottom: 14px; padding-bottom: 12px;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-      }
-      .nav-pill {
-        flex: 1; text-align: center; padding: 5px 0; border-radius: 6px;
-        font-size: 11px; text-decoration: none; font-weight: 500;
-        background: rgba(255, 255, 255, 0.04); color: #94a3b8;
-        border: 1px solid rgba(255, 255, 255, 0.08); transition: all 0.15s ease;
-      }
-      .nav-pill:hover {
-        background: rgba(255, 255, 255, 0.08); color: #f8fafc;
-        border-color: rgba(255, 255, 255, 0.16);
-      }
-      .nav-pill.active {
-        background: rgba(56, 189, 248, 0.15); color: #38bdf8;
-        border-color: rgba(56, 189, 248, 0.35); font-weight: 600;
-      }
+      /* 页面级导航在 shared/demo-tabs（顶部浮动栏），面板里不再有 nav-pills */
 
       #panel section { margin-bottom: 14px; }
       #panel h2 {
@@ -268,9 +251,6 @@
         .brand-title { color: #0f172a; }
         #panel { color: #334155; }
         #panel h2 { color: #475569; border-top-color: rgba(0, 0, 0, 0.06); }
-        .nav-pills { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.06); }
-        .nav-pill { color: #64748b; }
-        .nav-pill:hover { color: #0f172a; background: rgba(0, 0, 0, 0.04); }
         .url-box input, .form-input, .form-select {
           background: #ffffff;
           color: #0f172a;

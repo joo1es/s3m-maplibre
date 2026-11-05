@@ -47,7 +47,8 @@ const PUBLIC_METHODS = [
 const PUBLIC_FIELDS = [
   'animator', 'attributeQuery', 'camera', 'canvas', 'edgeMaterial', 'geo', 'gpuPathManager',
   'groundManager', 'lineShared', 'onError', 'onPick', 'onReady', 'onStats', 'options',
-  'outlineMaterial', 'pickable', 'picker', 'renderer', 'scene', 'selectionEdgeMaterial',
+  // overlay 是 0.5 新增的覆盖物底座，不是拆分产物 —— 快照跟着改是预期内的
+  'outlineMaterial', 'overlay', 'pickable', 'picker', 'renderer', 'scene', 'selectionEdgeMaterial',
   'style', 'uniforms',
 ].sort();
 

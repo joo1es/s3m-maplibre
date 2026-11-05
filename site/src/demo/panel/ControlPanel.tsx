@@ -15,15 +15,7 @@ export default function ControlPanel() {
         <span class="version-tag" id="versionTag" />
       </div>
 
-      <div class="nav-pills">
-        <span class="nav-pill active">🗺️ MapLibre</span>
-        <a href="./three.html" class="nav-pill">
-          🧊 Three.js 版
-        </a>
-        <a href="../docs/index.html" class="nav-pill">
-          📚 开发文档
-        </a>
-      </div>
+      {/* 页面级导航统一由 shared/demo-tabs 挂在顶部，面板里不再重复一份 */}
 
       <SourceSection />
       <StyleSection />

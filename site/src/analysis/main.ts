@@ -12,7 +12,12 @@ import maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import * as THREE from 'three';
 import { S3MLayer, STYLE } from 's3m-maplibre';
-import type { LngLatAlt } from 's3m-maplibre';
+import type { LngLatAlt, OverlayHandle } from 's3m-maplibre';
+import { addFlowLine, clearFlowAnim } from '../examples/flow-line';
+import { addRangeCanopy } from '../examples/range-canopy';
+import { mountDemoTabs } from '../shared/demo-tabs';
+
+mountDemoTabs('analysis');
 
 const $ = (id: string): HTMLElement => document.getElementById(id)!;
 
@@ -41,7 +46,9 @@ const map = new maplibregl.Map({
   pitch: 60,
   bearing: -30,
   maxPitch: 85,
-  antialias: true,
+  // MapLibre v5 起 antialias 不再挂在 MapOptions 顶层，要显式传给 canvas 上下文；
+  // 写错位置不会报运行时错，只是抗锯齿静默失效
+  canvasContextAttributes: { antialias: true },
 });
 map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right');
 
@@ -504,7 +511,9 @@ function buildBuildingProxy(): THREE.Group {
     for (const f of features) {
       const h = Number((f.properties as { render_height?: number })?.render_height ?? 0);
       if (!(h > 0)) continue;
-      const ring = (f.geometry as GeoJSON.Polygon)?.coordinates?.[0];
+      // 只取外环，用结构化类型而不是 GeoJSON 命名空间：@types/geojson 导出的是模块，
+      // 不是全局命名空间，写 GeoJSON.Polygon 会报「找不到命名空间」
+      const ring = (f.geometry as { coordinates?: number[][][] } | null)?.coordinates?.[0];
       if (!ring || ring.length < 3) continue;
       const shape = new THREE.Shape(
         ring.map(([lng, lat]) => {
@@ -547,6 +556,69 @@ function buildBuildingProxy(): THREE.Group {
   return group;
 }
 
+/* ---------------------------------------------------------------- 覆盖物示例 */
+
+/**
+ * 这两组按钮演示 `layer.overlay` 的用法。
+ *
+ * 实现分别在 `examples/flow-line.ts` 与 `examples/range-canopy.ts` ——
+ * **它们不在库里**，只是两份可抄的用法说明。库只提供「锚点 + 重锚 + 帧驱动」，
+ * 飞线、光柱、扫描圈、glb 都是使用者自己造 Object3D。
+ */
+let flows: OverlayHandle[] = [];
+let canopies: OverlayHandle[] = [];
+
+const flowBtn = document.createElement('button');
+flowBtn.textContent = '飞线';
+flowBtn.onclick = () => {
+  if (flows.length) {
+    for (const h of flows) h.remove();
+    flows = [];
+    flowBtn.classList.remove('on');
+    return;
+  }
+  const b = layer.getBounds();
+  if (!b) return hud('数据集还没就绪。');
+  const [w, s] = b[0];
+  const [e, n] = b[1];
+  flows.push(addFlowLine(layer, [w, s, 220], [e, n, 220], { color: '#4ad8ff', fadeIn: true }));
+  flows.push(
+    addFlowLine(layer, [w, n, 200], [e, s, 200], { color: '#fbbf24', speed: 0.5, fadeIn: true })
+  );
+  flowBtn.classList.add('on');
+  hud('两条飞线。几何与 shader 见 site/src/examples/flow-line.ts。');
+};
+bar.appendChild(flowBtn);
+
+const canopyBtn = document.createElement('button');
+canopyBtn.textContent = '范围罩';
+canopyBtn.onclick = () => {
+  if (canopies.length) {
+    for (const h of canopies) h.remove();
+    canopies = [];
+    canopyBtn.classList.remove('on');
+    return;
+  }
+  const b = layer.getBounds();
+  if (!b) return hud('数据集还没就绪。');
+  const [w, s] = b[0];
+  const [e, n] = b[1];
+  canopies.push(
+    addRangeCanopy(layer, [(w + e) / 2, (s + n) / 2, 0], { radius: 110, height: 200 })
+  );
+  canopies.push(
+    addRangeCanopy(layer, [w + (e - w) * 0.28, s + (n - s) * 0.3, 0], {
+      radius: 70,
+      height: 130,
+      shape: 'box',
+      color: '#f472b6',
+    })
+  );
+  canopyBtn.classList.add('on');
+  hud('圆罩 + 方罩。场景是 Z-up，内置几何要绕 X 转 90°，见 examples/range-canopy.ts。');
+};
+bar.appendChild(canopyBtn);
+
 const clearBtn = document.createElement('button');
 clearBtn.textContent = '清除';
 clearBtn.onclick = () => {
@@ -557,6 +629,14 @@ clearBtn.onclick = () => {
   proxy?.parent?.remove(proxy);
   proxyShown = false;
   layer.setClipping(null);
+  for (const h of flows) h.remove();
+  flows = [];
+  // 兜底：正常情况下每条线的 onRemove 已经注销了自己的渐入通道
+  clearFlowAnim(layer);
+  for (const h of canopies) h.remove();
+  canopies = [];
+  flowBtn.classList.remove('on');
+  canopyBtn.classList.remove('on');
   ($('sky') as HTMLElement).classList.remove('on');
   setTool('none');
 };

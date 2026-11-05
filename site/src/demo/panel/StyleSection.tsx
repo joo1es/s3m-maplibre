@@ -179,6 +179,27 @@ export default function StyleSection() {
       </section>
 
       <section>
+        <h2>模型遮罩</h2>
+        <label
+          class="chk"
+          title="按数据集包围盒套一个半透明方罩。尺寸取 geoBounds 而不是已加载网格，LOD 变化时不会跟着抖"
+        >
+          <input type="checkbox" id="optCover" /> 罩住整个模型
+        </label>
+        <label class="rng">
+          <span>罩高</span>
+          <input type="range" id="optCoverHeight" min="20" max="600" step="10" value="200" />
+          <b id="coverHeightVal">200m</b>
+        </label>
+        <label class="rng">
+          <span>透明度</span>
+          <input type="range" id="optCoverOpacity" min="4" max="60" step="2" value="16" />
+          <b id="coverOpacityVal">16%</b>
+        </label>
+        <div id="coverInfo" style="font-size:10.5px;color:#64748b;margin-top:4px;">未开启</div>
+      </section>
+
+      <section>
         <h2>环境与投影</h2>
         <label class="chk">
           <input type="checkbox" id="optUnderground" /> 地下透视模式（半透明地表）

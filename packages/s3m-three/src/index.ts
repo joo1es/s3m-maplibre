@@ -185,4 +185,16 @@ export {
 } from './render/EdgeLines.js';
 export type { ThickLineMaterial, LineSharedUniforms, EdgeVertexRange } from './render/EdgeLines.js';
 
+// —— 三维覆盖物底座（不预设图元形态：飞线 / 光柱 / 罩子 / glb 都走 overlay.add）
+export { OverlayLayer, enuDelta } from './render/overlay/OverlayLayer.js';
+export type { OverlayHost, OverlayAnchorLike } from './render/overlay/OverlayLayer.js';
+export type {
+  OverlaySpec,
+  OverlayHandle,
+  OverlayFrame,
+  OverlayAnchor,
+  OverlayBuilder,
+  OverlayDepth,
+} from './render/overlay/types.js';
+
 export { S3MViewer as default } from './render/S3MViewer.js';

@@ -1,10 +1,13 @@
 /**
  * 一条命令起本地开发：编译两个包 → 常驻 tsc -w → 起 vite dev。
  *
- * 一个端口同时提供文档与 demo（dev 中间件里跑的是一次 SSG）：
- *   /                         s3m-maplibre 文档
- *   /three.html               s3m-three 文档
- *   /demo/                    demo（与线上 demo/index.html 同路径）
+ * 一个端口同时提供文档与 demo（dev 中间件里跑的是一次 SSG），
+ * 目录结构与线上产物一致，页面里的相对链接在两套环境下是同一份：
+ *   /docs/index.html         s3m-maplibre 文档
+ *   /docs/three.html         s3m-three 文档
+ *   /demo/                   demo（与线上 demo/index.html 同路径）
+ *   /demo/analysis.html      空间分析
+ *   /demo/three.html         纯 three 演示（读仓库里的产物）
  *
  * vite 解析 workspace 包走的是包里的 dist/，所以必须先编一次再起服务，
  * 之后由 tsc -w 增量；改 packages 下的 .ts 保存，vite 直接读到新产物。
@@ -51,7 +54,9 @@ children.push(
 );
 
 // 端口以 vite 打印的为准（5173 被占它会自动往后挑）
-console.log('[dev] 页面：/（图层文档）  /three.html（内核文档）  /demo/（示例）');
+console.log(
+  '[dev] 页面：/docs/index.html（图层文档）  /docs/three.html（内核文档）  /demo/（示例）',
+);
 
 let closing = false;
 const shutdown = (code = 0) => {
