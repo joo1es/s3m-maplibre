@@ -1,5 +1,6 @@
 import { onCleanup, onMount } from 'solid-js';
 import ControlPanel from './panel/ControlPanel';
+import { mountDemoTabs } from '../shared/demo-tabs';
 import './demo.css';
 
 // SSG 阶段不能碰 DOM，也不能 import maplibre（它在模块顶层读 window）
@@ -10,6 +11,9 @@ export default function DemoApp() {
 
   if (isBrowser) {
     onMount(() => {
+      // 页面级导航：三个演示之间的横向入口，和另外两页共用同一份实现
+      mountDemoTabs('demo');
+
       let dispose: (() => void) | undefined;
       let disposed = false;
 

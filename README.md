@@ -234,6 +234,7 @@ map.on('click', (e) => {
 - **📗 内核（s3m-three）API 文档** — <https://joo1es.github.io/s3m-maplibre/docs/three.html>
 - **🗺️ MapLibre 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/index.html>
 - **🧊 纯 three.js 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/three.html>
+- **🧭 空间分析 & 三维覆盖物演示** — <https://joo1es.github.io/s3m-maplibre/demo/analysis.html>
 - **🏠 Pages 导航入口** — <https://joo1es.github.io/s3m-maplibre/>
 
 本地跑：
@@ -249,9 +250,13 @@ bun run build  # 只产出，不起服务
 
 | 地址 | 内容 |
 |---|---|
-| <http://localhost:5173/> | s3m-maplibre 文档（改 `packages/*/docs/API.md` 保存即刷新） |
-| <http://localhost:5173/three.html> | s3m-three 内核文档 |
+| <http://localhost:5173/docs/index.html> | s3m-maplibre 文档（改 `packages/*/docs/API.md` 保存即刷新） |
+| <http://localhost:5173/docs/three.html> | s3m-three 内核文档 |
 | <http://localhost:5173/demo/> | demo（和线上 `demo/index.html` 同路径，相对资源不用改） |
+| <http://localhost:5173/demo/analysis.html> | 空间分析 + 三维覆盖物演示 |
+| <http://localhost:5173/demo/three.html> | 纯 three.js 演示（dev 下读仓库里的产物） |
+
+dev 的目录结构与线上产物完全一致（`docs/` 与 `demo/` 两个前缀），所以页面里的相对链接在两套环境下是同一份。旧地址 `/`、`/three.html`、`/analysis.html` 会 302 到对应页面。
 
 改 `packages/*/src/**/*.ts` 由 `tsc -w` 增量编译，vite 直接读到新产物；改 `site/` 下的组件走 HMR。
 

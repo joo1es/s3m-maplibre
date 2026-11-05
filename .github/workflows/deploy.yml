@@ -85,6 +85,10 @@ jobs:
                   <b>纯 three.js 示例 →</b>
                   <span>没有地图，只有一个 three 场景 + 瓦片树</span>
                 </a>
+                <a class="card" href="demo/analysis.html">
+                  <b>空间分析 & 三维覆盖物 →</b>
+                  <span>量算 · 通视 · 剖切 · 天际线 · 可视域 · 飞线 / 范围罩</span>
+                </a>
               </div>
             </body>
           </html>

@@ -37,9 +37,45 @@
       }
 
       #panel {
-        position: absolute; top: 16px; left: 16px; z-index: 5;
+        /* 56px 给顶部的演示切换栏让位 */
+        position: absolute; top: 56px; left: 16px; z-index: 5;
         width: 290px; padding: 14px 16px;
         display: flex; flex-direction: column; gap: 12px;
+      }
+
+      /* 演示切换栏 —— 与 site/src/shared/demo-tabs.ts 产出的标记 / 样式保持一致。
+         这一页没有构建入口（直接维护产物），所以这里是手写副本，改那边记得同步这里。 */
+      .demo-tabs {
+        position: fixed;
+        top: 12px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 60;
+        display: flex;
+        gap: 2px;
+        padding: 3px;
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.82);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        backdrop-filter: blur(8px);
+        font: 12px/1 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        white-space: nowrap;
+      }
+      .demo-tabs a {
+        padding: 6px 12px;
+        border-radius: 999px;
+        color: #cbd5e1;
+        text-decoration: none;
+        transition: background 0.15s, color 0.15s;
+      }
+      .demo-tabs a:hover { color: #fff; background: rgba(56, 189, 248, 0.16); }
+      .demo-tabs a.on { background: #0ea5e9; color: #04121f; font-weight: 600; }
+      .demo-tabs a.docs {
+        margin-left: 3px;
+        border-left: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 0 999px 999px 0;
+        padding-left: 14px;
+        color: #94a3b8;
       }
 
       /* 头部品牌栏 */
@@ -61,22 +97,7 @@
         font-family: ui-monospace, monospace;
       }
 
-      /* 顶部跨页导航胶囊 */
-      .nav-pills {
-        display: flex; gap: 5px; background: rgba(0, 0, 0, 0.25);
-        padding: 3px; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05);
-      }
-      .nav-pill {
-        flex: 1; text-align: center; text-decoration: none;
-        padding: 5px 0; font-size: 11px; font-weight: 500;
-        color: var(--text-sub); border-radius: 6px;
-        transition: all 0.15s ease;
-      }
-      .nav-pill:hover { color: var(--text-main); background: rgba(255, 255, 255, 0.05); }
-      .nav-pill.active {
-        color: #ffffff; background: #2563eb; font-weight: 600;
-        box-shadow: 0 2px 6px rgba(37, 99, 235, 0.35);
-      }
+      /* 顶部跨页导航已经上移到 .demo-tabs，面板里不再有 nav-pills */
 
       .desc-text {
         color: var(--text-sub); font-size: 11.5px; line-height: 1.5; margin: 0;
@@ -149,8 +170,6 @@
         .card { box-shadow: 0 16px 36px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.04); }
         .brand-title { background: linear-gradient(135deg, #0f172a 40%, #475569 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
         .brand-header { border-bottom-color: rgba(0, 0, 0, 0.06); }
-        .nav-pills { background: rgba(0, 0, 0, 0.04); border-color: rgba(0, 0, 0, 0.06); }
-        .nav-pill:hover { color: #0f172a; background: rgba(0, 0, 0, 0.04); }
         .form-select { background: #ffffff; color: #0f172a; border-color: #cbd5e1; }
         .seg { background: rgba(0, 0, 0, 0.05); border-color: rgba(0, 0, 0, 0.08); }
         .seg button { color: #64748b; }
@@ -163,6 +182,13 @@
     </style>
   </head>
   <body>
+    <nav class="demo-tabs" aria-label="演示切换">
+      <a href="./index.html">数据集演示</a>
+      <a class="on" aria-current="page" href="./three.html">three.js</a>
+      <a href="./analysis.html">空间分析</a>
+      <a class="docs" href="../docs/index.html">文档</a>
+    </nav>
+
     <div id="panel" class="card">
       <div class="brand-header">
         <div class="brand-title">
@@ -170,12 +196,6 @@
           <span>s3m-maplibre</span>
         </div>
         <span class="brand-badge">Three.js</span>
-      </div>
-
-      <div class="nav-pills">
-        <a href="./index.html" class="nav-pill">🗺️ MapLibre 版</a>
-        <span class="nav-pill active">🧊 纯 Three.js</span>
-        <a href="../docs/index.html" class="nav-pill">📚 开发文档</a>
       </div>
 
       <p class="desc-text">
