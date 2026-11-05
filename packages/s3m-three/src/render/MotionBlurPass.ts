@@ -24,8 +24,10 @@
  *    像素照样不出现。没有几何的像素（天空）discard，不写深度。
  * 3. **色调映射 / 色彩空间要补**：three 只在渲染到屏幕（target=null）时才对片元做
  *    tone mapping 与 linear→sRGB 转换；RT 里存的是线性值，合成 shader 末尾必须
- *    `#include <tonemapping_fragment>` + `#include <colorspace_fragment>` 补上，
- *    否则整层会比直渲发暗发灰。
+ *    调 `toneMapping()` 与 `linearToOutputTexel()` 补上，否则整层会比直渲发暗发灰。
+ *    这两步本来可以直接 include 现成的 chunk，但那些 chunk 内部硬写 `gl_FragColor`，
+ *    而 GLSL3 下 three 不再注入 `#define gl_FragColor pc_fragColor` 的别名，
+ *    展开必然编译失败 —— 所以内联成两次函数调用。
  *
  * 已知限制（有意为之，见 docs/API.md）：
  * - 拖影只出现在「当前帧几何覆盖范围内」：合成 quad 依赖本帧深度，快速甩动时
@@ -128,12 +130,13 @@ const BLEND_FRAG = /* glsl */ `
   uniform sampler2D tPrev;
   uniform float uDamp;
   in vec2 vUv;
+  out vec4 fragColor;
 
   void main() {
     vec4 cur = texture( tCur, vUv );
     vec4 prev = texture( tPrev, vUv );
     // RT 是线性空间（three 往 RT 渲染不做输出转换），混合本身也不涉及 tone map —— 原样直写
-    gl_FragColor = cur * ( 1.0 - uDamp ) + prev * uDamp;
+    fragColor = cur * ( 1.0 - uDamp ) + prev * uDamp;
   }
 `;
 
@@ -145,6 +148,7 @@ const COMPOSITE_FRAG = /* glsl */ `
   uniform sampler2D tSrc;
   uniform sampler2D tDepth;
   in vec2 vUv;
+  out vec4 fragColor;
 
   void main() {
     float d = texture( tDepth, vUv ).x;
@@ -154,9 +158,17 @@ const COMPOSITE_FRAG = /* glsl */ `
     if ( c.a <= 0.004 ) discard;
     // 写回本帧几何的深度：后画的宿主图层照旧能被 S3M 建筑挡住
     gl_FragDepth = d;
-    gl_FragColor = c;
-    #include <tonemapping_fragment>
-    #include <colorspace_fragment>
+    fragColor = c;
+    // 色调映射 + linear→输出色彩空间，必须自己补：three 只在渲染到屏幕时自动做，
+    // 走 RT 中转的合成拿到的仍是线性值。这里没有用那两段现成的 chunk ——
+    // 它们内部硬写 gl_FragColor，而 GLSL3 下 three 不再注入对应别名
+    // （WebGLProgram 里 glslVersion === GLSL3 的分支取空串），展开必然编译失败。
+    // toneMapping() 与 linearToOutputTexel() 都由 three 的 prefixFragment 提供，
+    // 跟着 renderer.toneMapping / outputColorSpace 走，逻辑与原 chunk 等价。
+    #if defined( TONE_MAPPING )
+      fragColor.rgb = toneMapping( fragColor.rgb );
+    #endif
+    fragColor = linearToOutputTexel( fragColor );
   }
 `;
 
@@ -171,6 +183,7 @@ const VELOCITY_FRAG = /* glsl */ `
   uniform mat4 uPrevMvp;
   uniform float uMaxOffset;
   in vec2 vUv;
+  out vec4 fragColor;
 
   void main() {
     float d = texture( tDepth, vUv ).x;
@@ -195,9 +208,12 @@ const VELOCITY_FRAG = /* glsl */ `
     if ( acc.a <= 0.004 ) discard;
 
     gl_FragDepth = d;
-    gl_FragColor = acc;
-    #include <tonemapping_fragment>
-    #include <colorspace_fragment>
+    fragColor = acc;
+    // 同合成 pass：这两个 chunk 内部写 gl_FragColor，GLSL3 下不能用，只能内联
+    #if defined( TONE_MAPPING )
+      fragColor.rgb = toneMapping( fragColor.rgb );
+    #endif
+    fragColor = linearToOutputTexel( fragColor );
   }
 `;
 
