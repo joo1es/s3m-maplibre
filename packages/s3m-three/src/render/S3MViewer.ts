@@ -41,6 +41,7 @@ import { TilePlacement } from './viewer/TilePlacement.js';
 import { PathFollow } from './viewer/PathFollow.js';
 import { TileRegistry } from './viewer/TileRegistry.js';
 import { StyleController } from './viewer/StyleController.js';
+import { OverlayLayer } from './overlay/OverlayLayer.js';
 import type { PathSpec } from './viewer/PathFollow.js';
 import type {
   LightOptions,
@@ -230,6 +231,15 @@ export class S3MViewer {
 
   /** 3D 物理地表面 / 基坑开挖管理器 */
   readonly groundManager: GroundManager;
+
+  /**
+   * 三维覆盖物底座（见 render/overlay/OverlayLayer.ts）。
+   *
+   * 它不预设任何图元形态：飞线、光柱、范围罩子、glb 模型都走 `overlay.add()`，
+   * 使用者自己造 three 对象，这里只负责锚点、重锚补偿、帧驱动和生命周期。
+   * 只依赖 scene / 锚点 / 重绘三样设施，不认 smid 与瓦片。
+   */
+  readonly overlay: OverlayLayer;
   /** 多数据集生命周期与锚点管理器 */
   private readonly _datasetManager = new DatasetManager();
   /**
@@ -619,6 +629,17 @@ export class S3MViewer {
     this.lineShared = this._edges.lineShared;
     this.edgeMaterial = this._edges.edgeMaterial;
     this.selectionEdgeMaterial = this._edges.selectionEdgeMaterial;
+
+    // 覆盖物底座：只吃 scene / 锚点 / 重绘三样设施。scene 在 mount 前是 null，
+    // 所以 host 成员一律写成 getter，add 时读到的是「当下」的实例
+    this.overlay = new OverlayLayer({
+      get scene() {
+        return self.scene;
+      },
+      getAnchor: () => self.sceneAnchor,
+      lngLatToPoint: (p) => self.lngLatToPoint(p),
+      requestRepaint: () => self.triggerRepaint(),
+    });
     this._sel = new SelectionDecorator({
       uniforms: this.uniforms,
       style: this.style,
@@ -738,6 +759,9 @@ export class S3MViewer {
     this.scene = new THREE.Scene();
     this.scene.add(this.groundManager.group);
     this._addLights();
+    // 覆盖物的容器跟着新 scene 走。unmount 时容器被摘掉但条目还在，
+    // 所以重新 mount 要把它们挂回来
+    this.overlay.attachToScene();
 
     this.camera = new THREE.Camera();
     this.camera.matrixAutoUpdate = false;
@@ -801,6 +825,8 @@ export class S3MViewer {
     this._motionBlur = null;
     this.edgeMaterial.dispose();
     this.selectionEdgeMaterial.dispose();
+    // 覆盖物只摘不 dispose：几何与材质是使用者造的，只有他知道要不要复用
+    this.overlay.dispose();
     this.scene?.clear();
     this._sel.reset();
     this._smidMeshes.clear();
@@ -2476,6 +2502,8 @@ export class S3MViewer {
 
     // 先推进动画，再刷脏标记，最后渲染 —— 保证本帧画出来的是最新值
     const animating = this.animator.tick();
+    // 覆盖物自己计时（rAF / 宿主帧率都不该影响它），顺带在这一帧完成锚点重锚补偿
+    this.overlay.tick(performance.now());
 
     // 脏标记正常由微任务刷掉；这里再兜一次底，保证「本帧画出来的」一定是最新样式
     this.flushOverrides();
@@ -2644,6 +2672,9 @@ export class S3MViewer {
       animating ||
       this.style.mode === STYLE.DYNAMIC ||
       gpuPathActive ||
+      // 有动态覆盖物就必须继续驱动：它的 update 钩子还等着下一帧。
+      // 静态覆盖物不参与，否则挂着 200 个 glb 地图就永远不空闲
+      this.overlay.hasAnimated ||
       this.stats.loading > 0 ||
       tilesetChanged;
 
