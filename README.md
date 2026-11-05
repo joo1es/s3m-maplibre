@@ -55,6 +55,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 单体级点选 + 属性 | ✅ | GPU 拾取，代价与面数无关；支持 `pickPosition()` 返回精确表面交点与世界坐标 |
 | 穿透拾取 drillPick | ✅ | 沿视线方向穿透拾取多个单体并按深度排序返回 |
 | 单体包围盒与飞向 | ✅ | `getFeatureBounds(smid)`（内核）与 `flyToFeature(smid)`（图层，内部走宿主 `map.fitBounds`）聚焦单体 |
+| 三维覆盖物 | ✅ | `viewer.overlay` / `layer.overlay`：往场景里放飞线、范围罩、模型等非 S3M 数据。锚点跟着数据集自动重锚，被建筑正确遮挡，静态对象不进帧循环，见 [s3m-three API 文档](./packages/s3m-three/docs/API.md#三维覆盖物overlay) |
 | 单体三维平移 | ✅ | `FeatureStyle.translation` 存 `[dx, dy, dz]`（米），与着色器 / 拾取 / 描边全链路同步 |
 | LOD 细化倍率 | ✅ | `lodRangeScale` 运行时动态调节粗细模判定阈值 |
 | LOD 过渡细化 | ✅ | 支持 'binary'（整节点二值切换，默认）与 'incremental'（primary/fallback 双列表 + LEQUAL 深度推移增量细化，慢 child 不阻塞其它子瓦，平滑过渡不出洞） |

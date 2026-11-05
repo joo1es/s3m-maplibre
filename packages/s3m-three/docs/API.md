@@ -15,9 +15,10 @@
 - [投影](#投影)
 - [业务字段：锚点在库内，对应关系在外部](#业务字段锚点在库内对应关系在外部)
 - [动画与过渡](#动画与过渡)
+- [三维覆盖物（overlay）](#三维覆盖物overlay)
 - [纯 three.js 使用](#纯-threejs-使用)
 - [底层 API](#底层-api)
-- [性能调优](#性能调优)
+- [性能调优与显存管理](#性能调优与显存管理)
 - [已知限制](#已知限制)
 - [数据与许可](#数据与许可)
 
@@ -1013,7 +1014,8 @@ interface TransitionOptions {
 - **打断保速**（`retarget: 'proportional'`，默认）：新时长为 `base × 剩余距离 / 总距离`，并夹在 `[15%, 100%] × base`；`base` 是本次传入的 `duration`，不传则沿用上一次。只差 1% 的修正不会也走完整 600ms。`'fixed'` 则每次都走完整时长。
 - **spring**：没有时长概念，靠物理收敛，中途改目标位置和速度都连续。收敛判据是位移与速度同时小于 `epsilon`（默认 `1e-3`），判定后 track 结束；`epsilon` 设得过小会长时间不收敛，让 `tick()` 一直返回 `true`。典型 `{ stiffness: 120, damping: 14 }`。
 - **一次调用的参数对所有通道生效**。要「透明度 800ms、颜色 200ms」，分两次 `setStyle` 调用，不要指望一个对象里逐通道配置（目前没有 per-channel transition 表）。
-- `easing` 默认是 **`linear`**，不是 CSS 的 `ease`。想要网页常见手感就显式写 `easeInOutCubic` / `cubicBezier(...)`。
+- `easing` 默认是 **`linear`**，不是 CSS 的 `ease`。短过渡（300ms 以内）用 `easeOutCubic` 最接近网页上那种手感；要精确对齐设计稿就给 `cubicBezier(...)`，它和 CSS 的数值约定一致。
+- **连续输入不要开补间**。滑块 `input`、指针跟随、拖拽这类每帧都可能来的输入，直接把值写进去（`setStyle({ opacity })` 不带 `transition`）。加了 `{ duration: 200 }` 就是每次输入都从当前值重新起一条曲线，手指停了画面还在追，体感就是「黏」。补间留给离散指令：按钮、预设、模式切换。这条比选哪条曲线重要得多，也最容易被顺手加错。
 
 #### 曲线库
 
@@ -1275,6 +1277,106 @@ function frame(now: number) {
 - `shading` 首次切换不再现场编译：首帧后会自动预热另一种变体（选项 `prewarmShading`，默认开），切换时直接取 program 缓存。预热期间跳一两帧渲染，肉眼不可见；要自己挑时机就关掉选项、手动调 `prewarmShading()`。
 - 全局 `opacity` 可以到 0：到 0 时本层**跳过绘制**，不写颜色也不写深度，不会在底图上留洞。
 - GPU 路径运动中的单体：**拾取已经准确**（`PICK_VERT` 与主着色器采样同一份路径纹理，含 loop / pingpong / clamp 与自动朝向），**`getFeatureBounds()` 也按同一公式在 CPU 复算**。仍按原位置计算的只剩「属性过滤」这类不涉及空间的逻辑，以及你自己按 `pickId` 做的空间索引。
+
+---
+
+## 三维覆盖物（overlay）
+
+`viewer.overlay` 用来往场景里放**不属于 S3M 数据**的东西：飞线、范围罩、风机模型、光柱、扫描圈。
+
+它不预设形态。没有 `addMarker` / `addFlowLine` 这类方法，只有三个东西：一个 three 对象、一个锚点、一个可选的每帧钩子。具体长什么样由你自己造 —— 形态太多了，一旦写进 API 就得长期维护一张谁记不住的字典。
+
+放在内核里而不是单独发包，是因为它只从 `S3MViewer` 拿四样设施：`scene`、`sceneAnchor`、`lngLatToPoint`、`requestRepaint`。没有一样是 S3M 专有的，纯 three 场景（`sceneAnchor` 为 `null`）给个手写锚点也能用。这个依赖方向是硬约束：它不 import `DatasetManager`，也不按 smid 找 mesh，哪天需要了，那它就该搬出去。
+
+### 快速开始
+
+```ts
+// 放一个现成对象：底座负责摆到经纬度上，并跟着锚点变化
+const gltf = await new GLTFLoader().loadAsync('/models/turbine.glb');
+const h = viewer.overlay.add({
+  anchor: [120.124, 30.281, 12],
+  object: gltf.scene,
+  rotation: [-Math.PI / 2, 0, 0],   // Z-up 导出的 BIM / glb 要转
+  scale: 2,
+});
+
+h.remove();   // 几何和材质归你 dispose，底座不替你做
+```
+
+需要自己造几何时，把 `object` 换成工厂即可，锚点的 ENU 坐标会作为参数传进来：
+
+```ts
+const h = viewer.overlay.add({
+  anchor: [120.1, 30.2, 0],
+  object: (enu) => new THREE.Mesh(ribbon(arc(enu, target)), material),
+});
+```
+
+三个可直接抄的完整例子在仓库 `site/src/examples/` 下：`flow-line.ts`（飞线，带 shader 与锚点重建）、`range-canopy.ts`（静态范围罩）、`model-cover.ts`（整模型遮罩，带运行时调参）。
+
+### 传实例还是传工厂
+
+`object` 接受 `Object3D`，也接受 `(enu) => Object3D`。这只影响一件事 —— 锚点变化时怎么处理：
+
+| 传什么 | 锚点变化时 | 适合 |
+|---|---|---|
+| 实例 | 容器平移补偿，对象本身不动 | 加载好的 glb、静态几何 |
+| 工厂 | 用新锚点重新调用工厂，整块重建 | 经纬度已经烘进顶点的几何（飞线、贴地折线） |
+
+两种不能混。工厂模式下几何里的 ENU 是按**旧锚点**算的，平移补偿救不回来，只会整片错位；实例模式下容器管位置就够了，重建纯属浪费。
+
+### `OverlaySpec`
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `object` | 必填 | `Object3D` 或 `(enu: [x, y, z]) => Object3D` |
+| `anchor` | 必填 | `[lng, lat, alt]` 或 `{ lng, lat, altitude }` |
+| `rotation` | `[0, 0, 0]` | 弧度，XYZ 顺序 |
+| `scale` | `1` | 单值等比，或 `[x, y, z]` |
+| `offset` | `[0, 0, 0]` | 相对锚点的 ENU 偏移（米），微调用 |
+| `depth` | `'occluded'` | 见下面的深度策略 |
+| `update` | 无 | 每帧钩子。**不传就是静态对象**，不进帧循环 |
+| `onRemove` | 无 | 摘掉时回调（`remove` / `clear` / 重建 / 销毁都会触发） |
+| `visible` | `true` | 初始可见性 |
+
+`depth` 两个取值：
+
+- `'occluded'`（默认）：和建筑共用深度缓冲，被楼挡住就看不见。三维覆盖物该有的样子。
+- `'always'`：永远画在最前，底座会把对象所有材质的 `depthTest` / `depthWrite` 关掉并抬高 `renderOrder`。**之后你自己换材质不会自动套用**，要重新 `refresh()`。范围罩别用它，用了就是一张贴纸，没有前后关系。
+
+### `OverlayHandle`
+
+| 成员 | 说明 |
+|---|---|
+| `object` | 当前挂着的对象。工厂模式重锚后会指向新对象，别长期持有旧引用 |
+| `remove()` | 摘掉并触发 `onRemove`，重复调用无副作用 |
+| `setVisible(v)` | 切可见性 |
+| `refresh()` | 重新套用 `rotation` / `scale` / `offset` / `depth`，结尾请求一次重绘 |
+| `requestRepaint()` | **只**请求重绘，不动位姿 |
+
+### 三层容器：`content` 的 transform 归你
+
+每个覆盖物内部是 `root → pivot → content`：`root` 管锚点补偿，`pivot` 放锚点位置和 `offset`，`content` 就是你的对象。
+
+底座**不碰 `content` 的 position / rotation / scale**，这是刻意留的。所以「让罩子跟着某个单体走」这种需求，不用等库支持，自己在 `update` 里改 `content.position` 就行。
+
+### 几条必须知道的行为
+
+- **不传 `update` 就真的是静态的**：不进 `tick()`、不请求重绘，地图该空闲就空闲。挂两百个静态模型不会让宿主永远满帧跑。这条是整套东西能上生产的前提，别反过来。
+- **改完要自己喊一声**。静态对象改了材质、几何或缩放之后，必须调 `handle.requestRepaint()`。静态对象不进帧循环，地图空闲时不产生新帧，你不喊就一直在显示旧画面。拖滑块「看着没反应」就是这个原因，值其实早写进去了。
+- **重绘请求只有一条来源**：`renderFrame()` 里的 `needsNextFrame` 会并上 `overlay.hasAnimated`，覆盖物不自己起 `requestAnimationFrame`。
+- **锚点变化没有事件**。要感知就用 `update` 拿到的 `frame.anchorMoved`（只在那一帧为 `true`），或者自己比 `sceneAnchor` 的快照。`addDataset` / `removeDataset` 之后锚点会挪，工厂模式的对象这时会被重建。
+- **裁剪是全局的**。`setClipping` 开的裁剪会把覆盖物一起裁掉 —— `renderer.clippingPlanes` 本来就作用于整个场景，没法反向排除。做基坑开挖时飞线和罩子跟着消失，不是 bug。
+- **覆盖物不在拾取表里**。点它会穿透到后面的建筑，这通常是想要的行为。
+- **场景是 Z-up**。`BoxGeometry(w, d, h)` 三个参数正好是 x/y/z，天然对齐；`CylinderGeometry` / `ConeGeometry` 的主轴是 Y，不绕 X 转 90° 就是个躺平的桶。
+
+### 已知边界
+
+下面这些是**现在不做**的，不是待办：
+
+- **覆盖物拾取**：要动 `PickResult` 这个公共类型面，得加一个 overlay 分支。场景没定之前做，容易留个半成品 API。
+- **跟随单体（`follow: smid`）**：要挂进瓦片注册/注销流程，成本比整个底座还高。建筑物本来不动，真要跟随就在 `update` 里调 `getFeatureBounds(smid)` 重算并改 `content.position`。
+- **文字和标签**：用 MapLibre 的 Marker / symbol 更划算 —— 排版、清晰度、hover、批量都是现成的。放进 three 等于把这些重写一遍，一千个标签就是一千张纹理。
 
 ---
 

@@ -11,6 +11,7 @@
 - [与 s3m-three 的分界](#与-s3m-three-的分界)
 - [`S3MLayer`](#s3mlayer)
 - [动画与过渡](#动画与过渡)
+- [三维覆盖物](#三维覆盖物)
 - [投影](#投影)
   - [全局正交（beta，选配）](#全局正交beta选配)
   - [近裁剪面（贴脸看时不消失）](#近裁剪面贴脸看时不消失)
@@ -327,6 +328,7 @@ readonly fps: number
 readonly projection: 'perspective' | 'orthographic'
 readonly projectionT: number                              // 0 = 纯透视，1 = 纯正交
 readonly animation: S3MViewer['animator']                 // 动画调度器，见[动画与过渡](#动画与过渡)
+readonly overlay: S3MViewer['overlay']                    // 三维覆盖物容器，见[三维覆盖物](#三维覆盖物)
 dispose(): void
 ```
 
@@ -372,6 +374,8 @@ interface TransitionOptions {
 ```
 
 语义见 [s3m-three 过渡参数](../s3m-three/docs/API.md#过渡参数transitionoptions)。两个最容易踩的点：**默认曲线是 `linear`**（不是 CSS `ease`）；**一次调用的参数对所有通道生效**，要不同时长请分开调用。
+
+第三条，业务 UI 里最容易加错的：**滑块拖动不要挂 `transition`**。面板上的 `input` 事件一帧能来好几次，每次都带上 `{ duration: 200 }`，就是每来一次都重新起一条曲线，手指停下了画面还在追，手感发黏。连续输入直接写值，补间留给「点一下」这类离散指令 —— 预设切换、按钮、模式切换。
 
 ### 样式 / 棱线 / 模式
 
@@ -544,6 +548,39 @@ layer.flyToFeature(smid);   // 内部 map.fitBounds
 - **空闲时零成本**：动画结束后 `renderFrame()` 返回 `false`，帧循环停止；如果发现一直重绘，先查是否有未收敛的 `spring`、已注册的 GPU 路径或未结束的瓦片加载。
 - **不要绕过 animator 写 uniform**：动画期间 animator 是唯一写者，公开 API 走 `setStyle` / `animateFeature`。
 - **交叉淡化是全量替换**（不是合并）、**opacity 到 0 时整层不绘制**、**GPU 路径的位移只在着色器与包围盒里体现**这三点在调试时最容易被误判成 bug。
+
+---
+
+## 三维覆盖物
+
+`layer.overlay` 就是内部 `viewer.overlay` 的转发，同一个实例，API 完全一致。完整字段表、句柄方法、锚点重绑语义都在 [s3m-three 三维覆盖物](../s3m-three/docs/API.md#三维覆盖物overlay)，这里只写宿主相关的部分。
+
+```ts
+const h = layer.overlay.add({
+  anchor: [120.124, 30.281, 12],
+  object: gltf.scene,
+  rotation: [-Math.PI / 2, 0, 0],
+  scale: 2,
+});
+h.remove();
+```
+
+三层容器里的 `content`（也就是你传进去的对象）的 transform 底座不碰，留给业务代码自己用。要让罩子跟着某个单体走，就在 `update` 里改 `content.position`。
+
+**这一层和纯 three 场景的差别只有三处：**
+
+- 锚点由地图驱动。`addDataset` / `removeDataset` 之后 `sceneAnchor` 会挪，传工厂的覆盖物会被重建。纯 three 场景没有锚点，要自己给 ENU 坐标。
+- 坐标换算直接用 `layer.lngLatToPoint()`，和瓦片用的是同一套。
+- 重绘最终落到 `map.triggerRepaint()`。所以静态覆盖物改完材质必须 `handle.requestRepaint()`，不喊就没有下一帧 —— 面板上拖滑块「看着没反应」都是这个原因。
+
+**两个宿主侧的坑：**
+
+- `setClipping` 开的裁剪是 `renderer.clippingPlanes`，全局生效，覆盖物会被一起裁掉。基坑开挖时飞线和罩子跟着消失，这不是 bug。
+- 覆盖物不在拾取表里，点它会穿透到后面的建筑。要可点击得自己挂 pickId 和射线求交，成本会翻一截。
+
+**什么时候别用 overlay**：贴地的图标、文字、气泡用 MapLibre 的 Marker / symbol。排版、清晰度、hover、批量都是现成的，放进 three 等于重写一遍。只有「必须被建筑遮挡」和「必须离开地面」这两条，才值得进场景。
+
+现成例子：数据集演示面板上的「模型遮罩」，以及分析页的「飞线」「范围罩」两个工具，源码在 `site/src/examples/`。
 
 ---
 
