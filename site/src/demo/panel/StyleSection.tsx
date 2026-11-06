@@ -239,6 +239,44 @@ export default function StyleSection() {
       </section>
 
       <section>
+        <h2>后处理（presenter）</h2>
+        <select
+          id="optPostMode"
+          class="form-select"
+          title="用 setPresenter 接管「场景→屏幕」：场景先进 RT，再由示例自己合成回屏幕。底图不在 RT 里，所以只有 S3M 的模型被处理，地图和标注保持清晰"
+        >
+          <option value="off" selected>
+            关闭（默认）
+          </option>
+          <option value="blur">高斯模糊 (blur)</option>
+          <option value="glow">辉光 (bloom)</option>
+        </select>
+        <div id="wrapPostRadius" style="display:none">
+          <label class="rng" title="模糊半径（像素）。改完会请求重绘 —— 静态画面不会自己再来一帧">
+            <span>半径</span>
+            <input type="range" id="optPostRadius" min="0" max="16" step="1" value="6" />
+            <b id="postRadiusVal">6px</b>
+          </label>
+        </div>
+        <div id="wrapPostGlow" style="display:none">
+          <label class="rng" title="辉光叠加强度：原图 + 提取出的亮部 × 强度。0 = 看不出效果">
+            <span>强度</span>
+            <input type="range" id="optPostStrength" min="0" max="30" step="1" value="15" />
+            <b id="postStrengthVal">1.50</b>
+          </label>
+          <label
+            class="rng"
+            title="亮度阈值：低于它的像素不参与发光。比的是线性空间的绝对亮度（不是屏幕观感值），普通立面常在 0.2~0.5，所以默认只要 0.25；调到 0.7 以上经常一粒都不发光"
+          >
+            <span>阈值</span>
+            <input type="range" id="optPostThreshold" min="0" max="150" step="5" value="25" />
+            <b id="postThresholdVal">0.25</b>
+          </label>
+        </div>
+        <div id="postInfo" style="font-size:10.5px;color:#64748b;margin-top:4px;">关闭</div>
+      </section>
+
+      <section>
         <h2>环境与投影</h2>
         <label class="chk">
           <input type="checkbox" id="optUnderground" /> 地下透视模式（半透明地表）
