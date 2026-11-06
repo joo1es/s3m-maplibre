@@ -3,6 +3,7 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat, enableMapLibreOrtho, parseConfigText, classifyDatasetKind } from 's3m-maplibre';
 import pkg from 's3m-maplibre/package.json';
 import { addModelCover, datasetBaseHeight } from '../examples/model-cover';
+import { createPostPresenter } from '../examples/post-presenter';
 
 
 
@@ -764,6 +765,12 @@ $('optCoverOpacity')?.addEventListener('input', (e) => {
  */
 function applyMotionBlur() {
   const mode = $('optBlurMode')?.value ?? 'off';
+  // 运动模糊和后处理都要接管「场景→屏幕」，内核里 presenter 优先。
+  // 这里先把后处理关掉，面板上不留一个「选了却没生效」的值
+  if (mode !== 'off' && postEffect) {
+    if ($('optPostMode')) $('optPostMode').value = 'off';
+    applyPost();
+  }
   $('wrapBlurDamp').style.display = mode === 'afterimage' ? '' : 'none';
   $('wrapBlurOffset').style.display = mode === 'velocity' ? '' : 'none';
 
@@ -803,6 +810,84 @@ $('optBlurMaxOffset')?.addEventListener('input', (e) => {
   $('blurMaxOffsetVal').textContent = `${e.target.value}%`;
   applyMotionBlur();
 });
+
+/**
+ * 后处理示例：用 `layer.setPresenter()` 接管「场景 → 屏幕」。
+ *
+ * 和运动模糊的区别是这层是使用者自己写的：场景先渲进 RT，颜色与**深度**纹理交出来，
+ * 之后画几趟、怎么合成全由示例决定。
+ *
+ * - 高斯模糊：横一趟 + 竖一趟可分离卷积
+ * - 辉光：亮部提取 → 两趟模糊 → 原图 + 辉光叠加
+ *
+ * 底图不在这张 RT 里，所以只有 S3M 模型被处理，地图和标注保持清晰 —— 这正是
+ * 「拷整张画布再后处理」做不到的。
+ */
+let postEffect = null;
+let postMode = null;
+// 两个效果的合适半径不一样：模糊 6px 已经很明显，辉光要 10px 光晕才铺得开
+const postRadiusByMode = { blur: 6, glow: 10 };
+
+function applyPost() {
+  const mode = $('optPostMode')?.value ?? 'off';
+  $('wrapPostRadius').style.display = mode === 'blur' ? '' : 'none';
+  $('wrapPostGlow').style.display = mode === 'glow' ? '' : 'none';
+
+  const radius = Number($('optPostRadius')?.value ?? 6);
+  // 滑块用整数，这里换成实际量纲：强度 0~3.0、阈值 0~1.5
+  const strength = Number($('optPostStrength')?.value ?? 14) / 10;
+  const threshold = Number($('optPostThreshold')?.value ?? 70) / 100;
+  $('postRadiusVal').textContent = `${radius}px`;
+  $('postStrengthVal').textContent = strength.toFixed(2);
+  $('postThresholdVal').textContent = threshold.toFixed(2);
+
+  if (mode === 'off') {
+    layer.setPresenter(null);
+    postEffect?.dispose();
+    postEffect = null;
+    postMode = null;
+    $('postInfo').textContent = '关闭';
+    return;
+  }
+
+  // 两者互斥，开这个就把运动模糊关掉，UI 跟着走
+  if ($('optBlurMode').value !== 'off') {
+    $('optBlurMode').value = 'off';
+    applyMotionBlur();
+  }
+
+  // 换效果要重建：shader 与 uniform 面不一样，没必要做一个通用壳
+  if (!postEffect || postMode !== mode) {
+    layer.setPresenter(null);
+    postEffect?.dispose();
+    postEffect = createPostPresenter(layer, { mode, radius, strength, threshold });
+    layer.setPresenter(postEffect.presenter);
+    postMode = mode;
+  } else {
+    postEffect.setRadius(radius);
+    postEffect.setStrength(strength);
+    postEffect.setThreshold(threshold);
+  }
+
+  $('postInfo').textContent =
+    mode === 'blur'
+      ? `高斯模糊 · 半径 ${radius}px（只作用于 S3M，底图保持清晰）`
+      : `辉光 · 强度 ${strength.toFixed(2)}、阈值 ${threshold.toFixed(2)}（只作用于 S3M）`;
+}
+
+$('optPostMode')?.addEventListener('change', () => {
+  const mode = $('optPostMode').value;
+  // 换效果时把半径切回该效果自己的默认值，两个效果的「合适半径」不是一回事
+  if (mode !== 'off') $('optPostRadius').value = postRadiusByMode[mode];
+  applyPost();
+});
+$('optPostRadius')?.addEventListener('input', () => {
+  const mode = $('optPostMode').value;
+  if (mode !== 'off') postRadiusByMode[mode] = Number($('optPostRadius').value);
+  applyPost();
+});
+$('optPostStrength')?.addEventListener('input', applyPost);
+$('optPostThreshold')?.addEventListener('input', applyPost);
 
 function updateTerrainInfo(note) {
   const el = $('terrainInfo');

@@ -16,6 +16,7 @@
 - [业务字段：锚点在库内，对应关系在外部](#业务字段锚点在库内对应关系在外部)
 - [动画与过渡](#动画与过渡)
 - [三维覆盖物（overlay）](#三维覆盖物overlay)
+- [后处理：接管上屏（presenter）](#后处理接管上屏presenter)
 - [纯 three.js 使用](#纯-threejs-使用)
 - [底层 API](#底层-api)
 - [性能调优与显存管理](#性能调优与显存管理)
@@ -551,6 +552,8 @@ setDepthMode(mode: DepthMode): void            // 运行时调整深度处理策
 readonly depthMode: DepthMode                  // 当前深度策略
 setMotionBlur(cfg: MotionBlurOptions | null): void  // 运行时开关运动模糊；null = 关闭并释放 RT 显存
 readonly motionBlur: MotionBlurOptions | null       // 当前配置（归一化后的副本）
+setPresenter(p: ViewerPresenter | null): void      // 接管上屏做自己的后处理，见[后处理](#后处理接管上屏presenter)
+readonly presenter: ViewerPresenter | null         // 当前接管者；null = 由库自己合成
 readonly stats: Stats
 readonly fps: number
 getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
@@ -1377,6 +1380,69 @@ const h = viewer.overlay.add({
 - **覆盖物拾取**：要动 `PickResult` 这个公共类型面，得加一个 overlay 分支。场景没定之前做，容易留个半成品 API。
 - **跟随单体（`follow: smid`）**：要挂进瓦片注册/注销流程，成本比整个底座还高。建筑物本来不动，真要跟随就在 `update` 里调 `getFeatureBounds(smid)` 重算并改 `content.position`。
 - **文字和标签**：用 MapLibre 的 Marker / symbol 更划算 —— 排版、清晰度、hover、批量都是现成的。放进 three 等于把这些重写一遍，一千个标签就是一千张纹理。
+
+---
+
+## 后处理：接管上屏（presenter）
+
+`setPresenter()` 把「场景 → 屏幕」这一步交给使用者。库仍然负责把场景渲进自己的 RT，
+然后交出**颜色**与**深度**两张纹理，之后画什么、画几趟、怎么上屏，全是你的事。
+
+```ts
+const presenter = {
+  render(ctx) {
+    // ctx.color / ctx.depth 是本帧已经渲好的场景
+    // 自己画到屏幕：renderer.setRenderTarget(null) 之后 render
+  },
+};
+viewer.setPresenter(presenter);
+viewer.setPresenter(null);   // 解除接管，RT 立刻释放
+```
+
+这是「开个口子」而不是「一套后处理框架」：没有 pass 列表、没有顺序、没有共享池。
+想叠加多个效果就在自己的 `render` 里串，库不参与编排。完整可跑的示例见
+`site/src/examples/post-presenter.ts`（高斯模糊与辉光两种效果、可分离卷积 + 合成，
+含逐段注释），数据集演示面板里的「后处理（presenter）」就是它。
+
+### 每帧拿到的 `PresenterContext`
+
+| 字段 | 说明 |
+|---|---|
+| `renderer` | `THREE.WebGLRenderer`，同一个宿主上下文 |
+| `scene` / `camera` | 本帧已就位的场景与相机，想再渲一遍做第二个 pass 可以直接用 |
+| `width` / `height` | 绘图缓冲尺寸（像素），不是 CSS 尺寸 |
+| `color` | 场景渲好的颜色纹理：**线性空间**、透明底、premultiplied |
+| `depth` | 同尺寸深度纹理。合成时用来写回 `gl_FragDepth` |
+
+### 三件事必须自己做
+
+这三条是接管上屏的全部代价，漏了都能出画，只是错得很难查：
+
+| 漏掉 | 现象 |
+|---|---|
+| 色调映射（`toneMapping()`，跟着 `renderer.toneMapping` 走） | 整层比直渲发亮，高光糊成一片 |
+| linear→输出色彩空间（`linearToOutputTexel()`） | 整层发灰、发暗 |
+| 用 `ctx.depth` 写回 `gl_FragDepth` | 后画的宿主图层（标注、其它 custom layer）挡不住建筑，被楼穿过去 |
+
+前两个不用手写公式：`toneMapping()` 与 `linearToOutputTexel()` 由 three 的片元前缀提供。
+**不要用 `#include <tonemapping_fragment>` / `<colorspace_fragment>`** —— 这两个 chunk
+内部硬写 `gl_FragColor`，而声明了 `glslVersion: GLSL3` 之后 three 不再注入这个别名，
+展开必然编译失败（`ERROR: 'gl_FragColor' : undeclared identifier`），内联成函数调用即可。
+
+### 必须知道的约定
+
+- **独占上屏**。设了 presenter，库不再自己合成，结尾要 `renderer.setRenderTarget(null)`
+  再画，否则画面停在上一次。
+- **与运动模糊互斥**。两者都要接管同一步：`setPresenter` 会自动关掉 `motionBlur` 并 warn；
+  反过来设了 presenter 之后再开 `motionBlur` 不生效，也会 warn（presenter 一直赢 ——
+  它是你自己的代码，悄悄丢掉比拒绝设置更糟）。
+- **需要 WebGL2**（`DepthTexture`）。不支持时回退直渲并 warn 一次，画面与没设 presenter 一致。
+- **只处理 S3M**。底图（MapLibre 的矢量、地形）根本不在这张 RT 里，所以后处理不会影响它们 ——
+  这也意味着「整屏级」效果（比如让 bloom 把底图照亮）在当前架构下做不到。
+- **RT 是 HalfFloat**。存的是 tone map 之前的线性值，高光不被 clamp；代价是显存与带宽 ×2。
+  尺寸变化、`unmount`、`restoreContext` 时库自己重建/释放，不用你管。
+- **静态画面不会自己重绘**。presenter 里有动画（时间 uniform 之类）时自己
+  `viewer.triggerRepaint()`，库不替你判断「还在动」。
 
 ---
 

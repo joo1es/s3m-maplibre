@@ -12,6 +12,7 @@
 - [`S3MLayer`](#s3mlayer)
 - [动画与过渡](#动画与过渡)
 - [三维覆盖物](#三维覆盖物)
+- [后处理：接管上屏](#后处理接管上屏)
 - [投影](#投影)
   - [全局正交（beta，选配）](#全局正交beta选配)
   - [近裁剪面（贴脸看时不消失）](#近裁剪面贴脸看时不消失)
@@ -310,6 +311,8 @@ setDepthMode(mode: 'scene' | 'clear' | 'auto'): void          // 运行时调整
 readonly depthMode: 'scene' | 'clear' | 'auto'
 setMotionBlur(cfg: MotionBlurOptions | null): void       // 运行时开关运动模糊；null = 关闭并释放 RT
 readonly motionBlur: MotionBlurOptions | null
+setPresenter(p: ViewerPresenter | null): void           // 接管上屏做自己的后处理；null = 交回本层合成
+readonly presenter: ViewerPresenter | null
 lngLatToPoint(p: LngLatAlt): [number, number, number]   // 经纬度 → 场景 ENU（画代理几何用）
 pointToLngLat(v: [number, number, number]): LngLatAlt
 measureDistance(a: LngLatAlt, b: LngLatAlt): { distance3D; distanceHorizontal; heightDiff }
@@ -581,6 +584,29 @@ h.remove();
 **什么时候别用 overlay**：贴地的图标、文字、气泡用 MapLibre 的 Marker / symbol。排版、清晰度、hover、批量都是现成的，放进 three 等于重写一遍。只有「必须被建筑遮挡」和「必须离开地面」这两条，才值得进场景。
 
 现成例子：数据集演示面板上的「模型遮罩」，以及分析页的「飞线」「范围罩」两个工具，源码在 `site/src/examples/`。
+
+---
+
+## 后处理：接管上屏
+
+`layer.setPresenter()` 转发到 `viewer.setPresenter()`，用法、`PresenterContext` 字段与那三条必须自己补的补偿（色调映射 / 色彩空间 / `gl_FragDepth`）都在 [s3m-three 后处理](../s3m-three/docs/API.md#后处理接管上屏presenter)。这里只写宿主相关的部分。
+
+```ts
+layer.setPresenter({
+  render(ctx) {
+    // ctx.color / ctx.depth 是本帧 S3M 场景，自己画到屏幕
+  },
+});
+layer.setPresenter(null);
+```
+
+**这一层和纯 three 场景的差别只有三处：**
+
+- **底图不在 RT 里**。RT 只装 S3M 这一层，所以后处理只影响模型 —— 地图底图、标注、DOM Marker 保持清晰。想要连底图一起处理，当前架构做不到，那要接管整个 style 的渲染。
+- **重绘最终落到 `map.triggerRepaint()`**。presenter 里有动画就自己 `layer.viewer.triggerRepaint()`，地图空闲时不会自己再来一帧。
+- **和运动模糊互斥**。两者都想接管「场景 → 屏幕」，`setPresenter` 会自动关掉 `motionBlur` 并 warn，反过来不生效。
+
+现成例子：数据集演示面板的「后处理（presenter）」分组（高斯模糊 / 辉光），源码 `site/src/examples/post-presenter.ts`（可分离卷积 + 亮部提取 + 合成，约 300 行，含逐段注释）。
 
 ---
 

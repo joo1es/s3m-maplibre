@@ -78,6 +78,8 @@ import { Picker } from './Picker.js';
 import { GpuEdgePass } from './GpuEdgePass.js';
 import { MotionBlurPass, normalizeMotionBlur, autoMotionBlurDamp } from './MotionBlurPass.js';
 import type { MotionBlurOptions, MotionBlurConfig } from './MotionBlurPass.js';
+import { PresenterTarget } from './PresenterTarget.js';
+import type { ViewerPresenter, PresenterContext } from './PresenterTarget.js';
 import { Animator } from '../anim/Animator.js';
 import type {
   ClipOptions,
@@ -175,6 +177,7 @@ export type {
   DepthMode,
 } from './viewer/types.js';
 export type { MotionBlurOptions, MotionBlurConfig } from './MotionBlurPass.js';
+export type { ViewerPresenter, PresenterContext } from './PresenterTarget.js';
 
 /** 稳健归一化 depthMode 入参，默认 'scene' */
 export function normalizeDepthMode(mode?: unknown): DepthMode {
@@ -388,6 +391,13 @@ export class S3MViewer {
    */
   private _motionBlurCfg: MotionBlurConfig | null = null;
   private _motionBlur: MotionBlurPass | null = null;
+  /**
+   * 使用者接管「场景 → 屏幕」的钩子（默认 null = 库自己合成）。
+   * 设了就独占上屏，并且与 motionBlur 互斥 —— 两者都想接管同一步，同时开必然打架。
+   */
+  private _presenter: ViewerPresenter | null = null;
+  /** presenter 的 RT 载体。延迟到首次 render 才建，没设 presenter 时零开销 */
+  private readonly _presenterTarget = new PresenterTarget();
   /**
    * 瓦片级放置（默认关）。关时 `_registerTile` 完全不碰瓦片矩阵，代码路径与改动前
    * 逐字一致；开时每块瓦片用自己的中心纬度算尺度，见 `tilePlacement.ts`。
@@ -823,6 +833,8 @@ export class S3MViewer {
     this._edges.disposeGpuEdge();
     this._motionBlur?.dispose();
     this._motionBlur = null;
+    // presenter 的 RT 绑在旧上下文上，直接丢掉，下一次 render 按需重建
+    this._presenterTarget.dispose();
     this.edgeMaterial.dispose();
     this.selectionEdgeMaterial.dispose();
     // 覆盖物只摘不 dispose：几何与材质是使用者造的，只有他知道要不要复用
@@ -1826,8 +1838,57 @@ export class S3MViewer {
    * 「场景 → 屏幕」改走 RT 中转（合成 quad 会补回色调映射 / sRGB / 深度）。
    * WebGL1 上开了也自动回退直渲。`damp: 'auto'` 每帧按实时 FPS 重新解析。
    */
+  /**
+   * 接管「场景 → 屏幕」这一步，让使用者自己做后处理。
+   *
+   * 设置后，本库把场景渲进自己的 RT（线性空间、透明底、带深度纹理），然后把
+   * `color` / `depth` 两张纹理交给 `presenter.render(ctx)`，**上屏由它负责**：
+   * 画什么、画几趟、要不要再渲一遍场景，全是普通 three 代码。
+   *
+   * 这是「开个口子」而不是「造一套后处理框架」：没有 pass 列表、没有顺序、没有
+   * 共享池。想叠加多个效果就在自己的 render 里串，框架不参与编排。
+   *
+   * 三个必须知道的约定：
+   * - **独占上屏**：设了 presenter，本库不再自己合成。实现方结尾要
+   *   `renderer.setRenderTarget(null)` 再画，否则画面停在上一次。
+   * - **三处补偿是使用者的责任**：色调映射、linear→输出色彩空间、用 `depth`
+   *   写回 `gl_FragDepth`。前两个漏了整层发亮发灰；第三个漏了，后画的宿主图层
+   *   挡不住 S3M，会被楼穿过去。
+   * - **与 motionBlur 互斥**：两者都要接管这一步，同时设会互相覆盖，所以本方法
+   *   会自动关掉 motionBlur 并 warn。
+   *
+   * 需要 WebGL2（DepthTexture）。不支持时回退直渲，并 warn 一次。
+   * 传 `null` 解除接管，RT 立刻释放。
+   */
+  setPresenter(presenter: ViewerPresenter | null | undefined): void {
+    if (!presenter) {
+      this._presenter = null;
+      this._presenterTarget.dispose();
+      this.triggerRepaint();
+      return;
+    }
+    if (this._motionBlurCfg) {
+      console.warn('[s3m] setPresenter 与运动模糊都要接管「场景→屏幕」，已自动关闭运动模糊');
+      this.setMotionBlur(null);
+    }
+    this._presenter = presenter;
+    this.triggerRepaint();
+  }
+
+  /** 当前接管上屏的 presenter；null = 由本库自己合成 */
+  get presenter(): ViewerPresenter | null {
+    return this._presenter;
+  }
+
   setMotionBlur(cfg: MotionBlurOptions | null | undefined): void {
-    this._motionBlurCfg = normalizeMotionBlur(cfg);
+    const next = normalizeMotionBlur(cfg);
+    // presenter 一旦设上就一直赢：它是使用者自己的代码，悄悄丢掉比拒绝设置更糟
+    if (next && this._presenter) {
+      console.warn('[s3m] 已设置 presenter，运动模糊不再生效（两者都要接管「场景→屏幕」）；需要运动模糊请先 setPresenter(null)');
+      this.triggerRepaint();
+      return;
+    }
+    this._motionBlurCfg = next;
     if (!this._motionBlurCfg) {
       this._motionBlur?.dispose();
       this._motionBlur = null;
@@ -2645,7 +2706,20 @@ export class S3MViewer {
     // 这里跳过的是「本层的绘制」，宿主自己的清屏 / 底图照旧。
     if ((this.uniforms.uOpacity?.value ?? 1) > OPACITY_EPS) {
       this._sortSplats();
-      if (this._motionBlurCfg && this._renderMotionBlur(canvas.width, canvas.height)) {
+      // presenter 优先级最高：设了就由使用者接管「场景 → 屏幕」，库不再自己合成
+      const presented = this._presenter
+        ? this._presenterTarget.render(
+            this.renderer,
+            this.scene,
+            this.camera,
+            canvas.width,
+            canvas.height,
+            this._presenter
+          )
+        : false;
+      if (presented) {
+        // 场景已进 RT，上屏由 presenter 负责（见 PresenterTarget）
+      } else if (this._motionBlurCfg && this._renderMotionBlur(canvas.width, canvas.height)) {
         // 运动模糊接管了「场景 → 屏幕」：场景进 RT，合成 quad 补回色调映射 / sRGB / 深度
       } else {
         this.renderer.render(this.scene, this.camera);
