@@ -43,6 +43,7 @@ import type {
   LightOptions,
   LightingPreset,
   MotionBlurOptions,
+  ViewerPresenter,
   DepthMode,
   TransitionOptions,
   Path,
@@ -585,6 +586,25 @@ export class S3MLayer extends HostRenderer {
 
   get motionBlur(): MotionBlurOptions | null {
     return this.viewer.motionBlur;
+  }
+
+  /**
+   * 接管「场景 → 屏幕」，自己写后处理（bloom / 景深 / FXAA / 自定义合成）。
+   *
+   * 设置后本层把场景渲进 RT，把颜色与**深度**纹理交给 presenter，上屏由它负责。
+   * 与 `setMotionBlur` 互斥（两者都要接管同一步），设了 presenter 运动模糊自动关闭。
+   *
+   * 三个约定见内核 `S3MViewer.setPresenter`：独占上屏、三处补偿
+   * （色调映射 / 色彩空间 / `gl_FragDepth` 写回）由实现方负责、需要 WebGL2。
+   * `null` 解除接管并释放 RT。
+   */
+  setPresenter(presenter: ViewerPresenter | null | undefined): void {
+    this.viewer.setPresenter(presenter);
+  }
+
+  /** 当前接管上屏的 presenter；null = 由本层自己合成 */
+  get presenter(): ViewerPresenter | null {
+    return this.viewer.presenter;
   }
 
   /* ------------------------------------------------------------ 三维空间分析 */
