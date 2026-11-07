@@ -77,6 +77,7 @@ import {
   type MapMouseEventLike,
   type WorldCoordinateHelperLike,
 } from './MapLibreGeoAdapter.js';
+import { canvasPointFromClient } from './pickPoint.js';
 
 /* 兼容再导出：0.2.x 起这些符号就从 s3m-maplibre 根出口暴露，老代码不用改 */
 export * from 's3m-three';
@@ -113,6 +114,7 @@ export interface S3MLayerOptions extends S3MViewerOptions {
    */
   nearPlaneScale?: number;
 }
+
 
 export class S3MLayer extends HostRenderer {
   readonly type = 'custom' as const;
@@ -378,13 +380,19 @@ export class S3MLayer extends HostRenderer {
     this.onPick(hit);
   };
 
-  /** 事件对象（宿主 MouseEvent 或原生事件）→ 拾取结果 */
+  /**
+   * 事件对象（宿主 MouseEvent 或原生事件）→ 拾取结果。
+   *
+   * 坐标换算在 `pickPoint.ts`：父级只是 `translate`/`scale` 时按 rect 还原，
+   * 带 `rotate` / `skew` / `perspective` 时 rect 已经不是那个盒子了（宽度里混进了高度），
+   * 必须量四个角点再做单应反解。无 transform 时与历史实现逐像素一致。
+   */
   pickFromEvent(e: MapMouseEventLike | MouseEvent): PickResult | null {
     const canvas = this.map?.getCanvas();
     if (!canvas) return null;
-    const rect = canvas.getBoundingClientRect();
     const oe = (e as MapMouseEventLike).originalEvent ?? (e as MouseEvent);
-    return this.viewer.pick(oe.clientX - rect.left, oe.clientY - rect.top);
+    const p = canvasPointFromClient(canvas, oe.clientX, oe.clientY);
+    return this.viewer.pick(p.x, p.y);
   }
 
   /** 按 canvas 左上角的 CSS 像素坐标拾取 */

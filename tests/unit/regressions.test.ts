@@ -729,3 +729,49 @@ describe('13. 地形/影像缓存（Terrainz / Type=Image）不能伪装成「�
     expect(ts.isS3MV1).toBe(true);
   });
 });
+
+describe('14. 父级 CSS transform 缩放时，点击拾取不能被缩放带偏', () => {
+  /**
+   * `pickFromEvent` 用 `getBoundingClientRect()` 减出偏移量 —— 那是**缩放后的视觉像素**；
+   * 而 `Picker.pick` 拿 `canvas.clientWidth/Height`（布局像素，不受 transform 影响）当分母。
+   * 两边口径不一致的后果：父级 `scale(s)` 时拾取点等于真实坐标 × s，
+   * 实测 `scale(0.5)` 下点中 CCTV 楼会拾到空（偏移后那片是空的）。
+   */
+  const mkLayer = (rect: { left: number; top: number; width: number; height: number }) => {
+    const layer = new S3MLayer({ configUrl: 'http://example.com/a.scp' });
+    const canvas = {
+      // 口径与 MapLibre 的 DOM.getScale() 一致：rect.width / offsetWidth
+      clientWidth: 1000,
+      clientHeight: 500,
+      offsetWidth: 1000,
+      offsetHeight: 500,
+      getBoundingClientRect: () => ({ ...rect, right: rect.left + rect.width, bottom: rect.top + rect.height }),
+    };
+    (layer as unknown as { _map: unknown })._map = { getCanvas: () => canvas };
+    const calls: Array<[number, number]> = [];
+    (layer.viewer as unknown as { pick: (x: number, y: number) => null }).pick = (x, y) => {
+      calls.push([x, y]);
+      return null;
+    };
+    return { layer, calls };
+  };
+
+  test('scale(0.5)：视觉像素要先还原成布局像素再拾取', () => {
+    const { layer, calls } = mkLayer({ left: 10, top: 20, width: 500, height: 250 });
+    // 视觉上 (260, 145) = 布局上 (10 + 500, 20 + 250)
+    layer.pickFromEvent({ clientX: 260, clientY: 145 } as MouseEvent);
+    expect(calls[0]).toEqual([500, 250]);
+  });
+
+  test('没有 transform 时换算严格为 1，坐标与改动前逐像素相同', () => {
+    const { layer, calls } = mkLayer({ left: 10, top: 20, width: 1000, height: 500 });
+    layer.pickFromEvent({ clientX: 260, clientY: 145 } as MouseEvent);
+    expect(calls[0]).toEqual([250, 125]);
+  });
+
+  test('取不到 rect（宽高为 0）时不能除零，退回不做缩放补偿', () => {
+    const { layer, calls } = mkLayer({ left: 0, top: 0, width: 0, height: 0 });
+    layer.pickFromEvent({ clientX: 100, clientY: 50 } as MouseEvent);
+    expect(calls[0]).toEqual([100, 50]);
+  });
+});

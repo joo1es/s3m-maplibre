@@ -235,6 +235,19 @@ flyToFeature(smid: number, options?: Record<string, unknown>): boolean
 
 `pick` 的坐标是**相对 canvas 左上角的 CSS 像素**。`pickFromEvent` 接受 MapLibre 的 `MouseEvent` 或原生事件，自动换算。返回值包含单体属性、中心经纬度、以及精确交点世界坐标（`point: [x,y,z]`, `lngLat: [lng,lat]`, `altitude: number`），结构见 [s3m-three 拾取章节](../s3m-three/docs/API.md#拾取与属性)。
 
+`pickFromEvent` 会处理**地图容器被 CSS 变换过**的情况（弹层动画、缩放预览、透视展示）：
+
+| 父级变换 | 处理方式 | 不做的话偏多少（1262×704 画布实测） |
+|---|---|---|
+| 无 / 只有 translate | 减 rect 偏移 | 0 |
+| `scale` | 按 `rect / offsetWidth` 还原 | 不还原时拾取点 = 真实坐标 × 缩放比 |
+| `rotate` / `skew` | 量四个角点解仿射 | `rotate(30deg)` 偏 (19.9, 22.1) px |
+| `perspective` + `rotate3D` | 同上，按**单应**（8 自由度）反解 | `rotateX(22deg)` 偏 (−119.3, −58.4) px |
+
+后两种靠「在画布容器里临时摆 4 个 0×0 探针、读它们被变换到屏幕上的位置」测量，用完立即移除；探针的包围盒必须与 canvas 的 rect 重合，否则退回标量换算（宁可保留旧行为也不换错坐标）。一次点击约多花 0.2 ms。
+
+注意这**只修了本层**：同一个容器里 MapLibre 自己的 `e.point` / `e.lngLat` 仍按标量还原（`DOM.getScale()`），旋转或透视下依旧是偏的。要用它，先拿 `pick(x, y)` 的坐标系自己换。
+
 - `pickPosition(x, y)`：拾取指定屏幕像素对应的精确三维世界坐标。优先对命中的建筑网格精确表面求交；未命中建筑时与地表面（z=0）求交。
 - `drillPick(x, y, limit?)`：视线穿透拾取，沿射线命中所有单体，按由近至远距离排序返回。
 - `getFeatureBounds(smid)`：获取指定 SMID 单体的经纬度包围盒 `[[minLng, minLat], [maxLng, maxLat]]`（自动叠加单体平移/拔高）。
