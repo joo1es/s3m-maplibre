@@ -304,6 +304,25 @@ export default defineConfig({
     outDir: 'dist',
     emptyOutDir: true,
     target: 'es2022',
+    rollupOptions: {
+      output: {
+        /**
+         * three 与 maplibre 单独成块。
+         *
+         * 之前它们和 S3M 内核挤在同一个 1.86 MB（gzip 511 KB）的 chunk 里，每次发版
+         * 都要整块重下、整块重新解析（实测单个 300 ms 长任务）。拆开之后：
+         *   ① 这两坨几乎不随业务改动，跨版本能命中浏览器缓存；
+         *   ② 三个块并行下载，弱网下比一个大块更快到齐；
+         *   ③ 解析压力摊到三个任务上，不再是一个 300 ms 的长任务堵住主线程。
+         */
+        manualChunks(id: string) {
+          // 注意别用 includes('three')：packages/s3m-three 里全是这个名字
+          if (id.includes('node_modules/three/')) return 'three';
+          if (id.includes('node_modules/maplibre-gl/')) return 'maplibre';
+          return undefined;
+        },
+      },
+    },
   },
   ssr: {
     // SSR 打包时不能 external：Node 里 import 'solid-js' 拿到的是浏览器构建

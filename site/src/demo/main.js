@@ -132,6 +132,149 @@ const terrainState = {
   groundOffset: 0,
 };
 
+/* ------------------------------------------------------------------ 底图源 */
+
+/**
+ * 可选底图。面板「底图」下拉切换，也能用 `?basemap=` 直接指定；默认 `esri`（Esri 浅灰）。
+ *
+ * 为什么默认不再用 OSM 官方站：
+ *   ① tile.openstreetmap.org 的使用政策不欢迎大体量站点直连，demo 挂在 GitHub Pages 上
+ *      天天被陌生人打开，正好是它明确劝阻的那类用法；
+ *   ② 国内直连慢，而它又恰好卡在「模型什么时候出现」的路径上。
+ *
+ * 坐标系统一是硬约束：S3M 模型的经纬度是 WGS84，底图必须也是 WGS84/CGCS2000，
+ * 否则整体偏 200~600 米、偏移量还随位置变化。所以**刻意没有高德 / 腾讯 / 百度**：
+ * 它们用 GCJ-02 / BD-09，要用得先在渲染层做纠偏，那是另一件事。
+ */
+const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services';
+
+/** 天地图 WMTS 的 URL 模板（MapLibre 不认 Leaflet 的 `{s}` 子域，只能把 8 个域名都列上） */
+const tdtTiles = (layer, key) =>
+  ['0', '1', '2', '3', '4', '5', '6', '7'].map(
+    (s) =>
+      `https://t${s}.tianditu.gov.cn/${layer}_w/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0` +
+      `&LAYER=${layer}&STYLE=default&TILEMATRIXSET=w&FORMAT=tiles` +
+      `&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}&tk=${encodeURIComponent(key)}`
+  );
+
+/**
+ * 免 key 的底图。`maxzoom` 是服务端真实层级，超过之后 MapLibre 会放大父级瓦片
+ * （Esri 浅灰只到 16，贴到楼跟前会略糊；要看细节就切街道 / 影像 / 天地图）。
+ */
+const BASEMAPS = {
+  esri: {
+    label: 'Esri 浅灰',
+    tiles: [`${ESRI}/Canvas/World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}`],
+    attribution: '© Esri, HERE, Garmin, © OpenStreetMap contributors',
+    maxzoom: 16,
+  },
+  esriStreet: {
+    label: 'Esri 街道',
+    tiles: [`${ESRI}/World_Street_Map/MapServer/tile/{z}/{y}/{x}`],
+    attribution: '© Esri, HERE, Garmin, © OpenStreetMap contributors',
+    maxzoom: 19,
+  },
+  esriImg: {
+    label: 'Esri 影像',
+    tiles: [`${ESRI}/World_Imagery/MapServer/tile/{z}/{y}/{x}`],
+    attribution: '© Esri, Maxar, Earthstar Geographics',
+    maxzoom: 19,
+  },
+  osm: {
+    label: 'OpenStreetMap',
+    tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+    attribution: '© OpenStreetMap contributors',
+    maxzoom: 19,
+  },
+  none: { label: '无底图', tiles: null, attribution: '', maxzoom: 19 },
+};
+
+const DEFAULT_BASEMAP = 'esri';
+const BASEMAP_STORE = 's3m.basemap';
+const TDT_KEY_STORE = 's3m.tdtKey';
+
+const basemapLabel = (id) => (id === 'tdt' ? '天地图' : (BASEMAPS[id]?.label ?? id));
+
+/** 底图栅格层的公共画法（压暗、降饱和，免得抢模型的视觉重心） */
+const RASTER_PAINT = {
+  'raster-opacity': 0.82,
+  'raster-saturation': -0.55,
+  'raster-brightness-max': 0.94,
+};
+
+const readStore = (k) => {
+  try {
+    return window.localStorage.getItem(k) || '';
+  } catch {
+    return '';
+  }
+};
+
+const writeStore = (k, v) => {
+  try {
+    window.localStorage.setItem(k, v);
+  } catch {
+    /* 隐私模式下 localStorage 会抛，退化成「本次会话有效」 */
+  }
+};
+
+/** 按 id 造一个底图描述；天地图缺 key 时返回 null，由调用方决定怎么提示 */
+function basemapById(id, key) {
+  if (id === 'tdt') {
+    const k = (key || '').trim();
+    // 没 key 不装作能用：宁可回落，也不要像 CARTO 那样铺一屏「API KEY REQUIRED」水印图
+    if (!k) return null;
+    return {
+      id: 'tdt',
+      label: '天地图',
+      tiles: tdtTiles('vec', k),
+      annotation: tdtTiles('cva', k),
+      attribution: '© 天地图',
+      maxzoom: 18,
+    };
+  }
+  const hit = BASEMAPS[id];
+  if (!hit) return null;
+  return {
+    id,
+    label: hit.label,
+    tiles: hit.tiles,
+    annotation: null,
+    attribution: hit.attribution,
+    maxzoom: hit.maxzoom,
+  };
+}
+
+/** 优先级：URL 参数 > 上次在面板里选的（localStorage）> 默认 CARTO */
+function resolveBasemap() {
+  const params = new URLSearchParams(window.location.search);
+  const urlId = (params.get('basemap') || '').trim().toLowerCase();
+  const urlKey = (params.get('tdtKey') || params.get('tk') || '').trim();
+  const savedKey = readStore(TDT_KEY_STORE);
+
+  if (urlId) {
+    const bm = basemapById(urlId, urlKey || savedKey);
+    if (bm) return bm;
+    return {
+      ...basemapById(DEFAULT_BASEMAP),
+      notice: `?basemap=${urlId} 需要天地图 key（加 &tdtKey=你的key），已回落到 ${basemapLabel(DEFAULT_BASEMAP)}`,
+    };
+  }
+
+  const savedId = (readStore(BASEMAP_STORE) || DEFAULT_BASEMAP).trim().toLowerCase();
+  return basemapById(savedId, savedKey) ?? basemapById(DEFAULT_BASEMAP);
+}
+
+/** 面板上选中的是「用户的意愿」，哪怕天地图还没 key（此时 BASEMAP 先回落） */
+let basemapPref = (() => {
+  const params = new URLSearchParams(window.location.search);
+  const urlId = (params.get('basemap') || '').trim().toLowerCase();
+  if (urlId) return urlId;
+  return (readStore(BASEMAP_STORE) || DEFAULT_BASEMAP).trim().toLowerCase();
+})();
+
+let BASEMAP = resolveBasemap();
+
 function setStatus(text, kind) {
   $('statusText').textContent = text;
   $('dot').className = kind ?? '';
@@ -144,62 +287,173 @@ function setStatus(text, kind) {
 }
 
 function baseStyle() {
-  return {
-    version: 8,
-    sources: {
-      osm: {
-        type: 'raster',
-        tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-        tileSize: 256,
-        maxzoom: 19,
-        attribution: '© OpenStreetMap contributors',
-      },
-      // 地形 DEM 源（AWS Terrarium，公开免 key）
-      dem: {
-        ...DEM_SOURCE,
-        attribution: 'Elevation: AWS Terrain Tiles',
-      },
-      // 地形表面纹理源：地形网格的贴图来自 RTT 栈（raster/hillshade/background 等层
-      // 渲染进 FBO 的结果），所以必须有一个 raster 层为它供图。
-      // 独立于 osm 源 ⇒ 「隐藏地图底图」时地形仍能出图。
-      terrainTex: {
-        type: 'raster',
-        tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
-        tileSize: 256,
-        maxzoom: 19,
-      },
+  const tiles = BASEMAP.tiles;
+  const noBasemap = !tiles;
+
+  const sources = {
+    // 地形 DEM 源（AWS Terrarium，公开免 key）
+    dem: {
+      ...DEM_SOURCE,
+      attribution: 'Elevation: AWS Terrain Tiles',
     },
-    layers: [
-      { id: 'bg', type: 'background', paint: { 'background-color': '#e9edf2' } },
-      {
-        id: 'osm',
-        type: 'raster',
-        source: 'osm',
-        paint: { 'raster-opacity': 0.82, 'raster-saturation': -0.55, 'raster-brightness-max': 0.94 },
-      },
-      {
-        // 地形纹理层：只在地形开启时可见，视觉上盖在 osm 之上给地形面供图
-        id: 'terrainTex',
-        type: 'raster',
-        source: 'terrainTex',
-        layout: { visibility: 'none' },
-        paint: { 'raster-opacity': 0.82, 'raster-saturation': -0.55, 'raster-brightness-max': 0.94 },
-      },
-      {
-        id: 'terrainShade',
-        type: 'hillshade',
-        source: 'dem',
-        layout: { visibility: 'none' },
-        paint: {
-          'hillshade-shadow-color': '#0b1220',
-          'hillshade-highlight-color': '#8fb6d8',
-          'hillshade-accent-color': '#4a6fa5',
-          'hillshade-exaggeration': 0.4,
-          'hillshade-illumination-direction': 335,
-        },
-      },
-    ],
   };
+  const layers = [{ id: 'bg', type: 'background', paint: { 'background-color': '#e9edf2' } }];
+
+  if (!noBasemap) {
+    sources.osm = {
+      type: 'raster',
+      tiles,
+      tileSize: 256,
+      maxzoom: BASEMAP.maxzoom ?? 19,
+      attribution: BASEMAP.attribution,
+    };
+    // 地形表面纹理源：地形网格的贴图来自 RTT 栈（raster/hillshade/background 等层
+    // 渲染进 FBO 的结果），所以必须有一个 raster 层为它供图。
+    // 独立于 osm 源 ⇒ 「隐藏地图底图」时地形仍能出图。
+    sources.terrainTex = {
+      type: 'raster',
+      tiles,
+      tileSize: 256,
+      maxzoom: BASEMAP.maxzoom ?? 19,
+    };
+
+    layers.push({
+      id: 'osm',
+      type: 'raster',
+      source: 'osm',
+      paint: RASTER_PAINT,
+    });
+    layers.push({
+      // 地形纹理层：只在地形开启时可见，视觉上盖在 osm 之上给地形面供图
+      id: 'terrainTex',
+      type: 'raster',
+      source: 'terrainTex',
+      layout: { visibility: 'none' },
+      paint: RASTER_PAINT,
+    });
+  }
+
+  layers.push({
+    id: 'terrainShade',
+    type: 'hillshade',
+    source: 'dem',
+    layout: { visibility: 'none' },
+    paint: {
+      'hillshade-shadow-color': '#0b1220',
+      'hillshade-highlight-color': '#8fb6d8',
+      'hillshade-accent-color': '#4a6fa5',
+      'hillshade-exaggeration': 0.4,
+      'hillshade-illumination-direction': 335,
+    },
+  });
+
+  // 天地图的注记是独立一层（cva）。只接 vec 会是一张「哑图」：路网有、地名没有
+  if (BASEMAP.annotation) {
+    sources.tdtAnno = {
+      type: 'raster',
+      tiles: BASEMAP.annotation,
+      tileSize: 256,
+      maxzoom: BASEMAP.maxzoom ?? 18,
+    };
+    layers.push({ id: 'tdtAnno', type: 'raster', source: 'tdtAnno' });
+  }
+
+  return { version: 8, sources, layers };
+}
+
+/* ---------------------------------------------------------------- 底图运行时切换 */
+
+/** 底图占的图层 / 源 id，切换时按这个顺序拆（先层后源） */
+const BASEMAP_LAYERS = ['tdtAnno', 'terrainTex', 'osm'];
+
+/** 面板下拉与 key 输入框跟着当前状态走 */
+function syncBasemapUI() {
+  const sel = $('optBasemap');
+  if (sel) sel.value = basemapPref;
+  const row = $('tdtKeyRow');
+  if (row) row.style.display = basemapPref === 'tdt' ? '' : 'none';
+  const input = $('tdtKey');
+  if (input && !input.value) input.value = readStore(TDT_KEY_STORE);
+}
+
+/**
+ * 运行时换底图：拆掉旧的栅格层 / 源，按新描述重建。
+ *
+ * 不走 `map.setStyle()` —— 那会连着把 S3M 这个 custom layer（以及地形、正交接管
+ * 这些运行时状态）一起清掉。这里只碰 `baseStyle()` 里的那三个栅格层，插在
+ * `terrainShade` 之前，保证底图永远压在模型和地形阴影之下。
+ */
+function applyBasemap(id) {
+  basemapPref = id;
+  writeStore(BASEMAP_STORE, id);
+
+  const next = basemapById(id, readStore(TDT_KEY_STORE));
+  syncBasemapUI();
+  if (!next) {
+    // 天地图还没 key：底图保持原样，把 key 输入框亮出来等人填
+    setStatus('天地图需要 key：填在「底图」下面那个输入框，回车生效', 'err');
+    return;
+  }
+  BASEMAP = next;
+
+  for (const layerId of BASEMAP_LAYERS) if (map.getLayer(layerId)) map.removeLayer(layerId);
+  for (const srcId of BASEMAP_LAYERS) if (map.getSource(srcId)) map.removeSource(srcId);
+
+  if (BASEMAP.tiles) {
+    const before = map.getLayer('terrainShade') ? 'terrainShade' : undefined;
+    map.addSource('osm', {
+      type: 'raster',
+      tiles: BASEMAP.tiles,
+      tileSize: 256,
+      maxzoom: BASEMAP.maxzoom ?? 19,
+      attribution: BASEMAP.attribution,
+    });
+    map.addLayer({ id: 'osm', type: 'raster', source: 'osm', paint: RASTER_PAINT }, before);
+
+    map.addSource('terrainTex', {
+      type: 'raster',
+      tiles: BASEMAP.tiles,
+      tileSize: 256,
+      maxzoom: BASEMAP.maxzoom ?? 19,
+    });
+    map.addLayer(
+      { id: 'terrainTex', type: 'raster', source: 'terrainTex', layout: { visibility: 'none' }, paint: RASTER_PAINT },
+      before
+    );
+
+    // 天地图的注记层要压在地形阴影之上、模型之下
+    if (BASEMAP.annotation) {
+      map.addSource('tdtAnno', {
+        type: 'raster',
+        tiles: BASEMAP.annotation,
+        tileSize: 256,
+        maxzoom: BASEMAP.maxzoom ?? 18,
+      });
+      map.addLayer({ id: 'tdtAnno', type: 'raster', source: 'tdtAnno' }, map.getLayer('s3m') ? 's3m' : undefined);
+    }
+  }
+
+  updateBasemapVisibility();
+  setStatus(BASEMAP.tiles ? `底图：${BASEMAP.label}` : '已关掉底图，只显示模型', 'ok');
+}
+
+function initBasemapControls() {
+  syncBasemapUI();
+
+  const sel = $('optBasemap');
+  if (sel) sel.addEventListener('change', (e) => applyBasemap(e.target.value));
+
+  const input = $('tdtKey');
+  if (input) {
+    const commit = () => {
+      writeStore(TDT_KEY_STORE, input.value.trim());
+      if (basemapPref === 'tdt') applyBasemap('tdt');
+    };
+    input.addEventListener('change', commit);
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') commit();
+    });
+  }
 }
 
 /* ---------------------------------------------------------------- 地图与图层初始化 */
@@ -254,7 +508,9 @@ const layer = new S3MLayer({
   // 最粗一级的雪碧图（一栋楼只剩十几像素、再被 uv 平铺几十遍）。
   // ?maxTiles=Infinity 可关掉淘汰，用来区分「消失是淘汰还是渲染」。
   maxTiles: layerMaxTiles,
-  maxConcurrent: 4,
+  // 6 = 浏览器对同一 origin 的并发连接上限（HTTP/1.1）。给 4 时每一波都会空出两个
+  // 连接槽白等；大服务（几十块根瓦片）首屏能明显看到「一波一波」地来。
+  maxConcurrent: 6,
   style: {
     mode: STYLE.TEXTURE,
     colorA: '#ffffff', // 顶面高亮暖白
@@ -957,7 +1213,7 @@ function updateBasemapVisibility() {
   const hide = !!$('optHideBasemap')?.checked || orthoMode === 'local';
   const isUnderground = !!$('optUnderground')?.checked;
 
-  for (const id of ['bg', 'osm']) {
+  for (const id of ['bg', 'osm', 'tdtAnno']) {
     if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', hide ? 'none' : 'visible');
   }
 
@@ -2218,11 +2474,29 @@ layer.onPick = (f) => renderFeature(f);
 
 /* ---------------------------------------------------------------- 地图加载入口 */
 
-map.on('load', async () => {
+/**
+ * 为什么是 `style.load` 而不是 `load`。
+ *
+ * `load` 的语义是「样式 + 首屏资源全部到位、首帧也画完了」，其中「首屏资源」包含
+ * 底图的每一张栅格瓦片。挂在 `load` 上意味着：底图没下完之前 `addLayer` 根本不会执行，
+ * S3M 连 `.scp` 都不会请求。实测（本地回环、网络极好）白等 0.7s；国内直连 OSM 时
+ * 这段没有上限，底图拉不到模型就一直不出现。
+ *
+ * `style.load` 只等样式解析完（本 demo 的样式是内联对象，几乎立刻触发），
+ * 于是 S3M 的配置/瓦片请求可以和底图瓦片并行跑。底图仍是异步补上来的，
+ * 视觉上就是「模型先出来、底图随后铺满」。
+ */
+map.once('style.load', async () => {
   // ?nos3m=1：只留 MapLibre 底图，用来隔离「正交接管」与「S3M 层」各自的问题
   const nos3m = new URLSearchParams(window.location.search).get('nos3m') === '1';
   if (!nos3m) map.addLayer(layer);
   initSourceControls();
+  initBasemapControls();
+  // 参数写错时不静默：状态栏每秒都被 onStats 覆盖，这条提示放到底部 hint 上才留得住
+  if (BASEMAP.notice) {
+    console.warn('[basemap]', BASEMAP.notice);
+    if ($('hint')) $('hint').textContent = BASEMAP.notice;
+  }
 
   // ?ortho=local 只把模型换正交；?ortho=global 接管整个 MapLibre（=1 等同 local）
   const orthoParam = new URLSearchParams(window.location.search).get('ortho');

@@ -1694,6 +1694,8 @@ export class S3MViewer {
   /** @internal 一块瓦片落地：写 userData / 拾取表 / SMID 索引 / 高度 / 棱线 / 样式继承 */
   private _registerTile(node: TileNode, entry: S3MDatasetEntry): void {
     this._tiles.registerTile(node, entry);
+    // 材质一落地就发起预热，而不是等这一帧画完（见 `_prewarmShadingSoon`）。
+    this._prewarmShadingSoon();
   }
 
   /** @internal 瓦片被淘汰：从拾取表与场景里摘掉，并释放几何与材质显存 */
@@ -2752,12 +2754,25 @@ export class S3MViewer {
       this.stats.loading > 0 ||
       tilesetChanged;
 
-    // 首帧画完、场上有材质了，再把另一种 shading 变体编出来（异步，不挡当前帧）
-    if (this._prewarmShadingEnabled && !this._shadingPrewarmed && this._picks.pickables.size > 0) {
-      void this.prewarmShading();
-    }
+    // 兜底：材质不是经 `_registerTile` 进来的路径（如原地重建材质）也能热一次。
+    // 正常路径上 `_registerTile` 已经发起过，这里有 `_shadingPrewarmed` 挡着。
+    this._prewarmShadingSoon();
 
     return needsNextFrame;
+  }
+
+  /**
+   * 发起一次着色器预热（没有材质 / 没挂载就什么都不做）。
+   *
+   * 时机很要紧：`compileAsync` 内部只把 program 交给 GPU 进程去链（`linkProgram` 立即返回），
+   * 真正的等待发生在 `compileAsync` 的轮询里，不占 JS。所以越早发起越好 —— 放在
+   * `renderFrame` 末尾时那一帧已经画完了，首帧的 `useProgram` 仍要同步等链接完成
+   * （实测主线程卡 ~300ms，CPU profile 里 `getProgramInfoLog` 独占 35%）。
+   */
+  private _prewarmShadingSoon(): void {
+    if (!this._prewarmShadingEnabled || this._shadingPrewarmed) return;
+    // `prewarmShading` 自己没有材质时也会安全返回，这里只做「开关 + 只热一次」的门禁
+    void this.prewarmShading();
   }
 
   /* ---------------------------------------------------------------- 只读属性 */

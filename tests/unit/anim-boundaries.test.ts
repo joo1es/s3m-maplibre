@@ -178,6 +178,66 @@ describe('2. shading 由 uniform 驱动（零重编译）', () => {
     v.dispose();
   });
 
+  /**
+   * 预热的时机比「预热本身」更要紧。
+   *
+   * 老位置在 `renderFrame` 末尾：那一帧已经画完了，`void prewarmShading()` 只能帮到
+   * 下一帧。首帧的 `useProgram` 照样要同步等 program 链接完成（实测主线程卡 ~300ms，
+   * CPU profile 里 `getProgramInfoLog` 独占 35%）。放到「瓦片注册之后、下一次重绘之前」，
+   * `compileAsync` 只负责发起链接，真正的编译由 GPU 进程并行做，和 rAF 重叠掉。
+   */
+  test('瓦片一注册就预热，不等这一帧画完', () => {
+    const v = makeViewer();
+    const order: string[] = [];
+    (v as unknown as { renderer: unknown }).renderer = {
+      compileAsync: async () => {
+        order.push('compile');
+      },
+    };
+    (v as unknown as { camera: THREE.Camera }).camera = new THREE.PerspectiveCamera();
+
+    expect((v as unknown as { _shadingPrewarmed: boolean })._shadingPrewarmed).toBe(false);
+    registerMesh(v, 901); // 材质落地
+
+    expect(order).toEqual(['compile']); // 注册当帧就发起，不用等到 renderFrame 末尾
+    expect((v as unknown as { _shadingPrewarmed: boolean })._shadingPrewarmed).toBe(true);
+    v.dispose();
+  });
+
+  test('后续瓦片不会重复预热（program 只有一份，反复 compile 是纯浪费）', () => {
+    const v = makeViewer();
+    let calls = 0;
+    (v as unknown as { renderer: unknown }).renderer = {
+      compileAsync: async () => {
+        calls++;
+      },
+    };
+    (v as unknown as { camera: THREE.Camera }).camera = new THREE.PerspectiveCamera();
+
+    registerMesh(v, 902);
+    registerMesh(v, 903);
+    registerMesh(v, 904);
+    expect(calls).toBe(1);
+    v.dispose();
+  });
+
+  test('没挂载（没有 camera / renderer）时注册瓦片不预热，挂载后再补上', () => {
+    const v = makeViewer();
+    let calls = 0;
+    registerMesh(v, 905); // 此时 camera / renderer 都还没有
+    expect((v as unknown as { _shadingPrewarmed: boolean })._shadingPrewarmed).toBe(false);
+
+    (v as unknown as { renderer: unknown }).renderer = {
+      compileAsync: async () => {
+        calls++;
+      },
+    };
+    (v as unknown as { camera: THREE.Camera }).camera = new THREE.PerspectiveCamera();
+    (v as unknown as { _prewarmShadingSoon: () => void })._prewarmShadingSoon();
+    expect(calls).toBe(1);
+    v.dispose();
+  });
+
   test('setStyle smooth 只翻 uniform，flatShading 与 program 不动', async () => {
     const v = makeViewer();
     v.setStyle({ shading: 'smooth' });

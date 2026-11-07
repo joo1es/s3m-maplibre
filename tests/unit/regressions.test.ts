@@ -187,6 +187,63 @@ describe('3. 瓦片失败退避重试，超次数才进 failed', () => {
   });
 });
 
+describe('3b. HTTP 404 / 410 是确定性答案，不做退避重试', () => {
+  /**
+   * 数据集里 pageLOD 引用了导出时根本不存在的子块（CBD 样例就是），
+   * 旧逻辑把它当瞬时故障：404 → 等 800ms → 再 404 → 再等 1600ms → 才进 failed。
+   * 一次 404 换不来 2.4 秒的「加载中」，只会让状态栏一直挂着、首屏永远到不了「就绪」。
+   */
+  test('404 只请求一次，当场进 failed，不再退避重试', async () => {
+    const ts = mkTileset({ maxRetries: 2, onError: () => {} });
+
+    let fakeNow = 1000;
+    performance.now = () => fakeNow;
+    let calls = 0;
+    globalThis.fetch = (async () => {
+      calls++;
+      return new Response('not found', { status: 404 });
+    }) as never;
+
+    const url = 'http://example.com/gone.s3mb';
+    await (ts as any)._load(url);
+
+    expect(calls).toBe(1);
+    expect(ts.failed.has(url)).toBe(true);
+    expect((ts as any).stats.failed).toBe(1);
+
+    // 时间过去多久都不该再请求：404 不会因为等一会儿变成 200
+    fakeNow += 60000;
+    (ts as any)._enqueue(url);
+    await (ts as any)._load(url);
+    expect(calls).toBe(1);
+  });
+
+  test('410 同样按永久错误处理；普通 5xx 仍然重试', async () => {
+    const ts = mkTileset({ maxRetries: 2, onError: () => {} });
+    let fakeNow = 1000;
+    performance.now = () => fakeNow;
+
+    let gone = 0;
+    globalThis.fetch = (async () => {
+      gone++;
+      return new Response('gone', { status: 410 });
+    }) as never;
+    await (ts as any)._load('http://example.com/410.s3mb');
+    expect(gone).toBe(1);
+    expect(ts.failed.has('http://example.com/410.s3mb')).toBe(true);
+
+    const ts2 = mkTileset({ maxRetries: 2, onError: () => {} });
+    let flaky = 0;
+    globalThis.fetch = (async () => {
+      flaky++;
+      return new Response('boom', { status: 503 });
+    }) as never;
+    await (ts2 as any)._load('http://example.com/503.s3mb');
+    expect(flaky).toBe(1);
+    expect(ts2.failed.size).toBe(0); // 5xx 是瞬时故障，还要重试
+  });
+});
+
 describe('4. 拾取 ID 回收复用（2 字节上限）', () => {
   test('释放的 ID 会被下一个网格复用，不会无限增长', () => {
     const layer = new S3MLayer({ configUrl: 'http://example.com/a.scp' });

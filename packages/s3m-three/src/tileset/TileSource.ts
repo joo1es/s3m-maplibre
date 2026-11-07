@@ -22,6 +22,22 @@ import type { TileGeometryData } from '../core/TileGeometry.js';
 import { getSharedS3MWorker, S3MWorkerClient, WorkerDeadError } from '../worker/S3MWorkerClient.js';
 import type { BuildTileFn } from './types.js';
 
+/**
+ * 瓦片在服务器上根本不存在（HTTP 404 / 410）。
+ *
+ * 标 `permanent` 让调度器**不要**退避重试：S3M 数据集的 pageLOD 里常年引用
+ * 「导出时就没有生成」的子块（CBD 样例的 `_0000_0000.s3mb` 就是一例），
+ * 重试再多也只会把状态栏的「加载中」多拖 2.4 秒（800ms + 1600ms 两轮退避），
+ * 最后仍要在「N 个瓦片失败」里报出来。缺块是确定性答案，一次请求记进 failed 即可。
+ */
+export class MissingTileError extends Error {
+  readonly permanent = true;
+  constructor(message: string) {
+    super(message);
+    this.name = 'MissingTileError';
+  }
+}
+
 /** 一次取源的产物：解析好的瓦片 + 它来自哪个块文件、是不是块容器 */
 export interface LoadedTileSource {
   tile: ParsedTile;
@@ -100,7 +116,10 @@ export class TileSource {
 
     const res = await authFetch(baseUrl, this.host.authenticate, 'tile');
     if (!res.ok) {
-      throw new Error(`HTTP ${res.status} 加载瓦片失败: ${baseUrl}`);
+      const message = `HTTP ${res.status} 加载瓦片失败: ${baseUrl}`;
+      // 404 / 410 = 服务器明确说「没有这块」，退避重试不会把它变成 200。
+      // 其余状态码（5xx、429、401 过期刷新后的重试）仍按瞬时故障走退避。
+      throw res.status === 404 || res.status === 410 ? new MissingTileError(message) : new Error(message);
     }
     const ctype = res.headers.get('content-type') || '';
     if (ctype.includes('text/html')) {
