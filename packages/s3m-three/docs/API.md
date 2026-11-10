@@ -581,7 +581,7 @@ interface Stats {
 
 | kind | 数据 | 现状 |
 |:---|:---|:---|
-| `gaussian-splatting-points` | 3DGS（`dataType = "3DGaussianSplatting"`） | **按 Points 渲染**。`gsScale` / `gsRotation` 的量化格式未标定，画不出 EWA splatting，详见 [FORMAT-NOTES 第九节](./FORMAT-NOTES.md#九未标定字段d-级) |
+| `gaussian-splatting-points` | 3DGS（`dataType = "3DGaussianSplatting"`） | **按 Points 渲染**。只在数据声明是 3DGS、骨架里却真的没有 `gsScale` / `gsRotation` 两条流时才触发；量化格式早已标定，MeshOpt（u8 log）与 Draco（f32 直读）两种压缩都走正常泼溅路径，见 FORMAT-NOTES 第九节 |
 
 三层可见，任选自己需要的：
 

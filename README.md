@@ -77,7 +77,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 深度策略 | ✅ | `depthMode` 支持 `'scene'`（保留宿主深度，默认，离散建筑/管线被地形遮挡）、`'clear'`（先清深度再画，贴地倾斜摄影/开挖/大范围 DEM 化模型消除共面 z-fighting）、`'auto'`（按 ground / OSGB 倾斜摄影自动推断） |
 | 深度遮挡 | ✅ | **深度来源可替换**：本层全程不清深度缓冲（`autoClear = false`），谁写了更近的深度谁就遮挡建筑。地形只是其中一个来源（宿主 `setTerrain` + DEM，山体挡楼）；自带物理地表代理（`ground.occlude`）是另一个来源，能把地下结构真正切掉，两者可叠加 |
 | Draco 压缩几何 | ✅ 点云/网格 | v3.01 点云与三角网格（TRIANGULAR_MESH）分支已解码（内联 wasm、按需加载，点云解出分类码/强度/权重，网格逐面解出索引与法线交由 THREE.Mesh 渲染）；容器与规范描述对不上，按真实瓦片标定，见[核心格式标定说明](#核心格式逆向与标定说明) |
-| 高斯泼溅服务（`3DGaussianSplatting`） | ✅ 完整 | 已标定 gsScale / gsRotation 量化格式，支持各向异性高斯片、协方差计算、深度排序与点选拾取 |
+| 高斯泼溅服务（`3DGaussianSplatting`） | ✅ 完整 | MeshOpt / Draco 两种压缩都走正常泼溅路径：前者是已标定的 u8 log 量化，后者是无损 f32 直读；支持各向异性高斯片、协方差计算、深度排序与点选拾取 |
 | SuperMapCache / S3M 1.x（`.s3m`） | ✅ | 几何、UV、索引、DXT1 纹理、整棵 LOD 树都能解；瓦片是 `s3m\0` + zlib 的老容器，走独立解析器 `core/S3M1Parser.ts`。见[线上服务的三种发布形态](#线上服务的三种发布形态) |
 | CRN 纹理（`compressType` 26 / 27 / 38001 / 50000） | ✅ | 内联 crunch wasm 转 DXT 后走同一套解码，只在遇到时懒加载；已在 SuperMap Online 公有服务实测 |
 | KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
