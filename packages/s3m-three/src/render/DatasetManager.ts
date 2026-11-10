@@ -9,6 +9,7 @@
  */
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
+import type { AnchorOverride } from '../tileset/types.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import type { Anchor } from '../core/types.js';
 import type { UnsupportedPolicy } from '../core/degradations.js';
@@ -39,6 +40,9 @@ export function normalizeDatasetOptions(options: S3MViewerOptions): S3MDatasetOp
       polygonOffset: options.polygonOffset,
       lodTransition: options.lodTransition,
       fallbackOffset: options.fallbackOffset,
+      // 图层级锚点只给单数据集简写用：多数据集时逐个在 datasets 里指定，
+      // 否则一个锚点会把所有（含正常经纬度）数据集一起搬走。
+      ...(options.anchorOverride ? { anchorOverride: options.anchorOverride } : {}),
     }];
   return [];
 }
@@ -48,6 +52,11 @@ export interface S3MDatasetOptions {
   id: string;
   name?: string;
   configUrl: string;
+  /**
+   * 显式锚点覆盖：给没有地理参考的局部米数据指定经纬度（度 / 米）。
+   * 默认关闭，不传时 config 与锚点的解析与旧版逐字一致。见 S3MTilesetOptions.anchorOverride。
+   */
+  anchorOverride?: AnchorOverride;
   visible?: boolean;
   maxTiles?: number;
   /** 该数据集驻留三角形总数的软上限（默认跟随图层级设置；都不传则不限制） */
@@ -317,6 +326,7 @@ export class DatasetManager {
 
     const tileset = new S3MTileset({
       configUrl: ds.configUrl,
+      anchorOverride: ds.anchorOverride,
       maxTiles: ds.maxTiles ?? maxTiles,
       maxConcurrent: maxConcurrent,
       maxTriangles: ds.maxTriangles ?? maxTriangles,

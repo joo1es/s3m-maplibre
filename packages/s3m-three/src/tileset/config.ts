@@ -5,7 +5,9 @@
  * 从 `S3MTileset.ts` 原样搬出来（issue #27 的 P1 阶段），行为逐字未变。
  */
 import type { Anchor } from '../core/types.js';
-import type { DatasetKind, GeoBounds } from './types.js';
+import type { AnchorOverride, DatasetKind, GeoBounds, SpatialReference } from './types.js';
+
+export type { AnchorOverride, SpatialReference } from './types.js';
 
 /** 每度对应的米数（等距圆柱近似），与 demo 里量测瓦片尺寸用的是同一套系数 */
 const METERS_PER_DEG_LAT = 110540;
@@ -183,4 +185,100 @@ export function resolveAnchor(config: Record<string, unknown>): Anchor {
     return { lon: centerLon!, lat: centerLat!, height: z };
   }
   return { lon: p!.x!, lat: p!.y!, height: z };
+}
+
+/**
+ * 读 .scp 的空间参考字段。
+ *
+ * 只做记录与判别：库不引 proj4、不做 EPSG 反算——按超图官方 JS SDK 的口径，
+ * 投影由生产端负责，运行时最多按 `position.unit` 决定「要不要再投一次」
+ * （S3M_JS/S3M_module/S3MTiles/S3MTilesLayer.js:410-425）。这里把信息暴露出来，
+ * 让上层能识别「这份数据不是经纬度」，而不是等模型被摆到大西洋才纳闷。
+ */
+export function readSpatialReference(config: Record<string, unknown>): SpatialReference {
+  const rawCrs = config.crs;
+  const crs =
+    typeof rawCrs === 'string' && rawCrs.trim()
+      ? rawCrs.trim()
+      : typeof rawCrs === 'number' && Number.isFinite(rawCrs)
+        ? `epsg:${rawCrs}`
+        : null;
+
+  let epsg: number | null = null;
+  if (crs) {
+    const m = /^epsg\s*:\s*(\d+)/i.exec(crs);
+    if (m) epsg = Number(m[1]);
+  }
+
+  const pos = config.position as { units?: unknown; unit?: unknown } | null | undefined;
+  const rawUnit = pos?.units ?? pos?.unit;
+  const unit = typeof rawUnit === 'string' && rawUnit.trim() ? rawUnit.trim() : null;
+
+  const ext = config.extensions as { crs?: unknown } | null | undefined;
+  const wkt = ext && typeof ext === 'object' && typeof ext.crs === 'string' ? ext.crs : null;
+
+  // 只有明确的米制单位才算非地理数据；缺字段按旧行为（经纬度）兜底
+  const isGeographic = unit === null || !/^(meter|metre|m)s?$/i.test(unit);
+  return { crs, epsg, unit, wkt, isGeographic };
+}
+
+function normalizeOverride(o: AnchorOverride): Required<AnchorOverride> {
+  const lon = o?.lon;
+  const lat = o?.lat;
+  const height = o?.height;
+  if (typeof lon !== 'number' || !Number.isFinite(lon) || Math.abs(lon) > 180) {
+    throw new RangeError('[s3m] anchorOverride.lon 必须是 [-180, 180] 内的有限数（度）');
+  }
+  if (typeof lat !== 'number' || !Number.isFinite(lat) || Math.abs(lat) > 90) {
+    throw new RangeError('[s3m] anchorOverride.lat 必须是 [-90, 90] 内的有限数（度）');
+  }
+  if (height !== undefined && (typeof height !== 'number' || !Number.isFinite(height))) {
+    throw new RangeError('[s3m] anchorOverride.height 必须是有限数（米）');
+  }
+  return { lon, lat, height: height ?? 0 };
+}
+
+/**
+ * 把「没有地理参考」的数据整体挂到指定经纬度上：改写 position，并把 geoBounds
+ * 一起搬过去，否则 `getBounds()` / `fitBounds()` 仍会拿原始米值当经纬度、把镜头
+ * 甩到几内亚湾。
+ *
+ * 顶点不动：它们本来就是相对 position 原点的局部 ENU 米，换原点后照常使用。
+ * 不修改入参，返回新 config —— App 还能拿原始 config 做诊断。
+ */
+export function applyAnchorOverride(
+  config: Record<string, unknown>,
+  override: AnchorOverride
+): Record<string, unknown> {
+  const { lon, lat, height } = normalizeOverride(override);
+  const ref = readSpatialReference(config);
+  const src = resolveAnchor(config);
+  const b = usableGeoBounds(config.geoBounds);
+
+  let geoBounds: unknown = config.geoBounds;
+  if (b) {
+    // 平面数据的框是米：相对原点的偏移按等距圆柱近似换算成度，与 OSGB XML
+    // 的 BoundingBox 反算用同一套系数。地理数据的框本来就是度：只平移不缩放，
+    // 否则跨度会被当成米压扁。
+    const kx = METERS_PER_DEG_LON_EQUATOR * Math.max(Math.cos((lat * Math.PI) / 180), 1e-6);
+    const ky = METERS_PER_DEG_LAT;
+    const toDeg = (v: number, horizontal: boolean) =>
+      ref.isGeographic ? v : v / (horizontal ? kx : ky);
+    const cx = (b.left + b.right) / 2 - src.lon;
+    const cy = (b.bottom + b.top) / 2 - src.lat;
+    const hw = (b.right - b.left) / 2;
+    const hh = (b.top - b.bottom) / 2;
+    geoBounds = {
+      left: lon + toDeg(cx - hw, true),
+      right: lon + toDeg(cx + hw, true),
+      bottom: lat + toDeg(cy - hh, false),
+      top: lat + toDeg(cy + hh, false),
+    };
+  }
+
+  return {
+    ...config,
+    position: { point3D: { x: lon, y: lat, z: height }, unit: 'Degree' },
+    geoBounds,
+  };
 }
