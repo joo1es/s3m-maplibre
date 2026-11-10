@@ -162,6 +162,7 @@ new S3MViewer(options?: S3MViewerOptions)
 | `style` | `Partial<S3MStyle>` | 见[样式](#样式s3mstyle) | 初始样式 |
 | `ground` | `GroundOptions` | — | 3D 物理地表面 / 基坑开挖配置 |
 | `pickable` | `boolean` | `true` | 是否响应拾取 |
+| `anchorOverride` | `{ lon: number; lat: number; height?: number }` | 不传 = 关闭 | 给没有地理参考的局部米数据指定经纬度锚点（只对 `configUrl` 单数据集简写生效；多数据集请逐个在 `S3MDatasetOptions.anchorOverride` 上指定）。不传时 config / anchor 解析路径与旧版逐字一致，详见[坐标系与锚点覆盖](#坐标系与锚点覆盖) |
 | `maxTiles` | `number` | `64` | 每个数据集驻留瓦片上限，超了淘汰最久没用的（不是停止加载） |
 | `maxTriangles` | `number` | `Infinity` | 每个数据集**驻留三角形总数**的软上限（不限制）。`maxTiles` 数不了「一块精模几十万面」，这条按实际面数做刹车，走同一套 make-before-break 淘汰，不开洞 |
 | `maxMemory` | `number` | `Infinity` | 每个数据集**驻留显存/内存字节数**的软上限（不限制）。包含几何缓冲精确字节与纹理显存估计，超限走同一套 make-before-break 淘汰，不开洞 |
@@ -603,7 +604,43 @@ viewer.addDataset({ /* ... */, unsupported: 'throw' })    // 数据集级覆盖
 
 纯函数 `planDegradations(incoming, known, policy)` 也导出了，需要自定义聚合（比如按数据集分行显示）时可以直接用。
 
-### 投影
+### 坐标系与锚点覆盖
+
+`s3m-three` 假定 `.scp` 的 `position` 是 WGS84 经纬度（度）+ 高程米，瓦片顶点是相对
+该锚点的局部 ENU 米。官方规范其实允许任意 CRS（`crs: epsg:xxxx` / `wkt:...`），
+并且 `position.unit` 可以是 `Meter` —— 这类数据只有局部工程坐标，没有经纬度。
+库不做 EPSG 反算（投影由生产端负责），但提供两个东西：
+
+```ts
+// 1. 显式把局部米原点挂到指定经纬度（默认关闭）
+new S3MViewer({
+  configUrl: './sculpture.scp',
+  anchorOverride: { lon: 116.4581, lat: 39.9123, height: 0 },
+});
+
+// 2. 读取 / 预处理 .scp 的空间参考
+import { readSpatialReference, applyAnchorOverride } from 's3m-three';
+const ref = readSpatialReference(config);   // { crs, epsg, unit, wkt, isGeographic }
+const patched = applyAnchorOverride(config, { lon: 116.4581, lat: 39.9123 });
+```
+
+`applyAnchorOverride` 是纯函数：改写 `position`，并把 `geoBounds` 一起平移
+（地理数据按度，平面数据按等距圆柱近似从米换算成度），不修改入参。
+`S3MTileset.init()` 在 opt-in 时对它调用一次，因此 `getBounds()`、
+`usableGeoBounds()` 以及下游 fitBounds 都拿到一致的新框。
+
+`S3MTileset.spatialRef` 是 getter（不占实例公共字段，避免挤掉
+`tileset-api-surface` 的快照），`init()` 后可读。非地理数据且未传
+`anchorOverride` 时 `init()` 会 `console.warn` 一次 —— 旧版会静默把米当度，
+模型形状完全正常却整块落在错误位置，比报错更难查。数值口径保持不变（不变式 ①）。
+
+**边界**：`lon / lat / height` 非有限或超范围抛 `RangeError`；`height` 省略按 0。
+`anchorOverride` 只对 `configUrl` 单数据集简写生效；用 `datasets: [...]`
+时请在每个 `S3MDatasetOptions` 上单独指定，避免一个锚点搬走全部数据集。
+
+---
+
+## 投影
 
 ```ts
 // S3MViewer 不提供投影切换：内核只消费宿主传入的 mvp。

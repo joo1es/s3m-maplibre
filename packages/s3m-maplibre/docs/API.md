@@ -119,6 +119,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `id` | `string` | `'s3m'` | 图层 id |
 | `configUrl` | `string` | — | 单数据集简写 |
 | `datasets` | `S3MDatasetOptions[]` | `[]` | 多数据集叠加 |
+| `anchorOverride` | `{ lon: number; lat: number; height?: number }` | 不传 = 关闭 | **单数据集简写专用**：给没有地理参考的局部米数据指定经纬度锚点（度 / 米）。用 `datasets` 时请在每个数据集上单独指定，详见[坐标系与锚点覆盖](#坐标系与锚点覆盖) |
 | `style` | `Partial<S3MStyle>` | 见[s3m-three 样式章节](../s3m-three/docs/API.md#样式s3mstyle) | 初始样式 |
 | `ground` | `GroundOptions` | — | 3D 物理地表面 / 基坑开挖配置 |
 | `pickable` | `boolean` | `true` | 是否响应点击 |
@@ -620,6 +621,53 @@ layer.setPresenter(null);
 - **和运动模糊互斥**。两者都想接管「场景 → 屏幕」，`setPresenter` 会自动关掉 `motionBlur` 并 warn，反过来不生效。
 
 现成例子：数据集演示面板的「后处理（presenter）」分组（高斯模糊 / 辉光），源码 `site/src/examples/post-presenter.ts`（可分离卷积 + 亮部提取 + 合成，约 300 行，含逐段注释）。
+
+---
+
+## 坐标系与锚点覆盖
+
+S3M 规范的 `.scp` 带 `crs`（`epsg:` / `wkt:`，见 `Specification/scp.json.md`）和
+`position.unit`（`Degree` / `Meter`）。超图生产端负责把成果投到目标坐标系，
+运行时不做 EPSG 反算；本库同样不引 proj4，只按锚点把局部 ENU 米挂到宿主世界坐标上。
+
+**问题**：官方 `gaussianSplatting/sculpture.scp`（3DGS 雕塑）是纯平面工程坐标 ——
+`crs=epsg:0`、`position.unit=Meter`、`extensions.crs` 写着
+`Planar Coordinate System---m`，整份数据没有经纬度。旧实现会把
+`(-2.49, 5.57, 678.92)` 当成度，模型画得出来却静默落在大西洋并抬高 678 米，
+`getBounds()` 也会把镜头一起带过去。
+
+**用法**（默认关闭，不变式 ①）：
+
+```ts
+const layer = new S3MLayer({
+  configUrl: './data/sculpture/sculpture.scp',
+  anchorOverride: { lon: 116.4581, lat: 39.9123, height: 0 },
+});
+map.addLayer(layer);
+
+// 多数据集时逐个指定（图层级锚点只给 configUrl 单数据集简写用）
+layer.addDataset({ id: 'a', configUrl: '...', anchorOverride: { lon: 116.4, lat: 39.9 } });
+```
+
+传了以后 `position` 与 `geoBounds` 会**一起**搬：地理数据的框按度平移，平面数据的框
+按等距圆柱近似从米换算成度（与 OSGB XML 的 `BoundingBox` 反算同一套系数），
+所以 `getBounds()` / `fitBounds()` 不会再跑到几内亚湾。顶点不动 —— 它们本来就是
+相对原点的局部 ENU 米，换了原点照常使用。
+
+不传时**数值口径不变**（含「米当度」这个旧行为），但 `S3MTileset.init()` 会明确
+`console.warn` 指出这份数据不是经纬度、需要 `anchorOverride`。这是把已知错误从
+「静默」改成「可见」，不是给旧调用路径加新行为。
+
+`tileset.spatialRef`（getter）返回 `{ crs, epsg, unit, wkt, isGeographic }`；
+纯函数 `readSpatialReference(config)` / `applyAnchorOverride(config, override)`
+从 `s3m-three` 导出，便于加载前自行判别或预处理。
+
+**边界**：`lon ∈ [-180, 180]`、`lat ∈ [-90, 90]`、`height` 必须有限，否则抛
+`RangeError`；`height` 省略按 0。约 1 米大的局部数据别用 `fitBounds`
+（`maxZoom` 会挡在 16.6，出来只有一两个像素），直接 `map.jumpTo({ center, zoom: 20.5 })`。
+
+**注意**：`bakeMercator` 是硬编码 Web 墨卡托的逐顶点烘焙（`core/BakeMercator.ts`），
+不经过 `GeoAdapter`；非标准世界坐标下建议显式传 `bakeMercator: false`。
 
 ---
 

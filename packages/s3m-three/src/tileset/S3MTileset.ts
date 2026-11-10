@@ -23,29 +23,41 @@ import type { Group, Texture } from 'three';
 
 import { dirOf, fixPathEncoding, resolveUrl, s3m1ChildUrl, toAbsolute } from './url.js';
 import {
+  applyAnchorOverride,
   classifyDatasetKind,
   configTypeHint,
   datasetNameOf,
   parseConfigText,
+  readSpatialReference,
   resolveAnchor,
 } from './config.js';
 import type {
+  AnchorOverride,
   BuildTileFn,
   DatasetKind,
   GeoBounds,
   S3MTilesetOptions,
+  SpatialReference,
   TileNode,
   TileVisibilityTest,
 } from './types.js';
 
 // 公共面原样保留：这些符号过去就从这个模块导出，引用方不用改一行
 export { fixPathEncoding, s3m1ChildUrl } from './url.js';
-export { classifyDatasetKind, parseConfigText, usableGeoBounds } from './config.js';
+export {
+  applyAnchorOverride,
+  classifyDatasetKind,
+  parseConfigText,
+  readSpatialReference,
+  usableGeoBounds,
+} from './config.js';
 export type {
+  AnchorOverride,
   BuildTileFn,
   DatasetKind,
   GeoBounds,
   S3MTilesetOptions,
+  SpatialReference,
   TileNode,
   TileVisibilityTest,
 } from './types.js';
@@ -60,6 +72,14 @@ export class S3MTileset {
    */
   private _blockTileIndex: Set<string> | null = null;
   anchor: Anchor = { lon: 0, lat: 0, height: 0 };
+  /**
+   * `.scp` 的空间参考信息（crs / unit / WKT），init() 后可读，只做记录不重投影。
+   * 刻意做成 getter 而不是实例字段：`tileset-api-surface` 钉住了公共自有字段清单，
+   * 新能力不该挤掉它（和 StyleController 那次同一条规矩）。
+   */
+  get spatialRef(): SpatialReference | null {
+    return this._spatialRef;
+  }
 
   readonly rootUrls: string[] = [];
   readonly nodes = new Map<string, TileNode>();
@@ -175,9 +195,14 @@ export class S3MTileset {
   private readonly _groupCache = new Map<string, S3MBlockGroupSet>();
   /** 是否允许走 Worker 解析经典 .s3mb（`useWorker` 选项，默认开） */
   private readonly _useWorker: boolean;
+  /** 显式锚点覆盖（opt-in），见 S3MTilesetOptions.anchorOverride */
+  private readonly _anchorOverride: AnchorOverride | null;
+  /** 原始 .scp 的空间参考；下划线开头，不进公共字段快照 */
+  private _spatialRef: SpatialReference | null = null;
 
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
+    this._anchorOverride = options.anchorOverride ?? null;
     this.lodRangeScale = options.lodRangeScale ?? 3.0;
     this.lodTransition = options.lodTransition ?? 'binary';
     this.fallbackOffset = {
@@ -280,7 +305,20 @@ export class S3MTileset {
     const res = await authFetch(this.configUrl, this.authenticate, 'config');
     if (!res.ok) throw new Error(`配置读取失败 ${res.status} ${this.configUrl}`);
     const text = await res.text();
-    const config = parseConfigText(text);
+    const parsed = parseConfigText(text);
+    this._spatialRef = readSpatialReference(parsed);
+
+    // 非地理坐标系（unit=Meter / 平面 crs）的数据只有局部米，没有经纬度。
+    // 旧实现会静默把米当度，模型画得出来却整块落在错误位置，比报错更难查；
+    // 这里不改旧数值（不变式 ①），但必须把病因说出来。
+    if (!this._spatialRef.isGeographic && !this._anchorOverride) {
+      console.warn('[s3m] 该数据集不是经纬度坐标系，且未提供 anchorOverride：位置会被当成经纬度解释', {
+        configUrl: this.configUrl,
+        crs: this._spatialRef.crs,
+        unit: this._spatialRef.unit,
+      });
+    }
+    const config = this._anchorOverride ? applyAnchorOverride(parsed, this._anchorOverride) : parsed;
     this.config = config;
 
     // 地形/影像缓存（金字塔栅格，无瓦片清单）不能当模型加载：走到下面「缺少 root tile」

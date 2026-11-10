@@ -12,6 +12,7 @@ import type { Path } from '../../anim/Path.js';
 import type { EasingFn, EasingName } from '../../anim/easing.js';
 import type { FeatureAttributes, GeoPackageEntry, ParsedTile, Stats } from '../../core/types.js';
 import type { UnsupportedPolicy } from '../../core/degradations.js';
+import type { AnchorOverride } from '../../tileset/types.js';
 import type { AttributeQueryOptions } from '../../core/AttributeQuery.js';
 import type { AuthenticateFn } from '../../core/AuthFetch.js';
 import type { LightingPreset } from '../lightingPreset.js';
@@ -86,6 +87,15 @@ export interface LightOptions {
 export type DepthMode = 'scene' | 'clear' | 'auto';
 
 export interface S3MViewerOptions {
+  /**
+   * 显式锚点覆盖，**默认关闭**。给「没有地理参考」的局部米数据（.scp 里
+   * `position.unit = Meter` / 非地理 crs，如官方 sculpture.scp）指定该摆在哪个经纬度。
+   *
+   * 只对 `configUrl` 单数据集简写生效；用 `datasets: [...]` 时请在每个数据集上单独
+   * 指定。库不做 EPSG 反算——投影由生产端负责，这里只是把局部 ENU 米原点挂到地图上。
+   * 不传时 config / anchor 的解析路径与旧版逐字一致，但非地理数据会明确告警。
+   */
+  anchorOverride?: AnchorOverride;
   /**
    * 本层绘制前如何处理宿主已有的深度缓冲。
    * - `'scene'`  保留（默认）。地形能遮挡本层几何，适用于建筑、管线等离散对象。

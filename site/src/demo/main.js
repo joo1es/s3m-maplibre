@@ -37,6 +37,23 @@ const PRESETS = [
     underground: false,
   },
   {
+    id: 'sculpture',
+    name: '雕塑 (平面坐标系)',
+    url: './data/sculpture/sculpture.scp',
+    color: '#7c3aed',
+    tip:
+      '官方 3DGS 样例：crs=epsg:0、position.unit=Meter 的纯局部米数据，' +
+      '没有经纬度；用 anchorOverride 显式挂到地图上',
+    align: 'origin',
+    heightOffset: 0,
+    underground: false,
+    // 这份 .scp 只有局部工程坐标，库不做 EPSG 反算，由 App 指定它该摆在哪。
+    // 不传的话旧路径会把米当度，模型静默落到几内亚湾（init 里会告警）。
+    anchorOverride: { lon: 116.4581, lat: 39.9123, height: 0 },
+    // 雕塑只有约 1 米大，fitBounds 会被 maxZoom 16.6 挡住，直接给一个近景。
+    camera: { center: [116.4581, 39.9123], zoom: 20.5, pitch: 45, bearing: -25 },
+  },
+  {
     id: 'subwayCrn',
     // 这份数据的纹理全走 CRN（v3.01，compressType=50000），用来肉眼验证 CRN 解码链路
     name: '地铁站 (CRN 纹理)',
@@ -750,6 +767,8 @@ async function loadSource(rawUrl) {
         configUrl: d.configUrl,
         align: presetAlign,
         heightOffset: presetHeightOffset,
+        // 预设指定的锚点覆盖（只有平面坐标系那类数据会带，其余为 undefined）
+        ...(matchedPreset?.anchorOverride ? { anchorOverride: matchedPreset.anchorOverride } : {}),
       });
       updateDatasetTag(d.id);
     } catch (e) {
@@ -762,8 +781,15 @@ async function loadSource(rawUrl) {
   $('optHeightOffset').value = effectiveHeight;
   $('heightOffsetVal').textContent = `${effectiveHeight > 0 ? '+' : ''}${effectiveHeight.toFixed(1)}m`;
 
-  // 定位镜头到图层范围（如预设指定了推荐倾角/偏航则应用）
-  fitLayerBounds(matchedPreset ? { pitch: matchedPreset.pitch ?? 58, bearing: matchedPreset.bearing ?? -25 } : undefined);
+  // 定位镜头到图层范围（如预设指定了推荐倾角/偏航则应用）。
+  // sculpture 这类「约 1 米」的局部坐标数据不能走 fitBounds：maxZoom 会把它挡在
+  //  16.6，出来只有一两个像素；预设直接给近景镜头。
+  if (!userMovedCamera && matchedPreset?.camera) {
+    const c = matchedPreset.camera;
+    map.jumpTo({ center: c.center, zoom: c.zoom, pitch: c.pitch ?? 58, bearing: c.bearing ?? -25 });
+  } else {
+    fitLayerBounds(matchedPreset ? { pitch: matchedPreset.pitch ?? 58, bearing: matchedPreset.bearing ?? -25 } : undefined);
+  }
 
   // 数据集换了，罩子的包围盒也要跟着换
   if ($('optCover')?.checked) refreshCover();

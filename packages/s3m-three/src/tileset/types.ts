@@ -86,9 +86,50 @@ export interface TileNode {
   stats?: { meshes: number; vertices: number; triangles: number; memory?: number };
 }
 
+/**
+ * 显式场景锚点：给「没有地理参考」的局部米数据指定该摆在哪。
+ *
+ * 官方 S3M 规范允许 .scp 用 `position.unit = Meter` + 非地理 `crs`（如 epsg:0 平面
+ * 坐标系），这类数据只有局部米坐标，没有经纬度（见 gaussianSplatting/sculpture.scp）。
+ * 库不做 EPSG 反算 —— 投影由生产端负责 —— 但需要 App 能把局部米原点挂到地图上。
+ * 数值单位：lon / lat 为**度**，height 为**米**。
+ */
+export interface AnchorOverride {
+  lon: number;
+  lat: number;
+  /** 高程（米），默认 0 */
+  height?: number;
+}
+
+/** .scp 里读出来的空间参考信息。只做记录与告警，不做任何重投影 */
+export interface SpatialReference {
+  /** 顶层 crs 原值，如 `epsg:0` / `epsg:4490` / `wkt:...`；缺失为 null */
+  crs: string | null;
+  /** `epsg:` 前缀后抠出的码；wkt / 缺失 / 非数字为 null */
+  epsg: number | null;
+  /** `position.unit`（v3.01）或 `position.units`（老版）；缺失为 null */
+  unit: string | null;
+  /** `extensions.crs` 里的 WKT / XML 文本（平面坐标系常写在这里） */
+  wkt: string | null;
+  /** 是否按经纬度解释 position。unit 缺失时按地理数据兜底（旧行为） */
+  isGeographic: boolean;
+}
+
 export interface S3MTilesetOptions {
   bakeMercator?: boolean;
   configUrl: string;
+  /**
+   * 显式锚点覆盖，**默认关闭**。
+   *
+   * 传了才生效：把 config.position / geoBounds 整体平移到指定经纬度，顶点仍按
+   * 数据集局部 ENU 米处理，于是平面工程坐标的数据能挂到地图上。不传时 config
+   * 与锚点的解析路径与改动前逐字一致（不变式 ①）——包括「米被当成度」这个旧行为，
+   * 但此时 init() 会明确告警，不再静默画错。
+   *
+   * 只用于单个数据集：多数据集时请在各自的 `S3MDatasetOptions.anchorOverride` 上指定，
+   * 避免一个图层级锚点把所有数据集都搬走。
+   */
+  anchorOverride?: AnchorOverride;
   maxTiles?: number;
   maxConcurrent?: number;
   /** 原始图像/子图集缓存上限（LRU），默认 128 */

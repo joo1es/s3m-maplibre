@@ -14,6 +14,9 @@
  * 全量快照会逼着每个私有成员都留在主类上，反而把 facade 撑大。
  *
  * 拆分过程中如果这个测试红了，说明公共面真的变了 —— 不要改快照，改代码。
+ *
+ * 拆分已结束，之后**只有显式新增公共能力**才允许往清单里加条目（并写进下面的注释）。
+ * 0.4.x：`spatialRef` getter —— 暴露 .scp 的 crs / unit，让上层识别非地理坐标系数据。
  */
 import { describe, expect, test } from 'bun:test';
 import { S3MTileset } from '../../packages/s3m-three/src/tileset/S3MTileset';
@@ -23,7 +26,7 @@ const PUBLIC_METHODS = [
   'dispose', 'getExternalAtlas', 'getLeafRecords', 'getLodTransition', 'heightRange', 'init',
   'putExternalAtlas', 'putLeafRecords', 'registerTileTextures', 'residentMemory', 'retryFailed',
   'setLodTransition', 'setMaterialQuality', 'setMaxMemory', 'setMaxTriangles', 'setRenderProfile',
-  'shouldBakeMercator', 'update',
+  'shouldBakeMercator', 'spatialRef', 'update',
 ].sort();
 
 /** 公共实例字段（构造后即可读的那些） */
