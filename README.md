@@ -70,6 +70,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 瓦片级放置（切平面尺度校正） | ✅ | `perTilePlacement`（默认开启）：逐瓦片按自身中心纬度计算墨卡托尺度并自动反解拾取坐标，消除大跨度（跨数十至数百公里）下单一切平面带来的米级至公里级尺度累积误差；支持传 `false` 回退旧版行为 |
 | 全球精确墨卡托烘焙 | ✅ | `bakeMercator`：逐顶点烘焙精确 Web 墨卡托偏移，消除全球大尺度（跨数十至数百公里单瓦片）内部视差游动（呼吸效应）。根半径 > 25 km 自动开启，<= 25 km 保持旧版逐字节一致 |
 | WGS84 椭球投影与各向异性校正 | ✅ | `GeoAdapter` 全面采用 WGS84 椭球模型，将米 ↔ 墨卡托/经纬度换算拆分为东西向（卯酉圈 $N$）与南北向（子午圈 $M$）双标量，彻底消除 0.4%~0.67% 的各向异性形变与大尺度米级系统漂移 |
+| 非地理 / 平面工程坐标系 | ✅ | `anchorOverride`：给只有局部米坐标的数据（`.scp` 里 `position.unit=Meter`、`crs=epsg:0`，如官方 3DGS `sculpture.scp`）显式指定经纬度锚点，连 `geoBounds` 一起搬，不再把米当度静默摆错位置；`tileset.spatialRef` 可读原始 crs / unit / WKT。默认关闭，不传时行为与旧版逐字一致，但非地理数据会明确告警。库不做 EPSG 反算，投影由生产端负责 |
 | 纹理变换与寻址 | ✅ | 支持 `texmodmatrix` 仿射变换与 `addressmode` |
 | DXT / WebP 纹理 | ✅ | |
 | 骨骼动画 | ❌ | 未实现：LODPackage 上的 animations JSON 直接跳过不解析，官方 JS SDK 同样只读偏移不驱动 |
@@ -264,7 +265,7 @@ dev 的目录结构与线上产物完全一致（`docs/` 与 `demo/` 两个前�
 
 `bun run build` 会按 `s3m-three → s3m-maplibre → docs → demo` 的顺序全部产出，其中 docs/ 与 demo/index.html 都由 `site/` 构建（共用一份 `site/vite.config.ts`，只是入口和输出目录不同；产物位置不变，URL 不变）。
 
-演示自带两份本地样例数据（北京 CBD 的 CCTV、comModel，离线可用），另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并标注类型（地形 / 影像打标签），默认勾选第一个**模型类**数据集。
+演示自带三份本地样例数据（北京 CBD 的 CCTV、comModel，以及官方 3DGS「雕塑」—— 纯平面工程坐标系，用 `anchorOverride` 挂到地图上，见[坐标系与锚点覆盖](./packages/s3m-maplibre/docs/API.md#坐标系与锚点覆盖)），离线可用，另有一个在线预设「地铁站 (CRN 纹理)」——SuperMap Online 公有服务，纹理全是 CRN，用来肉眼验证 CRN 转码链路；也可以在地址栏输入框里填任意 iServer `realspace` 服务根地址、`datas` 集合或具体的 `.scp`，自动列出数据集并标注类型（地形 / 影像打标签），默认勾选第一个**模型类**数据集。
 
 演示包含：数据集叠加开关、着色模式、透明度、平面/平滑着色、选中描边（棱线 / 外扩两种画法，粗细可调）、全局棱线、点击属性卡；右侧面板还能填 iServer 数据服务地址，按业务字段（KEYID / SmMaxZ…）上色出图例、按区间过滤、按字段值抬高。
 

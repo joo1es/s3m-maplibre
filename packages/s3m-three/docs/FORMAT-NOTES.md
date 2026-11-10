@@ -43,6 +43,22 @@ C 级的处置原则：**只在新样本进来时提高级别，不靠推理提�
 
 `classifyDatasetKind(config)` 按上表识别，认出地形/影像时 `S3MTileset.init` 会在解析锚点之前明确报错（错误带 `datasetKind` 属性），不再落到误导性的「配置中缺少 root tile」。
 
+### 2.1 `.scp` 的 `crs` 与 `position.unit`（实测，A 级）
+
+规范 `Specification/scp.json.md:22,59` 定义了 `crs`（`epsg:xxxx` 或 `wkt:...`，可表述任意 GB/T 30170 坐标参照系）与 `position.unit`（`Degree` / `Meter`）。**两件事要分开**：`crs` 说明数据的大地基准归属，`unit` 才决定 `position` / `geoBounds` 的数值怎么解释。官方 `Examples/example_scp.md:43` 就是 `crs:epsg:4490` 但 `position` 仍是度。
+
+实测三份官方样例（2026-11-10）：
+
+| 样例 | crs | unit | position | 含义 |
+|:---|:---|:---|:---|:---|
+| `S3M_JS/data/CBD/cbd.scp` | `epsg:0` | `Degree` | 116.458, 39.912, 0 | 经纬度；`epsg:0` 只是生产端没填的占位值 |
+| `S3M_JS/data/comModel/comModel.scp` | `epsg:4326` | `Degree` | **119, 41**（占位） | 与 `geoBounds` 中心差 4~5°，靠 `resolveAnchor` 的 0.5° 一致性检查兜住 |
+| `Latest/…/gaussianSplatting/sculpture.scp` | `epsg:0` | **`Meter`** | -2.496, 5.575, 678.92 | **纯局部平面工程坐标**，无经纬度；`extensions.crs` 写着 `Planar Coordinate System---m / Units=METER` |
+
+官方 JS SDK 也不读 `crs`，只在**平面场景**按 `positionUnits === "Meter"` 或经纬度超 ±180 决定要不要再投影一次（`S3MTilesLayer.js:410-425`）；3D 场景无条件 `fromDegrees`，喂第三份数据同样会错。也就是说**投影由生产端负责，运行时不做 EPSG 反算**。
+
+本库原先完全不读这两个字段，第三份数据会被静默当成经纬度摆到几内亚湾并抬高 678 米 —— 不报错、模型形状还完全正常。现在 `readSpatialReference()` 暴露它们、非地理数据 `init()` 时告警，并用 opt-in 的 `anchorOverride` 让 App 指定该摆在哪（连 `geoBounds` 一起搬，否则 `getBounds()` / `fitBounds()` 仍会把镜头带过去）。见两份 API 文档的「坐标系与锚点覆盖」。
+
 **S3M 1.x 必须靠魔数分流，不能靠配置。** 头 4 字节 `73 33 6D 00`（`"s3m\0"`）紧接 `78 da` 的 zlib。不分流的话，头 4 字节会被 float32 读成 1e-38 的「版本号」，再把 zlib 头当长度，报出来的是 `RangeError: Invalid typed array length` —— 一个彻底误导人的错。
 
 ---
