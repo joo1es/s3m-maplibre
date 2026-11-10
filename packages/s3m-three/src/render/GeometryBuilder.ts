@@ -21,7 +21,12 @@ import { assembleTileGeometry, LINE_PRIMITIVE, POINT_PRIMITIVE } from '../core/T
 import { bakeMercatorOffsets } from '../core/BakeMercator.js';
 import { mercatorFromLngLat } from './GeoAdapter.js';
 import type { TileGeometryData, PrimitiveData } from '../core/TileGeometry.js';
-import { decodeScale, decodeRotation } from '../core/GaussianSplat.js';
+import {
+  decodeScale,
+  decodeRotation,
+  decodeScaleF32,
+  decodeRotationF32,
+} from '../core/GaussianSplat.js';
 import { createSplatMaterial, createQuadGeometry, splatRaycast } from './SplatMaterial.js';
 import { SPLAT_SIGMA } from '../core/SplatProjection.js';
 import type {
@@ -84,8 +89,16 @@ function buildSplatGeometry(
   );
   if (count <= 0) return null;
 
-  const scales = decodeScale(scaleAttr.data, scaleAttr.stride, scaleAttr.offsetInBytes, count);
-  const quats = decodeRotation(rotAttr.data, rotAttr.stride, rotAttr.offsetInBytes, count);
+  // 两种压缩格式的泼溅参数口径不同：MeshOpt 是 u8 log 量化（见 GaussianSplat.ts 头部），
+  // Draco 直接给已解码的 f32 真实值。按 dtype 选路径，别把 f32 反量化回 u8 —— 那会平白
+  // 多一次精度损失。Draco 侧已把四元数从官方的 (w,x,y,z) 重排成 three 的 (x,y,z,w)。
+  const f32 = scaleAttr.dtype === 'f32' && rotAttr.dtype === 'f32';
+  const scales = f32
+    ? decodeScaleF32(scaleAttr.data, scaleAttr.stride, scaleAttr.offsetInBytes, count)
+    : decodeScale(scaleAttr.data, scaleAttr.stride, scaleAttr.offsetInBytes, count);
+  const quats = f32
+    ? decodeRotationF32(rotAttr.data, rotAttr.stride, rotAttr.offsetInBytes, count)
+    : decodeRotation(rotAttr.data, rotAttr.stride, rotAttr.offsetInBytes, count);
 
   // 代表性半轴：抽样的最长轴中位数（米）。LOD 判据要拿它估「屏幕上高斯有多大」，
   // 见 core/SplatLod.ts。抽样上限 512，解码已经付过代价，这里不再逐点扫。

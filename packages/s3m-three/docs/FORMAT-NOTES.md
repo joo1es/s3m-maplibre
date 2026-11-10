@@ -300,6 +300,38 @@ function D(t){                                     // rotation
 > 走正常泼溅路径，不再产生 `gaussian-splatting-points`。机制本身（`stats.degradations`
 > / `unsupported`）保留，见 `API.md#降级上报degradations`。
 
+### 9.1 Draco 容器：泼溅流是 f32 真实值，不是 u8 量化
+
+上面那套 u8 log 量化是 **MeshOpt** 骨架的格式（寿宁阁）。官方行标样例
+`Latest(S3M 3.0&行标)/sampledata/gaussianSplatting/sculpture.scp` 走 **Draco**
+（`s3m:VertexCompressionType=DRACO`、`s3m:FileType=PointCloudFile`，
+`extensions.gaussianSplatInfo.totalGaussians = 53195`），
+`customVertexAttribute = {"GS_Rotation":1,"GS_Scale":0}` 指向两条 Draco 自定义属性：
+
+| 属性 | 分量 | 类型 | 实测首点 |
+|:---|:---|:---|:---|
+| `GS_Scale` | 3 | float32 | (0.008855, 0.002361, 0.000200) 米 |
+| `GS_Rotation` | 4 | float32 | `(w,x,y,z)` = (0.986080, -0.051973, 0.109283, -0.114035) |
+
+两条都是**解码器已经还原好的真实值**，没有任何量化。`Draco.ts` 把它们归一成
+`gsScale` / `gsRotation`（`dtype='f32'`，stride 12 / 16），四元数从官方的
+`(w,x,y,z)` 重排成 three 的 `(x,y,z,w)`；`GeometryBuilder` 按 `dtype` 选
+`decodeScaleF32` / `decodeRotationF32` 直读，**不反量化回 u8**（那会二次损失精度）。
+
+顺序判据：官方 `decodeRotation` 的 w 恒由 `sqrt(1-x²-y²-z²)` 补出，即 w ≥ 0。
+Draco 首点首分量 0.986、末分量 -0.114 —— 只有 `(w,x,y,z)` 才符合这个规范。
+
+**旧实现为什么画成点云**：`Draco.ts` 的自定义属性分支只挑 `PointCloudClassCode`，
+注释写着「其余渲染层用不上」，把这两条流丢了 → 解析结果只剩 position/color →
+`S3MBParser` 找不到 `gsScale`/`gsRotation`，打上 `gaussian-splatting-points` →
+53195 个高斯被画成一堆点。修复与回归见 `tests/unit/draco-splat.test.ts`
+（含 `buildTileObjects` 断言 `Points = 0`、`instanceCount = 53195`）。
+
+> 注意：`PointCloudFile` / DRACO 与「是不是 3DGS」无关，判据始终是
+> `extensions.GaussianSplatting.isGaussianSplatting` 和那两条流在不在。
+
+---
+
 ## 九之二、仍未标定的字段（D 级）
 
 **保留原始字节，不猜语义。**

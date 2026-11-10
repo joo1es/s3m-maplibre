@@ -173,3 +173,56 @@ export function covariance(
   out[at + 4] = m10 * m20 + m11 * m21 + m12 * m22;
   out[at + 5] = m20 * m20 + m21 * m21 + m22 * m22;
 }
+
+/**
+ * 按 stride / offset 从交织字节流里直读 f32（小端）。
+ *
+ * 越界分量按 0 兜底：宁可少画几片，也不要让一个坏 stride 抛异常把整层拖崩。
+ * count 为非有限 / 负数时 `new Float32Array` 会得到空数组，循环不执行。
+ */
+function readF32Stream(
+  bytes: Uint8Array,
+  stride: number,
+  offset: number,
+  count: number,
+  comps: number
+): Float32Array {
+  const n = Number.isFinite(count) ? Math.max(0, Math.floor(count)) : 0;
+  const out = new Float32Array(n * comps);
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  for (let i = 0; i < n; i++) {
+    const o = offset + i * stride;
+    for (let c = 0; c < comps; c++) {
+      const p = o + c * 4;
+      out[i * comps + c] = p >= 0 && p + 4 <= view.byteLength ? view.getFloat32(p, true) : 0;
+    }
+  }
+  return out;
+}
+
+/**
+ * Draco 压缩的 3DGS：`GS_Scale` 是**已经解码好的** 3 分量米制半轴（float32），
+ * 不是 `decodeScale` 期望的 u8 log 量化。直读，不做任何反量化。
+ */
+export function decodeScaleF32(
+  bytes: Uint8Array,
+  stride: number,
+  offset: number,
+  count: number
+): Float32Array {
+  return readF32Stream(bytes, stride, offset, count, 3);
+}
+
+/**
+ * Draco 压缩的 3DGS：`GS_Rotation` 是 4 分量单位四元数（float32）。
+ * 官方内部顺序是 `(w, x, y, z)`，Draco.ts 在产出属性时已重排成 three 的
+ * `(x, y, z, w)`，与 `decodeRotation` 的输出契约一致，这里只管直读。
+ */
+export function decodeRotationF32(
+  bytes: Uint8Array,
+  stride: number,
+  offset: number,
+  count: number
+): Float32Array {
+  return readF32Stream(bytes, stride, offset, count, 4);
+}

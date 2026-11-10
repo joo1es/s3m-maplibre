@@ -201,7 +201,8 @@ export interface S3MTilesetOptions {
   /**
    * 遇到「解析得了但画不出该有的样子」的数据时怎么办。**默认 `'warn'`**。
    *
-   * 目前只有一类：3DGS 数据按点渲染（`gsScale` / `gsRotation` 的量化格式未标定）。
+   * 目前只有一类：数据声明是 3DGS、骨架里却没有 gsScale / gsRotation 两条流时按 Points 渲染。
+   * 量化格式已标定，MeshOpt 与 Draco 两种压缩都走正常泼溅路径。
    *   'warn'   —— 首次遇到告警一次，照常出图。旧版没有这个开关，但也不告警，
    *               所以这里的差异只有多一条日志，不传参时的渲染路径逐字未变。
    *   'throw'  —— 直接拒绝这类瓦片（标 `permanent`，不重试）。给「宁可不显示，
