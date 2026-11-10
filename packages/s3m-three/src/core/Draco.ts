@@ -335,13 +335,41 @@ export async function parseDracoGeometry(r: BinaryReader, vp: VertexPackage): Pr
         continue;
       }
 
-      // 自定义属性：只挑分类码，其余（高度 / 强度）渲染层用不上
+      // 自定义属性：分类码给点云着色，3DGS 的两条泼溅流要无损透传到渲染层。
+      // Draco 版本（官方行标 gaussianSplatting/sculpture 样例）里它们是**已解码的
+      // f32 真实值**：GS_Scale 是 3 分量米制半轴，GS_Rotation 是 (w,x,y,z) 单位四元数。
+      // 与 MeshOpt 那套 u8 log 量化不同，不能反量化回去，否则白白多一次精度损失。
       const name = customNames.get(uid);
       if (name === 'PointCloudClassCode' && comps === 1) {
         const raw = readAttribute(draco, decoder, geometry, attr);
         if (raw && !(raw instanceof Float32Array)) {
           classCode = new Uint8Array(numPoints);
           for (let p = 0; p < numPoints; p++) classCode[p] = raw[p] ?? 0;
+        }
+      } else if (name === 'GS_Scale' || name === 'GS_Rotation') {
+        const raw = readAttribute(draco, decoder, geometry, attr);
+        if (raw instanceof Float32Array) {
+          if (name === 'GS_Scale' && comps >= 3) {
+            const out = new Float32Array(numPoints * 3);
+            for (let p = 0; p < numPoints; p++) {
+              const o = p * comps;
+              out[p * 3] = raw[o] ?? 0;
+              out[p * 3 + 1] = raw[o + 1] ?? 0;
+              out[p * 3 + 2] = raw[o + 2] ?? 0;
+            }
+            pushAttr(vp, 'gsScale', new Uint8Array(out.buffer), 3, 12, 0, undefined, 'f32');
+          } else if (name === 'GS_Rotation' && comps >= 4) {
+            // 官方内部 (w,x,y,z) → three 的 (x,y,z,w)，与 decodeRotation 的输出契约一致
+            const out = new Float32Array(numPoints * 4);
+            for (let p = 0; p < numPoints; p++) {
+              const o = p * comps;
+              out[p * 4] = raw[o + 1] ?? 0;
+              out[p * 4 + 1] = raw[o + 2] ?? 0;
+              out[p * 4 + 2] = raw[o + 3] ?? 0;
+              out[p * 4 + 3] = raw[o] ?? 0;
+            }
+            pushAttr(vp, 'gsRotation', new Uint8Array(out.buffer), 4, 16, 0, undefined, 'f32');
+          }
         }
       }
     }
