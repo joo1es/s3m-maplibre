@@ -198,3 +198,218 @@ export function lngLatFromWorld(adapter: GeoAdapter | null, x: number, y: number
   if (adapter) return adapter.lngLatFromWorld(x, y);
   return lngLatFromMercator(x, y);
 }
+
+/* ----------------------------------------------------------------- GCJ-02 坐标换算与高德定标 (Phase 0) */
+
+/** Krasovsky 1940 椭球长半轴（米，GCJ-02 使用） */
+export const GCJ_A = 6378245.0;
+/** Krasovsky 1940 第一偏心率平方 ee = 2f - f² ≈ 0.00669342162296594323 */
+export const GCJ_EE = 0.00669342162296594323;
+
+/** 判断坐标是否在中国国境内（GCJ-02 加密范围：经度 72.004~137.8347，纬度 0.8293~55.8271） */
+export function isInsideChina(lng: number, lat: number): boolean {
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return false;
+  return lng >= 72.004 && lng <= 137.8347 && lat >= 0.8293 && lat <= 55.8271;
+}
+
+function transformLat(x: number, y: number): number {
+  let ret =
+    -100.0 +
+    2.0 * x +
+    3.0 * y +
+    0.2 * y * y +
+    0.1 * x * y +
+    0.2 * Math.sqrt(Math.abs(x));
+  ret +=
+    ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin((y / 3.0) * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((160.0 * Math.sin((y / 12.0) * Math.PI) + 320.0 * Math.sin((y * Math.PI) / 30.0)) * 2.0) / 3.0;
+  return ret;
+}
+
+function transformLng(x: number, y: number): number {
+  let ret =
+    300.0 +
+    x +
+    2.0 * y +
+    0.1 * x * x +
+    0.1 * x * y +
+    0.1 * Math.sqrt(Math.abs(x));
+  ret +=
+    ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin((x / 3.0) * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((150.0 * Math.sin((x / 12.0) * Math.PI) + 300.0 * Math.sin((x / 30.0) * Math.PI)) * 2.0) / 3.0;
+  return ret;
+}
+
+/**
+ * WGS84 经纬度 → GCJ-02 经纬度（国测局火星坐标系）
+ * 境外不转换原样返回。
+ */
+export function wgs84ToGcj02(lng: number, lat: number): [number, number] {
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return [lng, lat];
+  if (!isInsideChina(lng, lat)) return [lng, lat];
+
+  let dLat = transformLat(lng - 105.0, lat - 35.0);
+  let dLng = transformLng(lng - 105.0, lat - 35.0);
+  const radLat = (lat / 180.0) * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - GCJ_EE * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  dLat = (dLat * 180.0) / (((GCJ_A * (1 - GCJ_EE)) / (magic * sqrtMagic)) * Math.PI);
+  dLng = (dLng * 180.0) / ((GCJ_A / sqrtMagic) * Math.cos(radLat) * Math.PI);
+
+  return [lng + dLng, lat + dLat];
+}
+
+/**
+ * GCJ-02 经纬度 → WGS84 经纬度
+ * 基于前向迭代反解，4 步迭代即可将往返误差压至 1e-8 度（亚毫米级）。境外不转换原样返回。
+ */
+export function gcj02ToWgs84(lng: number, lat: number): [number, number] {
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return [lng, lat];
+  if (!isInsideChina(lng, lat)) return [lng, lat];
+
+  let wgsLng = lng;
+  let wgsLat = lat;
+  for (let i = 0; i < 4; i++) {
+    const [currGcjLng, currGcjLat] = wgs84ToGcj02(wgsLng, wgsLat);
+    const dLng = lng - currGcjLng;
+    const dLat = lat - currGcjLat;
+    wgsLng += dLng;
+    wgsLat += dLat;
+    if (Math.abs(dLng) < 1e-9 && Math.abs(dLat) < 1e-9) break;
+  }
+  return [wgsLng, wgsLat];
+}
+
+/** 高德 customCoords 对象的最小鸭子类型接口 */
+export interface AMapCustomCoordsLike {
+  lngLatToCoord?(lngLat: [number, number] | { lng: number; lat: number }): [number, number] | [number, number, number];
+  coordToLngLat?(coord: [number, number] | [number, number, number]): [number, number];
+  setCenter?(center: [number, number]): void;
+  getCenter?(): [number, number];
+}
+
+/** 高德适配选项 */
+export interface AMapLikeOptions {
+  customCoords?: AMapCustomCoordsLike;
+  center?: [number, number] | { lng: number; lat: number };
+}
+
+/**
+ * 创建高德地图 (AMap) 的 GeoAdapter。
+ * 1. 负责 WGS84 ↔ GCJ-02 坐标换算；
+ * 2. 桥接 AMap customCoords 经纬度与局部 3D 直角坐标；
+ * 3. 完成高德坐标定标：水平尺度按 Web 墨卡托比率 (1/cosφ)，垂直尺度 meterInMercatorUp 定标为 1.0 (米制)。
+ */
+export function createAMapGeoAdapter(
+  target?: AMapLikeOptions | AMapCustomCoordsLike | { customCoords?: AMapCustomCoordsLike; getCenter?(): any } | null
+): GeoAdapter | null {
+  if (!target) return null;
+  const customCoords =
+    ('customCoords' in target ? target.customCoords : target) as AMapCustomCoordsLike | undefined;
+  const rawCenter =
+    'center' in target
+      ? target.center
+      : typeof (target as any).getCenter === 'function'
+      ? (target as any).getCenter()
+      : customCoords?.getCenter?.();
+
+  const centerLngLat: [number, number] | null = Array.isArray(rawCenter)
+    ? [rawCenter[0], rawCenter[1]]
+    : rawCenter && typeof rawCenter === 'object' && 'lng' in rawCenter && 'lat' in rawCenter
+    ? [rawCenter.lng, rawCenter.lat]
+    : null;
+
+  return {
+    worldFromLngLat(lng: number, lat: number, altitude = 0) {
+      // 1. S3M 顶点与 scp 为 WGS84，高德底图为 GCJ-02
+      const [gcjLng, gcjLat] = wgs84ToGcj02(lng, lat);
+
+      let x = 0;
+      let y = 0;
+      let z = 0;
+
+      if (customCoords && typeof customCoords.lngLatToCoord === 'function') {
+        const pt = customCoords.lngLatToCoord([gcjLng, gcjLat]);
+        x = pt[0];
+        y = pt[1];
+        if (pt.length > 2 && typeof pt[2] === 'number' && Number.isFinite(pt[2])) z = pt[2];
+      } else if (centerLngLat) {
+        const R = WGS84_A;
+        const cX = (centerLngLat[0] * Math.PI * R) / 180;
+        const cY = R * Math.log(Math.tan(Math.PI / 4 + (centerLngLat[1] * Math.PI) / 360));
+        const mX = (gcjLng * Math.PI * R) / 180;
+        const mY = R * Math.log(Math.tan(Math.PI / 4 + (gcjLat * Math.PI) / 360));
+        x = mX - cX;
+        y = mY - cY;
+      }
+
+      // 2. 尺度定标（Phase 0 定标项）：
+      // 水平增量为 Web 墨卡托尺度 (~1/cosφ)，垂直高度 z 为物理米制高程 (sUp = 1.0)
+      const latRad = (gcjLat * Math.PI) / 180;
+      const cosLat = Math.max(Math.abs(Math.cos(latRad)), 1e-12);
+      const N = primeVerticalRadius(latRad);
+      const M = meridianRadius(latRad);
+
+      const dLon1m = (1 / (N * cosLat)) * (180 / Math.PI);
+      const dLat1m = (1 / M) * (180 / Math.PI);
+
+      let sEast = 0;
+      let sNorth = 0;
+
+      if (customCoords && typeof customCoords.lngLatToCoord === 'function') {
+        try {
+          const cEast = customCoords.lngLatToCoord([gcjLng + dLon1m, gcjLat]);
+          const de = Math.hypot(cEast[0] - x, cEast[1] - y);
+          if (Number.isFinite(de) && de > 0) sEast = de;
+
+          const cNorth = customCoords.lngLatToCoord([gcjLng, gcjLat + dLat1m]);
+          const dn = Math.hypot(cNorth[0] - x, cNorth[1] - y);
+          if (Number.isFinite(dn) && dn > 0) sNorth = dn;
+        } catch {
+          // 差分失败时继续降级
+        }
+      }
+
+      if (sEast === 0) sEast = WGS84_A / (N * cosLat);
+      if (sNorth === 0) sNorth = WGS84_A / (M * cosLat);
+
+      const sUp = 1.0; // 核心定标：高德 3D 垂直单位就是真实物理米
+
+      return {
+        x,
+        y,
+        z: z + altitude * sUp,
+        meterInMercatorEast: sEast,
+        meterInMercatorNorth: sNorth,
+        meterInMercatorUp: sUp,
+        meterInMercator: sEast,
+        altitude,
+      };
+    },
+
+    lngLatFromWorld(x: number, y: number): [number, number] {
+      if (customCoords && typeof customCoords.coordToLngLat === 'function') {
+        const gcj = customCoords.coordToLngLat([x, y]);
+        return gcj02ToWgs84(gcj[0], gcj[1]);
+      }
+      if (centerLngLat) {
+        const R = WGS84_A;
+        const cX = (centerLngLat[0] * Math.PI * R) / 180;
+        const cY = R * Math.log(Math.tan(Math.PI / 4 + (centerLngLat[1] * Math.PI) / 360));
+        const mX = x + cX;
+        const mY = y + cY;
+        const gcjLng = (mX / (Math.PI * R)) * 180;
+        const gcjLat = ((2 * Math.atan(Math.exp(mY / R)) - Math.PI / 2) * 180) / Math.PI;
+        return gcj02ToWgs84(gcjLng, gcjLat);
+      }
+      return [0, 0];
+    },
+  };
+}

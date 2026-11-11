@@ -129,6 +129,7 @@ export class S3MLayer extends HostRenderer {
 
   set map(map: MapLike | null) {
     this._map = map;
+    this._host = map;
     this.viewer.geo = map ? createMapLibreGeoAdapter(map) : null;
   }
 
@@ -196,7 +197,7 @@ export class S3MLayer extends HostRenderer {
   }
 
   /** 宿主能力钩子：请求下一帧重绘（MapLibre / Mapbox → triggerRepaint） */
-  protected requestRepaint(): void {
+  protected override requestRepaint(): void {
     this.map?.triggerRepaint();
   }
 

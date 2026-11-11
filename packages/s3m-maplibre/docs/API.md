@@ -41,12 +41,14 @@ npm install s3m-maplibre three
 import { S3MLayer, STYLE, type PickResult } from 's3m-maplibre';
 ```
 
-### 宿主兼容
+### 宿主兼容与通用接口
 
 图层是 MapLibre / Mapbox 都能挂的普通对象，不依赖任何一方的类型：
 
+- 宿主能力收敛于 `s3m-three` 导出的通用窄接口 `S3MHost`，`MapLike` 继承该接口。
 - `render(gl, matrix)` 同时接受 `Float32Array(16)`（MapLibre v4）、`{ defaultProjectionData: { mainMatrix } }`（MapLibre v5）和 `modelViewProjectionMatrix`（Mapbox）。
 - 只用到宿主的 `getCanvas / triggerRepaint / on / off / getBearing`，其余全部可选。
+- 如需将 S3M 挂载到高德地图（AMap）等第二宿主，可参考仓库 `examples/amap/` 中的实现方式。
 
 ---
 

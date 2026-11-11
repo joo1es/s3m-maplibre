@@ -66,6 +66,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | 可调光照 | ✅ | `setLight()` / `getLight()` 支持动态调整环境光与主平行光的颜色、强度、方位角与高度角，支持 `headlamp`（跟随视角）与 `fixed`（太阳固定世界方位）模式 |
 | 服务鉴权 | ✅ | `authenticate` 钩子：内核发出的全部请求（配置 / 瓦片 / 子图集 / 棱线缓存 / 属性查询）统一改写 URL（加 `?token=`）或附加请求头，支持异步换 token，见[服务鉴权](#服务鉴权authenticate) |
 | 显存与多图层优化 | ✅ | 全局瓦片预算 `totalMaxTiles` 动态分配、纹理引用计数淘汰自动释放 GPU 显存、递归深度释放几何/材质/点云/线框，防止长时间漫游或多图层堆叠爆显存 |
+| S3MHost 通用宿主接口与高德适配 | ✅ | 抽象出收敛窄接口 `S3MHost`，使渲染内核天然具备跨宿主复用能力；提供高德地图（AMap JS API v2）适配层 demo（`examples/amap/`）与 WGS84 ↔ GCJ-02 椭球双向坐标转换及尺度定标 |
 | 瓦片同材质合批 | ✅ | 倾斜摄影大瓦片自动合批，大幅降低 DrawCall |
 | 瓦片级放置（切平面尺度校正） | ✅ | `perTilePlacement`（默认开启）：逐瓦片按自身中心纬度计算墨卡托尺度并自动反解拾取坐标，消除大跨度（跨数十至数百公里）下单一切平面带来的米级至公里级尺度累积误差；支持传 `false` 回退旧版行为 |
 | 全球精确墨卡托烘焙 | ✅ | `bakeMercator`：逐顶点烘焙精确 Web 墨卡托偏移，消除全球大尺度（跨数十至数百公里单瓦片）内部视差游动（呼吸效应）。根半径 > 25 km 自动开启，<= 25 km 保持旧版逐字节一致 |
@@ -314,6 +315,23 @@ function tick() {
 | `core/` 解析 | 一个 `ArrayBuffer` | 完全无关，Node 里也能跑 |
 | `tileset/` 瓦片树 | `fetch` + 一个 `three.Group` 当容器 | 只要喂相机位置算 LOD |
 | `render/` 几何 | WebGL 上下文 | 只产出 `THREE.Group` / `Mesh` |
+
+---
+
+## 高德地图 (AMap) 与多宿主扩展
+
+从 `s3m-three` 抽出通用宿主窄接口 `S3MHost`：收敛 `getCanvas`、`triggerRepaint`、`getCenter`、`getZoom`、`getPitch`、`getBearing` 与事件系统。
+
+仓库在 `examples/amap/` 提供了高德地图（AMap JS API v2）的完整最小实现：
+1. **共享 WebGL Context**：基于 `AMap.GLCustomLayer`，`init(gl)` 直接交由 `S3MViewer.mount(canvas, gl)`，设置 `autoClear = false`，且在每帧渲染前后各调用一次 `resetState()` 保证 WebGL 状态安全交接；
+2. **相机参数折叠**：通过高德 `customCoords.getCameraParams()` 提取标准透视相机参数，折合成 MVP 喂入内核；
+3. **坐标系与尺度定标**：S3M 数据集原点为标准 WGS84 椭球坐标，高德底图为 GCJ-02 加密坐标。内核提供 `wgs84ToGcj02` / `gcj02ToWgs84` 及 `createAMapGeoAdapter`，高德 3D 体系下水平 $x/y$ 为 Web 墨卡托米制单位（比例为 $\approx 1/\cos\phi$），垂直 $z$ 轴定标为真实物理米（`meterInMercatorUp = 1.0`）。
+
+本地运行：
+```bash
+NODE_OPTIONS= bun run serve
+# 浏览器访问：http://localhost:8123/s3m-maplibre/examples/amap/
+```
 
 ```js
 import * as THREE from 'three';

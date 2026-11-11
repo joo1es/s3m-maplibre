@@ -24,6 +24,7 @@ import type { ProjectionMode } from './OrthoProjection.js';
 import type { TransitionOptions } from '../anim/Animator.js';
 import type { Stats } from '../core/types.js';
 import type { S3MDatasetEntry } from './DatasetManager.js';
+import type { S3MHost } from './S3MHost.js';
 
 /** HostRenderer 构造选项：渲染内核选项 + 三个适配器层专属开关 */
 export interface HostRendererOptions extends S3MViewerOptions {
@@ -99,15 +100,26 @@ export abstract class HostRenderer {
     });
   }
 
+  /** 关联的宿主地图/视图（S3MHost） */
+  protected _host: S3MHost | null = null;
+
+  /** 获取当前关联的通用宿主 */
+  get host(): S3MHost | null {
+    return this._host;
+  }
+
   /**
    * 宿主能力的钩子：请求下一帧重绘。
-   * maplibre → `map.triggerRepaint()`；arcgis → `externalRenderers.requestRender(view)`。
+   * maplibre → `map.triggerRepaint()`；amap → `triggerRepaint()`；arcgis → `externalRenderers.requestRender(view)`。
+   * 若已绑定通用宿主 S3MHost，默认转发 host.triggerRepaint()。
    */
-  protected abstract requestRepaint(): void;
+  protected requestRepaint(): void {
+    this._host?.triggerRepaint();
+  }
 
-  /** 宿主方位角（度）；宿主无关默认 0（灯光不跟随视角） */
+  /** 宿主方位角（度）；默认从 host 读取，无 host 时返回 0（灯光不跟随视角） */
   protected getBearing(): number {
-    return 0;
+    return this._host?.getBearing?.() ?? 0;
   }
 
   /* ----------------------------------------------------------------- 生命周期 */

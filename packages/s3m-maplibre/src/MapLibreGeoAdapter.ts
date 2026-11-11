@@ -10,7 +10,7 @@
  * 纯 three 宿主不需要这个文件 —— 直接用 GeoAdapter 的墨卡托兜底，
  * 或自己实现一个 GeoAdapter 即可。
  */
-import { primeVerticalRadius, meridianRadius, type GeoAdapter } from 's3m-three';
+import { primeVerticalRadius, meridianRadius, type GeoAdapter, type S3MHost } from 's3m-three';
 
 /** MapLibre 默认垂直视场角（弧度） */
 export const DEFAULT_FOV = 0.6435011087932844;
@@ -23,13 +23,16 @@ export interface WorldCoordinateHelperLike {
   metersPerWorldUnit?(x: number, y: number): number;
 }
 
-/** 宿主地图上我们真正用到的能力，MapLibre / Mapbox 的交集 */
-export interface MapLike {
+/** 宿主地图上我们真正用到的能力，MapLibre / Mapbox 的交集，继承通用 S3MHost 窄接口 */
+export interface MapLike extends S3MHost {
   getCanvas(): HTMLCanvasElement;
   triggerRepaint(): void;
-  on(type: string, listener: (e: MapMouseEventLike) => void): unknown;
-  off(type: string, listener: (e: MapMouseEventLike) => void): unknown;
+  on(type: string, listener: (e: any) => void): unknown;
+  off(type: string, listener: (e: any) => void): unknown;
   getBearing?(): number;
+  getPitch?(): number;
+  getCenter?(): any;
+  getZoom?(): number;
   getFreeCameraOptions?(): { position?: { x: number; y: number; z: number } | null } | null;
   /** 注意 fov 在 MapLibre v5 起是「度」，v4 / Mapbox 是「弧度」；弧度用 fovInRadians */
   transform?: {

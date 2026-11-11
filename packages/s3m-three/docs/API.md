@@ -226,6 +226,52 @@ prewarmShading(): Promise<void>        // 手动预热另一种 shading 变体�
   - 彻底消除传统单标量模型在南北/东西方向上 0.4%~0.67% 的各向异性拉伸与米级系统残差。
 - 包导出了高精度大地测量工具：`primeVerticalRadius`, `meridianRadius`, `enuToLngLat`, `lngLatToEnu` 及 `WGS84_A`, `WGS84_E2` 常量。
 
+### 宿主抽象（S3MHost & HostRenderer）与多地图适配
+
+为了让渲染内核能在除 MapLibre 之外的其它地图宿主（如高德 AMap、Cesium、ArcGIS 等）复用，包内定义了通用宿主窄接口与基类：
+
+```ts
+export interface S3MHost {
+  getCanvas(): HTMLCanvasElement;
+  triggerRepaint(): void;
+  on(type: string, listener: (e: any) => void): unknown;
+  off(type: string, listener: (e: any) => void): unknown;
+  getCenter?(): [number, number] | { lng: number; lat: number };
+  getZoom?(): number;
+  getPitch?(): number;
+  getBearing?(): number;
+  getLayer?(id: string): unknown;
+  addLayer?(layer: unknown): unknown;
+  removeLayer?(id: string): unknown;
+}
+
+export abstract class HostRenderer {
+  readonly id: string;
+  readonly viewer: S3MViewer;
+  get host(): S3MHost | null;
+  setProjection(mode: ProjectionMode, transition?: TransitionOptions): void;
+  setNearPlaneScale(scale: number): void;
+}
+```
+
+### GCJ-02 坐标换算与高德定标 (AMapGeoAdapter)
+
+国内高德底图采用 GCJ-02 加密坐标系，而 S3M 的 `.scp` 锚点和瓦片顶点为标准 WGS84。包提供了高精度双向换算与高德适配器：
+
+```ts
+// 纯数学转换函数（境外坐标不转换，往返误差 < 1e-7 度）
+wgs84ToGcj02(lng: number, lat: number): [number, number]
+gcj02ToWgs84(lng: number, lat: number): [number, number]
+isInsideChina(lng: number, lat: number): boolean
+
+// 创建高德地图 GeoAdapter
+createAMapGeoAdapter(target?: AMapLikeOptions | AMapCustomCoordsLike | null): GeoAdapter | null
+```
+
+**高德 3D 体系尺度定标（必须注意）**：
+- 高德 `customCoords.lngLatToCoord` 的水平坐标为 Web 墨卡托米制投影，地面 1 米对应的水平增量比例约为 $1/\cos\phi$（北京纬度约为 1.303）；
+- 高德 3D 垂直 $z$ 轴则是真实物理米，因此 `createAMapGeoAdapter` 将 `meterInMercatorUp` 严格定标为 `1.0`，杜绝水平与垂直尺度的混淆变形。
+
 ### 数据集管理
 
 ```ts

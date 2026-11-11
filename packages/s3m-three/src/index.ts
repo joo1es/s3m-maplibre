@@ -49,7 +49,7 @@ export type {
   StyleUniforms,
 } from './core/types.js';
 
-// —— 地理坐标适配（宿主无关接口 + 墨卡托兜底）
+// —— 地理坐标适配（宿主无关接口 + 墨卡托兜底 + GCJ-02/高德定标）
 export {
   WGS84_A,
   WGS84_B,
@@ -64,8 +64,22 @@ export {
   lngLatFromMercator,
   worldFromLngLat,
   lngLatFromWorld,
+  GCJ_A,
+  GCJ_EE,
+  isInsideChina,
+  wgs84ToGcj02,
+  gcj02ToWgs84,
+  createAMapGeoAdapter,
 } from './render/GeoAdapter.js';
-export type { GeoAdapter, WorldCoordinateResult } from './render/GeoAdapter.js';
+export type {
+  GeoAdapter,
+  WorldCoordinateResult,
+  AMapCustomCoordsLike,
+  AMapLikeOptions,
+} from './render/GeoAdapter.js';
+
+// —— 宿主通用接口
+export type { S3MHost, S3MHostMouseEvent } from './render/S3MHost.js';
 
 // —— 瓦片层
 export {
