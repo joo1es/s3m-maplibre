@@ -615,7 +615,7 @@ h.remove();
 
 ## 后处理：接管上屏
 
-`layer.setPresenter()` 转发到 `viewer.setPresenter()`，用法、`PresenterContext` 字段与那三条必须自己补的补偿（色调映射 / 色彩空间 / `gl_FragDepth`）都在 [s3m-three 后处理](../s3m-three/docs/API.md#后处理接管上屏presenter)。这里只写宿主相关的部分。
+`layer.setPresenter()` 转发到 `viewer.setPresenter()`，用法、`PresenterContext` 字段与那四条必须自己补的补偿（色调映射 / 色彩空间 / `gl_FragDepth` / 空像素丢弃）都在 [s3m-three 后处理](../s3m-three/docs/API.md#后处理接管上屏presenter)。这里只写宿主相关的部分。
 
 ```ts
 layer.setPresenter({

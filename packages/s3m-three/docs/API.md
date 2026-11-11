@@ -1426,13 +1426,22 @@ const h = viewer.overlay.add({
 然后交出**颜色**与**深度**两张纹理，之后画什么、画几趟、怎么上屏，全是你的事。
 
 ```ts
-const presenter = {
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), compositeMaterial);
+const quadScene = new THREE.Scene();
+quadScene.add(quad);
+const quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+viewer.setPresenter({
   render(ctx) {
-    // ctx.color / ctx.depth 是本帧已经渲好的场景
-    // 自己画到屏幕：renderer.setRenderTarget(null) 之后 render
+    // 1. 效果串在 presenter 内部：亮部提取 → 横/竖两趟模糊（ping-pong RT）
+    // 2. 合成 quad 绑本帧的颜色 / 深度 / 模糊结果
+    compositeMaterial.uniforms.tSrc.value = ctx.color;
+    compositeMaterial.uniforms.tDepth.value = ctx.depth;
+    // 3. 上屏是自己的责任：先回默认 framebuffer 再画
+    ctx.renderer.setRenderTarget(null);
+    ctx.renderer.render(quadScene, quadCamera);
   },
-};
-viewer.setPresenter(presenter);
+});
 viewer.setPresenter(null);   // 解除接管，RT 立刻释放
 ```
 
@@ -1451,15 +1460,27 @@ viewer.setPresenter(null);   // 解除接管，RT 立刻释放
 | `color` | 场景渲好的颜色纹理：**线性空间**、透明底、premultiplied |
 | `depth` | 同尺寸深度纹理。合成时用来写回 `gl_FragDepth` |
 
-### 三件事必须自己做
+### 四件事必须自己做
 
-这三条是接管上屏的全部代价，漏了都能出画，只是错得很难查：
+这四条是接管上屏的全部代价，漏了都能出画，只是错得很难查：
 
 | 漏掉 | 现象 |
 |---|---|
 | 色调映射（`toneMapping()`，跟着 `renderer.toneMapping` 走） | 整层比直渲发亮，高光糊成一片 |
 | linear→输出色彩空间（`linearToOutputTexel()`） | 整层发灰、发暗 |
-| 用 `ctx.depth` 写回 `gl_FragDepth` | 后画的宿主图层（标注、其它 custom layer）挡不住建筑，被楼穿过去 |
+| 用 `ctx.depth` 写回 `gl_FragDepth` | 后画的宿主图层（标注、其它 custom layer）挡不住建筑，被楼穿过去；**GPU 描边也会穿透模型** —— 它在 presenter 之后画，依赖本帧已经写好的深度 |
+| 合成时丢掉空像素（`depth >= 1` 或 `color.a ≈ 0`） | 天空 / 没画过几何的地方被当成不透明画上去，MapLibre 底图整片被盖掉 |
+
+合成片元着色器的开头应该是这个形状（`render/MotionBlurPass.ts` 与
+`site/src/examples/post-presenter.ts` 都是这么写的）：
+
+```glsl
+float d = texture( tDepth, vUv ).x;
+if ( d >= 0.999999 ) discard;      // 天空 / 本帧没画过几何
+vec4 c = texture( tSrc, vUv );
+if ( c.a <= 0.004 ) discard;       // 透明底，别盖住宿主底图
+gl_FragDepth = d;                  // 深度必须回到宿主 framebuffer
+```
 
 前两个不用手写公式：`toneMapping()` 与 `linearToOutputTexel()` 由 three 的片元前缀提供。
 **不要用 `#include <tonemapping_fragment>` / `<colorspace_fragment>`** —— 这两个 chunk
@@ -1480,6 +1501,10 @@ viewer.setPresenter(null);   // 解除接管，RT 立刻释放
   尺寸变化、`unmount`、`restoreContext` 时库自己重建/释放，不用你管。
 - **静态画面不会自己重绘**。presenter 里有动画（时间 uniform 之类）时自己
   `viewer.triggerRepaint()`，库不替你判断「还在动」。
+- **状态交接有边界**。`PresenterTarget` 负责把场景渲进 RT、调用你的 `render`，收尾统一
+  `renderer.resetState()` 拉回「屏幕 + 默认状态」，但**不负责清屏**，也不改动你已经画上去的
+  像素。如果 presenter 里直接调 raw gl 绕过了 three 的状态缓存，交回前不要假设 three 的缓存
+  仍与 GL 一致；后面还有 GPU 描边要画，它依赖同一个 framebuffer 的深度。
 
 ---
 
