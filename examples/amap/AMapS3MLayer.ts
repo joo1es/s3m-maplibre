@@ -1,12 +1,15 @@
 /**
  * S3M × 高德地图 (AMap) 适配层 (Phase 2)
  *
- * 继承宿主无关基类 `HostRenderer`，适配高德地图 JS API v2 的 `AMap.GLCustomLayer`：
- *   1. 共享 WebGL Context：通过 GLCustomLayer.init(gl) 将底图上下文直接挂载给 S3MViewer；
- *   2. 严格遵循 WebGL 状态交接纪律：每帧渲染前后各调用一次 `renderer.resetState()`，并将 `autoClear` 置为 `false`，
- *      防止擦除高德矢量/栅格底图；
- *   3. 坐标与相机对齐：通过高德 `customCoords.getCameraParams()` 提取真实透视相机参数，折合成标准 MVP 矩阵；
- *   4. 单体拾取与事件联动：复用 S3MViewer 的 GPU 离屏拾取通道。
+ * 继承宿主无关基类 `HostRenderer`，适配高德地图 JS API v2：
+ *   1. 独立 WebGL2 画布覆盖层：由于 Three.js 从 r163 起彻底移除 WebGL1 支持，而高德地图底层
+ *      共享上下文为 WebGL1，因此本适配层采用独立的 WebGL2 画布覆盖在地图上，实现现代 Three.js 的
+ *      完整渲染能力；
+ *   2. 惰性坐标系装配：高德的 `customCoords` 在地图完全就绪后才初始化，本层检测到就绪后自动装配
+ *      `createAMapGeoAdapter` 并重新计算锚点；
+ *   3. 坐标与相机对齐：通过高德 `customCoords.getCameraParams()` 提取真实透视相机参数，结合
+ *      GeoAdapter 出口处 Y 轴归一（+y 取负），计算出纯净的 MVP 矩阵（无镜像负缩放，不破坏三角形绕序与背面剔除）；
+ *   4. 单体拾取与事件联动：通过地图点击事件坐标进行 GPU 离屏单体拾取与高亮。
  */
 import { Matrix4, PerspectiveCamera } from 'three';
 import {
@@ -17,7 +20,6 @@ import {
   type TransitionOptions,
   type PickResult,
   type S3MHost,
-  type WorldCoordinateResult,
 } from 's3m-three';
 
 export interface AMapCameraParams {
@@ -38,8 +40,18 @@ export interface AMapCustomCoords {
 }
 
 export interface AMapLike extends S3MHost {
-  customCoords?: AMapCustomCoords;
+  getContainer(): HTMLElement;
+  getSize?(): { width: number; height: number };
+  on(type: string, listener: (...args: any[]) => void): unknown;
+  off(type: string, listener: (...args: any[]) => void): unknown;
+  getBearing?(): number;
+  getPitch?(): number;
+  getZoom?(): number;
+  getCenter?(): any;
   render?(): void;
+  customCoords?: AMapCustomCoords;
+  add?(layer: any): void;
+  remove?(layer: any): void;
 }
 
 export interface AMapS3MLayerOptions extends HostRendererOptions {
@@ -47,6 +59,7 @@ export interface AMapS3MLayerOptions extends HostRendererOptions {
   zIndex?: number;
   zooms?: [number, number];
   opacity?: number;
+  canvas?: HTMLCanvasElement;
 }
 
 export class AMapS3MLayer extends HostRenderer {
@@ -55,19 +68,30 @@ export class AMapS3MLayer extends HostRenderer {
   readonly opacity: number;
 
   private _amap: AMapLike | null = null;
-  private _contextLost = false;
-  private _listenersAttached = false;
+  private _canvas: HTMLCanvasElement | null = null;
   private _cameraHelper = new PerspectiveCamera();
-  private _yFlipMatrix = new Matrix4().makeScale(1, -1, 1);
+  private _listenersAttached = false;
+  private _customLayer: any = null;
 
   constructor(options: AMapS3MLayerOptions = {}) {
     super(options);
     this.zIndex = options.zIndex ?? 120;
     this.zooms = options.zooms ?? [2, 20];
     this.opacity = options.opacity ?? 1;
+
+    if (options.canvas) {
+      this._canvas = options.canvas;
+      this._canvas.style.position = 'absolute';
+      this._canvas.style.top = '0';
+      this._canvas.style.left = '0';
+      this._canvas.style.width = '100%';
+      this._canvas.style.height = '100%';
+      this._canvas.style.pointerEvents = 'none';
+      this._canvas.style.zIndex = String(this.zIndex);
+    }
+
     if (options.map) {
-      this._amap = options.map;
-      this._host = options.map;
+      this.setMap(options.map);
     }
   }
 
@@ -76,18 +100,49 @@ export class AMapS3MLayer extends HostRenderer {
   }
 
   set map(map: AMapLike | null) {
-    this._amap = map;
-    this._host = map;
-    this.viewer.geo = map ? createAMapGeoAdapter(map) : null;
+    this.setMap(map);
   }
 
-  /** 请求下一帧重绘（转发高德 render 或 triggerRepaint） */
+  /**
+   * 绑定或解绑高德地图实例
+   */
+  setMap(map: AMapLike | null): void {
+    if (this._amap === map) return;
+
+    if (this._amap) {
+      this._detachFromMap();
+    }
+
+    this._amap = map;
+    this._host = map;
+
+    if (map) {
+      this._attachToMap(map);
+    }
+  }
+
+  /** 兼容 AMap.GLCustomLayer / AMap.CustomLayer 的 init 方法签名 */
+  init(arg1: any, arg2?: any): void {
+    const map = (arg2 ? arg1 : arg1?.getContainer ? arg1 : this._amap) as AMapLike | null;
+    if (map) {
+      this.setMap(map);
+    }
+  }
+
+  /** 获取独立渲染 Canvas 元素 */
+  getCanvas(): HTMLCanvasElement | null {
+    return this._canvas;
+  }
+
+  /** 请求下一帧重绘（转发高德 render 或触发自身重绘） */
   protected override requestRepaint(): void {
     if (this._amap) {
       if (typeof this._amap.render === 'function') {
         this._amap.render();
-      } else {
+      } else if (typeof this._amap.triggerRepaint === 'function') {
         this._amap.triggerRepaint();
+      } else {
+        this.render();
       }
     }
   }
@@ -98,7 +153,7 @@ export class AMapS3MLayer extends HostRenderer {
   }
 
   /**
-   * 正交投影模式限制：第一版显式禁用并告警一次，保持透视模式（对应 Issue 43 约束）
+   * 正交投影模式限制：高德适配层第一版保持透视模式
    */
   override setProjection(mode: ProjectionMode, transition?: TransitionOptions): void {
     if (mode === 'orthographic') {
@@ -111,113 +166,206 @@ export class AMapS3MLayer extends HostRenderer {
     super.setProjection(mode, transition);
   }
 
-  /* ---------------------------------------------------------------- 生命周期 */
+  /* ---------------------------------------------------------------- 生命周期挂载与卸载 */
 
-  /**
-   * 由 AMap.GLCustomLayer 自动调用的初始化方法。
-   * 支持签名：init(gl) 或 init(map, gl)。
-   */
-  init(arg1: any, arg2?: any): void {
-    let map: AMapLike | null = this._amap;
-    let gl: WebGLRenderingContext | WebGL2RenderingContext;
+  private _attachToMap(map: AMapLike): void {
+    const container = map.getContainer();
+    if (!container) return;
 
-    if (arg2) {
-      map = arg1 as AMapLike;
-      gl = arg2 as WebGLRenderingContext;
-    } else {
-      gl = arg1 as WebGLRenderingContext;
+    if (!this._canvas && typeof document !== 'undefined') {
+      const canvas = document.createElement('canvas');
+      canvas.className = 'amap-s3m-layer-canvas';
+      this._canvas = canvas;
     }
 
-    if (map) {
-      this.map = map;
+    if (this._canvas) {
+      this._canvas.style.position = 'absolute';
+      this._canvas.style.top = '0';
+      this._canvas.style.left = '0';
+      this._canvas.style.width = '100%';
+      this._canvas.style.height = '100%';
+      this._canvas.style.pointerEvents = 'none'; // 地图手势交互自然穿透
+      this._canvas.style.zIndex = String(this.zIndex);
     }
 
-    const canvas = this._amap?.getCanvas?.() ?? (gl.canvas as HTMLCanvasElement);
-    this.mountViewer(canvas, gl);
-
-    // 关键纪律：共享 WebGL context 下绝对不能开启 autoClear，否则会擦除高德底图
-    if (this.viewer.renderer) {
-      this.viewer.renderer.autoClear = false;
+    if (this._canvas && !this.viewer.renderer) {
+      const gl = typeof this._canvas.getContext === 'function' ? this._canvas.getContext('webgl2') : null;
+      if (gl) {
+        this.mountViewer(this._canvas, gl as WebGL2RenderingContext);
+        const renderer = (this.viewer as any).renderer;
+        if (renderer) {
+          renderer.autoClear = true;
+        }
+      }
     }
 
-    if (this._amap && !this._listenersAttached) {
-      this._amap.on('click', this._onClick);
-      this._amap.on('webglcontextlost', this._onContextLost);
-      this._amap.on('webglcontextrestored', this._onContextRestored);
+    // 优先尝试与高德 AMap.CustomLayer 集成，若无全局 AMap 则直接挂入容器
+    if (typeof window !== 'undefined' && typeof (window as any).AMap?.CustomLayer === 'function' && this._canvas) {
+      try {
+        this._customLayer = new (window as any).AMap.CustomLayer(this._canvas, {
+          zIndex: this.zIndex,
+          zooms: this.zooms,
+          alwaysRender: true,
+          render: () => this.render(),
+        });
+        if (typeof map.add === 'function') {
+          map.add(this._customLayer);
+        }
+      } catch {
+        this._customLayer = null;
+      }
+    }
+
+    if (!this._customLayer && this._canvas && !container.contains(this._canvas)) {
+      container.appendChild(this._canvas);
+    }
+
+    // 绑定地图事件同步
+    if (!this._listenersAttached) {
       this._listenersAttached = true;
+      map.on('viewchange', this._onViewChange);
+      map.on('move', this._onViewChange);
+      map.on('zoomchange', this._onViewChange);
+      map.on('rotatechange', this._onViewChange);
+      map.on('pitchchange', this._onViewChange);
+      map.on('resize', this._onResize);
+      map.on('click', this._onClick);
     }
+
+    // 若 customCoords 已可用则立刻装配，未就绪则在 render 中惰性装配
+    if (map.customCoords) {
+      this.viewer.geo = createAMapGeoAdapter(map);
+      this.viewer.recomputeAnchors();
+    }
+
+    this._syncCanvasSize();
+    this.requestRepaint();
   }
 
-  /** 销毁或从地图中移除 */
-  destroy(): void {
+  private _detachFromMap(): void {
     if (this._amap && this._listenersAttached) {
-      this._amap.off('click', this._onClick);
-      this._amap.off('webglcontextlost', this._onContextLost);
-      this._amap.off('webglcontextrestored', this._onContextRestored);
       this._listenersAttached = false;
+      this._amap.off('viewchange', this._onViewChange);
+      this._amap.off('move', this._onViewChange);
+      this._amap.off('zoomchange', this._onViewChange);
+      this._amap.off('rotatechange', this._onViewChange);
+      this._amap.off('pitchchange', this._onViewChange);
+      this._amap.off('resize', this._onResize);
+      this._amap.off('click', this._onClick);
     }
-    this.unmountViewer();
+
+    if (this._customLayer && this._amap && typeof this._amap.remove === 'function') {
+      try {
+        this._amap.remove(this._customLayer);
+      } catch {}
+      this._customLayer = null;
+    }
+
+    if (this._canvas && this._canvas.parentElement) {
+      this._canvas.parentElement.removeChild(this._canvas);
+    }
+
     this.viewer.geo = null;
-    this._amap = null;
-    this._host = null;
   }
 
-  /* ---------------------------------------------------------------- 每帧渲染 */
+  private _onViewChange = (): void => {
+    this.render();
+  };
+
+  private _onResize = (): void => {
+    this._syncCanvasSize();
+    this.render();
+  };
+
+  private _syncCanvasSize(): void {
+    if (!this._canvas || !this._amap) return;
+    const container = this._amap.getContainer();
+    if (!container) return;
+
+    const width = container.clientWidth || 300;
+    const height = container.clientHeight || 150;
+    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const targetW = Math.round(width * dpr);
+    const targetH = Math.round(height * dpr);
+
+    if (this._canvas.width !== targetW || this._canvas.height !== targetH) {
+      this._canvas.width = targetW;
+      this._canvas.height = targetH;
+      this._canvas.style.width = width + 'px';
+      this._canvas.style.height = height + 'px';
+      if (this.viewer.renderer) {
+        this.viewer.renderer.setSize(width, height, false);
+      }
+    }
+  }
+
+  /* ---------------------------------------------------------------- 逐帧渲染驱动 */
 
   /**
-   * 由 AMap.GLCustomLayer 逐帧调用的渲染方法
+   * 驱动单帧渲染：从高德地图相机提取参数，换算成 MVP 矩阵喂给 S3MViewer 内核
    */
   render(): void {
-    const map = this._amap;
+    if (!this._amap || !this._canvas) return;
+
+    // 1. 惰性装配 GeoAdapter：等待 map.customCoords 准备就绪
+    if (!this.viewer.geo && this._amap.customCoords) {
+      const geo = createAMapGeoAdapter(this._amap);
+      if (geo) {
+        this.viewer.geo = geo;
+        this.viewer.recomputeAnchors();
+      }
+    }
+
+    const customCoords = this._amap.customCoords;
+    if (!customCoords || typeof customCoords.getCameraParams !== 'function') {
+      return;
+    }
+
     const anchor = this.viewer.sceneAnchor;
-    if (!map || !anchor) return;
-    if (this._contextLost) return;
+    if (!anchor) return;
 
-    const customCoords = map.customCoords;
-    if (!customCoords || typeof customCoords.getCameraParams !== 'function') return;
+    const camParams = customCoords.getCameraParams();
+    if (!camParams) return;
 
-    const renderer = this.viewer.renderer;
-    // 关键纪律：渲染前重置 three.js 的 WebGL 状态机，避免状态污染
-    if (renderer) renderer.resetState();
+    this._syncCanvasSize();
 
-    const canvas = map.getCanvas();
-    const aspect = canvas.width / (canvas.height || 1);
+    const { fov, near, far, position, lookAt, up } = camParams;
+    const canvas = this._canvas;
+    const aspect = canvas.width / Math.max(canvas.height, 1);
 
-    // 1. 提取高德实时透视相机参数
-    const { near, far, fov, up, lookAt, position } = customCoords.getCameraParams();
+    // 2. 相机参数对齐：
+    // 因 GeoAdapter 在出口已将高德北向 +y 转换为 S3M 内部南向 +y（即 y 取负），
+    // 此处将相机的 position、lookAt、up 的 y 分量同步取负，在右手坐标系中无缝对齐。
+    const camPos: [number, number, number] = [position[0], -position[1], position[2]];
+    const camLookAt: [number, number, number] = [lookAt[0], -lookAt[1], lookAt[2]];
+    const camUp: [number, number, number] = [up[0], -up[1], up[2]];
 
-    // 2. 构造透视相机并更新变换矩阵
     const cam = this._cameraHelper;
     cam.fov = fov;
     cam.aspect = aspect;
     cam.near = near;
     cam.far = far;
-    cam.position.set(position[0], position[1], position[2]);
-    cam.up.set(up[0], up[1], up[2]);
-    cam.lookAt(lookAt[0], lookAt[1], lookAt[2]);
+    cam.position.set(camPos[0], camPos[1], camPos[2]);
+    cam.up.set(camUp[0], camUp[1], camUp[2]);
+    cam.lookAt(camLookAt[0], camLookAt[1], camLookAt[2]);
     cam.updateMatrixWorld(true);
     cam.updateProjectionMatrix();
 
     // 3. 计算折叠 MVP 矩阵：
-    // 高德 customCoords 坐标系中 +Y 为正北向，S3MViewer 内部世界坐标系遵循墨卡托标准（+Y 为正南向，-Y 为正北向）。
-    // 因此在 MVP 上乘以 Y 轴翻转，将 S3M 顶点坐标无缝映射入高德投影空间。
+    // 保持纯净的投影与视图矩阵乘积，不施加任何负镜像缩放，杜绝三角形绕序翻转与背面剔除整面消失问题。
     const mvp = new Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
-    mvp.multiply(this._yFlipMatrix);
 
     // 4. 计算相机在局部场景 ENU 空间中的位置（米），用于 LOD 精度判定
     const sEast = anchor.meterInMercatorEast ?? anchor.meterInMercator;
     const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
     const sUp = anchor.meterInMercatorUp ?? 1.0;
 
-    // 高德坐标系下的锚点坐标：x = anchor.x, y = -anchor.y, z = anchor.z
-    const dX = position[0] - anchor.x;
-    const dY = position[1] - (-anchor.y);
-    const dZ = position[2] - anchor.z;
-
+    // anchor 在世界坐标系中为 [anchor.x, anchor.y, anchor.z]，其中 anchor.y 为南向世界坐标。
+    // camPos[1] - anchor.y 为南向位移，局部 ENU 北向位移为其相反数 -(camPos[1] - anchor.y)。
     const camEnu: [number, number, number] = [
-      dX / sEast,
-      dY / sNorth,
-      dZ / sUp,
+      (camPos[0] - anchor.x) / sEast,
+      -(camPos[1] - anchor.y) / sNorth,
+      (camPos[2] - anchor.z) / sUp,
     ];
 
     const fovRad = (fov * Math.PI) / 180;
@@ -229,31 +377,9 @@ export class AMapS3MLayer extends HostRenderer {
       fovRad,
       canvasHeight: canvas.height,
     });
-
-    // 关键纪律：渲染完成后再次重置 WebGL 状态，完好交还给高德底层渲染管线
-    if (renderer) renderer.resetState();
   }
 
   /* ---------------------------------------------------------------- 事件与拾取 */
-
-  private _onContextLost = (): void => {
-    this._contextLost = true;
-  };
-
-  private _onContextRestored = (): void => {
-    this._contextLost = false;
-    const canvas = this._amap?.getCanvas();
-    const gl =
-      (canvas?.getContext('webgl2') as WebGLRenderingContext | null) ??
-      (canvas?.getContext('webgl') as WebGLRenderingContext | null);
-    if (gl) {
-      this.viewer.restoreContext(gl);
-      if (this.viewer.renderer) {
-        this.viewer.renderer.autoClear = false;
-      }
-    }
-    this.requestRepaint();
-  };
 
   private _onClick = (e: any): void => {
     if (!this.pickable) return;
@@ -268,12 +394,12 @@ export class AMapS3MLayer extends HostRenderer {
 
   /** 鼠标事件对象 → 拾取结果 */
   pickFromEvent(e: any): PickResult | null {
-    const canvas = this._amap?.getCanvas();
+    const canvas = this._canvas;
     if (!canvas) return null;
     const rect = canvas.getBoundingClientRect();
-    const oe = e.originalEvent ?? e;
-    const clientX = oe.clientX ?? e.pixel?.x ?? 0;
-    const clientY = oe.clientY ?? e.pixel?.y ?? 0;
+    const oe = e?.originalEvent ?? e;
+    const clientX = oe?.clientX ?? e?.pixel?.x ?? 0;
+    const clientY = oe?.clientY ?? e?.pixel?.y ?? 0;
     return this.viewer.pick(clientX - rect.left, clientY - rect.top);
   }
 
@@ -283,7 +409,13 @@ export class AMapS3MLayer extends HostRenderer {
   }
 
   /** 选中单体高亮 */
-  select(pickOrId: PickResult | number | null): void {
-    this.viewer.select(pickOrId);
+  select(result: PickResult | null, opts: { silent?: boolean } = {}): void {
+    this.viewer.select(result, opts);
+  }
+
+  /** 销毁图层与资源 */
+  destroy(): void {
+    this._detachFromMap();
+    this.viewer.dispose();
   }
 }

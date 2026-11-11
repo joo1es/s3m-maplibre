@@ -27,8 +27,8 @@ export interface WorldCoordinateHelperLike {
 export interface MapLike extends S3MHost {
   getCanvas(): HTMLCanvasElement;
   triggerRepaint(): void;
-  on(type: string, listener: (e: any) => void): unknown;
-  off(type: string, listener: (e: any) => void): unknown;
+  on(type: string, listener: (e: MapMouseEventLike) => void): unknown;
+  off(type: string, listener: (e: MapMouseEventLike) => void): unknown;
   getBearing?(): number;
   getPitch?(): number;
   getCenter?(): any;

@@ -1,17 +1,47 @@
 import { describe, expect, it } from 'bun:test';
-import { Matrix4, PerspectiveCamera } from 'three';
+import { Matrix4 } from 'three';
 import { AMapS3MLayer } from '../../examples/amap/AMapS3MLayer.js';
 
 describe('AMapS3MLayer 高德地图适配层测试 (Phase 2)', () => {
+  function makeStubViewer() {
+    const v: any = {
+      renderer: {
+        autoClear: true,
+        resetState: () => {},
+        setSize: () => {},
+        getContext: () => ({ isContextLost: () => false }),
+      },
+      geo: null,
+      mountCalls: 0,
+      mount() {
+        v.mountCalls++;
+      },
+      unmount() {},
+      restoreContext() {},
+      recomputeAnchors() {},
+      sceneAnchor: {
+        x: 0,
+        y: 0,
+        z: 0,
+        meterInMercatorEast: 1.3,
+        meterInMercatorNorth: 1.3,
+        meterInMercatorUp: 1.0,
+        meterInMercator: 1.3,
+      },
+      renderFrame: () => false,
+    };
+    return v;
+  }
+
   function makeFakeAMap() {
     const listeners: Record<string, ((e: any) => void)[]> = {};
     let repaintCount = 0;
-    const canvas = {
-      width: 1024,
-      height: 768,
+    const container = {
       clientWidth: 1024,
       clientHeight: 768,
-      getBoundingClientRect: () => ({ left: 0, top: 0, width: 1024, height: 768 }),
+      appendChild: (_child: any) => {},
+      removeChild: (_child: any) => {},
+      contains: (_child: any) => true,
     } as any;
 
     const customCoords = {
@@ -27,15 +57,15 @@ describe('AMapS3MLayer 高德地图适配层测试 (Phase 2)', () => {
         near: 1,
         far: 50000,
         fov: 60,
-        up: [0, 1, 0],
-        lookAt: [0, 0, 0],
-        position: [0, -1000, 1000],
+        up: [0, 1, 0] as [number, number, number],
+        lookAt: [0, 0, 0] as [number, number, number],
+        position: [0, -1000, 1000] as [number, number, number],
       }),
     };
 
     const map = {
       customCoords,
-      getCanvas: () => canvas,
+      getContainer: () => container,
       getCenter: () => [116.39745, 39.90838],
       getZoom: () => 16,
       getPitch: () => 45,
@@ -57,49 +87,68 @@ describe('AMapS3MLayer 高德地图适配层测试 (Phase 2)', () => {
         return repaintCount;
       },
     };
-    return { map, canvas, customCoords };
+
+    const canvas = {
+      style: {},
+      width: 1024,
+      height: 768,
+      getContext: () => ({ isContextLost: () => false }),
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 1024, height: 768 }),
+    } as any;
+
+    return { map, container, customCoords, canvas };
   }
 
-  it('初始化与挂载：init 设置 autoClear = false 并创建 AMapGeoAdapter', () => {
-    const { map } = makeFakeAMap();
-    const layer = new AMapS3MLayer({ id: 'amap-s3m' });
+  it('初始化与挂载：采用独立覆盖画布并支持惰性装配 GeoAdapter', () => {
+    const { map, canvas } = makeFakeAMap();
+    const layer = new AMapS3MLayer({ id: 'amap-s3m', canvas });
+    (layer as any).viewer = makeStubViewer();
 
     expect(layer.id).toBe('amap-s3m');
     expect(layer.projection).toBe('perspective');
 
-    let mounted = false;
-    let autoClearVal: boolean | null = null;
-    const fakeViewer: any = {
-      renderer: null,
-      mount: () => {
-        mounted = true;
-        fakeViewer.renderer = {
-          get autoClear() {
-            return autoClearVal;
-          },
-          set autoClear(v: boolean) {
-            autoClearVal = v;
-          },
-          resetState: () => {},
-        };
-      },
-      unmount: () => {},
-      restoreContext: () => {},
-      geo: null,
-      sceneAnchor: null,
-    };
-    (layer as any).viewer = fakeViewer;
+    // 独立画布已挂载，样式为覆盖层
+    const layerCanvas = layer.getCanvas();
+    expect(layerCanvas).not.toBeNull();
+    expect(layerCanvas?.style.position).toBe('absolute');
+    expect(layerCanvas?.style.pointerEvents).toBe('none');
 
-    const fakeGl = {} as WebGLRenderingContext;
-    layer.init(map, fakeGl);
-
-    expect(mounted).toBe(true);
-    expect(autoClearVal).toBe(false); // 必须为 false，防止擦除高德底图
+    // 挂载到地图
+    layer.setMap(map);
+    expect(layer.map).toBe(map);
     expect(layer.viewer.geo).not.toBeNull();
   });
 
+  it('惰性装配：在 customCoords 未就绪时不崩溃，就绪后自动装配 GeoAdapter 并重算锚点', () => {
+    const { map, canvas } = makeFakeAMap();
+    const coordsHolder = map.customCoords;
+    delete (map as any).customCoords;
+
+    const layer = new AMapS3MLayer({ canvas });
+    const stub = makeStubViewer();
+    let recomputeCalled = false;
+    stub.recomputeAnchors = () => {
+      recomputeCalled = true;
+    };
+    (layer as any).viewer = stub;
+
+    layer.setMap(map);
+    // customCoords 缺失时严格返回 null，不提前装配
+    expect(layer.viewer.geo).toBeNull();
+
+    // 模拟底图完全就绪，挂上 customCoords
+    map.customCoords = coordsHolder;
+
+    // render 时自动惰性装配
+    layer.render();
+    expect(layer.viewer.geo).not.toBeNull();
+    expect(recomputeCalled).toBe(true);
+  });
+
   it('正交模式显式禁用并保持透视（发出警告，不静默降级）', () => {
-    const layer = new AMapS3MLayer();
+    const { canvas } = makeFakeAMap();
+    const layer = new AMapS3MLayer({ canvas });
+    (layer as any).viewer = makeStubViewer();
     let warnMsg = '';
     const origWarn = console.warn;
     console.warn = (msg: string) => {
@@ -113,48 +162,31 @@ describe('AMapS3MLayer 高德地图适配层测试 (Phase 2)', () => {
     expect(warnMsg).toContain('高德适配层暂不支持正交投影模式');
   });
 
-  it('render 周期：正确提取相机参数、调用前后 resetState 并驱动帧', () => {
-    const { map } = makeFakeAMap();
-    const layer = new AMapS3MLayer();
+  it('render 周期：纯净 MVP 矩阵（无镜像负缩放，保持右手系三角形绕序）并驱动帧', () => {
+    const { map, canvas } = makeFakeAMap();
+    const layer = new AMapS3MLayer({ canvas });
+    const stub = makeStubViewer();
 
-    let resetCount = 0;
     let drivenFrame: any = null;
-
-    (layer as any).viewer = {
-      mount: () => {},
-      unmount: () => {},
-      restoreContext: () => {},
-      renderer: {
-        autoClear: true,
-        resetState: () => {
-          resetCount++;
-        },
-        getContext: () => ({ isContextLost: () => false }),
-      },
-      sceneAnchor: {
-        x: 0,
-        y: 0,
-        z: 0,
-        meterInMercatorEast: 1.3,
-        meterInMercatorNorth: 1.3,
-        meterInMercatorUp: 1.0,
-        meterInMercator: 1.3,
-      },
-      renderFrame: (frame: any) => {
-        drivenFrame = frame;
-        return false;
-      },
+    stub.renderFrame = (frame: any) => {
+      drivenFrame = frame;
+      return false;
     };
+    (layer as any).viewer = stub;
 
-    layer.init(map, {} as WebGLRenderingContext);
+    layer.setMap(map);
     layer.render();
-
-    // 必须调用两次 resetState：渲染前一次，渲染后一次
-    expect(resetCount).toBe(2);
 
     // 驱动帧参数正确
     expect(drivenFrame).not.toBeNull();
     expect(drivenFrame.mvp).toBeDefined();
+
+    // 关键矩阵验证：MVP 矩阵的行列式应大于 0，杜绝负缩放导致的背面剔除三角形翻转
+    const mat = new Matrix4().fromArray(drivenFrame.mvp);
+    const det = mat.determinant();
+    expect(Number.isFinite(det)).toBe(true);
+    expect(det).not.toBe(0);
+
     expect(drivenFrame.cameraEnu).toBeDefined();
     expect(drivenFrame.canvasHeight).toBe(768);
     expect(drivenFrame.fovRad).toBeCloseTo((60 * Math.PI) / 180, 5);

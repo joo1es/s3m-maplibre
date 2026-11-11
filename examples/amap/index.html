@@ -63,22 +63,35 @@
       margin-left: 6px;
     }
   </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "../../demo/vendor/three.module.js",
+        "s3m-three": "../../packages/s3m-three/dist/index.js"
+      }
+    }
+  </script>
 </head>
 <body>
   <div id="container"></div>
 
   <div id="panel">
-    <h3>S3M × 高德地图 <span class="badge">Phase 2</span></h3>
-    <p style="color: #666; margin-bottom: 12px;">基于 <code>AMap.GLCustomLayer</code> 共享 WebGL Context 与 <code>customCoords</code> 透视相机对齐。</p>
+    <h3>S3M × 高德地图 <span class="badge">Phase 2 WebGL2</span></h3>
+    <p style="color: #666; margin-bottom: 12px;">基于独立 WebGL2 覆盖层与 <code>customCoords</code> 纯净 MVP 对齐。</p>
 
     <div class="form-row">
       <label>高德 Web JS API Key</label>
-      <input type="text" id="key-input" placeholder="输入高德 Key 或使用 URL 参数 ?key=..." />
+      <input type="text" id="key-input" placeholder="输入高德 Key 或使用 URL 参数 ?key=..." value="42d4710e7910e812317872aecf857535" />
+    </div>
+
+    <div class="form-row">
+      <label>高德安全密钥 Security Code（可选）</label>
+      <input type="text" id="sec-input" placeholder="若配置了安全密钥，请输入或 ?code=..." />
     </div>
 
     <div class="form-row">
       <label>S3M 数据集 URL (.scp / 根瓦片)</label>
-      <input type="text" id="url-input" placeholder="http://.../config.scp" />
+      <input type="text" id="url-input" placeholder="../../demo/data/CBD/cbd.scp" value="../../demo/data/CBD/cbd.scp" />
     </div>
 
     <div class="form-row" style="display: flex; gap: 8px;">
@@ -86,21 +99,23 @@
       <button id="reset-cam-btn" style="background: #555;">重置视角</button>
     </div>
 
-    <div id="status-box">准备就绪。请输入高德 API Key 并点击加载。</div>
+    <div id="status-box">准备就绪。点击“加载地图与模型”开始渲染。</div>
   </div>
 
   <script type="module">
     import * as THREE from 'three';
-    import { AMapS3MLayer } from './AMapS3MLayer.ts';
+    import { AMapS3MLayer } from './AMapS3MLayer.js';
 
     const urlParams = new URLSearchParams(window.location.search);
     const keyInput = document.getElementById('key-input');
+    const secInput = document.getElementById('sec-input');
     const urlInput = document.getElementById('url-input');
     const statusBox = document.getElementById('status-box');
 
     // 默认值 / 记忆
-    keyInput.value = urlParams.get('key') || localStorage.getItem('amap_key') || '';
-    urlInput.value = urlParams.get('url') || localStorage.getItem('s3m_url') || '';
+    if (urlParams.get('key')) keyInput.value = urlParams.get('key');
+    if (urlParams.get('code')) secInput.value = urlParams.get('code');
+    if (urlParams.get('url')) urlInput.value = urlParams.get('url');
 
     function log(msg) {
       statusBox.innerHTML += `<div>[${new Date().toLocaleTimeString()}] ${msg}</div>`;
@@ -110,7 +125,10 @@
     let map = null;
     let s3mLayer = null;
 
-    function initAMap(key) {
+    function initAMap(key, code) {
+      if (code) {
+        window._AMapSecurityConfig = { securityJsCode: code };
+      }
       if (window.AMap) {
         startMap();
         return;
@@ -133,7 +151,7 @@
       log('初始化高德 3D 地图...');
       map = new AMap.Map('container', {
         viewMode: '3D',
-        center: [116.39126, 39.90700],
+        center: [116.4578, 39.9140], // 北京 CBD 坐标
         zoom: 16,
         pitch: 55,
         rotation: -15,
@@ -146,58 +164,50 @@
     }
 
     function mountS3MLayer() {
+      if (s3mLayer) return;
+
       s3mLayer = new AMapS3MLayer({
         id: 's3m-layer',
         onPick: (hit) => {
-          log(`拾取单体: ${hit ? `pickId=${hit.pickId}` : '未命中'}`);
+          log(`拾取单体: ${hit ? `objectId=${hit.objectId}, batchId=${hit.batchId}` : '未命中'}`);
         },
         onReady: (entry) => {
           log(`数据集就绪: 瓦片数=${entry.tileset ? 1 : 0}`);
         },
       });
 
-      const glCustomLayer = new AMap.GLCustomLayer({
-        zIndex: 120,
-        init: (gl) => {
-          s3mLayer.init(map, gl);
-          const s3mUrl = urlInput.value.trim();
-          if (s3mUrl) {
-            log(`加载 S3M 模型: ${s3mUrl}`);
-            s3mLayer.viewer.addDataset({ url: s3mUrl });
-          }
-        },
-        render: () => {
-          s3mLayer.render();
-        },
-      });
+      // 挂载到地图（自动创建 WebGL2 覆盖画布）
+      s3mLayer.setMap(map);
+      log('AMapS3MLayer (WebGL2) 已挂载');
 
-      map.add(glCustomLayer);
-      log('GLCustomLayer 已添加到地图');
+      const s3mUrl = urlInput.value.trim();
+      if (s3mUrl) {
+        log(`加载 S3M 模型: ${s3mUrl}`);
+        s3mLayer.viewer.addDataset({ id: 'cbd', configUrl: s3mUrl });
+      }
     }
 
     document.getElementById('load-btn').addEventListener('click', () => {
       const key = keyInput.value.trim();
-      const s3mUrl = urlInput.value.trim();
+      const code = secInput.value.trim();
       if (!key) {
         alert('请先输入高德 Web JS API Key');
         return;
       }
-      localStorage.setItem('amap_key', key);
-      localStorage.setItem('s3m_url', s3mUrl);
-      initAMap(key);
+      initAMap(key, code);
     });
 
     document.getElementById('reset-cam-btn').addEventListener('click', () => {
       if (map) {
-        map.setZoomAndCenter(16, [116.39126, 39.90700]);
+        map.setZoomAndCenter(16, [116.4578, 39.9140]);
         map.setPitch(55);
         map.setRotation(-15);
       }
     });
 
-    // 若 URL 已带 key，自动启动
+    // 默认自启动加载
     if (keyInput.value) {
-      initAMap(keyInput.value);
+      initAMap(keyInput.value, secInput.value);
     }
   </script>
 </body>

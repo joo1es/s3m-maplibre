@@ -111,11 +111,9 @@ export abstract class HostRenderer {
   /**
    * 宿主能力的钩子：请求下一帧重绘。
    * maplibre → `map.triggerRepaint()`；amap → `triggerRepaint()`；arcgis → `externalRenderers.requestRender(view)`。
-   * 若已绑定通用宿主 S3MHost，默认转发 host.triggerRepaint()。
+   * 保持 abstract：漏实现等于「永不重绘」，由编译期强制各宿主适配层显式提供。
    */
-  protected requestRepaint(): void {
-    this._host?.triggerRepaint();
-  }
+  protected abstract requestRepaint(): void;
 
   /** 宿主方位角（度）；默认从 host 读取，无 host 时返回 0（灯光不跟随视角） */
   protected getBearing(): number {

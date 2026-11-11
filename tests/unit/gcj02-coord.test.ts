@@ -142,4 +142,37 @@ describe('高德 customCoords 尺度定标与 GeoAdapter (Phase 0)', () => {
     expect(backLng).toBeCloseTo(116.39126, 5);
     expect(backLat).toBeCloseTo(39.90700, 5);
   });
+
+  it('未就绪或缺失 customCoords 投影工具时严格返回 null，避免所有点塌陷至原点', () => {
+    expect(createAMapGeoAdapter(null)).toBeNull();
+    expect(createAMapGeoAdapter(undefined)).toBeNull();
+    expect(createAMapGeoAdapter({})).toBeNull();
+    expect(createAMapGeoAdapter({ center: [116.4, 39.9] } as any)).toBeNull();
+    expect(createAMapGeoAdapter({ customCoords: {} } as any)).toBeNull();
+  });
+
+  it('Y 轴方向归一：GeoAdapter 出口 y 取负，确保 S3M 内部保持右手系', () => {
+    const centerLon = 116.39745;
+    const centerLat = 39.90838;
+    const fakeCustomCoords = {
+      lngLatToCoord([lng, lat]: [number, number]) {
+        // 模拟正北向 y 为正
+        return [0, (lat - centerLat) * 111000];
+      },
+      coordToLngLat([x, y]: [number, number]): [number, number] {
+        return [centerLon, centerLat + y / 111000];
+      },
+    };
+    const adapter = createAMapGeoAdapter({ customCoords: fakeCustomCoords, center: [centerLon, centerLat] });
+    expect(adapter).not.toBeNull();
+
+    // 位于中心正北方的点（lat 增大）：高德 lngLatToCoord 产出正 y
+    // 但 S3M 内部遵循墨卡托 +y 朝南，因此 GeoAdapter 出口必须为负 y
+    const northPt = adapter!.worldFromLngLat(116.39745, centerLat + 0.01);
+    expect(northPt.y).toBeLessThan(0);
+
+    // 往返互逆还原
+    const [backLon, backLat] = adapter!.lngLatFromWorld(northPt.x, northPt.y);
+    expect(backLat).toBeCloseTo(centerLat + 0.01, 4);
+  });
 });

@@ -305,7 +305,10 @@ export interface AMapLikeOptions {
  * 创建高德地图 (AMap) 的 GeoAdapter。
  * 1. 负责 WGS84 ↔ GCJ-02 坐标换算；
  * 2. 桥接 AMap customCoords 经纬度与局部 3D 直角坐标；
- * 3. 完成高德坐标定标：水平尺度按 Web 墨卡托比率 (1/cosφ)，垂直尺度 meterInMercatorUp 定标为 1.0 (米制)。
+ * 3. 完成高德坐标定标：水平尺度按 Web 墨卡托比率 (1/cosφ)，垂直尺度 meterInMercatorUp 定标为 1.0 (米制)；
+ * 4. Y 轴方向归一：高德 customCoords 原生 +y 为正北向，S3MViewer 内部遵循 +y 为正南向。
+ *    在 GeoAdapter 出口将 y 取负（lngLatFromWorld 互逆传入 -y），使 S3M 场景与着色器几何保持正右手系，
+ *    彻底避免 MVP 负缩放导致的三角形绕序翻转（背面剔除整面消失）。
  */
 export function createAMapGeoAdapter(
   target?: AMapLikeOptions | AMapCustomCoordsLike | { customCoords?: AMapCustomCoordsLike; getCenter?(): any } | null
@@ -313,42 +316,28 @@ export function createAMapGeoAdapter(
   if (!target) return null;
   const customCoords =
     ('customCoords' in target ? target.customCoords : target) as AMapCustomCoordsLike | undefined;
-  const rawCenter =
-    'center' in target
-      ? target.center
-      : typeof (target as any).getCenter === 'function'
-      ? (target as any).getCenter()
-      : customCoords?.getCenter?.();
 
-  const centerLngLat: [number, number] | null = Array.isArray(rawCenter)
-    ? [rawCenter[0], rawCenter[1]]
-    : rawCenter && typeof rawCenter === 'object' && 'lng' in rawCenter && 'lat' in rawCenter
-    ? [rawCenter.lng, rawCenter.lat]
-    : null;
+  // 拿不到可用投影工具时返回 null，避免产出所有点塌陷至原点的哑适配器
+  if (!customCoords || typeof customCoords.lngLatToCoord !== 'function') {
+    return null;
+  }
+
+  const lngLatToCoord = customCoords.lngLatToCoord.bind(customCoords);
+  const coordToLngLat = typeof customCoords.coordToLngLat === 'function'
+    ? customCoords.coordToLngLat.bind(customCoords)
+    : undefined;
 
   return {
     worldFromLngLat(lng: number, lat: number, altitude = 0) {
       // 1. S3M 顶点与 scp 为 WGS84，高德底图为 GCJ-02
       const [gcjLng, gcjLat] = wgs84ToGcj02(lng, lat);
 
-      let x = 0;
-      let y = 0;
-      let z = 0;
-
-      if (customCoords && typeof customCoords.lngLatToCoord === 'function') {
-        const pt = customCoords.lngLatToCoord([gcjLng, gcjLat]);
-        x = pt[0];
-        y = pt[1];
-        if (pt.length > 2 && typeof pt[2] === 'number' && Number.isFinite(pt[2])) z = pt[2];
-      } else if (centerLngLat) {
-        const R = WGS84_A;
-        const cX = (centerLngLat[0] * Math.PI * R) / 180;
-        const cY = R * Math.log(Math.tan(Math.PI / 4 + (centerLngLat[1] * Math.PI) / 360));
-        const mX = (gcjLng * Math.PI * R) / 180;
-        const mY = R * Math.log(Math.tan(Math.PI / 4 + (gcjLat * Math.PI) / 360));
-        x = mX - cX;
-        y = mY - cY;
-      }
+      const pt = lngLatToCoord([gcjLng, gcjLat]);
+      const x = pt[0];
+      // 高德 customCoords 原生 +y 为正北向；S3M 内部世界坐标系（enuMatrix / 墨卡托）+y 为正南向。
+      // 在此处将 y 取负，使整个渲染与分析管线内保持纯正右手系，MVP 无需再做镜像翻转。
+      const y = -pt[1];
+      const z = (pt.length > 2 && typeof pt[2] === 'number' && Number.isFinite(pt[2]) ? pt[2] : 0);
 
       // 2. 尺度定标（Phase 0 定标项）：
       // 水平增量为 Web 墨卡托尺度 (~1/cosφ)，垂直高度 z 为物理米制高程 (sUp = 1.0)
@@ -363,18 +352,16 @@ export function createAMapGeoAdapter(
       let sEast = 0;
       let sNorth = 0;
 
-      if (customCoords && typeof customCoords.lngLatToCoord === 'function') {
-        try {
-          const cEast = customCoords.lngLatToCoord([gcjLng + dLon1m, gcjLat]);
-          const de = Math.hypot(cEast[0] - x, cEast[1] - y);
-          if (Number.isFinite(de) && de > 0) sEast = de;
+      try {
+        const cEast = lngLatToCoord([gcjLng + dLon1m, gcjLat]);
+        const de = Math.hypot(cEast[0] - pt[0], cEast[1] - pt[1]);
+        if (Number.isFinite(de) && de > 0) sEast = de;
 
-          const cNorth = customCoords.lngLatToCoord([gcjLng, gcjLat + dLat1m]);
-          const dn = Math.hypot(cNorth[0] - x, cNorth[1] - y);
-          if (Number.isFinite(dn) && dn > 0) sNorth = dn;
-        } catch {
-          // 差分失败时继续降级
-        }
+        const cNorth = lngLatToCoord([gcjLng, gcjLat + dLat1m]);
+        const dn = Math.hypot(cNorth[0] - pt[0], cNorth[1] - pt[1]);
+        if (Number.isFinite(dn) && dn > 0) sNorth = dn;
+      } catch {
+        // 差分失败时降级
       }
 
       if (sEast === 0) sEast = WGS84_A / (N * cosLat);
@@ -395,19 +382,10 @@ export function createAMapGeoAdapter(
     },
 
     lngLatFromWorld(x: number, y: number): [number, number] {
-      if (customCoords && typeof customCoords.coordToLngLat === 'function') {
-        const gcj = customCoords.coordToLngLat([x, y]);
+      if (coordToLngLat) {
+        // 与 worldFromLngLat 中的 y 取负互逆：传入高德原生坐标系 +y
+        const gcj = coordToLngLat([x, -y]);
         return gcj02ToWgs84(gcj[0], gcj[1]);
-      }
-      if (centerLngLat) {
-        const R = WGS84_A;
-        const cX = (centerLngLat[0] * Math.PI * R) / 180;
-        const cY = R * Math.log(Math.tan(Math.PI / 4 + (centerLngLat[1] * Math.PI) / 360));
-        const mX = x + cX;
-        const mY = y + cY;
-        const gcjLng = (mX / (Math.PI * R)) * 180;
-        const gcjLat = ((2 * Math.atan(Math.exp(mY / R)) - Math.PI / 2) * 180) / Math.PI;
-        return gcj02ToWgs84(gcjLng, gcjLat);
       }
       return [0, 0];
     },
