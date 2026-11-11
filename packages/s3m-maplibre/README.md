@@ -31,6 +31,47 @@ map.addLayer(layer);
 
 不接地图、只要 three 场景？直接用 `s3m-three` 的 `S3MViewer`。
 
+## 自定义投影适配（GeoAdapter）
+
+默认情况下本层从 MapLibre 的 `transform.worldCoordinateHelper` 自动推断当前投影，
+把 S3M 锚点（经纬度）换算成宿主世界坐标。对**标准经纬度 S3M + 任意底图 CRS**
+（如 CGCS2000 / 4547 分带投影）这已自动工作，无需任何配置。
+
+当你要**完全接管**「经纬度 → 世界坐标」换算（例如模型自带 3857 墨卡托米、
+或在分带投影下做自定义重投影）时，可注入自定义 `GeoAdapter`：
+
+```ts
+import type { GeoAdapter } from 's3m-maplibre';
+import proj4 from 'proj4';
+
+// 把入参（视作 3857 米）反解为真实经纬度，再委托宿主 4547 的 helper
+const crsBridge: GeoAdapter = {
+  worldFromLngLat(lng, lat, alt = 0) {
+    const [lon, latR] = proj4('EPSG:3857', 'EPSG:4326', [lng, lat]);
+    const h = map.transform.worldCoordinateHelper;
+    const c = h.worldFromLngLat(lon, latR, alt);
+    const mpw = h.metersPerWorldUnit?.(c.x, c.y) ?? 1;
+    return { x: c.x, y: c.y, z: c.z ?? alt,
+             meterInMercatorEast: mpw, meterInMercatorNorth: mpw,
+             meterInMercatorUp: mpw, meterInMercator: mpw, altitude: alt };
+  },
+  lngLatFromWorld(x, y) {
+    const ll = map.transform.worldCoordinateHelper.lngLatFromWorld(x, y);
+    return proj4('EPSG:4326', 'EPSG:3857', [ll[0], ll[1]]);
+  },
+};
+
+const layer = new S3MLayer({ configUrl, geo: crsBridge });
+// layer.setGeoAdapter(crsBridge);  // 运行时切换
+// layer.setGeoAdapter(null);       // 恢复自动推断
+```
+
+注入后本层**不再从宿主自动推断投影、也不再在 `projectiontransition` 时自动重建**
+适配器——投影变化由你负责响应。`GeoAdapter` 的 `worldFromLngLat(lng, lat)` 输入契约是
+**经纬度**，所以「模型是 3857 米」时需在喂入数据前用 proj4 转成真实经纬度（或把 3857 米
+塞进数据的经纬度字段再在此反解）。库**不引入 proj4**，换算逻辑完全由你提供。
+详见 [docs/API.md](./docs/API.md)。
+
 ## 许可
 
 Apache-2.0
