@@ -181,11 +181,20 @@ describe('AMapS3MLayer 高德地图适配层测试 (Phase 2)', () => {
     expect(drivenFrame).not.toBeNull();
     expect(drivenFrame.mvp).toBeDefined();
 
-    // 关键矩阵验证：MVP 矩阵的行列式应大于 0，杜绝负缩放导致的背面剔除三角形翻转
+    // 关键矩阵验证：整体从 ENU 到 Clip 的行列式与标准 Three.js 一致（det < 0），杜绝正面网格被背面剔除
     const mat = new Matrix4().fromArray(drivenFrame.mvp);
     const det = mat.determinant();
     expect(Number.isFinite(det)).toBe(true);
     expect(det).not.toBe(0);
+
+    const enuMatrix = new Matrix4().set(
+      1.3, 0, 0, stub.sceneAnchor.x,
+      0, -1.3, 0, stub.sceneAnchor.y,
+      0, 0, 1.0, stub.sceneAnchor.z,
+      0, 0, 0, 1
+    );
+    const total = mat.clone().multiply(enuMatrix);
+    expect(total.determinant()).toBeLessThan(0);
 
     expect(drivenFrame.cameraEnu).toBeDefined();
     expect(drivenFrame.canvasHeight).toBe(768);

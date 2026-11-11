@@ -151,10 +151,10 @@
       log('初始化高德 3D 地图...');
       map = new AMap.Map('container', {
         viewMode: '3D',
-        center: [116.4578, 39.9140], // 北京 CBD 坐标
-        zoom: 16,
-        pitch: 55,
-        rotation: -15,
+        center: [116.464265, 39.913635], // 北京 CBD 央视大楼 GCJ-02 真实坐标
+        zoom: 17,
+        pitch: 60,
+        rotation: 35,
       });
 
       map.on('complete', () => {
@@ -199,9 +199,9 @@
 
     document.getElementById('reset-cam-btn').addEventListener('click', () => {
       if (map) {
-        map.setZoomAndCenter(16, [116.4578, 39.9140]);
-        map.setPitch(55);
-        map.setRotation(-15);
+        map.setZoomAndCenter(17, [116.464265, 39.913635]);
+        map.setPitch(60);
+        map.setRotation(35);
       }
     });
 

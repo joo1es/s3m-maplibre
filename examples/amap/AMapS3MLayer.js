@@ -221,27 +221,25 @@ class AMapS3MLayer extends HostRenderer {
     const { fov, near, far, position, lookAt, up } = camParams;
     const canvas = this._canvas;
     const aspect = canvas.width / Math.max(canvas.height, 1);
-    const camPos = [position[0], -position[1], position[2]];
-    const camLookAt = [lookAt[0], -lookAt[1], lookAt[2]];
-    const camUp = [up[0], -up[1], up[2]];
     const cam = this._cameraHelper;
     cam.fov = fov;
     cam.aspect = aspect;
     cam.near = near;
     cam.far = far;
-    cam.position.set(camPos[0], camPos[1], camPos[2]);
-    cam.up.set(camUp[0], camUp[1], camUp[2]);
-    cam.lookAt(camLookAt[0], camLookAt[1], camLookAt[2]);
+    cam.position.set(position[0], position[1], position[2]);
+    cam.up.set(up[0], up[1], up[2]);
+    cam.lookAt(lookAt[0], lookAt[1], lookAt[2]);
     cam.updateMatrixWorld(true);
     cam.updateProjectionMatrix();
-    const mvp = new Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    const camMVP = new Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    const mvp = camMVP.multiply(new Matrix4().makeScale(1, -1, 1));
     const sEast = anchor.meterInMercatorEast ?? anchor.meterInMercator;
     const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
     const sUp = anchor.meterInMercatorUp ?? 1;
     const camEnu = [
-      (camPos[0] - anchor.x) / sEast,
-      -(camPos[1] - anchor.y) / sNorth,
-      (camPos[2] - anchor.z) / sUp
+      (position[0] - anchor.x) / sEast,
+      (position[1] + anchor.y) / sNorth,
+      (position[2] - anchor.z) / sUp
     ];
     const fovRad = fov * Math.PI / 180;
     this.driveFrame({

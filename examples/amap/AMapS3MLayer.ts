@@ -334,38 +334,43 @@ export class AMapS3MLayer extends HostRenderer {
     const aspect = canvas.width / Math.max(canvas.height, 1);
 
     // 2. 相机参数对齐：
-    // 因 GeoAdapter 在出口已将高德北向 +y 转换为 S3M 内部南向 +y（即 y 取负），
-    // 此处将相机的 position、lookAt、up 的 y 分量同步取负，在右手坐标系中无缝对齐。
-    const camPos: [number, number, number] = [position[0], -position[1], position[2]];
-    const camLookAt: [number, number, number] = [lookAt[0], -lookAt[1], lookAt[2]];
-    const camUp: [number, number, number] = [up[0], -up[1], up[2]];
-
+    // AMap customCoords.getCameraParams() 给出的是高德直角坐标系 (+X 东, +Y 北, +Z 上) 下的原生相机参数。
+    // 直接设置 PerspectiveCamera，保证相机坐标系正交无翻转（X 轴保持朝右，杜绝水平镜像）。
     const cam = this._cameraHelper;
     cam.fov = fov;
     cam.aspect = aspect;
     cam.near = near;
     cam.far = far;
-    cam.position.set(camPos[0], camPos[1], camPos[2]);
-    cam.up.set(camUp[0], camUp[1], camUp[2]);
-    cam.lookAt(camLookAt[0], camLookAt[1], camLookAt[2]);
+    cam.position.set(position[0], position[1], position[2]);
+    cam.up.set(up[0], up[1], up[2]);
+    cam.lookAt(lookAt[0], lookAt[1], lookAt[2]);
     cam.updateMatrixWorld(true);
     cam.updateProjectionMatrix();
 
     // 3. 计算折叠 MVP 矩阵：
-    // 保持纯净的投影与视图矩阵乘积，不施加任何负镜像缩放，杜绝三角形绕序翻转与背面剔除整面消失问题。
-    const mvp = new Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    // S3MViewer 内部世界矩阵假设 y 为南向（_enuMatrix 第二行为 0, -sNorth, 0, anchor.y）。
+    // GeoAdapter 出口处已将 y 转换为南向 (y = -pt[1])。
+    // 通过在此处对相机 MVP 矩阵乘以 makeScale(1, -1, 1)，
+    // 使得 mvp · _enuMatrix 中的 (-1) · (-sNorth) 恰好对消为正 (+sNorth)，
+    // 且整体矩阵行列式与标准 Three.js 透视相机一致（det < 0），
+    // 彻底解决两大致命问题：
+    //   1. 三角形正面 CCW 绕序不被翻转，背面剔除正常生效，正面玻璃网格不再缺失；
+    //   2. 相机不产生镜像负缩放，建筑朝向与高德底图完全吻合（东西向不反转）。
+    const camMVP = new Matrix4().multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
+    const mvp = camMVP.multiply(new Matrix4().makeScale(1, -1, 1));
 
     // 4. 计算相机在局部场景 ENU 空间中的位置（米），用于 LOD 精度判定
     const sEast = anchor.meterInMercatorEast ?? anchor.meterInMercator;
     const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
     const sUp = anchor.meterInMercatorUp ?? 1.0;
 
-    // anchor 在世界坐标系中为 [anchor.x, anchor.y, anchor.z]，其中 anchor.y 为南向世界坐标。
-    // camPos[1] - anchor.y 为南向位移，局部 ENU 北向位移为其相反数 -(camPos[1] - anchor.y)。
+    // anchor.x 为 pt_anchor[0], anchor.y 为 -pt_anchor[1]。
+    // 相机在 AMap 坐标系中位置为 position[0], position[1], position[2]。
+    // 局部 ENU 偏移量（米）：
     const camEnu: [number, number, number] = [
-      (camPos[0] - anchor.x) / sEast,
-      -(camPos[1] - anchor.y) / sNorth,
-      (camPos[2] - anchor.z) / sUp,
+      (position[0] - anchor.x) / sEast,
+      (position[1] + anchor.y) / sNorth,
+      (position[2] - anchor.z) / sUp,
     ];
 
     const fovRad = (fov * Math.PI) / 180;
