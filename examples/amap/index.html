@@ -151,10 +151,10 @@
       log('初始化高德 3D 地图...');
       map = new AMap.Map('container', {
         viewMode: '3D',
-        center: [116.464265, 39.913635], // 北京 CBD 央视大楼 GCJ-02 真实坐标
-        zoom: 17,
+        center: [116.464129, 39.915287], // 北京 CBD 央视大楼 GCJ-02 POI 中心点
+        zoom: 16.5,
         pitch: 60,
-        rotation: 35,
+        rotation: 30,
       });
 
       map.on('complete', () => {
@@ -168,6 +168,7 @@
 
       s3mLayer = new AMapS3MLayer({
         id: 's3m-layer',
+        lightingPreset: 'supermap',
         onPick: (hit) => {
           log(`拾取单体: ${hit ? `objectId=${hit.objectId}, batchId=${hit.batchId}` : '未命中'}`);
         },
@@ -199,9 +200,9 @@
 
     document.getElementById('reset-cam-btn').addEventListener('click', () => {
       if (map) {
-        map.setZoomAndCenter(17, [116.464265, 39.913635]);
+        map.setZoomAndCenter(16.5, [116.464129, 39.915287]);
         map.setPitch(60);
-        map.setRotation(35);
+        map.setRotation(30);
       }
     });
 

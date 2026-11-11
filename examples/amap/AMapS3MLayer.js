@@ -14,11 +14,13 @@ class AMapS3MLayer extends HostRenderer {
   _cameraHelper = new PerspectiveCamera;
   _listenersAttached = false;
   _customLayer = null;
+  _refCenter = null;
   constructor(options = {}) {
     super(options);
     this.zIndex = options.zIndex ?? 120;
     this.zooms = options.zooms ?? [2, 20];
     this.opacity = options.opacity ?? 1;
+    this._refCenter = options.center ?? null;
     if (options.canvas) {
       this._canvas = options.canvas;
       this._canvas.style.position = "absolute";
@@ -72,7 +74,15 @@ class AMapS3MLayer extends HostRenderer {
     }
   }
   getBearing() {
-    return this._amap?.getBearing?.() ?? 0;
+    if (this._amap) {
+      if (typeof this._amap.getBearing === "function") {
+        return this._amap.getBearing();
+      }
+      if (typeof this._amap.getRotation === "function") {
+        return -this._amap.getRotation();
+      }
+    }
+    return 0;
   }
   setProjection(mode, transition) {
     if (mode === "orthographic") {
@@ -141,6 +151,19 @@ class AMapS3MLayer extends HostRenderer {
       map.on("click", this._onClick);
     }
     if (map.customCoords) {
+      if (!this._refCenter && typeof map.getCenter === "function") {
+        const c = map.getCenter();
+        if (Array.isArray(c)) {
+          this._refCenter = [c[0], c[1]];
+        } else if (c && typeof c.getLng === "function") {
+          this._refCenter = [c.getLng(), c.getLat()];
+        } else if (c && typeof c.lng === "number") {
+          this._refCenter = [c.lng, c.lat];
+        }
+      }
+      if (this._refCenter && typeof map.customCoords.setCenter === "function") {
+        map.customCoords.setCenter(this._refCenter);
+      }
       this.viewer.geo = createAMapGeoAdapter(map);
       this.viewer.recomputeAnchors();
     }
@@ -201,6 +224,19 @@ class AMapS3MLayer extends HostRenderer {
     if (!this._amap || !this._canvas)
       return;
     if (!this.viewer.geo && this._amap.customCoords) {
+      if (!this._refCenter && typeof this._amap.getCenter === "function") {
+        const c = this._amap.getCenter();
+        if (Array.isArray(c)) {
+          this._refCenter = [c[0], c[1]];
+        } else if (c && typeof c.getLng === "function") {
+          this._refCenter = [c.getLng(), c.getLat()];
+        } else if (c && typeof c.lng === "number") {
+          this._refCenter = [c.lng, c.lat];
+        }
+      }
+      if (this._refCenter && typeof this._amap.customCoords.setCenter === "function") {
+        this._amap.customCoords.setCenter(this._refCenter);
+      }
       const geo = createAMapGeoAdapter(this._amap);
       if (geo) {
         this.viewer.geo = geo;
@@ -210,6 +246,9 @@ class AMapS3MLayer extends HostRenderer {
     const customCoords = this._amap.customCoords;
     if (!customCoords || typeof customCoords.getCameraParams !== "function") {
       return;
+    }
+    if (this._refCenter && typeof customCoords.setCenter === "function") {
+      customCoords.setCenter(this._refCenter);
     }
     const anchor = this.viewer.sceneAnchor;
     if (!anchor)
