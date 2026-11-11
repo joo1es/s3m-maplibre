@@ -77,7 +77,19 @@ const layer = new S3MLayer({
   onPick: (f) => console.log(f?.smid, f?.height),
 });
 
-map.on('load', () => map.addLayer(layer));
+map.on('load', () => {
+  map.addLayer(layer);
+  // pitch 压大之后，地平线以上没有任何图层覆盖 —— 不配 sky 就是清屏色（黑），
+  // 看着像「天上破了个洞」。成因与排查见「宿主兼容与已知限制」。
+  map.setSky({
+    'sky-color': '#b9cfe4',
+    'sky-horizon-blend': 0.6,
+    'horizon-color': '#f0f4f8',
+    'horizon-fog-blend': 0.5,
+    'fog-color': '#f7f9fb',
+    'fog-ground-blend': 0.2,
+  });
+});
 ```
 
 ---
@@ -811,6 +823,7 @@ e[14] = -2 · far · near' / (far - near')
 - **贴近模型时整片消失**大概率是 MapLibre 的近裁剪面（默认离相机约 13 米）裁的，不是瓦片调度问题：用 `nearPlaneScale` 调，见[近裁剪面](#近裁剪面贴脸看时不消失)。另一条路是瓦片预算——相机贴近会让 LOD 深度暴涨、超过 `hardCap` 后可能强制淘汰正在显示的瓦片（开洞），表现为「局部空洞、过几秒补上」，与近裁剪的「整片空白、退回来立刻恢复」可区分。
 - **`layer.viewer.geo` 在 MapLibre 上经常是 `null`，这是正常的**：`createMapLibreGeoAdapter()` 只有从宿主拿到 `WorldCoordinateHelper`（`transform.worldCoordinateHelper` 等 4 个候选位置）时才生效，拿不到就返回 `null`，渲染层自动回退标准 Web 墨卡托（基于 WGS84 椭球高精度模型与各向异性尺度反推）。当宿主提供 `worldFromLngLat` 时，适配器会通过东向与北向各 1 米的大地线差分，精确获取各向异性米制尺度 `(meterInMercatorEast, meterInMercatorNorth, meterInMercatorUp)`。**自己换算经纬度时不要用 `if (viewer.geo)` 当门槛**，直接用 `worldFromLngLat(viewer.geo, lng, lat)`（`s3m-three` 导出，内部自带兜底），否则会把本来能用的墨卡托路径挡掉。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
+- **pitch 大时地平线以上是黑的，先排除本层**：MapLibre 的 `background` 层只铺地面平面，`sky` 没配置时地平线以上**没有任何图层覆盖**，那块就是 renderer 的清屏色（深色主题下纯黑），看着像「天上破了个洞」。这不是本层或覆盖物画的——**把本层整个隐藏再看一眼**（demo 里加 `?nos3m=1`），还是黑的就与本层无关。修法是给 style 根加 `sky`（MapLibre ≥ 5）或运行时 `map.setSky({...})`，完整写法见[快速开始](#快速开始)。另注意别用 `map.setStyle()` 切底图：它会重建 style、把 `sky` 一起丢掉，要么切完重设一次，要么像 demo 那样只增删栅格层。
 
 解析 / 几何 / 纹理 / 单体化相关的已知限制（实例化单体样式与拾取、切线流、骨骼动画等）见 [s3m-three 已知限制](../s3m-three/docs/API.md#已知限制)。
 
