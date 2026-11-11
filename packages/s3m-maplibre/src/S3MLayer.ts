@@ -68,7 +68,7 @@ import {
   extractNearFar,
   extractProjectionMatrix,
 } from 's3m-three';
-import type { ProjectionMode } from 's3m-three';
+import type { ProjectionMode, GeoAdapter } from 's3m-three';
 import {
   DEFAULT_FOV,
   createMapLibreGeoAdapter,
@@ -113,12 +113,27 @@ export interface S3MLayerOptions extends S3MViewerOptions {
    * 只影响透视模式——正交模式的 near 由它自己的视锥构造决定。
    */
   nearPlaneScale?: number;
+  /**
+   * 自定义 GeoAdapter，完全接管「经纬度 → 宿主世界坐标」的换算。
+   *
+   * 传入后本层不再从 MapLibre 自动推断投影，也不会在 `projectiontransition`
+   * 时自动重建——把任意坐标系、任意投影的换算自由交给调用方。典型用法：
+   * 用 proj4 把模型自带的 3857 墨卡托米先反解为经纬度、再委托宿主
+   * `worldCoordinateHelper`，即可在 CGCS2000 / 4547 等分带投影下渲染
+   * 非本地 CRS 的模型。
+   *
+   * 不传则保持默认：自动从 `map.transform` 的 WorldCoordinateHelper 推断。
+   */
+  geo?: GeoAdapter;
 }
 
 
 export class S3MLayer extends HostRenderer {
   readonly type = 'custom' as const;
   readonly renderingMode = '3d' as const;
+
+  /** 用户注入的 GeoAdapter（options.geo / setGeoAdapter）。非空时完全接管投影换算 */
+  private _userGeo: GeoAdapter | null = null;
 
   /** 宿主地图。赋值时自动同步 viewer 的地理坐标适配器（0.2.x 允许直接赋值的兼容行为） */
   private _map: MapLike | null = null;
@@ -129,12 +144,32 @@ export class S3MLayer extends HostRenderer {
 
   set map(map: MapLike | null) {
     this._map = map;
-    this.viewer.geo = map ? createMapLibreGeoAdapter(map) : null;
+    this.viewer.geo = this._userGeo ?? (map ? createMapLibreGeoAdapter(map) : null);
+  }
+
+  /**
+   * 运行时替换 / 清除自定义 GeoAdapter（对应 `options.geo` 的运行时入口）。
+   *
+   * - 传自定义 adapter：完全接管投影换算，后续不再从宿主自动推断。
+   * - 传 `null`：恢复为自动从宿主 `transform` 的 WorldCoordinateHelper 推断。
+   *
+   * 切换后立即按当前 map 重建或保留 adapter，并重算锚点。
+   */
+  setGeoAdapter(geo: GeoAdapter | null): void {
+    this._userGeo = geo;
+    this.viewer.geo = geo ?? (this.map ? createMapLibreGeoAdapter(this.map) : null);
+    this.viewer.recomputeAnchors();
   }
 
   private readonly _onProjectionChange = (): void => {
     // MapLibre v6 起 setProjection() 会 fire 'projectiontransition'。
-    // CRS 换了，世界坐标体系也换了，GeoAdapter 与锚点必须重建。
+    // CRS 换了，世界坐标体系也换了。
+    // 用户自定义 geo 时由调用方自行处理投影变化（不自动重建），仅重算锚点；
+    // 否则从宿主 helper 重建适配器 + 重算锚点。
+    if (this._userGeo) {
+      this.viewer.recomputeAnchors();
+      return;
+    }
     if (this.map) this.viewer.geo = createMapLibreGeoAdapter(this.map);
     this.viewer.recomputeAnchors();
   };
@@ -193,6 +228,7 @@ export class S3MLayer extends HostRenderer {
    */
   constructor(options: S3MLayerOptions = {}) {
     super(options);
+    this._userGeo = options.geo ?? null;
   }
 
   /** 宿主能力钩子：请求下一帧重绘（MapLibre / Mapbox → triggerRepaint） */
