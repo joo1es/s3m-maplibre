@@ -157,6 +157,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 业务字段章节](../s3m-three/docs/API.md#业务字段锚点在库内对应关系在外部) |
 | `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
 | `nearPlaneScale` | `number` | `1` | 近裁剪面缩放系数（`0 < scale < 1`，1 = 不改）。MapLibre 的 near 是硬编码的 `canvasHeight/50`，zoom 16.5 时约合 13 米，相机贴近模型会把楼面整片裁掉；缩放后 fov / far 不变，见[近裁剪面](#近裁剪面贴脸看时不消失) |
+| `geo` | `GeoAdapter` | 自动推断 | 自定义 GeoAdapter，完全接管「经纬度 → 宿主世界坐标」的换算。传入后本层不再从 MapLibre 自动推断投影、也不在 `projectiontransition` 时自动重建，把任意坐标系 / 任意投影的换算自由交给调用方（如用 proj4 把模型自带的 3857 墨卡托米反解为经纬度再委托宿主 helper，即可在 CGCS2000 / 4547 等分带投影下渲染非本地 CRS 模型）。见[自定义 GeoAdapter](#自定义-geoadapter) |
 | `onStats` | `(s: Stats) => void` | — | 统计更新 |
 | `onReady` | `(entry) => void` | — | 某个数据集就绪 |
 | `onPick` | `(f: PickResult \| null) => void` | — | 点击拾取结果 |
@@ -313,6 +314,7 @@ setExcavationBounds(bounds: [number, number, number, number] | null): void
 ```ts
 getBounds(): [[number, number], [number, number]] | null  // 合并经纬度范围
 setProjection(mode: 'perspective' | 'orthographic', transition?: TransitionOptions): void  // 投影模式，可平滑过渡，见[投影](#投影)
+setGeoAdapter(geo: GeoAdapter | null): void              // 运行时替换/清除自定义 GeoAdapter（见[自定义 GeoAdapter](#自定义-geoadapter)）；传 null 恢复自动推断
 setNearPlaneScale(scale: number): void                    // 近裁剪面缩放，1 = 恢复 MapLibre 原值
 setLodRangeScale(scale: number, datasetId?: string): void  // 缩放 LOD 切换距离阈值（>1 更倾向粗模，<1 提前细化）
 readonly lodRangeScale: number
@@ -680,6 +682,27 @@ layer.addDataset({ id: 'a', configUrl: '...', anchorOverride: { lon: 116.4, lat:
 
 **注意**：`bakeMercator` 是硬编码 Web 墨卡托的逐顶点烘焙（`core/BakeMercator.ts`），
 不经过 `GeoAdapter`；非标准世界坐标下建议显式传 `bakeMercator: false`。
+
+### 自定义 GeoAdapter
+
+默认从 MapLibre 的 `transform.worldCoordinateHelper` 自动推断当前投影，把 S3M 锚点
+（经纬度）换成宿主世界坐标。标准经纬度 S3M + 任意底图 CRS（如 CGCS2000 / 4547 分带）
+已自动工作，无需配置。
+
+需要**完全接管**换算时，注入自定义 `GeoAdapter`：
+
+- 构造期：`new S3MLayer({ configUrl, geo })`；
+- 运行时：`layer.setGeoAdapter(geo)` 切换，`setGeoAdapter(null)` 恢复自动推断。
+
+注入后本层**不再从宿主自动推断投影、也不在 `projectiontransition` 时自动重建**
+适配器——投影变化由调用方自行响应（数据源坐标系不变时通常只需重算锚点）。
+`GeoAdapter` 类型从 `s3m-three` 导出，其 `worldFromLngLat(lng, lat)` 的输入契约是
+**经纬度**，所以「模型自带 3857 墨卡托米」时需要在喂入前用 proj4 反解为经纬度
+（或把 3857 米塞进数据的经纬度字段、在 adapter 内再反解）。
+
+库**不引入 proj4**：转换逻辑（含任意 EPSG / 分带 / 自定义平面投影）完全由调用方提供，
+本层保持薄适配层定位。这与[上方](#坐标系与锚点覆盖)「运行时不做 EPSG 反算、不引 proj4」
+的设计哲学一致——区别只是反算的职责从「生产端预处理」变成了「运行时注入的 adapter」。
 
 ---
 
