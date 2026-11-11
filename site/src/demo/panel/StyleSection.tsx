@@ -200,6 +200,63 @@ export default function StyleSection() {
       </section>
 
       <section>
+        <h2>发光线框</h2>
+        <label
+          class="chk"
+          title="选择性辉光：多尺度高斯光晕 + 色散 + HDR 白热芯 + 沿线流光，全部在立方体自己的片元里算，不接管上屏、不碰全局 bloom。开着动画时地图会持续重绘"
+        >
+          <input type="checkbox" id="optGlowCube" /> 发光线框立方体
+        </label>
+        <label class="chk" title="地面的一圈落光与扩散环。关掉可用来排查画面异常来自哪一层">
+          <input type="checkbox" id="optGlowPool" checked /> 地面光池
+        </label>
+        <label
+          class="chk"
+          title="四个侧面的淡 fresnel 微光。只有从外部看才出现：相机在包围盒内部时会被 gl_FrontFacing 剔除；几何本身没有顶盖，不会盖住天空"
+        >
+          <input type="checkbox" id="optGlowShell" checked /> 内壁微光
+        </label>
+        <label class="rng" title="主色。光晕边缘的色散会围绕它展开">
+          <span>主色</span>
+          <input
+            type="color"
+            id="optGlowColor"
+            value="#4ad8ff"
+            style="width:36px;height:20px;border:none;background:transparent;padding:0;cursor:pointer;"
+          />
+          <b id="glowColorVal">#4ad8ff</b>
+        </label>
+        <label class="rng" title="立方体高度（米），只改 scale.z，不重建几何">
+          <span>高度</span>
+          <input type="range" id="optGlowHeight" min="20" max="600" step="10" value="450" />
+          <b id="glowHeightVal">450m</b>
+        </label>
+        <label class="rng" title="辉光能量。0 时只剩一层很淡的芯线">
+          <span>辉光</span>
+          <input type="range" id="optGlowStrength" min="0" max="300" step="5" value="45" />
+          <b id="glowStrengthVal">0.45</b>
+        </label>
+        <label class="rng" title="光晕宽度（屏幕像素，不随距离变细）">
+          <span>光晕</span>
+          <input type="range" id="optGlowHalo" min="8" max="80" step="2" value="14" />
+          <b id="glowHaloVal">14px</b>
+        </label>
+        <label class="rng" title="沿线流光速度。0 = 停在原地，只剩呼吸">
+          <span>流光</span>
+          <input type="range" id="optGlowSpeed" min="0" max="100" step="2" value="8" />
+          <b id="glowSpeedVal">0.08</b>
+        </label>
+        <label class="rng" title="色散：RGB 三层高斯用不同的 sigma，光晕边缘泛出冷暖色边。0 = 无色散">
+          <span>色散</span>
+          <input type="range" id="optGlowChroma" min="0" max="200" step="5" value="60" />
+          <b id="glowChromaVal">0.60</b>
+        </label>
+        <div id="glowCubeInfo" style="font-size:10.5px;color:#64748b;margin-top:4px;">
+          未开启
+        </div>
+      </section>
+
+      <section>
         <h2>运动模糊</h2>
         <select
           id="optBlurMode"

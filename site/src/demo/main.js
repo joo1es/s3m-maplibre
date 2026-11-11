@@ -4,6 +4,7 @@ import { S3MLayer, STYLE, AttributeQuery, worldFromLngLat, enableMapLibreOrtho, 
 import pkg from 's3m-maplibre/package.json';
 import { addModelCover, datasetBaseHeight } from '../examples/model-cover';
 import { createPostPresenter } from '../examples/post-presenter';
+import { addGlowCube } from '../examples/glow-cube';
 
 
 
@@ -375,7 +376,29 @@ function baseStyle() {
     layers.push({ id: 'tdtAnno', type: 'raster', source: 'tdtAnno' });
   }
 
-  return { version: 8, sources, layers };
+  return {
+    version: 8,
+    sources,
+    layers,
+    /**
+     * 天空。
+     *
+     * pitch 一压大，地平线以上就**没有任何图层覆盖**了 —— 那块在 canvas 里只剩
+     * renderer 的清屏色（黑），看起来像天上破了个洞。这不是 bug 而是缺配置：
+     * background 层只铺地面平面，天空得由 sky 单独填。
+     *
+     * 少了这一段，任何「抬头看」的视角（maxPitch 是 85）都会撞上它，和场景里有没有
+     * 覆盖物完全无关 —— 排查时先取消勾选覆盖物看一眼，就能把两者分开。
+     */
+    sky: {
+      'sky-color': '#b9cfe4',
+      'sky-horizon-blend': 0.6,
+      'horizon-color': '#f0f4f8',
+      'horizon-fog-blend': 0.5,
+      'fog-color': '#f7f9fb',
+      'fog-ground-blend': 0.2,
+    },
+  };
 }
 
 /* ---------------------------------------------------------------- 底图运行时切换 */
@@ -792,7 +815,7 @@ async function loadSource(rawUrl) {
   }
 
   // 数据集换了，罩子的包围盒也要跟着换
-  if ($('optCover')?.checked) refreshCover();
+  refreshAllOverlays();
 }
 
 function updateDatasetTag(id) {
@@ -856,7 +879,7 @@ function renderDatasetUI() {
             });
             updateDatasetTag(id);
             fitLayerBounds();
-            if ($('optCover')?.checked) refreshCover();
+            refreshAllOverlays();
           } catch (e) {
             $(`tag-${id}`).textContent = '失败';
             console.error(e);
@@ -864,7 +887,7 @@ function renderDatasetUI() {
         }
       } else {
         layer.setDatasetVisible(id, false);
-        if ($('optCover')?.checked) refreshCover();
+        refreshAllOverlays();
       }
     });
   });
@@ -1034,6 +1057,96 @@ $('optCoverOpacity')?.addEventListener('input', (e) => {
   const o = Number(e.target.value);
   $('coverOpacityVal').textContent = `${o}%`;
   modelCover?.setOpacity(o / 100);
+});
+
+/* ---------------------------------------------------------------- 发光线框 */
+
+/**
+ * 发光线框立方体：和罩子一样按 geoBounds 建，数据集换了要重建。
+ *
+ * 参数全走 setter，不重建覆盖物 —— 几何是按单位高度建的，四层材质共享同一批
+ * { value } uniform，拖滑块只改一个数字，不会产生新的 BufferGeometry / ShaderMaterial。
+ * 实现见 site/src/examples/glow-cube.ts。
+ */
+let glowCube = null;
+
+function refreshGlowCube() {
+  glowCube?.handle.remove();
+  glowCube = null;
+  if ($('optGlowCube')?.checked) {
+    glowCube = addGlowCube(layer, {
+      height: Number($('optGlowHeight')?.value ?? 450),
+      color: $('optGlowColor')?.value ?? '#4ad8ff',
+      glow: Number($('optGlowStrength')?.value ?? 45) / 100,
+      haloWidth: Number($('optGlowHalo')?.value ?? 14),
+      speed: Number($('optGlowSpeed')?.value ?? 8) / 100,
+      chroma: Number($('optGlowChroma')?.value ?? 60) / 100,
+      // 这两层是构造时决定的（几何 / 材质要不要建），改开关得重建覆盖物
+      pool: $('optGlowPool')?.checked ?? true,
+      shell: $('optGlowShell')?.checked ?? true,
+    });
+  }
+  updateGlowCubeInfo();
+}
+
+function updateGlowCubeInfo() {
+  const el = $('glowCubeInfo');
+  if (!el) return;
+  if (!glowCube) {
+    el.textContent = $('optGlowCube')?.checked ? '没有可套的数据集' : '未开启';
+    return;
+  }
+  const { width, depth, height } = glowCube.size;
+  el.textContent = `${width.toFixed(0)}×${depth.toFixed(0)}×${height.toFixed(0)}m · 4 个 draw call`;
+}
+
+/**
+ * 数据集增删 / 切预设 / 换对齐基准时，所有按 geoBounds 建的覆盖物一起重算。
+ * 只重建「当前勾着」的那些，没开的覆盖物不产生对象也不产生 dispose。
+ */
+function refreshAllOverlays() {
+  if ($('optCover')?.checked) refreshCover();
+  if ($('optGlowCube')?.checked) refreshGlowCube();
+}
+
+$('optGlowCube')?.addEventListener('change', () => refreshGlowCube());
+$('optGlowPool')?.addEventListener('change', () => refreshGlowCube());
+$('optGlowShell')?.addEventListener('change', () => refreshGlowCube());
+
+$('optGlowColor')?.addEventListener('input', (e) => {
+  $('glowColorVal').textContent = e.target.value;
+  glowCube?.setColor(e.target.value);
+});
+
+$('optGlowHeight')?.addEventListener('input', (e) => {
+  const h = Number(e.target.value);
+  $('glowHeightVal').textContent = `${h}m`;
+  glowCube?.setHeight(h);
+  updateGlowCubeInfo();
+});
+
+$('optGlowStrength')?.addEventListener('input', (e) => {
+  const v = Number(e.target.value) / 100;
+  $('glowStrengthVal').textContent = v.toFixed(2);
+  glowCube?.setGlow(v);
+});
+
+$('optGlowHalo')?.addEventListener('input', (e) => {
+  const px = Number(e.target.value);
+  $('glowHaloVal').textContent = `${px}px`;
+  glowCube?.setHaloWidth(px);
+});
+
+$('optGlowSpeed')?.addEventListener('input', (e) => {
+  const v = Number(e.target.value) / 100;
+  $('glowSpeedVal').textContent = v.toFixed(2);
+  glowCube?.setSpeed(v);
+});
+
+$('optGlowChroma')?.addEventListener('input', (e) => {
+  const v = Number(e.target.value) / 100;
+  $('glowChromaVal').textContent = v.toFixed(2);
+  glowCube?.setChroma(v);
 });
 
 /* ---------------------------------------------------------------- 运动模糊 */
@@ -1571,16 +1684,18 @@ $('optAlign')?.addEventListener('change', (e) => {
   $('heightOffsetVal').textContent = `${currentTotal > 0 ? '+' : ''}${currentTotal.toFixed(1)}m`;
   setStatus(`垂直对齐已设为：${align}`);
   // 对齐换了基准，模型整体位移了，罩子得跟着重算
-  if ($('optCover')?.checked) refreshCover();
+  refreshAllOverlays();
 });
 
 $('optHeightOffset').addEventListener('input', (e) => {
   const v = Number(e.target.value);
   $('heightOffsetVal').textContent = `${v > 0 ? '+' : ''}${v}m`;
   layer.setDatasetHeight(v);
-  // 高程滑块是连续的 input 事件，这里只平移罩子不重建几何。
+  // 高程滑块是连续的 input 事件，这里只平移覆盖物不重建几何。
   // 读 heightOffset 而不是 v：它是「对齐基准 + 手动偏移」的和，直接拿 v 会漏掉基准
-  modelCover?.setBaseHeight(datasetBaseHeight(layer));
+  const baseZ = datasetBaseHeight(layer);
+  modelCover?.setBaseHeight(baseZ);
+  glowCube?.setBaseHeight(baseZ);
 });
 
 $('optSelMode').addEventListener('change', (e) => {
@@ -2587,6 +2702,8 @@ window.__s3m = { map, layer, renderFeature, loadSource };
 
 return () => {
   clearInterval(statsTimer);
+  // 先摘掉自己的覆盖物，触发 onRemove 释放几何与材质；map.remove() 之后底座就没了
+  glowCube?.handle.remove();
   try {
     map.remove();
   } catch {
