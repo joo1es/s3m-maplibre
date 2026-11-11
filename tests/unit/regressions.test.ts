@@ -13,6 +13,7 @@
  * 9. CRN 解码器魔数先行拦截。
  * 10. 没有「叶子」可淘汰时不能永久卡死。
  * 11. 瓦片层级可见性互斥（HLOD）。
+ * 12. `setClipping()` 对高斯泼溅静默无效 —— 见文末的 3DGS 裁剪回归。
  *
  * 注意：bun test 默认所有测试文件跑在同一个进程、共享同一个 global，
  * 所以这里对 fetch / performance.now / console.warn 的替换都在每个用例内成对还原。
@@ -28,6 +29,8 @@ import { createSharedUniforms, createStyledMaterial } from '../../packages/s3m-t
 import { Picker } from '../../packages/s3m-three/src/render/Picker';
 import { transcodeCRN } from '../../packages/s3m-three/src/core/CRNDecode';
 import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
+import { createSplatMaterial, createSplatPickMaterial } from '../../packages/s3m-three/src/render/SplatMaterial';
+import { buildClipPlanes, isPointKept } from '../../packages/s3m-three/src/analysis/clipping';
 
 let realFetch: typeof globalThis.fetch;
 let realNow: typeof performance.now;
@@ -773,5 +776,82 @@ describe('14. 父级 CSS transform 缩放时，点击拾取不能被缩放带偏
     const { layer, calls } = mkLayer({ left: 0, top: 0, width: 0, height: 0 });
     layer.pickFromEvent({ clientX: 100, clientY: 50 } as MouseEvent);
     expect(calls[0]).toEqual([100, 50]);
+  });
+});
+
+/**
+ * 12. `setClipping()` 对高斯泼溅静默无效。
+ *
+ * 平面挂在 `renderer.clippingPlanes` 上，three 只会把它注入内置材质 / 带 clipping
+ * chunk 的 shader；泼溅用的是纯 ShaderMaterial，既没有 `clipping: true`（three 的
+ * WebGLRenderer 对 ShaderMaterial 要求显式打开），也没有那四段 include，于是
+ * `setClipping()` 切掉了网格却切不掉泼溅，画面上两种几何互相穿模。
+ *
+ * 修法不是自己维护一份平面 uniform（模块级单例会在多个 S3MLayer 之间串味），
+ * 而是让显示与拾取两套泼溅材质都走 three 的标准裁剪通道：图层级由各自的 renderer
+ * 保证，GPU 拾取用同一个 renderer，也就自动跟着裁，不会点中被切掉的高斯。
+ */
+describe('回归：3DGS 材质必须响应 renderer.clippingPlanes', () => {
+  const vertexChunks = ['clipping_planes_pars_vertex', 'clipping_planes_vertex'];
+  const fragmentChunks = ['clipping_planes_pars_fragment', 'clipping_planes_fragment'];
+  const allChunks = [...vertexChunks, ...fragmentChunks];
+
+  const cases: Array<[string, THREE.ShaderMaterial]> = [
+    ['显示材质', createSplatMaterial()],
+    ['拾取材质', createSplatPickMaterial(1)],
+  ];
+
+  const chunk = (name: string): string =>
+    (THREE.ShaderChunk as unknown as Record<string, string>)[name] ?? '';
+
+  test('three 的四个 clipping chunk 名仍然存在（改名会让 include 静默失效）', () => {
+    for (const name of allChunks) {
+      expect(chunk(name).length).toBeGreaterThan(0);
+    }
+  });
+
+  test('未设裁剪时四段 chunk 展开为空，默认渲染路径逐字不变', () => {
+    for (const name of allChunks) {
+      expect(chunk(name)).toContain('#if NUM_CLIPPING_PLANES > 0');
+    }
+  });
+
+  test.each(cases)('%s 开启 clipping 并注入四段 chunk', (_label, mat) => {
+    expect(mat.clipping).toBe(true);
+    for (const name of vertexChunks) {
+      expect(mat.vertexShader).toContain(`#include <${name}>`);
+    }
+    for (const name of fragmentChunks) {
+      expect(mat.fragmentShader).toContain(`#include <${name}>`);
+    }
+  });
+
+  test.each(cases)('%s 的顶点着色器提供 mvPosition', (_label, mat) => {
+    // clipping_planes_vertex 展开后是 `vClipPosition = - mvPosition.xyz`
+    expect(chunk('clipping_planes_vertex')).toContain('mvPosition');
+    expect(mat.vertexShader).toContain('mvPosition');
+  });
+
+  test.each(cases)('%s 在最前面执行裁剪', (_label, mat) => {
+    const frag = mat.fragmentShader;
+    const clipAt = frag.indexOf('#include <clipping_planes_fragment>');
+    expect(clipAt).toBeGreaterThanOrEqual(0);
+    // 高斯核 / 颜色编码之前就得 discard，否则被裁掉的高斯仍可能写进拾取 RT
+    const ownDiscard = frag.replace('#include <clipping_planes_fragment>', '').indexOf('discard');
+    expect(clipAt).toBeLessThan(ownDiscard === -1 ? frag.length : ownDiscard);
+  });
+
+  test('buildClipPlanes 的保留侧与 THREE.Plane.distanceToPoint 同号', () => {
+    const planes = buildClipPlanes({ type: 'box', a: [-2, -2, -2], b: [2, 2, 2] });
+    expect(planes.length).toBe(6);
+    const inside: [number, number, number] = [0, 0, 0];
+    const outside: [number, number, number] = [9, 0, 0];
+    for (const p of planes) {
+      const three = new THREE.Plane(new THREE.Vector3(...p.normal), p.constant);
+      expect(three.distanceToPoint(new THREE.Vector3(...inside)) >= 0)
+        .toBe(isPointKept([p], inside));
+      expect(three.distanceToPoint(new THREE.Vector3(...outside)) >= 0)
+        .toBe(isPointKept([p], outside));
+    }
   });
 });

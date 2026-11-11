@@ -26,6 +26,12 @@
  * ⚠️ 改这个文件时注意：GLSL 是用模板字符串写的，**着色器源码里的注释绝不能出现反引号**。
  * 反引号会提前终止模板字符串，剩下的 GLSL 被当成 JS 求值 —— 报错信息通常是
  * "ReferenceError: position is not defined"，而且只在运行时炸，很难一眼看出根源。
+ *
+ * 裁剪走 three 的标准 clipping 通道（`clipping: true` + 四段 include），不自己维护一份
+ * 平面 uniform：平面挂在每个 S3MLayer 各自的 renderer 上，模块级单例会在多图层之间串味；
+ * GPU 拾取复用同一个 renderer，拾取材质加同样的 chunk 就自动跟着裁。
+ * `vClipPosition` 由高斯中心算出，quad 四个顶点取到同一个值 —— 语义是「按中心整片剔除」，
+ * 与网格按三角面丢弃的口径一致。
  */
 import * as THREE from 'three';
 import {
@@ -70,7 +76,11 @@ export function createSplatMaterial(options: SplatMaterialOptions = {}): THREE.S
       uCullPixels: { value: options.cullPixels ?? 2.0 },
       uMaxPixels: { value: options.maxPixels ?? SPLAT_MAX_AXIS_PIXELS },
     },
+    // ShaderMaterial 必须显式打开，three 才会注入 clippingPlanes uniform（WebGLRenderer.js）
+    clipping: true,
     vertexShader: /* glsl */ `
+      #include <clipping_planes_pars_vertex>
+
       // position 由 three 的 ShaderMaterial 前缀自动声明（vec3），这里直接取 .xy
       attribute vec3 iCenter;
       attribute vec4 iQuat;    // (x, y, z, w)
@@ -85,8 +95,10 @@ export function createSplatMaterial(options: SplatMaterialOptions = {}): THREE.S
       varying vec4 vColor;
 
       void main() {
-        vec4 centerView = modelViewMatrix * vec4(iCenter, 1.0);
-        vec4 clip = projectionMatrix * centerView;
+        vec4 mvPosition = modelViewMatrix * vec4(iCenter, 1.0);
+        vec4 clip = projectionMatrix * mvPosition;
+        // 中心点的视图坐标，quad 四个顶点取到同一个值：按中心整片剔除
+        #include <clipping_planes_vertex>
 
         // 相机后方 / 退化实例：整个四边形扔到裁剪体外，不做任何透视除法
         if (clip.w <= 0.000001) {
@@ -204,12 +216,16 @@ export function createSplatMaterial(options: SplatMaterialOptions = {}): THREE.S
       }
     `,
     fragmentShader: /* glsl */ `
+      #include <clipping_planes_pars_fragment>
+
       uniform float uOpacity;
 
       varying vec2 vQuad;
       varying vec4 vColor;
 
       void main() {
+        #include <clipping_planes_fragment>
+
         float r2 = dot(vQuad, vQuad);
         // 3σ 之外直接丢，配合下面的高斯核就是「椭圆边界」而不是硬切一个方框
         if (r2 > 1.0) discard;
@@ -356,13 +372,19 @@ export function createSplatPickMaterial(objectId: number): THREE.ShaderMaterial 
       uObjectId: { value: objectId },
       uViewport: { value: SPLAT_VIEWPORT },
     },
+    // 拾取必须与显示用同一套裁剪，否则能点中被切掉的高斯
+    clipping: true,
     vertexShader: /* glsl */ `
+      #include <clipping_planes_pars_vertex>
+
       attribute vec3 iCenter;
 
       uniform vec2 uViewport;
 
       void main() {
-        vec4 clip = projectionMatrix * modelViewMatrix * vec4(iCenter, 1.0);
+        vec4 mvPosition = modelViewMatrix * vec4(iCenter, 1.0);
+        vec4 clip = projectionMatrix * mvPosition;
+        #include <clipping_planes_vertex>
         // 相机后方：扔出裁剪体，避免透视除法把方块翻到屏幕另一侧
         if (clip.w <= 0.000001) {
           gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
@@ -375,9 +397,13 @@ export function createSplatPickMaterial(objectId: number): THREE.ShaderMaterial 
       }
     `,
     fragmentShader: /* glsl */ `
+      #include <clipping_planes_pars_fragment>
+
       uniform float uObjectId;
 
       void main() {
+        #include <clipping_planes_fragment>
+
         float o = uObjectId + 1.0;
         gl_FragColor = vec4(mod(o, 256.0) / 255.0, floor(o / 256.0) / 255.0, 0.0, 0.0);
       }

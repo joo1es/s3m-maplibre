@@ -453,6 +453,7 @@ viewshed(opts: { origin: LngLatAlt; radius: number; grid?; eyeHeight?; size? }):
 - 面积有两套口径：`area3D` 是坡面真实面积（Newell 法），`areaHorizontal` 是水平投影（鞋带公式）。建筑面积、用地面积按后者。
 - `lineOfSight` 走 CPU 射线求交（`Raycaster` 打全部 pickable mesh），几十万面是几十毫秒量级，适合点击式查询；要拖拽时逐帧刷新得等深度图批量采样版本。
 - 裁剪是**图层级**的（每个 `S3MLayer` 一个 `WebGLRenderer`，平面挂在它的 `clippingPlanes` 上），同页其它图层不受影响。传 `null` 取消。
+- **高斯泼溅同样响应这组平面**：显示与拾取两套 `SplatMaterial` 都开了 three 的标准 clipping，按高斯中心整片剔除（不做片元级软裁）；GPU 拾取复用同一个 renderer，因此也点不中被切掉的高斯。
 - **两个已知边界**：① 只做「切掉」不做**封口**，剖开后看到的是空壳/背面；② 半空间求交只能表达凸区域，凹多边形裁剪需要多组并集，three 的 `clippingPlanes` 表达不了。
 - **分析范围只包含 S3M 场景里的几何**：MapLibre 底图地形与 MVT 建筑不在这个场景里，不参与遮挡判断。
 

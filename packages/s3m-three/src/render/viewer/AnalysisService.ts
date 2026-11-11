@@ -123,6 +123,9 @@ export class AnalysisService {
    *
    * 已知边界：只做「切掉」，不做**封口**——剖开后看到的是空壳/背面；
    * 凹多边形裁剪需要多组半空间并集，three 的 `clippingPlanes` 表达不了（只能凸）。
+   * 高斯泼溅同样响应这组平面（`SplatMaterial` 的两套材质都开了 three 的标准 clipping）：
+   * 按高斯中心整片剔除，不做片元级软裁；GPU 拾取复用同一个 renderer，因此也点不中
+   * 被裁掉的高斯。平面仍由各自图层的 renderer 持有，同页多个图层互不干扰。
    */
   setClipping(opt: ClipOptions | null): void {
     this._clip = opt;
