@@ -367,6 +367,15 @@ export function createAMapGeoAdapter(
       if (sEast === 0) sEast = WGS84_A / (N * cosLat);
       if (sNorth === 0) sNorth = WGS84_A / (M * cosLat);
 
+      const mercatorScale = 1.0 / cosLat;
+      // 高德地图底图为 Web 墨卡托投影，局部街区尺寸随纬度放大 1/cosφ。
+      // 若 customCoords 输出的是物理米 (de ≈ 1.0)，需对齐至底图墨卡托尺度 (~1/cosφ)，模型才能与道路红线严格贴合；
+      // 若 customCoords 已输出墨卡托米 (de ≈ 1/cosφ)，则保持原样，避免二次放大。
+      if (sEast > 0 && sEast < (mercatorScale + 1) / 2) {
+        sEast *= mercatorScale;
+        sNorth *= mercatorScale;
+      }
+
       const sUp = 1.0; // 核心定标：高德 3D 垂直单位就是真实物理米
 
       return {
