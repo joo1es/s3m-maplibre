@@ -15,5 +15,5 @@
       "s3m-three": ["./packages/s3m-three/src/index.ts"]
     }
   },
-  "include": ["packages/*/src/**/*.ts", "tests/types/**/*.ts"]
+  "include": ["packages/*/src/**/*.ts", "tests/types/**/*.ts", "examples/**/*.ts"]
 }

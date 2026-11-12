@@ -226,6 +226,32 @@ prewarmShading(): Promise<void>        // 手动预热另一种 shading 变体�
   - 彻底消除传统单标量模型在南北/东西方向上 0.4%~0.67% 的各向异性拉伸与米级系统残差。
 - 包导出了高精度大地测量工具：`primeVerticalRadius`, `meridianRadius`, `enuToLngLat`, `lngLatToEnu` 及 `WGS84_A`, `WGS84_E2` 常量。
 
+**通用宿主接口与高德适配工具（`S3MHost` / `GCJ-02` / `createAMapGeoAdapter`）**：
+
+```ts
+export interface S3MHost {
+  getCanvas?(): HTMLCanvasElement;
+  triggerRepaint(): void;
+  getCenter?(): unknown;
+  getZoom?(): number;
+  getPitch?(): number;
+  getBearing?(): number;
+  on?(type: string, listener: (e: S3MHostMouseEvent) => void): unknown;
+  off?(type: string, listener: (e: S3MHostMouseEvent) => void): unknown;
+  getLayer?(id: string): unknown;
+  addLayer?(layer: unknown): unknown;
+  removeLayer?(id: string): unknown;
+}
+
+isInsideChina(lng: number, lat: number): boolean
+wgs84ToGcj02(lng: number, lat: number): [number, number]
+gcj02ToWgs84(lng: number, lat: number): [number, number]
+createAMapGeoAdapter(target?: AMapLikeOptions | AMapCustomCoordsLike | null): GeoAdapter | null
+```
+
+- `HostRenderer` 暴露只读 `host: S3MHost | null` 属性，并在未显式覆写时自动从 `host.getBearing?.()` 读取视角朝向。
+- **高德 3D 体系尺度定标**：`customCoords.lngLatToCoord` 输出与 `getCameraParams()` 相机空间均位于 Web 墨卡托米空间（比例 $\approx 1/\cos\phi$），`createAMapGeoAdapter` 让垂直高程与水平同尺（`meterInMercatorUp = meterInMercatorEast`），并将原生北向 `+y` 取反为南向 `+y`，保持右手正交系。完整示例见 `examples/amap/`。
+
 ### 数据集管理
 
 ```ts

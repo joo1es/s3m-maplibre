@@ -46,7 +46,7 @@ import { S3MLayer, STYLE, type PickResult } from 's3m-maplibre';
 图层是 MapLibre / Mapbox 都能挂的普通对象，不依赖任何一方的类型：
 
 - `render(gl, matrix)` 同时接受 `Float32Array(16)`（MapLibre v4）、`{ defaultProjectionData: { mainMatrix } }`（MapLibre v5）和 `modelViewProjectionMatrix`（Mapbox）。
-- 只用到宿主的 `getCanvas / triggerRepaint / on / off / getBearing`，其余全部可选。
+- `MapLike` 继承 `s3m-three` 导出的通用窄接口 `S3MHost`；`S3MLayer` 继承自 `HostRenderer`（通过 `layer.host` 访问当前挂载宿主），核心只用到宿主的 `getCanvas / triggerRepaint / on / off / getBearing`，其余全部可选。
 
 ---
 

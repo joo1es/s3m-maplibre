@@ -361,6 +361,8 @@ export class S3MViewer {
   private readonly _enuMatrix = new THREE.Matrix4();
   /** 每帧复用：MVP 来自宿主，不要每帧 new（高频分配会带来 GC 抖动） */
   private readonly _frameMvp = new THREE.Matrix4();
+  /** 主场景绘制期间暂存 `camera.matrixWorld`（见 renderFrame 视图归一） */
+  private readonly _drawKeepWorld = new THREE.Matrix4();
   /** 颜色换算用的临时对象，避免每帧 new */
   private readonly _colorScratch = new THREE.Color();
   private _frame = 0;
@@ -2708,23 +2710,40 @@ export class S3MViewer {
     // 这里跳过的是「本层的绘制」，宿主自己的清屏 / 底图照旧。
     if ((this.uniforms.uOpacity?.value ?? 1) > OPACITY_EPS) {
       this._sortSplats();
-      // presenter 优先级最高：设了就由使用者接管「场景 → 屏幕」，库不再自己合成
-      const presented = this._presenter
-        ? this._presenterTarget.render(
-            this.renderer,
-            this.scene,
-            this.camera,
-            canvas.width,
-            canvas.height,
-            this._presenter
-          )
-        : false;
-      if (presented) {
-        // 场景已进 RT，上屏由 presenter 负责（见 PresenterTarget）
-      } else if (this._motionBlurCfg && this._renderMotionBlur(canvas.width, canvas.height)) {
-        // 运动模糊接管了「场景 → 屏幕」：场景进 RT，合成 quad 补回色调映射 / sRGB / 深度
-      } else {
-        this.renderer.render(this.scene, this.camera);
+      // ── 视图归一（避免非零 cameraEnu 下相机平移被作用两次）──────────────────
+      // `camera.projectionMatrix` 上面已经被设成完整 MVP（宿主 MVP · `_enuMatrix`），
+      // 视图变换已在其中。关掉 `matrixWorldAutoUpdate` 后 Three.js 不会重算
+      // `matrixWorldInverse`，渲染仍直接拿 `camera.matrixWorldInverse × object.matrixWorld`，
+      // 所以主场景绘制期间必须把 `matrixWorld` 与 `matrixWorldInverse` 一起置为单位阵，
+      // 并在 `finally` 还原，保证 GPU 描边 / 拾取 / LOD 仍拿到真实 `camEnu`。
+      const keepWorld = this._drawKeepWorld.copy(this.camera.matrixWorld);
+      const keepAuto = this.camera.matrixWorldAutoUpdate;
+      this.camera.matrixWorldAutoUpdate = false;
+      this.camera.matrixWorld.identity();
+      this.camera.matrixWorldInverse.identity();
+      try {
+        // presenter 优先级最高：设了就由使用者接管「场景 → 屏幕」，库不再自己合成
+        const presented = this._presenter
+          ? this._presenterTarget.render(
+              this.renderer,
+              this.scene,
+              this.camera,
+              canvas.width,
+              canvas.height,
+              this._presenter
+            )
+          : false;
+        if (presented) {
+          // 场景已进 RT，上屏由 presenter 负责（见 PresenterTarget）
+        } else if (this._motionBlurCfg && this._renderMotionBlur(canvas.width, canvas.height)) {
+          // 运动模糊接管了「场景 → 屏幕」：场景进 RT，合成 quad 补回色调映射 / sRGB / 深度
+        } else {
+          this.renderer.render(this.scene, this.camera);
+        }
+      } finally {
+        this.camera.matrixWorld.copy(keepWorld);
+        this.camera.matrixWorldAutoUpdate = keepAuto;
+        this.camera.matrixWorldInverse.copy(keepWorld).invert();
       }
       // GPU 描边必须画在主场景之后：它的全屏 quad 参与宿主深度测试，
       // 依赖本帧已经写好的深度（被地形挡住的地方不该描边）

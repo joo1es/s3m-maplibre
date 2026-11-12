@@ -144,6 +144,7 @@ export class S3MLayer extends HostRenderer {
 
   set map(map: MapLike | null) {
     this._map = map;
+    this._host = map;
     this.viewer.geo = this._userGeo ?? (map ? createMapLibreGeoAdapter(map) : null);
   }
 
