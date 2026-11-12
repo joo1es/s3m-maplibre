@@ -344,6 +344,16 @@ function tick() {
 
 完整可运行版本见 [`demo/three.js`](./demo/three.js)（一个文件，含轨道控制、切片统计、样式切换）。
 
+### 高德地图适配示例（`S3MHost` + `examples/amap`）
+
+`s3m-three` 导出了宿主无关窄接口 `S3MHost` / `HostRenderer`（`MapLike` 继承自 `S3MHost`），[`examples/amap/`](./examples/amap/index.html) 演示了如何将 `.s3mb` 挂到高德地图 JS API v2：
+
+1. **独立 WebGL2 覆盖画布**：通过 `AMap.CustomLayer` 挂载独立 WebGL2 canvas（`pointerEvents: none` 保持手势穿透），并处理 `webglcontextlost` / `webglcontextrestored`；
+2. **相机对齐与右手正交**：通过 `customCoords.getCameraParams()` 计算 MVP，右乘 `scale(1, -1, 1)` 与内核 `_enuMatrix` 的南向约定对消；
+3. **坐标系与尺度定标**：内核提供 `wgs84ToGcj02` / `gcj02ToWgs84` 与 `createAMapGeoAdapter`；高德 3D 空间与相机均在 Web 墨卡托米空间（比例约 $1/\cos\phi$），因此垂直高程与水平同尺（`meterInMercatorUp = meterInMercatorEast`）。
+
+本地运行：先执行 `NODE_OPTIONS= bun run build:three`，再用 `NODE_OPTIONS= bun run serve` 打开 `/examples/amap/index.html`。
+
 ---
 
 ## 核心格式逆向与标定说明
@@ -588,7 +598,9 @@ packages/
       tileset/    瓦片树 + LOD + 加载调度
       render/     three 渲染
         S3MViewer.ts         宿主无关场景查看器（多数据集 / 样式 / 拾取 / 选中）
-        GeoAdapter.ts        地理坐标接口 + 墨卡托兜底
+        HostRenderer.ts      宿主无关渲染底座（持有 S3MViewer 与通用 S3MHost）
+        S3MHost.ts           宿主地图最小通用窄接口
+        GeoAdapter.ts        地理坐标接口 + 墨卡托兜底 + GCJ-02/高德定标
         DatasetManager.ts    多数据集生命周期与锚点对齐
         FeatureStyleManager.ts  单体颜色 / 拔高 / 平移 / 显隐
         GroundManager.ts     3D 物理地表与基坑开挖
@@ -605,6 +617,7 @@ packages/
       S3MLayer.ts          薄图层：custom layer 生命周期 / render 矩阵提取 / 事件
       MapLibreGeoAdapter.ts WorldCoordinateHelper 提取 → GeoAdapter
 demo/       在线演示产物（index.html 由 site/ 构建）+ 样例数据；three.html 仍是单文件版
+examples/   第三方地图宿主集成示例（如 amap/ 高德 JS API v2 适配示例）
 site/       站点源码（vite + Solid SSG）：docs 正文由 markdown-it + shiki 构建期渲染，demo 面板为 Solid 组件
 tools/      自检脚本（MeshOpt 回归、纹理/CRN 探针、带热更新的静态服务）
 tests/      单元测试（bun test）：unit/ 纯逻辑与合成数据，e2e/ 需静态服务；types/ 类型级用法测试

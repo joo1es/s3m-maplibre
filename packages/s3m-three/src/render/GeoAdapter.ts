@@ -198,3 +198,189 @@ export function lngLatFromWorld(adapter: GeoAdapter | null, x: number, y: number
   if (adapter) return adapter.lngLatFromWorld(x, y);
   return lngLatFromMercator(x, y);
 }
+
+/* ----------------------------------------------------------------- GCJ-02 坐标换算与高德定标 */
+
+/** Krasovsky 1940 椭球长半轴（米，GCJ-02 使用） */
+export const GCJ_A = 6378245.0;
+/** Krasovsky 1940 第一偏心率平方 ee = 2f - f² */
+export const GCJ_EE = 0.00669342162296594323;
+
+/** 判断坐标是否在中国国境内（GCJ-02 加密范围：经度 72.004~137.8347，纬度 0.8293~55.8271） */
+export function isInsideChina(lng: number, lat: number): boolean {
+  if (!Number.isFinite(lng) || !Number.isFinite(lat)) return false;
+  return lng >= 72.004 && lng <= 137.8347 && lat >= 0.8293 && lat <= 55.8271;
+}
+
+function transformLat(x: number, y: number): number {
+  let ret =
+    -100.0 +
+    2.0 * x +
+    3.0 * y +
+    0.2 * y * y +
+    0.1 * x * y +
+    0.2 * Math.sqrt(Math.abs(x));
+  ret +=
+    ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin((y / 3.0) * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((160.0 * Math.sin((y / 12.0) * Math.PI) + 320.0 * Math.sin((y * Math.PI) / 30.0)) * 2.0) / 3.0;
+  return ret;
+}
+
+function transformLng(x: number, y: number): number {
+  let ret =
+    300.0 +
+    x +
+    2.0 * y +
+    0.1 * x * x +
+    0.1 * x * y +
+    0.1 * Math.sqrt(Math.abs(x));
+  ret +=
+    ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin((x / 3.0) * Math.PI)) * 2.0) / 3.0;
+  ret +=
+    ((150.0 * Math.sin((x / 12.0) * Math.PI) + 300.0 * Math.sin((x / 30.0) * Math.PI)) * 2.0) / 3.0;
+  return ret;
+}
+
+/**
+ * WGS84 经纬度 → GCJ-02 经纬度（国测局火星坐标系）。境外或非有限数原样返回。
+ */
+export function wgs84ToGcj02(lng: number, lat: number): [number, number] {
+  if (!Number.isFinite(lng) || !Number.isFinite(lat) || !isInsideChina(lng, lat)) {
+    return [lng, lat];
+  }
+
+  let dLat = transformLat(lng - 105.0, lat - 35.0);
+  let dLng = transformLng(lng - 105.0, lat - 35.0);
+  const radLat = (lat / 180.0) * Math.PI;
+  let magic = Math.sin(radLat);
+  magic = 1 - GCJ_EE * magic * magic;
+  const sqrtMagic = Math.sqrt(magic);
+  dLat = (dLat * 180.0) / (((GCJ_A * (1 - GCJ_EE)) / (magic * sqrtMagic)) * Math.PI);
+  dLng = (dLng * 180.0) / ((GCJ_A / sqrtMagic) * Math.cos(radLat) * Math.PI);
+
+  return [lng + dLng, lat + dLat];
+}
+
+/**
+ * GCJ-02 经纬度 → WGS84 经纬度。
+ * 迭代反解 4 步可将往返误差压至 1e-8 度以内；境外或非有限数原样返回。
+ */
+export function gcj02ToWgs84(lng: number, lat: number): [number, number] {
+  if (!Number.isFinite(lng) || !Number.isFinite(lat) || !isInsideChina(lng, lat)) {
+    return [lng, lat];
+  }
+
+  let wgsLng = lng;
+  let wgsLat = lat;
+  for (let i = 0; i < 4; i++) {
+    const [currGcjLng, currGcjLat] = wgs84ToGcj02(wgsLng, wgsLat);
+    const dLng = lng - currGcjLng;
+    const dLat = lat - currGcjLat;
+    wgsLng += dLng;
+    wgsLat += dLat;
+    if (Math.abs(dLng) < 1e-9 && Math.abs(dLat) < 1e-9) break;
+  }
+  return [wgsLng, wgsLat];
+}
+
+/** 高德 customCoords 对象的最小鸭子类型接口 */
+export interface AMapCustomCoordsLike {
+  lngLatToCoord?(lngLat: [number, number] | { lng: number; lat: number }): [number, number] | [number, number, number];
+  coordToLngLat?(coord: [number, number] | [number, number, number]): [number, number];
+  setCenter?(center: [number, number]): void;
+  getCenter?(): [number, number];
+}
+
+/** 高德适配选项 */
+export interface AMapLikeOptions {
+  customCoords?: AMapCustomCoordsLike;
+  center?: [number, number] | { lng: number; lat: number };
+}
+
+/**
+ * 创建高德地图 (AMap) 的 GeoAdapter。
+ *
+ * 1. S3M `.scp` 锚点为 WGS84，高德底图为 GCJ-02，进出口自动做 WGS84 ↔ GCJ-02 换算；
+ * 2. 高德 `customCoords` 输出 Web 墨卡托米（`≈ 1/cosφ`），`getCameraParams()` 的相机
+ *    也在同一墨卡托米空间内，故垂直高程必须与水平同尺（`sUp = sEast`），避免压扁 $1/\cos\phi$；
+ * 3. 高德原生 `+y` 朝北，而 `S3MViewer` 内部 ENU 矩阵约定 `+y` 朝南，出口对 `y` 取负
+ *    以保持整个渲染与拾取管线为右手正交系。
+ */
+export function createAMapGeoAdapter(
+  target?: AMapLikeOptions | AMapCustomCoordsLike | { customCoords?: AMapCustomCoordsLike; getCenter?(): unknown } | null
+): GeoAdapter | null {
+  if (!target) return null;
+  const customCoords = (
+    'customCoords' in target ? target.customCoords : target
+  ) as AMapCustomCoordsLike | undefined;
+
+  if (!customCoords || typeof customCoords.lngLatToCoord !== 'function') {
+    return null;
+  }
+
+  const lngLatToCoord = customCoords.lngLatToCoord.bind(customCoords);
+  const coordToLngLat =
+    typeof customCoords.coordToLngLat === 'function'
+      ? customCoords.coordToLngLat.bind(customCoords)
+      : undefined;
+
+  return {
+    worldFromLngLat(lng: number, lat: number, altitude = 0) {
+      const [gcjLng, gcjLat] = wgs84ToGcj02(lng, lat);
+      const pt = lngLatToCoord([gcjLng, gcjLat]);
+      const x = pt[0];
+      // 高德原生 +y 朝北，S3MViewer _enuMatrix 第二行约定 +y 朝南，这里取负消除镜像翻转
+      const y = -pt[1];
+      const z = pt.length > 2 && typeof pt[2] === 'number' && Number.isFinite(pt[2]) ? pt[2] : 0;
+
+      const latRad = (gcjLat * Math.PI) / 180;
+      const cosLat = Math.max(Math.abs(Math.cos(latRad)), 1e-12);
+      const N = primeVerticalRadius(latRad);
+      const M = meridianRadius(latRad);
+
+      const dLon1m = (1 / (N * cosLat)) * (180 / Math.PI);
+      const dLat1m = (1 / M) * (180 / Math.PI);
+
+      let sEast = 0;
+      let sNorth = 0;
+      try {
+        const cEast = lngLatToCoord([gcjLng + dLon1m, gcjLat]);
+        const de = Math.hypot(cEast[0] - pt[0], cEast[1] - pt[1]);
+        if (Number.isFinite(de) && de > 0) sEast = de;
+
+        const cNorth = lngLatToCoord([gcjLng, gcjLat + dLat1m]);
+        const dn = Math.hypot(cNorth[0] - pt[0], cNorth[1] - pt[1]);
+        if (Number.isFinite(dn) && dn > 0) sNorth = dn;
+      } catch {
+        // 差分失败时回退椭球解析墨卡托尺度
+      }
+
+      if (sEast === 0) sEast = WGS84_A / (N * cosLat);
+      if (sNorth === 0) sNorth = WGS84_A / (M * cosLat);
+      // 高德 3D 世界（含相机）同在墨卡托米空间，垂直高程必须与水平同尺
+      const sUp = sEast;
+
+      return {
+        x,
+        y,
+        z: z + altitude * sUp,
+        meterInMercatorEast: sEast,
+        meterInMercatorNorth: sNorth,
+        meterInMercatorUp: sUp,
+        meterInMercator: sEast,
+        altitude,
+      };
+    },
+
+    lngLatFromWorld(x: number, y: number): [number, number] {
+      if (!coordToLngLat) return [0, 0];
+      const gcj = coordToLngLat([x, -y]);
+      return gcj02ToWgs84(gcj[0], gcj[1]);
+    },
+  };
+}

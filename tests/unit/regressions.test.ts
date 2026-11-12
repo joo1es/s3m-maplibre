@@ -31,6 +31,7 @@ import { transcodeCRN } from '../../packages/s3m-three/src/core/CRNDecode';
 import { S3MViewer } from '../../packages/s3m-three/src/render/S3MViewer';
 import { createSplatMaterial, createSplatPickMaterial } from '../../packages/s3m-three/src/render/SplatMaterial';
 import { buildClipPlanes, isPointKept } from '../../packages/s3m-three/src/analysis/clipping';
+import { createAMapGeoAdapter } from '../../packages/s3m-three/src/render/GeoAdapter';
 
 let realFetch: typeof globalThis.fetch;
 let realNow: typeof performance.now;
@@ -853,5 +854,124 @@ describe('回归：3DGS 材质必须响应 renderer.clippingPlanes', () => {
       expect(three.distanceToPoint(new THREE.Vector3(...outside)) >= 0)
         .toBe(isPointKept([p], outside));
     }
+  });
+});
+
+describe('15. 高德 GeoAdapter 的三个尺度必须同尺（垂直写死 1.0 会把楼压扁 1/cosφ）', () => {
+  const adapter = () => {
+    const R = 6378137;
+    const project = (lng: number, lat: number): [number, number] => [
+      R * ((lng * Math.PI) / 180),
+      R * Math.log(Math.tan(Math.PI / 4 + ((lat * Math.PI) / 180) / 2)),
+    ];
+    const [cx, cy] = project(116.39126, 39.907);
+    return createAMapGeoAdapter({
+      customCoords: {
+        lngLatToCoord: ([lng, lat]: [number, number]) => {
+          const [px, py] = project(lng, lat);
+          return [px - cx, py - cy];
+        },
+      },
+    })!;
+  };
+
+  test('meterInMercatorUp 与水平尺度相等，而不是 1', () => {
+    const res = adapter().worldFromLngLat(116.39126, 39.907, 0);
+    expect(res.meterInMercatorUp).toBeCloseTo(res.meterInMercatorEast, 6);
+    expect(res.meterInMercatorUp).toBeGreaterThan(1.2);
+  });
+
+  test('100 米高程换算成 ≈130 个世界单位，与地面同尺', () => {
+    const res = adapter().worldFromLngLat(116.39126, 39.907, 100);
+    expect(res.z).toBeCloseTo(100 * res.meterInMercatorEast, 6);
+    expect(res.z).toBeGreaterThan(125);
+  });
+
+  test('水平尺度不做二次 ×1/cosφ', () => {
+    const res = adapter().worldFromLngLat(116.39126, 39.907, 0);
+    const cosLat = Math.cos((39.907 * Math.PI) / 180);
+    expect(res.meterInMercatorEast).toBeLessThan(1.4);
+    expect(res.meterInMercatorEast).toBeGreaterThan(1 / cosLat - 0.05);
+  });
+});
+
+describe('16. renderFrame 视图归一必须同时置零 camera.matrixWorldInverse（否则非零 cameraEnu 下缩成 0.5 倍）', () => {
+  const mkViewerWithRenderSpy = (onRender: (scene: THREE.Scene, camera: THREE.Camera) => void) => {
+    const v = new S3MViewer();
+    v.sceneAnchor = { x: 0, y: 0, z: 0, meterInMercator: 1 };
+    const camera = new THREE.PerspectiveCamera();
+    (v as unknown as { canvas: unknown }).canvas = { width: 800, height: 600 };
+    (v as unknown as { camera: unknown }).camera = camera;
+    (v as unknown as { renderer: unknown }).renderer = {
+      getContext: () => ({ isContextLost: () => false }),
+      capabilities: { isWebGL2: true },
+      setViewport: () => {},
+      resetState: () => {},
+      setRenderTarget: () => {},
+      getClearColor: (c: THREE.Color) => c,
+      setClearColor: () => {},
+      getClearAlpha: () => 1,
+      setClearAlpha: () => {},
+      clear: () => {},
+      render: onRender,
+      dispose: () => {},
+    };
+    return { v, camera };
+  };
+
+  test('非零 cameraEnu 下，renderer.render 期间 matrixWorld 与 matrixWorldInverse 均为单位阵，结束后恢复', () => {
+    stallFetch();
+    const id = new THREE.Matrix4().identity().elements;
+    const probe = new THREE.Object3D();
+    let duringWorld: number[] = [];
+    let duringInv: number[] = [];
+    let duringAutoUpdate = true;
+    const modelView = new THREE.Matrix4();
+
+    const { v, camera } = mkViewerWithRenderSpy((_scene, cam) => {
+      duringWorld = [...cam.matrixWorld.elements];
+      duringInv = [...cam.matrixWorldInverse.elements];
+      duringAutoUpdate = cam.matrixWorldAutoUpdate;
+      modelView.multiplyMatrices(cam.matrixWorldInverse, probe.matrixWorld);
+    });
+    v.scene.add(probe);
+    const keepAuto = camera.matrixWorldAutoUpdate;
+
+    v.renderFrame({
+      mvp: new THREE.Matrix4().identity().toArray(),
+      cameraEnu: [100, -200, 600],
+      fovRad: 0.6,
+      canvasHeight: 600,
+    });
+
+    expect(duringAutoUpdate).toBe(false);
+    expect(duringWorld).toEqual([...id]);
+    expect(duringInv).toEqual([...id]);
+    expect([modelView.elements[12], modelView.elements[13], modelView.elements[14]]).toEqual([0, 0, 0]);
+
+    expect(camera.matrixWorldAutoUpdate).toBe(keepAuto);
+    expect(camera.matrixWorld.elements.slice(12, 15)).toEqual([100, -200, 600]);
+    expect(camera.matrixWorldInverse.elements.slice(12, 15)).toEqual([-100, 200, -600]);
+    v.dispose();
+  });
+
+  test('renderer.render 抛错时 finally 仍恢复 matrixWorld 与 matrixWorldInverse', () => {
+    stallFetch();
+    const { v, camera } = mkViewerWithRenderSpy(() => {
+      throw new Error('mock gl failure');
+    });
+
+    expect(() =>
+      v.renderFrame({
+        mvp: new THREE.Matrix4().identity().toArray(),
+        cameraEnu: [12, -34, 560],
+        fovRad: 0.6,
+        canvasHeight: 600,
+      })
+    ).toThrow('mock gl failure');
+
+    expect(camera.matrixWorld.elements.slice(12, 15)).toEqual([12, -34, 560]);
+    expect(camera.matrixWorldInverse.elements.slice(12, 15)).toEqual([-12, 34, -560]);
+    v.dispose();
   });
 });
