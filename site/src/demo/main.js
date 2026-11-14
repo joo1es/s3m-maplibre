@@ -529,6 +529,10 @@ const poffsetParam = new URLSearchParams(window.location.search).get('poffset');
 const layerPolygonOffset =
   poffsetParam === '1' ? { factor: -1, units: -2 } : poffsetParam === '-1' ? { factor: 1, units: 2 } : undefined;
 
+// ?water=0 关掉数据集级水面特效配置（config 的 *.water 附件）。默认读，用来对照两种水面。
+// 只有 config 真的声明了 .water 的数据集才多一次请求，其余零开销。
+const waterEffectOn = new URLSearchParams(window.location.search).get('water') !== '0';
+
 // ?maxTiles=Infinity | 64 | 0：瓦片预算调试。默认 4096（要装得下近处所有可见瓦片）。
 // 注意这里只能在**构造时**生效 —— 图层没有 setMaxTiles / maxTiles 访问器，
 // 运行时 `layer.maxTiles = ...` 只会挂一个内核不读的野字段。
@@ -790,6 +794,8 @@ async function loadSource(rawUrl) {
         configUrl: d.configUrl,
         align: presetAlign,
         heightOffset: presetHeightOffset,
+        // 数据集级水面特效（config 的 *.water 附件）：用配置里的水色/亮度替代内置常量色
+        waterEffect: waterEffectOn,
         // 预设指定的锚点覆盖（只有平面坐标系那类数据会带，其余为 undefined）
         ...(matchedPreset?.anchorOverride ? { anchorOverride: matchedPreset.anchorOverride } : {}),
       });
@@ -876,6 +882,7 @@ function renderDatasetUI() {
               id: d.id,
               name: d.name,
               configUrl: d.configUrl,
+              waterEffect: waterEffectOn,
             });
             updateDatasetTag(id);
             fitLayerBounds();
