@@ -68,7 +68,7 @@ let layer;
 const qs = new URLSearchParams(location.search);
 // ?fog=0 关掉体积雾，方便对照「有雾 / 无雾」两张截图
 const fogEnabled = qs.get('fog') !== '0';
-// ?warm=0 直接撤遮罩（调试对照用）；?warmMs=60000 放宽预加载总预算
+// ?warm=0 直接撤遮罩（调试对照用）；?warmMs=15000 放宽首屏预热上限
 const warmEnabled = qs.get('warm') !== '0';
 const warmBudgetMs = Number(qs.get('warmMs')) || undefined;
 let stats = { tiles: 0, meshes: 0, triangles: 0, loading: 0, failed: 0 };
@@ -115,9 +115,19 @@ map = new maplibregl.Map({
 
 layer = new S3MLayer({
   id: 's3m',
-  // CBD 根瓦片就有几十块，预算给小了每帧都在淘汰-重下，纹理会永远停在最粗一级
+  // 7 个数据集实测 191 块根瓦片，预算给小了每帧都在淘汰-重下，纹理会永远停在最粗一级
   maxTiles: 4096,
+  // 保持 6：服务端实测是 HTTP/1.1 + keep-alive（openresty，无 h2），浏览器同域名
+  // 只有 6 条连接。7 个数据集已经远超这个上限，再提并发只会让请求在浏览器里
+  // 排队、还可能把 Building 的根瓦片挤到队尾。h1 下唯一有效的是减少请求总数。
   maxConcurrent: 6,
+  // 默认 false 是「全向加载」——视野外的瓦片照样继续细化，特写机位下 360° 的
+  // 子瓦片全都会被拉下来，这是瓦片数爆炸的最大来源。API 明确它只管请求、
+  // 不管绘制（画不画一律按宿主 MVP 视锥），视野内画质零损失。
+  cullRefine: true,
+  // LOD 阈值按绘图缓冲的物理像素高度算，2x/3x 屏细化层数跟着翻倍。按 CSS 高度
+  // ×1.5 截断，高分屏上少一整层瓦片；普通 1080p（DPR 1）此值不产生任何影响。
+  lodPixelRatioCap: 1.5,
   // MapLibre 的 nearZ 写死是 canvasHeight/50，zoom 16.8 贴脸看会把楼整片裁掉
   nearPlaneScale: 0.25,
   // 增量细化：子瓦片就绪一个显示一个，未就绪区域由父瓦片垫底，巡游时不会整块跳变
@@ -246,8 +256,8 @@ async function loadCity() {
       console.warn('[city] 着色预热失败（不影响渲染）', e);
     }
 
-    // 关键：addDataset 只等首棵根瓦片，且开场机位在 12.4 级高空，LOD 只要最粗一级。
-    // 用演出真实机位把精细瓦片全部预载并等请求收敛，俯冲时才不会边跑边下载。
+    // 只预热首屏：镜头短暂移到俯冲落点，让 LOD 把首屏要用的中等精度瓦片发出来，
+    // 增长停滞就撤遮罩。精细层交给演出中 26 秒的渐进细化，不在这里阻塞等到底。
     if (warmEnabled) {
       warmReport = await warmupCity({
         map,
@@ -263,8 +273,8 @@ async function loadCity() {
     }
 
     const note = warmReport.timedOut
-      ? ' · 已达预加载时限，余下瓦片会在巡游中增量细化'
-      : warmReport.skipped ? ' · 已跳过预加载' : '';
+      ? ' · 首屏已就绪，余下瓦片在巡游中增量细化'
+      : warmReport.skipped ? ' · 已跳过首屏预热' : '';
     hud.setLoading(
       `就绪 · ${ok}/${DATASETS.length} 个数据集 · 预载 ${warmReport.tiles.toLocaleString('zh-CN')} 块瓦片${note}`,
       100,

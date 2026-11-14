@@ -1,20 +1,18 @@
 /**
- * 开场瓦片预加载。
+ * 开场首屏预热。
  *
- * 问题：addDataset() 只 await 每个数据集的**首棵根瓦片**（S3MTileset.init 里
- * `await this._load(this.rootUrls[0])`，其余 root + 全部子瓦片走后台队列）。
- * 而且瓦片调度只在 MapLibre 的 renderFrame 里按「当前相机」推进：开场镜头停在
- * zoom 12.4 的高空，LOD 只需要最粗一级；演出一俯冲到 16.85，成百上千块精细
- * 瓦片才被请求，下载 / 解交错 / 建几何 / 传纹理全撞在开头几秒 → 卡顿。
+ * addDataset() 只 await 每个数据集的**首棵根瓦片**，其余 root + 全部子瓦片走后台
+ * 队列；瓦片调度又只在 MapLibre 的 renderFrame 里按「当前相机」推进。所以遮罩还在
+ * 时，把一个覆盖全城的中等高度机位连渲几帧，让 LOD 把首屏需要的瓦片发出去，
+ * 落地数达标就撤遮罩开演 —— 而不是等整条 LOD 链细化到叶子（那永远不会静默）。
  *
- * 做法：遮罩还没撤时，把演出会经过的机位依次 jumpTo 一遍。每个机位连渲几帧让
- * LOD 把该要的瓦片发出去，然后等「在途请求归零 + 瓦片数不再增长」持续一段时间
- * 才换下一个机位。切机位不带动画、不触发 movestart 的 originalEvent，所以不会
- * 惊动 Show 的自由视角判断（此时 show 也没 start）。
+ * 剩下精细瓦片由演出中的渐进细化补齐：镜头是 8.2s 才俯冲到 15.35 级、26s 后才
+ * 到 16.85 级特写，配合 incremental 过渡（父瓦片垫底）不会有整块跳变。这也是
+ * 官方 demo「瞬间出来」的同一套策略。
  *
- * 判定不靠固定 sleep，也不靠「有几块瓦片」：直接读内核的 stats.loading（在途
- * _load）+ 每个 tileset 的 pending / _queue（排队中），加上累计瓦片数是否还在涨。
- * tiles / meshes 在内核里是单调累计量（淘汰不减），正好当收敛信号。
+ * 判定读内核的 stats.loading（在途 _load）+ 每个 tileset 的 pending / _queue（排队
+ * 中），加上累计瓦片数是否还在涨。tiles / meshes 在内核里是单调累计量（淘汰不减）。
+ * 尾部零星请求不算忙，否则计时会被反复重置、白等到硬上限。
  */
 import { CAMERA, WARMUP } from './config.js';
 
@@ -71,10 +69,16 @@ async function settleCamera(map, cam) {
 }
 
 /**
- * 等一个机位的瓦片流水线静默。
- * @returns {{ reason: 'quiet'|'timeout'|'skipped', state: object, ms: number }}
+ * 等首屏「够看」——不是等流水线静默。
+ *
+ * 旧版把 inFlight > 0 算作忙并重置计时，但 LOD 会一路细化到叶子，在途请求在
+ * 整场演出里都不会归零（实测撤遮罩时仍有 30 个）。结果每个机位都撞硬上限，
+ * 进度条必然「百分百到上限时间」。现在主判据是累计落地瓦片数达标，增长停滞
+ * 只作为网络快时的提前退出；在途数只用于文案展示。
+ *
+ * @returns {{ reason: 'covered'|'quiet'|'timeout'|'skipped', state: object, ms: number }}
  */
-async function waitQuiet({ layer, timeoutMs, isSkipped, onTick }) {
+async function waitQuiet({ layer, timeoutMs, isSkipped, onTick, baseTiles = 0 }) {
   const t0 = performance.now();
   let last = readState(layer);
   let quietSince = t0;
@@ -85,18 +89,27 @@ async function waitQuiet({ layer, timeoutMs, isSkipped, onTick }) {
 
     const now = performance.now();
     const st = readState(layer);
-    const busy = st.inFlight > 0;
-    const grew = st.tiles > last.tiles || st.meshes > last.meshes;
-    if (busy || grew) quietSince = now;
+    const grew = st.tiles > last.tiles + WARMUP.growthTolerance
+      || st.meshes > last.meshes + WARMUP.growthTolerance;
+    if (grew) quietSince = now;
     last = st;
 
+    const elapsed = now - t0;
     const quiet = now - quietSince;
-    onTick?.(st, { elapsed: now - t0, quiet, busy, grew });
+    const gained = Math.max(0, st.tiles - baseTiles);
+    onTick?.(st, {
+      elapsed, quiet, gained,
+      busy: st.inFlight > WARMUP.busyThreshold,
+      grew,
+    });
 
-    if (!busy && !grew && quiet >= WARMUP.quietMs && now - t0 >= WARMUP.minViewMs) {
-      return { reason: 'quiet', state: st, ms: now - t0 };
+    const covered = gained >= WARMUP.readyTiles;
+    const settled = !grew && quiet >= WARMUP.quietMs;
+    if ((covered || settled)
+      && elapsed >= WARMUP.minViewMs && elapsed >= WARMUP.minWarmMs) {
+      return { reason: covered ? 'covered' : 'quiet', state: st, ms: elapsed };
     }
-    if (now - t0 >= timeoutMs) return { reason: 'timeout', state: st, ms: now - t0 };
+    if (elapsed >= timeoutMs) return { reason: 'timeout', state: st, ms: elapsed };
   }
 }
 
@@ -132,21 +145,18 @@ export async function warmupCity({
       layer,
       timeoutMs: Math.min(perViewMs, remain),
       isSkipped,
+      baseTiles,
       onTick: (st, info) => {
-        // 旧版把进度平均摊给每个机位，还让 quiet 一遇到新瓦片就归零：
-        // 结果最贵的第一机位（瓦片最多）权重只有 1/5，进度条长时间卡住甚至倒退。
-        // 现在主信号是「累计落地瓦片数」——它单调递增，瓦片一到就推进；
-        // 机位完成度只作收尾补偿。最后再 clamp 一次，全程绝不倒退。
-        const gained = Math.max(0, st.tiles - baseTiles);
-        const loaded = 1 - Math.exp(-gained / WARMUP.tileScale);
-        const viewDone = (i + (st.inFlight === 0
-          ? Math.min(1, info.quiet / WARMUP.quietMs) : 0)) / views.length;
+        // 进度 = 真实落地瓦片数 / 首屏目标数：线性、单调、有明确终点。
+        // 旧版按机位序号摊派还让 quiet 归零，进度条会长时间卡住甚至倒退；
+        // 饱和曲线也估不准（分母是拍脑袋的经验值）。现在分母就是退出条件本身。
         const raw = WARMUP.startPct
-          + (WARMUP.endPct - WARMUP.startPct) * Math.max(loaded, 0.9 * viewDone);
+          + (WARMUP.endPct - WARMUP.startPct)
+          * Math.min(1, info.gained / WARMUP.readyTiles);
         lastPct = Math.max(lastPct, Math.min(99, raw));
 
         hud.setLoading(
-          `预加载 ${i + 1}/${views.length} · ${v.label} · 瓦片 ${st.tiles.toLocaleString('zh-CN')} · 在途 ${st.inFlight} · ${Math.round(lastPct)}%${skipHint}`,
+          `首屏预热 · ${v.label} · ${info.gained}/${WARMUP.readyTiles} 块瓦片 · ${Math.round(lastPct)}%${skipHint}`,
           lastPct,
         );
       },
