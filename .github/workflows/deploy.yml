@@ -44,6 +44,10 @@ jobs:
           cp -r demo _site/demo
           cp -r packages _site/packages
           cp -r docs _site/docs
+          # smart-city/ 是独立 vite 项目：单独构建成静态页再拷进 _site。
+          # 配置里 base: './' + worker 用 import.meta.url，放 Pages 子路径不会 404。
+          NODE_OPTIONS= node ./node_modules/vite/bin/vite.js build --config smart-city/vite.config.mjs
+          cp -r smart-city/dist _site/smart-city
           cat << 'EOF' > _site/index.html
           <!doctype html>
           <html lang="zh-CN">
@@ -67,6 +71,9 @@ jobs:
                 a.card.primary { border-color: rgba(56, 189, 248, 0.4); background: rgba(56, 189, 248, 0.08); }
                 a.card.primary:hover { border-color: #38bdf8; background: rgba(56, 189, 248, 0.16); }
                 a.card.primary b { color: #38bdf8; }
+                a.card.showcase { border-color: rgba(56, 189, 248, 0.35); background: rgba(56, 189, 248, 0.06); }
+                a.card.showcase:hover { border-color: #38bdf8; background: rgba(56, 189, 248, 0.16); }
+                a.card.showcase b { color: #38bdf8; }
               </style>
             </head>
             <body>
@@ -88,6 +95,10 @@ jobs:
                 <a class="card" href="demo/analysis.html">
                   <b>空间分析 & 三维覆盖物 →</b>
                   <span>量算 · 通视 · 剖切 · 天际线 · 可视域 · 飞线 / 范围罩</span>
+                </a>
+                <a class="card showcase" href="smart-city/index.html">
+                  <b>🏙️ 智慧城市数字孪生 Showcase →</b>
+                  <span>北京 CBD 七数据集全量叠加 · 五幕自动镜头巡游 · 水面 / 体积雾 / 辉光后处理</span>
                 </a>
               </div>
             </body>
