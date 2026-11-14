@@ -28,6 +28,7 @@ import {
   decodeRotationF32,
 } from '../core/GaussianSplat.js';
 import { createSplatMaterial, createQuadGeometry, splatRaycast } from './SplatMaterial.js';
+import type { WaterEffect } from '../tileset/water.js';
 import { SPLAT_SIGMA } from '../core/SplatProjection.js';
 import type {
   GeoPackageEntry,
@@ -402,6 +403,13 @@ export interface BuildTileOptions {
   tileAnchor?: { lon: number; lat: number; height?: number };
   /** 瓦片中心偏移（ENU 米），烘焙墨卡托时使用 */
   tileCenter?: { x: number; y: number; z?: number };
+  /**
+   * 数据集级水面特效参数（数据集 config 的 `*.water` 附件，见 `tileset/water.ts`）。
+   *
+   * 只影响 `103.water` 这类**没有贴图**的内置水面：基色 / 亮度 / 不透明度改用配置值。
+   * 不传 = 用内置常量色（旧行为）。有贴图的水面不受影响（贴图本身已经是「真实参数」）。
+   */
+  water?: WaterEffect | null;
 }
 
 export interface BuildTileResult {
@@ -549,6 +557,18 @@ export async function buildTileObjects(
     // （实测 Waters 的 s3mb 只有 1081 字节，textures = 0，材质 diffuse 还是纯白）。
     // 以前当白色漫反射渲染，整片湖就是一块白板。这里按内置水面材质上色。
     const isWater = [unit0, unit1].some((u) => /\.water$/i.test(String(materialName(u) ?? u?.id ?? '')));
+    // 数据集级水面参数（config 的 `*.water` 附件，见 tileset/water.ts）优先于内置常量色：
+    // 常量色是「不知道真实参数时的兜底」，有一份写了基色 / 亮度 / alpha 的配置就没理由不用。
+    const water = isWater && !map ? (options.water ?? null) : null;
+    const waterColor = water
+      ? // 与 diffuse 同口径：S3M 的颜色就是工作色彩空间里的值，不走 sRGB 解码
+        new THREE.Color(water.waterColour[0], water.waterColour[1], water.waterColour[2]).multiplyScalar(
+          water.waterBrightness
+        )
+      : WATER_COLOR.clone();
+    // 官方 shader 最后一步是 `resultColor.a = waterColour.a`，配合 src_alpha 混合：
+    // alpha = 1 时水面就是不透明的（客户端同样如此），这里忠实照搬。
+    const waterOpacity = water ? Math.min(1, Math.max(0, water.waterColour[3])) : 0.86;
     // 官方 isTransparent = (alphaMode === MASK || BLEND)，MASK 我们交给 alphaTest；
     // 另外顶点色 alpha < 1 也必须走混合（SMID 4421 就是这种）。见 render/materialAlpha.ts
     const transparent = isTransparentMaterial({
@@ -587,10 +607,10 @@ export async function buildTileObjects(
     const mat = createStyledMaterial({
       uniforms,
       map,
-      color: isWater && !map ? WATER_COLOR.clone() : new THREE.Color(diffuse.r ?? 1, diffuse.g ?? 1, diffuse.b ?? 1),
+      color: isWater && !map ? waterColor : new THREE.Color(diffuse.r ?? 1, diffuse.g ?? 1, diffuse.b ?? 1),
       side: resolveSide(m),
       transparent,
-      opacity: isWater && !map ? 0.86 : (diffuse.a ?? 1),
+      opacity: isWater && !map ? waterOpacity : (diffuse.a ?? 1),
       roughness: isWater && !map ? 0.12 : roughness,
       alphaTest,
       atlas: hasAtlasRect && !!map,
@@ -604,6 +624,16 @@ export async function buildTileObjects(
       tilePivot: options.tileCenter ? new THREE.Vector3(options.tileCenter.x, options.tileCenter.y, options.tileCenter.z) : undefined,
       invTileScale: initialInvScale ? new THREE.Vector3(...initialInvScale) : undefined,
     });
+    if (isWater && !map && options.water) {
+      // 给自定义扩展留的钩子：用户想自己写水面 shader 时，靠这个标记找水面网格
+      mat.userData.s3mWater = true;
+      // 配置里 alpha = 1 时水面就是不透明的（官方 `resultColor.a = waterColour.a`）。
+      // 透明队列会关掉 depthWrite，水面后面的东西就会画到水面上来 —— 不透明水面必须写深度。
+      if ((options.water.waterColour[3] ?? 1) >= 0.999) {
+        mat.transparent = false;
+        mat.depthWrite = true;
+      }
+    }
     // 用户配置的深度偏移（共面摩尔纹 / 重合面归属的人工定序，见 BuildTileOptions 注释）
     if (options.polygonOffset) {
       mat.polygonOffset = true;
@@ -857,6 +887,10 @@ export async function buildTileObjects(
     object.userData.geoRef = geoRef;
     object.userData.tileRef = tile;
     object.userData.primitiveType = prim.primitiveType;
+    // 水面标记跟着材质走（自定义水面 shader 靠它识别水面网格）
+    if ((material as { userData?: { s3mWater?: boolean } })?.userData?.s3mWater) {
+      object.userData.s3mWater = true;
+    }
     // 绘制顺序 = 文件材质顺序（见 materialIndexOf 的说明）。只在拿到了序号时钉，
     // 拿不到就保持 three 的默认 0，不影响其他数据。
     // 透明材质例外：共面定序解决的是「不透明面深度相等谁赢」，而透明物体的正确

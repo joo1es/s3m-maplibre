@@ -12,6 +12,7 @@ import type { UnsupportedPolicy } from '../core/degradations.js';
 import type { TileGeometryData } from '../core/TileGeometry.js';
 import type { ParsedTile, Stats, StyleUniforms } from '../core/types.js';
 import type { TextureCreateOptions } from '../render/TextureFactory.js';
+import type { WaterEffect } from './water.js';
 
 /** 配置文件里的经纬度范围 */
 export interface GeoBounds {
@@ -50,6 +51,8 @@ export type BuildTileFn = (
     bakeMercator?: boolean;
     tileAnchor?: { lon: number; lat: number; height?: number };
     tileCenter?: { x: number; y: number; z?: number };
+    /** 数据集级水面特效参数（见 S3MTilesetOptions.waterEffect）；null/undefined = 用内置水面材质 */
+    water?: WaterEffect | null;
   }
 ) => Promise<{ group: Group; stats: Partial<Stats> }>;
 
@@ -193,6 +196,28 @@ export interface S3MTilesetOptions {
    * 度量方式见 `_tmp/atlas/rule2.mts`。
    */
   atlasLod?: boolean;
+  /**
+   * 是否读取数据集级水面特效（config 的 `extensions.attachFiles` 里那个 `*.water`）。
+   * **默认关**。
+   *
+   * S3M 里的水面信息分两层，别混：
+   *   - `103.water`（块里的纹理单元 id）只说「这块几何是水」，块里没有像素，
+   *     渲染层只能给一个内置常量色（见 `GeometryBuilder` 的 `WATER_COLOR`）；
+   *   - `*.water`（数据集 config 的附件）才写了「这片水长什么样」：
+   *     水体基色、菲涅尔曲线、噪声扰动、水面高程（`AverageHeight`）。
+   *
+   * 打开后：config 声明了 `.water` 才**多一次**请求（没声明的数据集零额外请求），
+   * 解析成功则用配置里的**基色 / 亮度 / 不透明度**替代内置常量，水面仍是纯色 + PBR。
+   * 解析失败一律降级回旧行为，不影响出图。
+   *
+   * 边界是刻意的：**只到纯色为止**。菲涅尔反射、波纹动画这些需要额外一趟场景渲染
+   * 和自定义着色器，本库不做——解析出来的完整参数挂在 `S3MTileset.waterEffect` 上，
+   * 需要真实水面效果的调用方可以自己写 shader（水面材质带 `userData.s3mWater` 标记，
+   * 便于在场景里找到它们）。
+   *
+   * 不传 = 不发请求、渲染路径与旧版逐字一致（不变式 ①）。
+   */
+  waterEffect?: boolean;
   /**
    * 鉴权适配函数（默认不传 = 行为与旧版一致）。每个请求（配置 scp / 瓦片 /
    * 子图集）发出前过一遍，可改写 URL（加 `?token=`）或附加请求头。见 `AuthenticateFn`。

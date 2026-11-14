@@ -79,6 +79,12 @@ export interface S3MDatasetOptions {
   /** 是否用 Web Worker 解析经典 .s3mb 瓦片（默认开，崩溃自动降级主线程），见 S3MTilesetOptions.useWorker */
   useWorker?: boolean;
   /**
+   * 是否读取本数据集的水面特效配置（config 的 `*.water` 附件），默认关。
+   * 打开后水面用配置里的基色 / 亮度 / 不透明度渲染，而不是内置常量色。
+   * 见 `S3MTilesetOptions.waterEffect`。
+   */
+  waterEffect?: boolean;
+  /**
    * 本数据集推荐的深度模式（'scene' | 'clear' | 'auto'）。
    * 当图层/Viewer 的 depthMode 为 'auto' 时，若任一可见数据集标注为 'clear'，则整层以 'clear' 绘制。
    */
@@ -343,6 +349,8 @@ export class DatasetManager {
       colorPipeline: this.defaultColorPipeline,
       textureOptions: this.defaultTextureOptions,
       useWorker: ds.useWorker,
+      // 水面特效：该数据集显式开启才多读一个 .water 附件
+      waterEffect: ds.waterEffect,
       bakeMercator: ds.bakeMercator ?? this.defaultBakeMercator,
       authenticate: ds.authenticate ?? authenticate,
       unsupported: ds.unsupported,

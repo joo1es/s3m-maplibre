@@ -17,6 +17,8 @@
  *
  * 拆分已结束，之后**只有显式新增公共能力**才允许往清单里加条目（并写进下面的注释）。
  * 0.4.x：`spatialRef` getter —— 暴露 .scp 的 crs / unit，让上层识别非地理坐标系数据。
+ * 0.4.x：`waterEffect` getter —— 暴露数据集级水面特效（config 的 `*.water` 附件）解析结果，
+ *         `waterEffect: true` 才非 null；用 getter 而不是实例字段，正是为了不动下面的字段快照。
  */
 import { describe, expect, test } from 'bun:test';
 import { S3MTileset } from '../../packages/s3m-three/src/tileset/S3MTileset';
@@ -26,7 +28,7 @@ const PUBLIC_METHODS = [
   'dispose', 'getExternalAtlas', 'getLeafRecords', 'getLodTransition', 'heightRange', 'init',
   'putExternalAtlas', 'putLeafRecords', 'registerTileTextures', 'residentMemory', 'retryFailed',
   'setLodTransition', 'setMaterialQuality', 'setMaxMemory', 'setMaxTriangles', 'setRenderProfile',
-  'shouldBakeMercator', 'spatialRef', 'update',
+  'shouldBakeMercator', 'spatialRef', 'update', 'waterEffect',
 ].sort();
 
 /** 公共实例字段（构造后即可读的那些） */

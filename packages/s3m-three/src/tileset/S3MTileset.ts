@@ -29,8 +29,11 @@ import {
   datasetNameOf,
   parseConfigText,
   readSpatialReference,
+  readWaterAttachFile,
   resolveAnchor,
 } from './config.js';
+import { parseWaterEffect } from './water.js';
+import type { WaterEffect } from './water.js';
 import type {
   AnchorOverride,
   BuildTileFn,
@@ -79,6 +82,17 @@ export class S3MTileset {
    */
   get spatialRef(): SpatialReference | null {
     return this._spatialRef;
+  }
+
+  /**
+   * 数据集级水面特效参数（`*.water`），`init()` 后可读。
+   *
+   * 只有显式传 `waterEffect: true` 且 config 的 `extensions.attachFiles` 声明了 `.water`
+   * 附件时才非 null；其余情况恒为 null，渲染层继续用内置水面材质（旧行为）。
+   * 和 `spatialRef` 一样做成 getter：`tileset-api-surface` 钉住了公共自有字段清单。
+   */
+  get waterEffect(): WaterEffect | null {
+    return this._waterEffect;
   }
 
   readonly rootUrls: string[] = [];
@@ -199,6 +213,10 @@ export class S3MTileset {
   private readonly _anchorOverride: AnchorOverride | null;
   /** 原始 .scp 的空间参考；下划线开头，不进公共字段快照 */
   private _spatialRef: SpatialReference | null = null;
+  /** 是否请求数据集级水面特效（`waterEffect` 选项，默认关） */
+  private readonly _loadWaterEffect: boolean;
+  /** 解析后的水面特效；null = 没开 / 没附件 / 读失败，全部回落旧行为 */
+  private _waterEffect: WaterEffect | null = null;
 
   constructor(options: S3MTilesetOptions) {
     this.configUrl = options.configUrl;
@@ -225,6 +243,8 @@ export class S3MTileset {
     this._materialQuality = options.materialQuality;
     this._colorPipeline = options.colorPipeline;
     this._textureOptions = options.textureOptions;
+    // 数据集级水面特效：默认关，显式 true 才多读一个 .water 附件（不变式①）
+    this._loadWaterEffect = options.waterEffect === true;
     // 着色器共享 uniform，由 S3MLayer 持有并传进来
     this._uniforms = options.uniforms ?? null;
 
@@ -352,6 +372,10 @@ export class S3MTileset {
       if (u) this.rootUrls.push(u);
     }
 
+    // 水面特效要在首棵树落地**之前**就位：材质是在 build 里一次性建好的，
+    // 晚到一步，最先加载的那批瓦片就永远是旧的常量色。
+    if (this._loadWaterEffect) await this._initWaterEffect();
+
     // S3M 1.x（SuperMapCache，.s3m）容器：早点说清楚，别等几十块瓦片全失败才看出来。
     // 位置与范围是按配置反算出来的，所以视角会正确落到模型上，只是这种容器还没接解码。
     this.isS3MV1 =
@@ -373,6 +397,39 @@ export class S3MTileset {
     for (const r of this.rootUrls.slice(1)) this._enqueue(r);
 
     return this;
+  }
+
+  /**
+   * 读取并解析数据集级水面特效（`*.water`）。
+   *
+   * 只在 `waterEffect: true` 时被调用，且只有 config 真的声明了 `.water` 附件才发请求 ——
+   * 绝大多数数据集没有这个附件，此时零额外请求、零行为变化。
+   *
+   * 失败一律降级（`_waterEffect` 保持 null，渲染层回落内置水面材质），
+   * 因为「没有水面参数」只是画得糙一点，不该把一个整块数据集拖死。
+   */
+  private async _initWaterEffect(): Promise<void> {
+    const file = readWaterAttachFile(this.config);
+    if (!file) return;
+    // 与 rootTiles 同一条相对路径规则：附件和 config 在同一目录
+    const url = resolveUrl(this.configUrl, file);
+    if (!url) return;
+
+    try {
+      const res = await authFetch(url, this.authenticate, 'config');
+      if (!res.ok) {
+        console.warn(`[s3m] 水面特效读取失败 ${res.status} ${url}，水面按内置材质渲染`);
+        return;
+      }
+      const parsed = parseWaterEffect(await res.text());
+      if (!parsed) {
+        console.warn(`[s3m] 水面特效文件无法识别（期望 FileType=WaterEffect）${url}`);
+        return;
+      }
+      this._waterEffect = parsed;
+    } catch (e) {
+      console.warn('[s3m] 水面特效读取异常，水面按内置材质渲染', e);
+    }
   }
 
   private _enqueue(url: string | null, parentUrl?: string): void {
@@ -589,6 +646,8 @@ export class S3MTileset {
         bakeMercator: shouldBake,
         tileAnchor: this.anchor,
         tileCenter: lodForBake?.boundingSphere?.center,
+        // null = 没开 / 没附件 / 读失败，构建器走旧的常量水面材质
+        water: this._waterEffect,
       });
       const { group, stats } = buildRes;
       const texKeys = (buildRes as any).textureKeys ?? (group.userData?.textureKeys as string[] | undefined) ?? Object.keys(tile.textures ?? {});

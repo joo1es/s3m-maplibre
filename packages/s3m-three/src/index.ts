@@ -76,6 +76,9 @@ export {
   applyAnchorOverride,
   usableGeoBounds,
 } from './tileset/S3MTileset.js';
+export { parseWaterEffect, DEFAULT_WATER_EFFECT } from './tileset/water.js';
+export type { WaterEffect } from './tileset/water.js';
+export { readWaterAttachFile } from './tileset/config.js';
 export type {
   TileNode,
   BuildTileFn,

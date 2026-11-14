@@ -83,6 +83,7 @@ demo/  docs/     构建产物，**已纳入 git**
 | `BlockAtlas` | `.texblock` 子请求、图集 LRU、整图替换的等比/色差验证 | `_leafPending` |
 | `TileBudget` | 三条软上限、淘汰候选、make-before-break 裁剪、纹理引用计数 | `_textureRefs`、`_tileTextureKeys` |
 | `TileVisibility` | `update()` 判定主体、两套可见性递归、fallback 深度推移 | 仅帧号（宿主持有） |
+| `water.ts` | 数据集级水面特效 `*.water`（Ogre `SCPDescriptor` XML）解析，`config.ts` 的 `readWaterAttachFile` 负责从 `extensions.attachFiles` 里挑文件 | 无（纯函数） |
 
 三个**故意没拆**的点，以及两个搬出来的坑：
 

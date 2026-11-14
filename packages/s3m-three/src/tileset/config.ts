@@ -131,6 +131,29 @@ export function configTypeHint(config: Record<string, unknown>): string {
   return parts.length ? parts.join(', ') : '无类型标记';
 }
 
+/**
+ * 从 config 的 `extensions.attachFiles` 里挑出数据集级水面特效文件（`*.water`）。
+ *
+ * 实测形态（supermapol 3D-CBD-2 / datas/Lake@CBD）：
+ * ```json
+ * "extensions": { "attachFiles": [ { "attachFile": "955833.water" } ] }
+ * ```
+ *
+ * 返回**文件名**而不是绝对 URL：URL 由调用方按 configUrl 解析（和 rootTiles 同一条规则），
+ * 这样本函数保持纯函数、可单测。没有 .water 附件时返回 `null` —— 调用方据此完全不发请求。
+ */
+export function readWaterAttachFile(config: Record<string, unknown> | null | undefined): string | null {
+  const ext = config?.extensions as { attachFiles?: unknown } | null | undefined;
+  const files = ext?.attachFiles;
+  if (!Array.isArray(files)) return null;
+  for (const f of files) {
+    if (!f || typeof f !== 'object') continue;
+    const name = (f as { attachFile?: unknown }).attachFile;
+    if (typeof name === 'string' && /\.water$/i.test(name.trim())) return name.trim();
+  }
+  return null;
+}
+
 /** 从 configUrl 里抠出数据集名（…/datas/<名>/config）；抠不出就原样返回，报错时能对上服务里的数据集 */
 export function datasetNameOf(configUrl: string): string {
   const m = /\/datas\/([^/?#]+)/i.exec(configUrl);
