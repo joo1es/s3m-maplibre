@@ -238,7 +238,10 @@ map.on('click', (e) => {
 - **🗺️ MapLibre 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/index.html>
 - **🧊 纯 three.js 版演示** — <https://joo1es.github.io/s3m-maplibre/demo/three.html>
 - **🧭 空间分析 & 三维覆盖物演示** — <https://joo1es.github.io/s3m-maplibre/demo/analysis.html>
+- **🏙️ 智慧城市数字孪生 Showcase** — <https://joo1es.github.io/s3m-maplibre/smart-city/>
 - **🏠 Pages 导航入口** — <https://joo1es.github.io/s3m-maplibre/>
+
+**智慧城市 Showcase**（`smart-city/`）是独立的 vite 项目，与主 demo 的面板和路由互不干扰：本地 `node smart-city/dev.mjs`（端口 5174，不占 5173）；push 到 `main` 后由 `.github/workflows/deploy.yml` 单独构建成静态页并发布到上面的 Pages 地址，无需本地提交 `smart-city/dist/`。
 
 本地跑：
 
