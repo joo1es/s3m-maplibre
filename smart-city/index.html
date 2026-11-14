@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CITY OS · 城市数字孪生 | S3M × MapLibre</title>
+    <meta name="description" content="基于 s3m-maplibre 的智慧城市三维可视化演示：原生 S3M 瓦片、动态着色、GPU 棱线、三维飞线、辉光后处理与镜头巡游。" />
+  </head>
+  <body>
+    <div id="app">
+      <!-- 三维画布：MapLibre 自己创建 canvas，S3M 作为 custom layer 共用同一个 WebGL 上下文 -->
+      <div id="map"></div>
+
+      <!-- 纯 CSS 的氛围层，不吃指针事件 -->
+      <div class="fx fx-vignette"></div>
+      <div class="fx fx-grid"></div>
+      <div class="fx fx-scan"></div>
+      <div class="fx fx-corner tl"></div>
+      <div class="fx fx-corner tr"></div>
+      <div class="fx fx-corner bl"></div>
+      <div class="fx fx-corner br"></div>
+
+      <header class="topbar">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 40 40" width="40" height="40">
+              <path d="M20 3 L35 11.5 L35 28.5 L20 37 L5 28.5 L5 11.5 Z" fill="none" stroke="currentColor" stroke-width="1.2" />
+              <path d="M20 10 L29 15.5 L29 25 L20 30.5 L11 25 L11 15.5 Z" fill="none" stroke="currentColor" stroke-width="1" opacity=".7" />
+              <path d="M20 3 L20 37 M5 11.5 L35 28.5 M35 11.5 L5 28.5" stroke="currentColor" stroke-width=".7" opacity=".45" />
+              <circle cx="20" cy="20" r="2.6" fill="currentColor" />
+            </svg>
+          </div>
+          <div class="brand-text">
+            <div class="brand-title">CITY<span>OS</span><em>城市数字孪生</em></div>
+            <div class="brand-sub">S3M × MapLibre · 浏览器原生三维渲染内核</div>
+          </div>
+        </div>
+
+        <div class="top-center">
+          <span class="chip"><i class="dot" id="statusDot"></i><span id="statusText">初始化</span></span>
+          <span class="chip">EPSG:4326 / WGS84</span>
+          <span class="chip">7 DATASETS</span>
+          <span class="chip">v0.4</span>
+        </div>
+
+        <div class="top-right">
+          <div class="clock" id="clock">--:--:--</div>
+          <div class="date" id="date">----</div>
+        </div>
+      </header>
+
+      <aside class="rail rail-left">
+        <section class="card">
+          <div class="card-hd"><span>演出章节</span><span class="card-tag">SEQUENCE</span></div>
+          <div class="acts" id="acts"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-hd"><span>渲染实时指标</span><span class="card-tag">RENDER</span></div>
+          <div class="metrics" id="renderMetrics"></div>
+          <div class="spark-wrap">
+            <div class="spark-label"><span>FPS 曲线</span><span id="fpsNow">—</span></div>
+            <canvas id="fpsSpark" width="260" height="52"></canvas>
+          </div>
+        </section>
+      </aside>
+
+      <aside class="rail rail-right">
+        <section class="card">
+          <div class="card-hd"><span>城市体征</span><span class="card-tag">DEMO DATA</span></div>
+          <div class="kpis" id="kpis"></div>
+          <div class="bars" id="bars"></div>
+        </section>
+
+        <section class="card">
+          <div class="card-hd"><span>引擎能力</span><span class="card-tag">CAPABILITY</span></div>
+          <ul class="caps" id="caps"></ul>
+        </section>
+      </aside>
+
+      <div class="feature-card" id="featureCard"></div>
+
+      <footer class="bottom">
+        <div class="caption">
+          <div class="caption-idx" id="actIdx">01<span>/ 05</span></div>
+          <div class="caption-body">
+            <h2 id="actTitle">正在初始化</h2>
+            <p id="actDesc">连接 SuperMap iServer 三维数据服务…</p>
+          </div>
+        </div>
+
+        <div class="timeline">
+          <div class="tl-track">
+            <div class="tl-fill" id="tlFill"></div>
+            <div class="tl-head" id="tlHead"></div>
+          </div>
+          <div class="tl-nodes" id="tlNodes"></div>
+        </div>
+
+        <div class="controls">
+          <button class="btn icon" id="btnPrev" title="上一幕 (←)">
+            <svg viewBox="0 0 16 16"><path d="M10 3 L5 8 L10 13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <button class="btn primary" id="btnPlay" title="播放 / 暂停 (空格)">
+            <svg id="playIcon" viewBox="0 0 16 16"><path d="M5 3 L12 8 L5 13 Z" fill="currentColor" /></svg>
+            <span id="playText">播放</span>
+          </button>
+          <button class="btn icon" id="btnNext" title="下一幕 (→)">
+            <svg viewBox="0 0 16 16"><path d="M6 3 L11 8 L6 13" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" /></svg>
+          </button>
+          <span class="sep"></span>
+          <button class="btn" id="btnReplay" title="重播 (R)">重播</button>
+          <button class="btn toggle on" id="btnLoop" title="结束后自动循环">循环 ON</button>
+          <button class="btn toggle" id="btnFree" title="暂停演出，自由拖拽视角">自由视角</button>
+          <span class="sep"></span>
+          <span class="hint">点击建筑查看单体信息</span>
+        </div>
+      </footer>
+
+      <div class="loading" id="loading">
+        <div class="loading-inner">
+          <div class="logo-ring"><span></span><span></span><span></span></div>
+          <div class="loading-title">CITY<span>OS</span></div>
+          <div class="loading-sub">正在构建城市数字孪生场景</div>
+          <div class="loading-bar"><div id="loadFill"></div></div>
+          <div class="loading-step" id="loadStep">连接数据服务…</div>
+          <div class="loading-err" id="loadErr"></div>
+        </div>
+      </div>
+
+      <div class="toast" id="toast"></div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
