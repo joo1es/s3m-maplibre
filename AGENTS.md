@@ -85,6 +85,13 @@ demo/  docs/     构建产物，**已纳入 git**
 | `TileVisibility` | `update()` 判定主体、两套可见性递归、fallback 深度推移 | 仅帧号（宿主持有） |
 | `water.ts` | 数据集级水面特效 `*.water`（Ogre `SCPDescriptor` XML）解析，`config.ts` 的 `readWaterAttachFile` 负责从 `extensions.attachFiles` 里挑文件 | 无（纯函数） |
 
+> 水面**只做到纯色**：解析出的 `waterColour × waterBrightness` 直接当材质色，
+> 没有 shader、没有反射 RT、没有波纹动画。这是**刻意停在这里**的结论，不是没做完 ——
+> 试过两轮（解析波法线 + 高光、镜像 MVP + 半分辨率反射 RT），在俯视距离上收益都撑不住成本：
+> `fresnelPower = 0.1` 让菲涅尔几乎是平的，没有真实反射内容时水面推不动颜色。
+> 要给水面加效果，正确入口是 `S3MTileset.waterEffect`（完整参数）+ 水面材质上的
+> `userData.s3mWater` 标记，由使用方自己写 shader，库不预设。
+
 三个**故意没拆**的点，以及两个搬出来的坑：
 
 - **公共字段决定谁能搬。** `leafRequestCache` / `externalAtlasCache` / `atlasUpgraded` /
