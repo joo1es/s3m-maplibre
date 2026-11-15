@@ -66,6 +66,7 @@
  * 由着色器逐片元算 `rect.xy + fract(uv) * rect.zw`——与官方 aTextureBatchId + batch 表
  * 等价，但不需要官方的采样数组。顶点上取 fract 会让跨平铺边界的三角形反向扫纹理，别那样做。
  */
+import { isSaneImageSize, isSaneSubValue } from './imageLimits.js';
 import { BinaryReader } from './BinaryReader.js';
 import type { InflateFn } from './S3MBParser.js';
 import type { GeoPackageEntry, GroupNode, PageLOD, ParsedTile, S3MAtlasRects, S3MTexture } from './types.js';
@@ -158,6 +159,9 @@ async function defaultInflate(bytes: Uint8Array): Promise<Uint8Array> {
 function parseBlockTextures(r: BinaryReader): Record<string, S3MBlockTexture> {
   const count = r.u32();
   const out: Record<string, S3MBlockTexture> = {};
+  /** 异常子区域 / 异常图集尺寸的计数，最后统一 warn 一次 */
+  let badSubCount = 0;
+  let badTexSize = 0;
 
   for (let i = 0; i < count; i++) {
     const id = r.string();
@@ -170,6 +174,10 @@ function parseBlockTextures(r: BinaryReader): Record<string, S3MBlockTexture> {
     const size = r.u32();
     const pixelFormat = r.u32();
     const data = isSaveData ? r.bytesCopy(size) : null;
+    // 图集尺寸同样无校验。置 0 让 composeLeafAtlas 里 `!tex.width` 的保护生效
+    // （返回 null = 这张图集放弃），而不是按天文数字开画布。
+    const saneTexSize = isSaneImageSize(width, height);
+    if (!saneTexSize) badTexSize++;
 
     const childTexCount = r.u32();
     const childTexNames: string[] = [];
@@ -189,6 +197,13 @@ function parseBlockTextures(r: BinaryReader): Record<string, S3MBlockTexture> {
       const subWidth = r.u32();
       const subHeight = r.u32();
       const geoCount = r.u32();
+      // 同样是无校验直读：offset 异常会让 composeLeafAtlas 按
+      // `offsetX + sprite.width` 算出天文数字的画布。夹到 0 保留数组下标
+      // （texUnitIndex 按下标对应，少一条会让后面全部错位）。
+      const saneRect =
+        isSaneSubValue(offsetX) && isSaneSubValue(offsetY) &&
+        isSaneSubValue(subWidth) && isSaneSubValue(subHeight);
+      if (!saneRect) badSubCount++;
       const bindings: S3MSubTextureBinding[] = [];
       for (let k = 0; k < geoCount; k++) {
         const geoName = r.string();
@@ -197,10 +212,34 @@ function parseBlockTextures(r: BinaryReader): Record<string, S3MBlockTexture> {
         const texUnitIndex = r.u32();
         bindings.push({ geoName, vertexOffset, vertexCount, texUnitIndex });
       }
-      subTexInfos.push({ subName, offsetX, offsetY, width: subWidth, height: subHeight, bindings });
+      subTexInfos.push({
+        subName,
+        offsetX: saneRect ? offsetX : 0,
+        offsetY: saneRect ? offsetY : 0,
+        width: saneRect ? subWidth : 0,
+        height: saneRect ? subHeight : 0,
+        bindings,
+      });
     }
 
-    out[id] = { id, level, width, height, compressType, pixelFormat, data, childTexNames, requestNames, subTexInfos };
+    out[id] = {
+      id,
+      level,
+      width: saneTexSize ? width : 0,
+      height: saneTexSize ? height : 0,
+      compressType,
+      pixelFormat,
+      data,
+      childTexNames,
+      requestNames,
+      subTexInfos,
+    };
+  }
+
+  if (badTexSize || badSubCount) {
+    console.warn(
+      `[s3m] 块内图集尺寸异常：${badTexSize} 张图集、${badSubCount} 个子区域已置空（不分配）`
+    );
   }
 
   return out;
@@ -780,6 +819,13 @@ export function composeLeafAtlas(
   for (const { sub, sprite } of placed) {
     W = Math.max(W, sub.offsetX + sprite.image.width);
     H = Math.max(H, sub.offsetY + sprite.image.height);
+  }
+
+  // 画布尺寸是 max(声明尺寸, 各精灵 offset + 宽高) 累出来的，没有理论上限。
+  // subTexInfos 的 offset 已在解析处夹过，但精灵尺寸 / 图集声明尺寸仍可能异常。
+  if (!isSaneImageSize(W, H)) {
+    console.warn(`[s3m] leaf 图集画布超限 ${W}x${H}，跳过合成`);
+    return null;
   }
 
   const data = new Uint8Array(W * H * 4);

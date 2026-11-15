@@ -1,4 +1,5 @@
 import DXTTextureDecode from './DXTTextureDecode.js';
+import { isSaneImageSize } from './imageLimits.js';
 
 /**
  * 把「一个块里的多张图集」合并成一张。
@@ -53,6 +54,8 @@ export interface DecodedAtlasImage {
  */
 export function decodeAtlasImage(tex: AtlasLike): DecodedAtlasImage | null {
   if (!tex.data || !tex.width || !tex.height) return null;
+  // 单张图集尺寸异常 → 放弃这张（调用方已按 null = 放弃处理），不尝试分配
+  if (!isSaneImageSize(tex.width, tex.height)) return null;
   const ct = tex.compressType;
   if ((ct === 0 || ct === undefined) && tex.pixelFormat === 28 && tex.data.length === tex.width * tex.height * 4) {
     return { rgba: tex.data, topDown: true };
@@ -103,6 +106,13 @@ export function packAtlases(tp: Record<string, AtlasLike>): PackedAtlases | null
   }
   const W = Math.max(1, usedW);
   const H = Math.max(1, y + rowH);
+  // 单张都健康，但货架累加后可能仍然过大（H 是逐行叠出来的，没有理论上限）。
+  // 超了就整体放弃 —— 调用方退回「不拼图」，代价是这块瓦片贴图错位/缺失，
+  // 但不会把整页拖崩。
+  if (!isSaneImageSize(W, H)) {
+    console.warn(`[s3m] 拼图集超限 ${W}x${H}，放弃合并（${entries.length} 张）`);
+    return null;
+  }
   const data = new Uint8Array(W * H * 4);
 
   for (const [id, img] of images) {

@@ -13,6 +13,7 @@
 import DXTTextureDecode from './DXTTextureDecode.js';
 import { transcodeCRN } from './CRNDecode.js';
 import { dxtPixelFormatOf, resolveTextureKind, PixelFormat } from './TextureFormat.js';
+import { isSaneImageSize } from './imageLimits.js';
 import type { S3MTexture } from './types.js';
 
 /** 解码产物：rgba 与 bitmap 二选一，都为 null = 解码失败 / 格式不支持 */
@@ -253,6 +254,11 @@ async function decodeTextureDataRaw(
     hasAlpha: false,
   };
   if (!tex || !tex.width || !tex.height) return empty;
+  // 宽高来自 s3mb 的 u32 直读。异常时 new Uint8Array(w*h*4) 会抛
+  // RangeError，错误信息和真 OOM 一样，排查方向会被带偏。
+  if (!isSaneImageSize(tex.width, tex.height)) {
+    return { ...empty, kind: 'unsupported(oversize)' };
+  }
 
   const kind = resolveTextureKind(tex.compressType ?? 0, tex.pixelFormat);
 

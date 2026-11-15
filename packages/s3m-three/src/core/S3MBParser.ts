@@ -10,6 +10,7 @@
  *   3. Draco 点云 / MeshOpt 几何压缩都用内联 wasm 解码器还原，与标准骨架同路输出。
  */
 import { BinaryReader } from './BinaryReader.js';
+import { describeImageSize, isSaneImageSize } from './imageLimits.js';
 import { parseDracoGeometry } from './Draco.js';
 import { parseMeshOptGeometry } from './MeshOpt.js';
 import { applyCustomAttributeSemantics } from './CustomAttributes.js';
@@ -508,6 +509,8 @@ function parseTextures(r: BinaryReader): Record<string, S3MTexture> {
 
   const count = r.u32();
   const textures: Record<string, S3MTexture> = {};
+  /** 被丢弃的异常纹理（只用于最后 warn 一次，避免逐条刷屏） */
+  const dropped: string[] = [];
 
   for (let i = 0; i < count; i++) {
     const code = r.string();
@@ -519,9 +522,25 @@ function parseTextures(r: BinaryReader): Record<string, S3MTexture> {
     const compressType = r.u32();
     const dataSize = r.u32();
     const pixelFormat = r.u32();
+    // data 必须先读掉：流位置要走到下一条记录，校验放在后面
     const data = r.bytesCopy(dataSize);
 
+    // 宽高是 u32 直读、没有校验。数据错位时这里是 4e9 这种值，下游
+    // new Uint8Array(w*h*4) 会抛 RangeError 把**整页**拖崩（且报错和真 OOM
+    // 无法区分）。丢掉这一条，代价只是这块瓦片少一张贴图。
+    if (!isSaneImageSize(width, height)) {
+      dropped.push(`${code || '?'} ${describeImageSize(width, height)}`);
+      continue;
+    }
+
     textures[code] = { code, level, width, height, compressType, pixelFormat, data };
+  }
+
+  if (dropped.length) {
+    console.warn(
+      `[s3m] 丢弃 ${dropped.length} 张尺寸异常的纹理（超过 ${'16384'}px 或 256MB）：`,
+      dropped.slice(0, 5)
+    );
   }
 
   r.offset = end;

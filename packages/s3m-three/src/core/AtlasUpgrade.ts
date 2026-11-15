@@ -35,6 +35,7 @@
  */
 
 import DXTTextureDecode from './DXTTextureDecode.js';
+import { isSaneImageSize } from './imageLimits.js';
 import { dxtPixelFormatOf, resolveTextureKind } from './TextureFormat.js';
 
 export interface AtlasPixels {
@@ -66,6 +67,7 @@ export const DEFAULT_MAX_MEAN_ERROR = 24;
  */
 function decodeRgba(tex: AtlasPixels): Uint8Array | null {
   if (!tex.data?.length || !tex.width || !tex.height) return null;
+  if (!isSaneImageSize(tex.width, tex.height)) return null;
   // 已经是 RGBA（AtlasPack 拼图、或某些服务端直接给 RGBA 的 .texblock）
   const need = tex.width * tex.height * 4;
   if (tex.compressType === 0 && tex.pixelFormat === 28 && tex.data.length >= need) {
@@ -90,6 +92,10 @@ export function boxDownsample(
   dw: number,
   dh: number
 ): Uint8Array {
+  if (!isSaneImageSize(dw, dh)) {
+    // 目标尺寸异常：返回空缓冲而不是抛错（调用方按下标读，全 0 等价于「没有像素」）
+    return new Uint8Array(0);
+  }
   const out = new Uint8Array(dw * dh * 4);
   for (let ty = 0; ty < dh; ty++) {
     const y0 = (ty * sh) / dh;

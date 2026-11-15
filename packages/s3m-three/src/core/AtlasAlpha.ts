@@ -1,4 +1,5 @@
 import DXTTextureDecode from './DXTTextureDecode.js';
+import { isSaneImageSize } from './imageLimits.js';
 
 /**
  * 解出图集的 alpha 掩码（1 B/像素）。只对 DXT 图集做，其它格式返回 null。
@@ -16,6 +17,7 @@ export function atlasAlphaMask(tex: {
   data: Uint8Array | null;
 }): Uint8Array | null {
   if (!tex.data || !tex.width || !tex.height) return null;
+  if (!isSaneImageSize(tex.width, tex.height)) return null;
   const ct = tex.compressType;
   const isDxt = ct === 14 || ct === 13 || ct === 12 || ct === 17 || ct === 19 || ct === 20 || ct === 21 || tex.pixelFormat >= 17;
   if (!isDxt) return null;
