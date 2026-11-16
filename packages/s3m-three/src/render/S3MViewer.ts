@@ -2786,6 +2786,8 @@ export class S3MViewer {
       tiles: 0,
       loading: 0,
       failed: 0,
+      ready: 0,
+      required: 0,
       meshes: 0,
       vertices: 0,
       triangles: 0,
@@ -2803,6 +2805,9 @@ export class S3MViewer {
       total.tiles += s.tiles;
       total.loading += s.loading;
       total.failed += s.failed;
+      // 进度按数据集求和：多数据集场景下宿主看到的是整体的「已就绪 / 还欠多少」
+      total.ready += s.ready;
+      total.required += s.required;
       total.meshes += s.meshes;
       total.vertices += s.vertices;
       total.triangles += s.triangles;
