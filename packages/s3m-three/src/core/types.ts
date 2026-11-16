@@ -228,6 +228,24 @@ export interface Stats {
   tiles: number;
   loading: number;
   failed: number;
+  /**
+   * 本轮**已就绪**的瓦片数（primary + fallback，即已经分配了显示职责的）。
+   *
+   * 给宿主画真实进度条用：`ready / required` 就是进度，不必再自己写
+   * 「15% 起步 + 时间插值 + N 秒兜底」那种假进度。每帧 `update()` 后刷新。
+   */
+  ready: number;
+  /**
+   * 本轮**总共要求**的瓦片数 = `ready + 在途数`。
+   *
+   * 口径说明（刻意如此，别改成「视锥内应该有多少块」）：S3M 是懒加载，
+   * 父瓦没下来就不知道子瓦存在，那个数字**原理上算不出来**。用
+   * 「就绪 + 在途」是唯一精确的算法，代价是它随视角变化。
+   *
+   * `required === ready` 等价于「这一帧没有任何在途瓦片」—— 宿主据此
+   * 可以收掉加载遮罩，不需要自己维护静默窗口计时器。
+   */
+  required: number;
   meshes: number;
   vertices: number;
   triangles: number;

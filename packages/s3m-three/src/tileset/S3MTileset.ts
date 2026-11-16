@@ -124,6 +124,8 @@ export class S3MTileset {
     tiles: 0,
     loading: 0,
     failed: 0,
+    ready: 0,
+    required: 0,
     meshes: 0,
     vertices: 0,
     triangles: 0,
@@ -760,7 +762,24 @@ export class S3MTileset {
     isVisible?: TileVisibilityTest,
     options?: TileVisibilityOptions
   ): boolean {
-    return this._visibility.update(camEnu, fovRad, screenHeight, isVisible, options);
+    const changed = this._visibility.update(camEnu, fovRad, screenHeight, isVisible, options);
+    this._refreshProgress();
+    return changed;
+  }
+
+  /**
+   * 刷新 `stats.ready` / `stats.required`（issue #51）。
+   *
+   * `ready` 取「已分配显示职责」的两套集合大小 —— 它们在 `update()` 收尾时才
+   * 定稿，所以只能在 update 之后算。`required` 再加上在途数，于是
+   * `required === ready` 就成了「本帧没有在途」的判据，宿主可以直接拿它收遮罩。
+   *
+   * 只读 `Set.size`，没有额外遍历，跟每帧原来的开销同级。
+   */
+  private _refreshProgress(): void {
+    const ready = this.primaryNodes.size + this.fallbackNodes.size;
+    this.stats.ready = ready;
+    this.stats.required = ready + this.pending.size;
   }
 
   getLodTransition(): 'binary' | 'incremental' {
