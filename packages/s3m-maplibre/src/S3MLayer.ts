@@ -87,6 +87,28 @@ export { DEFAULT_FOV, createMapLibreGeoAdapter, extractWorldCoordinateHelper } f
 export interface S3MLayerOptions extends S3MViewerOptions {
   id?: string;
   /**
+   * 复用已有的渲染内核，而不是新建（默认不传 = 旧行为，每层各建一个）。
+   *
+   * 多个数据集要放在同一个地图上时，推荐**一个内核挂多个数据集**，而不是一个数据集
+   * 一个 `S3MLayer`：每个内核 `mount()` 都会在同一个宿主 GL 上下文上
+   * `new THREE.WebGLRenderer()`，而 three 的 programCache / GL 状态缓存挂在 renderer 上，
+   * 多层叠在一起会让同一套材质编译多遍、每帧互相打脸状态、每帧多跑几遍 renderFrame。
+   *
+   * ```js
+   * const main = new S3MLayer({ id: 'city', configUrl })
+   * await map.once('load')
+   * map.addLayer(main)
+   * // 其余数据集复用主层的内核
+   * map.addLayer(new S3MLayer({ id: 'trees', configUrl: treesUrl, viewer: main.viewer }))
+   * ```
+   *
+   * 生命周期：内核由**第一个挂载它的图层**负责，它 `onRemove` 时才真正 `unmount`；
+   * 其余图层卸载只摘自己的数据集。所以别把创建者先于其他图层移除。
+   *
+   * 投影模式、宿主钩子、拾取 id 池是内核级状态，共享后即为所有数据集共用。
+   */
+  viewer?: S3MViewer;
+  /**
    * 投影模式，默认 `'perspective'`（跟随 MapLibre，与底图严格对齐）。
    * `'orthographic'` 让本层按正交投影重画：视图矩阵从 MapLibre 每帧输入反推，
    * pan / zoom / pitch / rotate 与拾取、选中描边全部照常。
