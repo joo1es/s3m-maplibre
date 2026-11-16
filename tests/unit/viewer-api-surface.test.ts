@@ -36,7 +36,7 @@ const PUBLIC_METHODS = [
   // presenter 是 0.5 新增的「使用者接管上屏」入口，不是拆分产物 —— 快照跟着改是预期内的
   'presenter',
   'registerGPUPath', 'removeDataset', 'removeFeatureStyle', 'renderFrame', 'resolveDepthMode', 'restoreContext',
-  'rotateFeature', 'rotateFeatureBy', 'sceneAnchor', 'select',   'setAnisotropyCap', 'setAttributeSource', 'setColorPipeline', 'setCullRefine', 'setDatasetAlign', 'setDatasetHeight', 'setDatasetVisible', 'setDepthMode', 'setEdges',
+  'rotateFeature', 'rotateFeatureBy', 'sceneAnchor', 'select',   'setAnisotropyCap', 'setAttributeSource', 'setColorPipeline', 'setCullRefine', 'setDatasetAlign', 'setDatasetHeight', 'setDatasetVisible', 'setDatasetRenderOrder', 'setDepthMode', 'setEdges',
   'setClipping', 'setEnvironment', 'setExcavationBounds', 'setFeatureStyle', 'setFeaturesStyle', 'setFilter',
   'setGPUPathProgress', 'setGPUPathTime', 'setGroundMode', 'setGroundOcclude', 'setGroundOpacity',
   'setLight', 'setLightingPreset', 'setLodPixelRatioCap', 'setLodRangeScale', 'setLodTransition', 'setMaterialQuality',

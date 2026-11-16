@@ -371,6 +371,19 @@ export class FeatureStyleManager {
     private readonly _isLayerTransparent: () => boolean = () => false
   ) {}
 
+  /**
+   * 该网格的「基础透明度」：数据集覆盖优先于图层。
+   *
+   * 数据集可以有自己的 `opacity`（见 `DatasetStyle`），此时它的混合开关由数据集
+   * 说了算 —— 这里若继续按图层判定，会把半透明数据集踩回不透明（alpha 直接失效）。
+   */
+  private _baseTransparent(mat: THREE.Material): boolean {
+    const ud = mat.userData as { s3mDatasetOpacity?: number; s3mOpts?: { transparent?: boolean } };
+    if (ud.s3mDatasetOpacity !== undefined) return ud.s3mDatasetOpacity < 0.999;
+    // 材质自身可能是 blend / 顶点 alpha 透明，不能只看图层
+    return ud.s3mOpts?.transparent === true || this._isLayerTransparent();
+  }
+
   setFeatureStyle(smid: number, style: FeatureStyle, meshes?: Iterable<THREE.Mesh>): void {
     this.featureStyles.set(smid, style);
     this.markOverridesDirty(meshes);
@@ -1014,7 +1027,7 @@ export class FeatureStyleManager {
       }
       // 单体淡化清除后，把材质 transparent 还原成「自身语义 || 全局透明度」
       // （只看全局透明度会把 alphaMode blend / 顶点 alpha 材质误关成不透明）
-      if (mat.transparent && !this._isLayerTransparent()) restoreBaseBlendState(mat, false);
+      if (mat.transparent && !this._baseTransparent(mat)) restoreBaseBlendState(mat, false);
       return;
     }
 
@@ -1022,7 +1035,7 @@ export class FeatureStyleManager {
       if (mat.userData.uBatchTexActive) {
         mat.userData.uBatchTexActive.value = 0;
       }
-      if (mat.transparent && !this._isLayerTransparent()) restoreBaseBlendState(mat, false);
+      if (mat.transparent && !this._baseTransparent(mat)) restoreBaseBlendState(mat, false);
       return;
     }
 
@@ -1056,7 +1069,7 @@ export class FeatureStyleManager {
 
     // 有淡化单体时整块材质要开混合才有透明效果；清除后还原为「自身语义 || 全局透明度」
     if (hasFade && !mat.transparent) mat.transparent = true;
-    else if (!hasFade && mat.transparent && !this._isLayerTransparent()) restoreBaseBlendState(mat, false);
+    else if (!hasFade && mat.transparent && !this._baseTransparent(mat)) restoreBaseBlendState(mat, false);
 
     if (conflicts > 0 && !this._batchConflictWarned) {
       this._batchConflictWarned = true;

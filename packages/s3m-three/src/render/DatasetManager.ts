@@ -12,9 +12,11 @@ import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
 import type { AnchorOverride } from '../tileset/types.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import type { Anchor } from '../core/types.js';
+import type { StyleUniforms } from '../core/types.js';
 import type { UnsupportedPolicy } from '../core/degradations.js';
 import { worldFromLngLat, type GeoAdapter } from './GeoAdapter.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
+import type { S3MStyle } from './StyleMaterial.js';
 import type { DepthMode, S3MViewerOptions } from './viewer/types.js';
 
 export type DatasetAlignment = 'origin' | 'bottom' | 'top' | 'center';
@@ -120,6 +122,28 @@ export interface S3MDatasetOptions {
    */
   lodTransition?: 'binary' | 'incremental';
   fallbackOffset?: { factor?: number; units?: number };
+  /**
+   * 本数据集的外观覆盖（patch 合并）。
+   *
+   * 数据集写过的字段优先，没写的继续跟随图层级 `setStyle` —— 实现上只有被覆盖的
+   * 键才分裂出独立的 uniform，其余仍与图层共用同一个 `{ value }` 对象。
+   *
+   * 只支持「改一个 uniform 就生效」的项：`mode` / `colorA` / `colorB` / `colorC` /
+   * `floorHeight` / `texMix` / `roofThreshold` / `ambientGain` / `metalness` /
+   * `roughness` / `opacity` / `dimFactor` / `shading`。
+   * `edges` 与选中态（`selectColor` / `selectMode` / `outline*` / `dimOthers`）是
+   * 图层级共享材质，仍跟图层走。
+   *
+   * 注意这是**静态配置**：图层 `setStyle` 不会改它已覆盖的键。见 `createDatasetUniforms`。
+   */
+  style?: Partial<S3MStyle>;
+  /**
+   * 本数据集在图层内的绘制顺序（默认 0 = 现状），数值越大越后画。
+   *
+   * 只在**同一透明度批次内部**有效：three 先画不透明物体再画透明物体，
+   * `renderOrder` 跨不过这个批次（不透明数据集永远画在透明数据集之前）。
+   */
+  renderOrder?: number;
 }
 
 export interface S3MDatasetEntry {
@@ -139,6 +163,12 @@ export interface S3MDatasetEntry {
   offset: [number, number, number];
   visible: boolean;
   error: unknown;
+  /**
+   * 本数据集实际使用的 uniform（`style` 有覆盖时是分裂出来的一份，否则与图层同一引用）。
+   *
+   * 材质重建（切光照档位 / 颜色管线）时要按它重建，否则覆盖项会在重建后丢回图层级。
+   */
+  uniforms?: StyleUniforms;
 }
 
 export interface DatasetManagerCallbacks {
@@ -327,6 +357,7 @@ export class DatasetManager {
       offset: [0, 0, 0],
       visible: ds.visible !== false,
       error: null,
+      uniforms: uniforms as StyleUniforms,
     };
     this.datasets.set(ds.id, entry);
 
@@ -341,6 +372,8 @@ export class DatasetManager {
       lodRangeScale: ds.lodRangeScale ?? defaultLodRangeScale,
       lodTransition: ds.lodTransition ?? this.defaultLodTransition,
       fallbackOffset: ds.fallbackOffset ?? this.defaultFallbackOffset,
+      // 数据集之间的绘制顺序；不传 = 0，瓦片级 order 与改动前逐字一致
+      renderOrder: ds.renderOrder,
       buildTile: buildTile ?? null,
       polygonOffset: ds.polygonOffset,
       // 数据集 > 图层 > 模块级默认（undefined 一路传下去，由 createStyledMaterial 回落）

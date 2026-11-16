@@ -528,6 +528,15 @@ export class S3MLayer extends HostRenderer {
     this.viewer.setDatasetVisible(id, visible);
   }
 
+  /**
+   * 动态设置数据集的绘制顺序（数据集之间比较，越大越后画，默认 0）。
+   *
+   * 只在同一透明度批次内有效：three 先画不透明再画透明。
+   */
+  setDatasetRenderOrder(id: string, order: number): void {
+    this.viewer.setDatasetRenderOrder(id, order);
+  }
+
   /** 获取指定数据集的垂直高程偏移（米） */
   getDatasetHeight(id?: string): number {
     return this.viewer.getDatasetHeight(id);

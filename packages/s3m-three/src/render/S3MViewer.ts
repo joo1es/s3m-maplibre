@@ -22,6 +22,8 @@
  */
 import * as THREE from 'three';
 import { S3MTileset, usableGeoBounds } from '../tileset/S3MTileset.js';
+import { normalizeRenderOrder } from '../tileset/TileVisibility.js';
+import { createDatasetUniforms } from './DatasetStyle.js';
 import type { BuildTileFn, TileNode, TileVisibilityTest } from '../tileset/S3MTileset.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
@@ -934,7 +936,9 @@ export class S3MViewer {
       merged,
       this.scene,
       this.geo,
-      this.uniforms,
+      // 数据集级样式：只有被覆盖的键才分裂 uniform，其余仍与图层共享同一份引用。
+      // 不传 style 时就是图层那份对象，路径与改动前逐字一致。
+      ds.style ? createDatasetUniforms(this.uniforms, ds.style) : this.uniforms,
       this._lodRangeScale,
       this.options.buildTile,
       this.options.maxTiles ?? 64,
@@ -1685,6 +1689,19 @@ export class S3MViewer {
   setDatasetVisible(id: string, visible: boolean): void {
     this._datasetManager.setDatasetVisible(id, visible);
     if (!visible && this._sel.selection?.datasetId === id) this.select(null);
+    this._requestRepaint();
+  }
+
+  /**
+   * 运行时改某个数据集的绘制顺序（数据集之间比较，默认 0）。
+   *
+   * 只写值 + 叫人重画：真正的 `group.renderOrder` 在下一帧 `update()` 里落地
+   * （`TileVisibility` 发现目标值变了才会写）。数据集不存在时静默忽略。
+   */
+  setDatasetRenderOrder(id: string, order: number): void {
+    const entry = this._datasetManager.datasets.get(id);
+    if (!entry?.tileset) return;
+    entry.tileset.renderOrder = normalizeRenderOrder(order);
     this._requestRepaint();
   }
 
