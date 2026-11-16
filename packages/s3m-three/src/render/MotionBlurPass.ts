@@ -41,6 +41,7 @@
  * false，调用方回退直渲路径，行为与不开运动模糊一致。
  */
 import * as THREE from 'three';
+import { supportsHalfFloatTargets } from './viewer/gpuCaps.js';
 
 /** 公共选项（S3MViewerOptions.motionBlur 的形状） */
 export interface MotionBlurOptions {
@@ -305,9 +306,12 @@ export class MotionBlurPass {
     this.quadScene.add(quad);
   }
 
-  /** gl_FragDepth 与 DepthTexture 都是 WebGL2 核心特性，WebGL1 直接不参与 */
+  /**
+   * 拖影要两个能力：写 `gl_FragDepth`（合成时把深度写回）+ 半精度颜色附件（RT 存线性值）。
+   * 缺任何一个都回退直渲 —— 判据见 `viewer/gpuCaps.ts`，别退回 `capabilities.isWebGL2`。
+   */
   supported(renderer: THREE.WebGLRenderer): boolean {
-    return (renderer.capabilities as { isWebGL2?: boolean }).isWebGL2 === true;
+    return supportsHalfFloatTargets(renderer);
   }
 
   private ensureSceneTarget(width: number, height: number): void {

@@ -16,6 +16,7 @@
  * 「设了就独占上屏」，叠加效果由使用者自己在 render 里串。
  */
 import * as THREE from 'three';
+import { supportsHalfFloatTargets } from './viewer/gpuCaps.js';
 
 /** presenter 每帧拿到的上下文。只读，不要 dispose 其中的纹理 */
 export interface PresenterContext {
@@ -57,11 +58,12 @@ export class PresenterTarget {
   }
 
   /**
-   * WebGL2 才有 DepthTexture。这把闸门和 MotionBlurPass 是同一条：
-   * 不支持时返回 false，调用方回退直渲，画面与没设 presenter 完全一致。
+   * 需要两样：写 `gl_FragDepth`（把深度写回宿主的深度附件）+ 半精度颜色附件
+   * （`RGBAFormat + HalfFloatType` 的 RT，透明底合成不能把线性值 clamp 掉）。
+   * 判据集中在 `viewer/gpuCaps.ts`，为什么不直接看 `capabilities.isWebGL2` 那里有说明。
    */
   supported(renderer: THREE.WebGLRenderer): boolean {
-    return (renderer.capabilities as { isWebGL2?: boolean }).isWebGL2 === true;
+    return supportsHalfFloatTargets(renderer);
   }
 
   /**
@@ -82,7 +84,10 @@ export class PresenterTarget {
     if (!this.supported(renderer)) {
       if (!this._warned) {
         this._warned = true;
-        console.warn('[s3m] setPresenter 需要 WebGL2（DepthTexture），当前环境不支持，本帧回退直渲');
+        console.warn(
+          '[s3m] setPresenter 需要 WebGL2 + 半精度颜色附件（EXT_color_buffer_float），' +
+            '当前环境不支持，本帧回退直渲'
+        );
       }
       return false;
     }

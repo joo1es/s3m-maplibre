@@ -42,9 +42,10 @@ interface FrameEvent {
 
 /**
  * 桩渲染管线：记录 setRenderTarget 与 render 的交错顺序。
- * isWebGL2 可控 —— motion blur 依赖 gl_FragDepth / DepthTexture，WebGL1 必须能降级。
+ * isWebGL2 / halfFloat 可控 —— motion blur 依赖 gl_FragDepth + HalfFloat 附件，
+ * 两条闸门都要能降级（详见 gpu-caps.test.ts）。
  */
-function stubPipeline(v: S3MViewer, isWebGL2 = true): { events: FrameEvent[]; renders: number } {
+function stubPipeline(v: S3MViewer, isWebGL2 = true, halfFloat = true): { events: FrameEvent[]; renders: number } {
   const events: FrameEvent[] = [];
   (v as unknown as { canvas: unknown }).canvas = {
     width: 200,
@@ -56,6 +57,10 @@ function stubPipeline(v: S3MViewer, isWebGL2 = true): { events: FrameEvent[]; re
   (v as unknown as { renderer: unknown }).renderer = {
     getContext: () => ({ isContextLost: () => false }),
     capabilities: { isWebGL2 },
+    extensions: {
+      has: (name: string) =>
+        name === 'EXT_color_buffer_float' ? halfFloat : false,
+    },
     setViewport: () => {},
     resetState: () => {},
     setRenderTarget: (t: unknown) => {
@@ -341,8 +346,24 @@ describe('WebGL1 上静默回退直渲', () => {
   });
 });
 
-/* ------------------------------------------------------------------ 7. 运行时开关 */
+/* ------------------------------------------- 6b. 半精度附件缺失（WebGL2 也可能缺） */
 
+describe('半精度附件不可用时静默回退直渲', () => {
+  test('isWebGL2 但缺 EXT_color_buffer_float：不建 RT，走直渲', () => {
+    const v = makeViewer({ motionBlur: { mode: 'velocity' } });
+    // 配置照常保留：能力不足只影响渲染路径，不该丢掉使用者的设置
+    expect(v.motionBlur).toEqual({ mode: 'velocity', damp: 'auto', maxOffset: 0.05 });
+
+    const { events } = stubPipeline(v, true, false);
+    frame(v);
+
+    expect(renderCount(events)).toBe(1);
+    expect(rtTargets(events)).toHaveLength(0);
+    v.dispose();
+  });
+});
+
+/* ------------------------------------------------------------------ 7. 运行时开关 */
 describe('setMotionBlur 运行时开关', () => {
   test('开启：走公共 triggerRepaint 请求重绘；关闭：恢复直渲并释放 RT', () => {
     const v = makeViewer();

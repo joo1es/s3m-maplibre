@@ -22,7 +22,7 @@ interface Call {
   args: unknown[];
 }
 
-function makeMock(opts: Record<string, unknown> = {}, webgl2 = true) {
+function makeMock(opts: Record<string, unknown> = {}, webgl2 = true, halfFloat = true) {
   const v = new S3MViewer(opts as ConstructorParameters<typeof S3MViewer>[0]);
   v.sceneAnchor = { x: 0, y: 0, z: 0, meterInMercator: 1 };
 
@@ -56,6 +56,10 @@ function makeMock(opts: Record<string, unknown> = {}, webgl2 = true) {
   (v as unknown as { renderer: unknown }).renderer = {
     getContext: () => mockGl,
     capabilities: { isWebGL2: webgl2 },
+    extensions: {
+      has: (name: string) =>
+        name === 'EXT_color_buffer_float' ? halfFloat : false,
+    },
     setViewport: (...a: number[]) => calls.push({ method: 'setViewport', args: a }),
     resetState: () => calls.push({ method: 'resetState', args: [] }),
     setRenderTarget: (rt: unknown) => calls.push({ method: 'setRenderTarget', args: [rt] }),
@@ -214,8 +218,25 @@ describe('setPresenter / 使用者接管上屏', () => {
     expect(warns.filter((w) => w.includes('WebGL2'))).toHaveLength(1);
   });
 
-  test('尺寸为 0 时回退直渲，不能黑屏', () => {
-    const m = makeMock();
+  test('缺 EXT_color_buffer_float 时同样回退直渲（WebGL2 也可能缺这把钥匙）', () => {
+    const m = makeMock({}, true, false);
+    let calls = 0;
+    m.v.setPresenter({ render: () => calls++ });
+
+    const warns = captureWarn(() => {
+      m.v.renderFrame(FRAME);
+      m.v.renderFrame(FRAME);
+    });
+
+    expect(calls).toBe(0);
+    expect(m.calls.filter((c) => c.method === 'render')).toHaveLength(2);
+    expect(m.calls.some((c) => c.method === 'setRenderTarget')).toBe(false);
+    expect(warns).toHaveLength(1);
+    // 告警要说清缺的是什么，别只说「需要 WebGL2」—— 设备明明是 WebGL2
+    expect(warns[0]).toContain('半精度');
+  });
+
+  test('尺寸为 0 时回退直渲，不能黑屏', () => {    const m = makeMock();
     let calls = 0;
     m.v.setPresenter({ render: () => calls++ });
     m.setCanvas(0, 0);

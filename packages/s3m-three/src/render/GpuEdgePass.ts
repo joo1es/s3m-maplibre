@@ -18,6 +18,7 @@
  * 返回 false，调用方静默跳过，不影响其它画法。
  */
 import * as THREE from 'three';
+import { supportsFragDepth } from './viewer/gpuCaps.js';
 
 /** 描边参数（全部来自 style，每帧传一次） */
 export interface GpuEdgeParams {
@@ -143,9 +144,13 @@ export class GpuEdgePass {
     this.quadScene.add(quad);
   }
 
-  /** `gl_FragDepth` 与深度纹理都是 WebGL2 核心特性，WebGL1 直接不参与 */
+  /**
+   * 只依赖 `gl_FragDepth`（RT 是 `RGBA8`，不吃半精度扩展）。
+   * 判据仍要保留 `isWebGL2` 那一半：`peerDependencies` 允许 three >= 0.155，
+   * r155–r162 上 WebGL1 上下文是真会出现的，那时这个 pass 必须不参与。
+   */
   supported(renderer: THREE.WebGLRenderer): boolean {
-    return (renderer.capabilities as { isWebGL2?: boolean }).isWebGL2 === true;
+    return supportsFragDepth(renderer);
   }
 
   /** 尺寸变了就重建 RT（canvas 跟着宿主缩放，必须每帧校验） */
