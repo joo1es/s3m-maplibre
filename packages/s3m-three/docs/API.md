@@ -247,8 +247,18 @@ interface S3MDatasetOptions {
   configUrl: string;    // .scp 地址
   visible?: boolean;    // 默认 true
   maxTiles?: number;    // 覆盖 viewer 级配置
+  style?: Partial<S3MStyle>;  // 数据集级外观覆盖（patch 合并），默认跟随图层
+  renderOrder?: number;       // 数据集之间的绘制顺序，默认 0
 }
 ```
+
+**数据集级样式**是 patch 合并：数据集写过的字段优先，没写的继续跟随图层级 `setStyle`（实现上只有被覆盖的键才分裂 uniform，其余与图层共用同一个对象，所以图层改色仍然自动生效，也不引入逐帧成本）。
+
+- 支持：`mode` / `colorA` / `colorB` / `colorC` / `floorHeight` / `texMix` / `roofThreshold` / `ambientGain` / `metalness` / `roughness` / `opacity` / `dimFactor` / `shading`。
+- 不支持：`edges`、选中态与描边（`selectColor` / `selectMode` / `outline*` / `dimOthers`）—— 棱线 / 描边材质是整层一份，仍跟图层走；点云（3DGS）也不跟数据集样式。
+- `style` 是静态配置：图层 `setStyle` 不会改数据集已覆盖的键。
+
+**`renderOrder`** 只决定数据集之间的先后，瓦片级 `100 + depth` 的相对关系不变（内部按 `renderOrder * 1000` 平移）。两个边界：只在**同一透明度批次**内有效（three 先画不透明再画透明，不透明数据集永远画在透明数据集之前）；同一数据集的瓦片之间不按它排序。运行时用 `setDatasetRenderOrder(id, order)` 调整。
 
 `addDataset` 在 `mount()` 之前调用会抛错（此时还没有 WebGL 上下文）。
 
