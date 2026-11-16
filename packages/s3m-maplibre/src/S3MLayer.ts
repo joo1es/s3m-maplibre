@@ -326,10 +326,11 @@ export class S3MLayer extends HostRenderer {
       this._warnOrtho('render() 输入里没有独立的投影矩阵（需要 MapLibre ≥ 5）');
       return null;
     }
+    const transform = this._getTransform();
     const built = buildBlendedMVP(
       { projectionMatrix, mvp: mvp.elements, nearZ, farZ },
       {
-        distance: this.map?.transform?.cameraToCenterDistance ?? 0,
+        distance: transform?.cameraToCenterDistance ?? 0,
         fov: this._frameFov(arg),
         aspect: this._canvasAspect(),
       },
@@ -342,6 +343,11 @@ export class S3MLayer extends HostRenderer {
     return built.matrix;
   }
 
+  /** 获取宿主地图的 transform（兼容 MapLibre v5/v6 与 Mapbox） */
+  private _getTransform(): any {
+    return (this.map as any)?._camera?.transform ?? this.map?.transform;
+  }
+
   /** 正交不可用只告警一次，不每帧刷屏 */
   private _warnOrtho(reason: string): void {
     if (this._orthoWarned) return;
@@ -350,11 +356,42 @@ export class S3MLayer extends HostRenderer {
   }
 
   /**
+   * 宿主 transform 的 fov 兜底（弧度）。
+   * MapLibre v5+ 存放在 fovInRadians（transform.fov 为度）；
+   * Mapbox 存放在 _fov（或无 getFov 时的 fov）；若宿主提供 getFov() 则 fov 为度需换算。
+   */
+  /**
+   * 宿主 transform 的 fov 兜底（弧度）。
+   * 1. MapLibre v5+ / v6+ 官方公开属性：fovInRadians（弧度）
+   * 2. MapLibre 1.x~4.x 以及 Mapbox 全系（1.x~3.x）底层字段：_fov（弧度）
+   * 3. 宿主若提供 getFov()：其返回值为度数，换算为弧度
+   * 注意：在 MapLibre（3.x~6.x）与 Mapbox（2.x~3.x）中，transform.fov 均为 getter 返回的「度数」，
+   * 绝不能直接作为弧度消费（即使度数恰好在 (0, π) 小范围也不行，否则如 fov=2° 会被误认为 2 弧度/114.6°）。
+   */
+  private _fallbackFov(): number | undefined {
+    const transform = this._getTransform();
+    if (!transform) return undefined;
+    if (typeof transform.fovInRadians === 'number' && Number.isFinite(transform.fovInRadians)) {
+      return transform.fovInRadians;
+    }
+    if (typeof transform._fov === 'number' && Number.isFinite(transform._fov)) {
+      return transform._fov;
+    }
+    if (typeof transform.getFov === 'function' || typeof (this.map as any)?.getFov === 'function') {
+      const fovDeg = typeof transform.getFov === 'function' ? transform.getFov() : transform.fov;
+      if (typeof fovDeg === 'number' && Number.isFinite(fovDeg) && fovDeg > 0) {
+        return (fovDeg * Math.PI) / 180;
+      }
+    }
+    return undefined;
+  }
+
+  /**
    * 本帧垂直视场角（弧度）。取 render() 入参的 fov（≥5 直接给弧度），
-   * 退回 transform.fovInRadians。**不用 transform.fov**：v5 起它是「度」。
+   * 兜底依次退回 transform.fovInRadians（MapLibre 5+）、_fov / fov（Mapbox）。
    */
   private _frameFov(arg: unknown): number {
-    return extractFovRadians(arg, this.map?.transform?.fovInRadians) ?? DEFAULT_FOV;
+    return extractFovRadians(arg, this._fallbackFov()) ?? DEFAULT_FOV;
   }
 
   private _canvasAspect(): number {
@@ -363,7 +400,7 @@ export class S3MLayer extends HostRenderer {
     return canvas.width / canvas.height;
   }
 
-  render(gl: WebGLRenderingContext | WebGL2RenderingContext, arg: unknown): void {
+  render(gl: WebGLRenderingContext | WebGL2RenderingContext, arg: unknown, ...rest: unknown[]): void {
     const map = this.map;
     const anchor = this.viewer.sceneAnchor;
     if (!map || !anchor) return;
@@ -376,15 +413,29 @@ export class S3MLayer extends HostRenderer {
 
     let mvpMat = new Matrix4().fromArray(matrix as number[]);
 
+    // 宿主输入参数归一化：
+    // - MapLibre 5.x / 6.x：第 2 参为 input 对象；
+    // - MapLibre 4.x：第 2 参为 matrix，第 3 参 (rest[0]) 为 input 对象；
+    // - Mapbox 3.32+：第 2 参为 matrix，第 8 参 (rest[5]) 为 renderParameters（含 projectionMatrix/viewMatrix）。
+    const inputArg = (
+      arg && typeof arg === 'object' && !Array.isArray(arg) && !(ArrayBuffer.isView(arg) && !(arg instanceof DataView))
+        ? arg
+        : rest[0] && typeof rest[0] === 'object' && ('projectionMatrix' in rest[0] || 'defaultProjectionData' in rest[0])
+          ? rest[0]
+          : rest[5] && typeof rest[5] === 'object' && 'projectionMatrix' in rest[5]
+            ? rest[5]
+            : null
+    );
+
     // 近平面缩放：MapLibre 的 nearZ 是写死的 canvasHeight/50，贴近模型时会把
     // 整面墙裁掉。这里只在纯透视下换一个 near 更小的投影矩阵，fov / far 不动，
     // 画面与原画面逐点重合；正交模式的 near 由 buildOrthoMVP 自己决定。
     if (this._nearPlaneScale < 1 && this._projectionT < 0.0001) {
       const scaled = buildNearScaledMVP(
         {
-          projectionMatrix: extractProjectionMatrix(arg),
+          projectionMatrix: extractProjectionMatrix(inputArg),
           mvp: mvpMat.elements,
-          ...extractNearFar(arg),
+          ...extractNearFar(inputArg),
         },
         this._nearPlaneScale
       );
@@ -394,7 +445,7 @@ export class S3MLayer extends HostRenderer {
     // 正交模式：视图矩阵从 MapLibre 输入反推（P⁻¹×MVP），不是自建相机，
     // 支持按 _projectionT 在透视与正交之间平滑插值过渡。
     if (this._projectionT > 0.0001) {
-      mvpMat = this._applyOrtho(arg, mvpMat, this._projectionT) ?? mvpMat;
+      mvpMat = this._applyOrtho(inputArg, mvpMat, this._projectionT) ?? mvpMat;
     }
 
     const canvas = map.getCanvas();

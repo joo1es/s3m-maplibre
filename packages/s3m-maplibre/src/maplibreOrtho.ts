@@ -71,19 +71,19 @@ function toMat4(m: Matrix4): Float64Array {
  * 结构完整复刻 `MercatorTransform._calcMatrices`，唯一区别是第一步的 n。
  */
 export function applyOrthoMatrices(t: AnyTransform): boolean {
-  const h = t._helper;
-  const width: number = h?._width;
-  const height: number = h?._height;
-  const near: number = h?._nearZ;
-  const far: number = h?._farZ;
-  const camDist: number = h?.cameraToCenterDistance;
-  const ppm: number = h?._pixelPerMeter;
-  const clipToPixels = t.clipSpaceToPixelsMatrix;
-  const center = t.center;
-  const worldSize = t.worldSize as number;
+  const st = t._cameraState ?? t._helper;
+  const width: number = st?.width ?? st?._width;
+  const height: number = st?.height ?? st?._height;
+  const near: number = st?.nearZ ?? st?._nearZ ?? t.nearZ ?? t._nearZ;
+  const far: number = st?.farZ ?? st?._farZ ?? t.farZ ?? t._farZ;
+  const camDist: number = st?.cameraToCenterDistance ?? t.cameraToCenterDistance;
+  const ppm: number = st?.pixelsPerMeter ?? st?._pixelPerMeter;
+  const clipToPixels = t.clipSpaceToPixelsMatrix ?? st?.clipSpaceToPixelsMatrix;
+  const center = t.center ?? st?.center;
+  const worldSize = (t.worldSize ?? st?.worldSize) as number;
 
   if (
-    !h ||
+    !st ||
     !(width > 0) ||
     !(height > 0) ||
     !(camDist > 0) ||
@@ -160,19 +160,24 @@ export function applyOrthoMatrices(t: AnyTransform): boolean {
   const invViewProj = viewProj.clone().invert();
   const pixelMatrixInverse = pixelMatrix.clone().invert();
 
-  // ---- 写回（字段名与 maplibre-gl@5.24 一致）-----------------------------
-  t._projectionMatrix = toMat4(projection);
-  t._invProjMatrix = toMat4(projection.clone().invert());
-  t._mercatorMatrix = toMat4(mercatorMatrix);
-  t._pixelMatrix = toMat4(pixelMatrix);
-  t._pixelMatrix3D = toMat4(pixelMatrix3D);
-  t._viewProjMatrix = toMat4(viewProj);
-  t._invViewProjMatrix = toMat4(invViewProj);
-  t._alignedProjMatrix = toMat4(aligned);
-  t._pixelMatrixInverse = toMat4(pixelMatrixInverse);
-  t._cameraPosition = unprojectCamera(invViewProj);
+  // ---- 写回（支持 MapLibre v5 挂在 t，MapLibre v6 挂在 currentTransform）-----
+  const targets = [t];
+  const cur = t._projection?.currentTransform;
+  if (cur && cur !== t) targets.push(cur);
 
-  t._clearMatrixCaches?.();
+  for (const target of targets) {
+    target._projectionMatrix = toMat4(projection);
+    target._invProjMatrix = toMat4(projection.clone().invert());
+    target._mercatorMatrix = toMat4(mercatorMatrix);
+    target._pixelMatrix = toMat4(pixelMatrix);
+    target._pixelMatrix3D = toMat4(pixelMatrix3D);
+    target._viewProjMatrix = toMat4(viewProj);
+    target._invViewProjMatrix = toMat4(invViewProj);
+    target._alignedProjMatrix = toMat4(aligned);
+    target._pixelMatrixInverse = toMat4(pixelMatrixInverse);
+    target._cameraPosition = unprojectCamera(invViewProj);
+    target._clearMatrixCaches?.();
+  }
   return true;
 }
 
@@ -192,13 +197,17 @@ function unprojectCamera(invViewProj: Matrix4): [number, number, number] {
  * `setProjection()` 会重建 transform，之后需要调用它补上 patch。
  */
 export function enableMapLibreOrtho(
-  map: { transform?: unknown },
+  map: { transform?: unknown; _camera?: { transform?: unknown } },
   options: MapLibreOrthoOptions = {}
 ): { setEnabled: (on: boolean) => void; reinstall: () => void; dispose: () => void } {
   let enabled = options.enabled ?? true;
 
+  const getTransform = (): AnyTransform | null => {
+    return ((map as any)._camera?.transform ?? (map as any).transform) as AnyTransform | null;
+  };
+
   const install = (): void => {
-    const t = map.transform as AnyTransform | null;
+    const t = getTransform();
     if (!t || typeof t._calcMatrices !== 'function') {
       console.warn('[s3m] 当前 maplibre 版本没有可接管的 _calcMatrices，正交不可用');
       return;
@@ -217,12 +226,20 @@ export function enableMapLibreOrtho(
       const dbg = (this as any).__s3mOrtho;
       if (on && options.debug && !dbg.reported) {
         dbg.reported = true;
+        const dbgSt = (this._cameraState ?? this._helper) as Record<string, any> | undefined;
+        const w = dbgSt?.width ?? dbgSt?._width;
+        const h = dbgSt?.height ?? dbgSt?._height;
+        const cDist = dbgSt?.cameraToCenterDistance ?? this.cameraToCenterDistance;
+        const pMeter = dbgSt?.pixelsPerMeter ?? dbgSt?._pixelPerMeter;
+        const nZ = dbgSt?.nearZ ?? dbgSt?._nearZ ?? this.nearZ ?? this._nearZ;
+        const fZ = dbgSt?.farZ ?? dbgSt?._farZ ?? this.farZ ?? this._farZ;
+        const hasClip = !!(this.clipSpaceToPixelsMatrix ?? dbgSt?.clipSpaceToPixelsMatrix);
         // 只在首次生效/失败时打一行，方便确认接管是否真的装上
         console.info(
-          `[s3m] MapLibre 正交接管 ${ok ? '已生效' : '未生效'} · helper=${!!this._helper} ` +
-            `ws=${this.worldSize} size=${this._helper?._width}x${this._helper?._height} ` +
-            `camDist=${this._helper?.cameraToCenterDistance} ppm=${this._helper?._pixelPerMeter} ` +
-            `near=${this._helper?._nearZ} far=${this._helper?._farZ} clip=${!!this.clipSpaceToPixelsMatrix}`
+          `[s3m] MapLibre 正交接管 ${ok ? '已生效' : '未生效'} · helper=${!!dbgSt} ` +
+            `ws=${this.worldSize} size=${w}x${h} ` +
+            `camDist=${cDist} ppm=${pMeter} ` +
+            `near=${nZ} far=${fZ} clip=${hasClip}`
         );
       }
     };
@@ -233,19 +250,19 @@ export function enableMapLibreOrtho(
   return {
     setEnabled: (on: boolean) => {
       enabled = on;
-      const t = map.transform as AnyTransform | null;
+      const t = getTransform();
       const state = t && (t as any).__s3mOrtho;
       if (state) state.enabled = on;
       else install();
       // 矩阵是惰性的：只有 transform 变化（pan/zoom/pitch）时才重算，开关切换本身
       // 不会触发。这里主动跑一次，否则「打开正交」要等用户拖一下地图才看得到效果。
-      const tt = map.transform as AnyTransform | null;
+      const tt = getTransform();
       if (typeof tt?._calcMatrices === 'function') tt._calcMatrices();
       (map as any).triggerRepaint?.();
     },
     reinstall: () => install(),
     dispose: () => {
-      const t = map.transform as AnyTransform | null;
+      const t = getTransform();
       const state = t && (t as any).__s3mOrtho;
       if (t && state) {
         t._calcMatrices = state.orig;

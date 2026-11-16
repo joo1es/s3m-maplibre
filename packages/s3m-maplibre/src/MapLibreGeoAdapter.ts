@@ -31,13 +31,30 @@ export interface MapLike {
   off(type: string, listener: (e: MapMouseEventLike) => void): unknown;
   getBearing?(): number;
   getFreeCameraOptions?(): { position?: { x: number; y: number; z: number } | null } | null;
+  /** MapLibre v6 将 transform 移到了 _camera.transform */
+  _camera?: {
+    transform?: {
+      fov?: number;
+      fovInRadians?: number;
+      _fov?: number;
+      cameraToCenterDistance?: number;
+      worldCoordinateHelper?: unknown;
+      projection?: { worldCoordinateHelper?: unknown };
+    };
+  };
   /** 注意 fov 在 MapLibre v5 起是「度」，v4 / Mapbox 是「弧度」；弧度用 fovInRadians */
   transform?: {
     fov?: number;
     fovInRadians?: number;
+    _fov?: number;
     cameraToCenterDistance?: number;
     worldCoordinateHelper?: unknown;
     projection?: { worldCoordinateHelper?: unknown };
+  };
+  style?: {
+    projection?: {
+      worldCoordinateHelper?: unknown;
+    };
   };
   getProjection?(): unknown;
   /** 上下文恢复后用于把自定义图层重新加回地图（MapLibre / Mapbox 都有） */
@@ -60,18 +77,26 @@ export function extractWorldCoordinateHelper(map: unknown): WorldCoordinateHelpe
       worldCoordinateHelper?: unknown;
       projection?: { worldCoordinateHelper?: unknown };
     };
-    painter?: {
+    _camera?: {
       transform?: {
+        worldCoordinateHelper?: unknown;
+        projection?: { worldCoordinateHelper?: unknown };
+      };
+    };
+    style?: {
+      projection?: {
         worldCoordinateHelper?: unknown;
       };
     };
     getProjection?(): { worldCoordinateHelper?: unknown } | unknown;
   };
 
+  const transform = m?._camera?.transform ?? m?.transform;
+
   const helper = (
-    m?.transform?.worldCoordinateHelper ??
-    m?.transform?.projection?.worldCoordinateHelper ??
-    m?.painter?.transform?.worldCoordinateHelper ??
+    transform?.worldCoordinateHelper ??
+    transform?.projection?.worldCoordinateHelper ??
+    m?.style?.projection?.worldCoordinateHelper ??
     (typeof m?.getProjection === 'function' ? (m.getProjection() as any)?.worldCoordinateHelper : null) ??
     null
   ) as WorldCoordinateHelperLike | null;

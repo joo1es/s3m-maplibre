@@ -45,8 +45,25 @@ import { S3MLayer, STYLE, type PickResult } from 's3m-maplibre';
 
 图层是 MapLibre / Mapbox 都能挂的普通对象，不依赖任何一方的类型：
 
-- `render(gl, matrix)` 同时接受 `Float32Array(16)`（MapLibre v4）、`{ defaultProjectionData: { mainMatrix } }`（MapLibre v5）和 `modelViewProjectionMatrix`（Mapbox）。
+- `render(gl, matrix)` 同时接受 `Float32Array(16)`（MapLibre 3.x / 4.x / Mapbox）、`{ defaultProjectionData: { mainMatrix } }`（MapLibre 5.x / 6.x）和 `modelViewProjectionMatrix`（Mapbox）。
+- 内部 transform 访问自适应 `map._camera?.transform ?? map.transform`，无缝兼容 MapLibre v6（`map.transform` 移除后的新结构）与 Mapbox 3.x。
+- 兜底 FOV 自动兼容 MapLibre（`fovInRadians`）与 Mapbox（`_fov` / `fov`），避免 Mapbox 自定义 FOV 模式下正交混合失真。
+- 投影正交接管 `enableMapLibreOrtho` 兼容 MapLibre v5（`_helper`）与 v6（`_cameraState` + `_projection.currentTransform`）。
 - 只用到宿主的 `getCanvas / triggerRepaint / on / off / getBearing`，其余全部可选。
+
+#### 各版本宿主整体兼容性矩阵
+
+| 能力项 | MapLibre 3.x | MapLibre 4.x | MapLibre 5.x | MapLibre 6.x | Mapbox 1.x ~ 3.x | 兼容实现说明 |
+|---|---|---|---|---|---|---|
+| **图层生命周期与挂载** | ✅ | ✅ | ✅ | ✅ | ✅ | `onAdd` / `onRemove` / `triggerRepaint` 规范全系一致 |
+| **三维主渲染（透视）** | ✅ | ✅ | ✅ | ✅ | ✅ | 3.x/Mapbox 给裸 `matrix`，4.x 给 `(gl, matrix, input)`，5.x+ 给 `(gl, input)`，全系自适应提取 |
+| **GPU 单体拾取 / 点击交互** | ✅ | ✅ | ✅ | ✅ | ✅ | 基于 Canvas 像素反解与射线求交，无宿主版本依赖 |
+| **动态样式 / 业务字段着色 / 动画** | ✅ | ✅ | ✅ | ✅ | ✅ | 纯 WebGL 材质与着色器管道，内核全功能支持 |
+| **世界坐标系适配** | 墨卡托 | 墨卡托 | 动态 CRS | 动态 CRS | 墨卡托 | 5.x+ 自动对接 `WorldCoordinateHelper`；3.x/4.x/Mapbox 自动走高精度 WGS84 椭球墨卡托 |
+| **垂直视场角兜底 (`_frameFov`)** | `_fov` (弧度) | `_fov` (弧度) | `fovInRadians` | `fovInRadians` | `_fov` (弧度) | 解决 Mapbox 与旧版 MapLibre 调 `setFov()` 时正交混合失真；绝不误将度数当弧度 |
+| **近裁剪面缩放 (`nearPlaneScale`)** | ❌ | ✅ | ✅ | ✅ | 3.32+ ✅ / 早期 ❌ | 需独立投影矩阵；MapLibre 4+ 及 Mapbox 3.32+（第 8 参）均可自适应获取，无独立投影时自动保持原 MVP |
+| **图层级正交 (`projection: 'orthographic'`)** | ❌ | ✅ | ✅ | ✅ | 3.32+ ✅ / 早期 ❌ | 需独立投影矩阵以反解视图矩阵（$V = P^{-1} \cdot MVP$）；MapLibre 4+ 与 Mapbox 3.32+ 均支持 |
+| **全局正交接管 (`enableMapLibreOrtho`)** | ❌ | ❌ | ✅ | ✅ | ❌ | 运行时 patch `_calcMatrices`；v5 适配 `_helper`，v6 适配 `_cameraState` + `_projection.currentTransform` |
 
 ---
 
@@ -769,7 +786,7 @@ n = ortho(-w/2, w/2, -h/2, h/2, …)        // 改成这个
 
 **beta 边界，务必先看**：
 
-- **只验证过 maplibre-gl 5.24**。它依赖 `_calcMatrices`、`_helper._nearZ`、`_viewProjMatrix` 等内部字段，MapLibre 大版本升级**一定会**需要重新核对，属于「升级即回归风险」的耦合。这也是它默认不启用、且放在独立函数而不是 `S3MLayer` 选项里的原因。
+- **验证支持 maplibre-gl 5.24 与 6.x**。它依赖 `_calcMatrices`，并在 v5（`_helper._nearZ`、`_viewProjMatrix` 等）与 v6（`_cameraState`、`_projection.currentTransform`）双路径下完成兼容适配。这也是它默认不启用、且放在独立函数而不是 `S3MLayer` 选项里的原因。
 - **正交视角本来就不自然**。没有灭点，pitch 一大画面就没有纵深感，斜视下看着"扁"。实践里它适合 `pitch = 0` 的俯视量测、规划图、工程图；不适合当常规漫游视图（这也是 deck.gl 把 `OrthographicView` 归到非地理视图的原因）。
 - **标签避让、地形高程、fog 仍按透视语义推导**。符号层用的是另一套 `labelPlaneMatrix` 系，正交下会有位置/避让偏差；地形（`terrain`）没有验证，建议正交时关掉。`queryRenderedFeatures` 的拾取已经一起重算，基本可用。
 - `map.setProjection()`（含 `vertical-perspective` / `globe`）会重建 transform 实例，patch 会丢，需要 `reinstall()`。监听 `projectiontransition` 事件后补装即可。

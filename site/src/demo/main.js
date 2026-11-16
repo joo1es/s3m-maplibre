@@ -1587,7 +1587,8 @@ function applyOrthoMode(mode) {
   // ?orthoDebug=1：核对接管是否真的生效。正交的标志是 viewProj 的 w 行 = (0,0,0,1)，
   // 仍是透视则是 (0,0,-1,0)。结果同时写到 data-ortho-w 与控制台。
   if (new URLSearchParams(window.location.search).get('orthoDebug') === '1') {
-    const w = map.transform?._viewProjMatrix;
+    const tr = map._camera?.transform ?? map.transform;
+    const w = tr?._viewProjMatrix ?? tr?._projection?.currentTransform?._viewProjMatrix;
     if (w) {
       const row = [w[3], w[7], w[11], w[15]].map((v) => Number(v).toFixed(3)).join(',');
       document.body.dataset.orthoW = row;

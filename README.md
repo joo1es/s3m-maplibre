@@ -62,7 +62,7 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | LOD 过渡细化 | ✅ | 支持 'binary'（整节点二值切换，默认）与 'incremental'（primary/fallback 双列表 + LEQUAL 深度推移增量细化，慢 child 不阻塞其它子瓦，平滑过渡不出洞） |
 | 视锥细化剔除 | ✅ | 可选开关（`cullRefine: true`，默认关闭），视野外瓦片跳过进一步请求与细化，大幅减少转头与大范围场景下的无效下载、Worker 解析与显存占用，带 15% 边界余量保障无闪烁 |
 | 实例化几何 | ✅ | `instanceMode` 16 / 17 |
-| 正交投影 | ✅ | 可选开关（`projection: 'orthographic'`），默认透视；需 MapLibre ≥ 5，正交时底图 / 地形 / marker 需 App 退出，见[正交投影](#正交投影) |
+| 正交投影 | ✅ | 可选开关（`projection: 'orthographic'`），默认透视；兼容 MapLibre v5/v6 与 Mapbox 3.x，正交时底图 / 地形 / marker 需 App 退出，见[正交投影](#正交投影) |
 | 可调光照 | ✅ | `setLight()` / `getLight()` 支持动态调整环境光与主平行光的颜色、强度、方位角与高度角，支持 `headlamp`（跟随视角）与 `fixed`（太阳固定世界方位）模式 |
 | 服务鉴权 | ✅ | `authenticate` 钩子：内核发出的全部请求（配置 / 瓦片 / 子图集 / 棱线缓存 / 属性查询）统一改写 URL（加 `?token=`）或附加请求头，支持异步换 token，见[服务鉴权](#服务鉴权authenticate) |
 | 显存与多图层优化 | ✅ | 全局瓦片预算 `totalMaxTiles` 动态分配、纹理引用计数淘汰自动释放 GPU 显存、递归深度释放几何/材质/点云/线框，防止长时间漫游或多图层堆叠爆显存 |
@@ -81,6 +81,24 @@ iServer / 本地目录  →  .scp 配置 + .s3mb 瓦片
 | SuperMapCache / S3M 1.x（`.s3m`） | ✅ | 几何、UV、索引、DXT1 纹理、整棵 LOD 树都能解；瓦片是 `s3m\0` + zlib 的老容器，走独立解析器 `core/S3M1Parser.ts`。见[线上服务的三种发布形态](#线上服务的三种发布形态) |
 | CRN 纹理（`compressType` 26 / 27 / 38001 / 50000） | ✅ | 内联 crunch wasm 转 DXT 后走同一套解码，只在遇到时懒加载；已在 SuperMap Online 公有服务实测 |
 | KTX2 纹理 | — | S3M 官方 `pixelFormat` 枚举里没有这个值，属于「不会遇到」而不是「不支持」 |
+
+---
+
+## 宿主兼容与版本矩阵
+
+`s3m-maplibre` 采用鸭子类型适配宿主地图（`MapLike`），不强绑定任何特定版本的库类型。内部自适应识别各版本结构差异，实现多代 MapLibre 与 Mapbox 无缝接入：
+
+| 能力项 | MapLibre 3.x | MapLibre 4.x | MapLibre 5.x | MapLibre 6.x | Mapbox 1.x ~ 3.x | 兼容实现说明 |
+|---|---|---|---|---|---|---|
+| **图层生命周期与挂载** | ✅ | ✅ | ✅ | ✅ | ✅ | `onAdd` / `onRemove` / `triggerRepaint` 规范全系一致 |
+| **三维主渲染（透视）** | ✅ | ✅ | ✅ | ✅ | ✅ | 3.x/Mapbox 给裸 `matrix`，4.x 给 `(gl, matrix, input)`，5.x+ 给 `(gl, input)`，全系自适应提取 |
+| **GPU 单体拾取 / 点击交互** | ✅ | ✅ | ✅ | ✅ | ✅ | 基于 Canvas 像素反解与射线求交，无宿主版本依赖 |
+| **动态样式 / 业务字段着色 / 动画** | ✅ | ✅ | ✅ | ✅ | ✅ | 纯 WebGL 材质与着色器管道，内核全功能支持 |
+| **世界坐标系适配** | 墨卡托 | 墨卡托 | 动态 CRS | 动态 CRS | 墨卡托 | 5.x+ 自动对接 `WorldCoordinateHelper`；3.x/4.x/Mapbox 自动走高精度 WGS84 椭球墨卡托 |
+| **垂直视场角兜底 (`_frameFov`)** | `_fov` (弧度) | `_fov` (弧度) | `fovInRadians` | `fovInRadians` | `_fov` (弧度) | 解决 Mapbox 与旧版 MapLibre 调 `setFov()` 时正交混合失真；绝不误将度数当弧度 |
+| **近裁剪面缩放 (`nearPlaneScale`)** | ❌ | ✅ | ✅ | ✅ | 3.32+ ✅ / 早期 ❌ | 需独立投影矩阵；MapLibre 4+ 及 Mapbox 3.32+（第 8 参）均可自适应获取，无独立投影时自动保持原 MVP |
+| **图层级正交 (`projection: 'orthographic'`)** | ❌ | ✅ | ✅ | ✅ | 3.32+ ✅ / 早期 ❌ | 需独立投影矩阵以反解视图矩阵（$V = P^{-1} \cdot MVP$）；MapLibre 4+ 与 Mapbox 3.32+ 均支持 |
+| **全局正交接管 (`enableMapLibreOrtho`)** | ❌ | ❌ | ✅ | ✅ | ❌ | 运行时 patch `_calcMatrices`；v5 适配 `_helper`，v6 适配 `_cameraState` + `_projection.currentTransform` |
 
 ---
 
