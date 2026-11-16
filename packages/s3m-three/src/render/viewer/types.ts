@@ -346,6 +346,15 @@ export interface MeshUserData {
   isSelectionEdge?: boolean;
   /** 该网格正在淡入时占用的动画通道 key，瓦片淘汰时要回收 */
   tileFadeKey?: string;
+  /**
+   * 所属数据集自己覆盖的 opacity（0~1）。
+   *
+   * 存在即表示「这块网格的混合开关由数据集说了算」：图层改透明度、瓦片淡入结束都
+   * 不能把它踩回不透明（否则 alpha 被忽略，看着一点不透明）。见 `DatasetStyle`。
+   */
+  s3mDatasetOpacity?: number;
+  /** 所属数据集自己覆盖的 shading：存在即表示图层切换 shading 时这块不跟 */
+  s3mDatasetShading?: 'flat' | 'smooth';
   pickMaterial?: THREE.Material;
   [key: string]: unknown;
 }

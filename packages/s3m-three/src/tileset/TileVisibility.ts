@@ -21,6 +21,21 @@ import type { TileNode, TileVisibilityTest } from './types.js';
 const EMPTY_CHILD_URLS: readonly string[] = [];
 
 /**
+ * 数据集绘制顺序的步长。
+ *
+ * 瓦片级 order 是 `100 + depth`（depth 会到 10~20，见下面的 `targetOrder`），
+ * 如果两个数据集只差 1，细化后的瓦片就会插到另一个数据集前面。所以把数据集序号
+ * 放大一个量级再相加：既保证「数据集之间永远按 renderOrder 排」，又不动瓦片级
+ * 的相对顺序。默认 0 → 乘积为 0，计算式与改动前逐字一致。
+ */
+export const DATASET_ORDER_STRIDE = 1000;
+
+/** 归一数据集绘制顺序：只接受有限数值，其余（含 NaN / Infinity）归 0 = 现状 */
+export function normalizeRenderOrder(order: unknown): number {
+  return typeof order === 'number' && Number.isFinite(order) ? order : 0;
+}
+
+/**
  * 稳定获取瓦片的子瓦片 URL 列表。
  *
  * 若节点未显式挂载 childUrls（如单测构造的 mock 节点），则按 `node.childUrls ?? (node.childUrl ? [node.childUrl] : [])`
@@ -55,6 +70,8 @@ export interface TileVisibilityHost {
   lodRangeScale(): number;
   /** LOD 过渡策略 */
   lodTransition(): 'binary' | 'incremental';
+  /** 数据集之间的绘制顺序基值（默认 0 = 现状），见 `DATASET_ORDER_STRIDE` */
+  renderOrder(): number;
   /** 进一帧，返回新的帧号（对应原来的 `this._frame++`） */
   beginFrame(): number;
   /** 当前帧号 */
@@ -259,8 +276,16 @@ export class TileVisibility {
         }
       }
       this.host.primaryNodes.clear();
+      // 数据集级顺序：binary 模式没有 fallback 深度推移，整组共用一个基值。
+      // 基值为 0 时写的就是原本的 0，与改动前逐字一致。
+      const baseOrder = normalizeRenderOrder(this.host.renderOrder()) * DATASET_ORDER_STRIDE;
       for (const [url, node] of this.host.nodes) {
-        if (node.group.visible) this.host.primaryNodes.add(url);
+        if (!node.group.visible) continue;
+        this.host.primaryNodes.add(url);
+        if (node.group.renderOrder !== baseOrder) {
+          node.group.renderOrder = baseOrder;
+          hasChanges = true;
+        }
       }
       this.host.fallbackNodes.clear();
     }
@@ -531,6 +556,8 @@ export class TileVisibility {
     }
 
     let changed = false;
+    // 数据集级顺序：整组平移。默认 0 → 下面的计算式与改动前逐字一致。
+    const baseOrder = normalizeRenderOrder(this.host.renderOrder()) * DATASET_ORDER_STRIDE;
 
     for (const [url, node] of this.host.nodes) {
       if (!visited.has(url)) continue;
@@ -541,7 +568,7 @@ export class TileVisibility {
           changed = true;
         }
         const depth = this._nodeDepths.get(url) ?? 0;
-        const targetOrder = 100 + depth;
+        const targetOrder = baseOrder + 100 + depth;
         if (node.group.renderOrder !== targetOrder) {
           node.group.renderOrder = targetOrder;
           changed = true;
@@ -556,7 +583,7 @@ export class TileVisibility {
           changed = true;
         }
         const depth = this._nodeDepths.get(url) ?? 0;
-        const targetOrder = depth;
+        const targetOrder = baseOrder + depth;
         if (node.group.renderOrder !== targetOrder) {
           node.group.renderOrder = targetOrder;
           changed = true;

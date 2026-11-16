@@ -14,7 +14,7 @@ import type { Anchor, ParsedTile, Stats, StyleUniforms } from '../core/types.js'
 import type { TileGeometryData } from '../core/TileGeometry.js';
 import { BlockAtlas } from './BlockAtlas.js';
 import { TileBudget, estimateObjectGeometryBytes } from './TileBudget.js';
-import { TileVisibility } from './TileVisibility.js';
+import { TileVisibility, normalizeRenderOrder } from './TileVisibility.js';
 import type { TileVisibilityOptions } from './TileVisibility.js';
 import { TileSource } from './TileSource.js';
 import { AUTO_BAKE_RADIUS_THRESHOLD } from '../core/BakeMercator.js';
@@ -150,6 +150,13 @@ export class S3MTileset {
   maxMemory: number;
   lodRangeScale: number;
   lodTransition: 'binary' | 'incremental';
+  /**
+   * 数据集之间的绘制顺序（默认 0 = 现状）。
+   *
+   * 运行时可直接改（改完等下一帧 `update()` 落地）；见 `TileVisibility` 的
+   * `DATASET_ORDER_STRIDE` —— 实际写进 three 的 order 是 `renderOrder * 步长 + 瓦片级偏移`。
+   */
+  renderOrder: number;
   fallbackOffset: { factor: number; units: number };
   readonly primaryNodes = new Set<string>();
   readonly fallbackNodes = new Set<string>();
@@ -225,6 +232,8 @@ export class S3MTileset {
     this._anchorOverride = options.anchorOverride ?? null;
     this.lodRangeScale = options.lodRangeScale ?? 3.0;
     this.lodTransition = options.lodTransition ?? 'binary';
+    // 数据集级绘制顺序：默认 0，非法值（NaN / Infinity）归 0，不改变旧口径
+    this.renderOrder = normalizeRenderOrder(options.renderOrder);
     this.fallbackOffset = {
       factor: options.fallbackOffset?.factor ?? 1,
       units: options.fallbackOffset?.units ?? 2,
@@ -303,6 +312,7 @@ export class S3MTileset {
       fallbackOffset: this.fallbackOffset,
       lodRangeScale: () => self.lodRangeScale,
       lodTransition: () => self.lodTransition,
+      renderOrder: () => self.renderOrder,
       beginFrame: () => ++self._frame,
       frame: () => self._frame,
       enqueue: (url, parentUrl) => self._enqueue(url, parentUrl),

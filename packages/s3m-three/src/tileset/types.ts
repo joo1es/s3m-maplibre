@@ -247,4 +247,11 @@ export interface S3MTilesetOptions {
    * 默认 { factor: 1, units: 2 }，通过向远处推移深度配合 gl.LEQUAL 消除共面 z-fighting。
    */
   fallbackOffset?: { factor?: number; units?: number };
+  /**
+   * 数据集之间的绘制顺序（由 `S3MDatasetOptions.renderOrder` 带下来），默认 0 = 现状。
+   *
+   * 只平移整组瓦片，**不改**瓦片级 `100 + depth` 的相对关系：越大的值越后画。
+   * 见 `TileVisibility` 的 `DATASET_ORDER_STRIDE`。
+   */
+  renderOrder?: number;
 }

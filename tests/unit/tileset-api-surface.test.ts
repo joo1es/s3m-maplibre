@@ -36,7 +36,7 @@ const PUBLIC_FIELDS = [
   'anchor', 'atlasLod', 'atlasLodCache', 'atlasUpgradeSkipped', 'atlasUpgraded', 'authenticate',
   'config', 'configUrl', 'externalAtlasCache', 'failed', 'fallbackNodes', 'fallbackOffset', 'hardCap',
   'isS3MV1', 'leafRequestCache', 'lodRangeScale', 'lodTransition', 'maxConcurrent', 'maxImageCache',
-  'maxMemory', 'maxTiles', 'maxTriangles', 'nodes', 'pending', 'primaryNodes', 'rootRadius',
+  'maxMemory', 'maxTiles', 'maxTriangles', 'nodes', 'pending', 'primaryNodes', 'renderOrder', 'rootRadius',
   'rootUrls', 'stats', 'textureCache',
 ].sort();
 

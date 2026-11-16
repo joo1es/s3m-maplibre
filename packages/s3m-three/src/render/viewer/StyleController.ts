@@ -430,6 +430,8 @@ export class StyleController {
         // 有单体淡化 / 正在淡入的材质，transparent 由各自的流程管，这里不要抢
         if (m.userData.uBatchTexActive?.value) continue;
         if ((m.userData.uTileFade?.value ?? 1) < 1) continue;
+        // 数据集自己覆盖过透明度的，混合开关归数据集 —— 这里改了会让它 alpha 失效
+        if (m.userData.s3mDatasetOpacity !== undefined) continue;
         // 材质自身可能是 blend / 顶点 alpha 透明（s3mOpts.transparent），
         // 关全局混合时不能把它一刀切成不透明
         restoreBaseBlendState(m, transparent, keepDepth);
@@ -463,6 +465,8 @@ export class StyleController {
       const m = styledMaterialOf(p.mesh);
       const u = m?.userData.uFlatShading;
       if (!u || u.value === target) continue;
+      // 数据集自己指定过 shading 的，跟数据集走，图层切换不覆盖它
+      if (m.userData.s3mDatasetShading !== undefined) continue;
       u.value = target;
     }
     this.host.requestRepaint();
@@ -544,11 +548,13 @@ export class StyleController {
       const old = raw as StyledMaterial | undefined;
       if (!old?.userData?.isStyled || !old.userData?.s3mOpts) continue;
       const opts = old.userData.s3mOpts as StyledMaterialOptions;
+      // 数据集有自己的样式时，重建必须继续绑它那份 uniform，否则覆盖项会在重建后丢回图层级
+      const dsUniforms = this.host.datasets.get(p.datasetId)?.uniforms;
       // 显式传本层档位与管线：s3mOpts 里记的是创建时的参数，可能是 undefined（跟随全局），
       // 重建时必须钉成本层当前值，否则「别处改了全局」会把这一层带跑。
       const fresh = createStyledMaterial({
         ...opts,
-        uniforms: this.host.uniforms,
+        uniforms: dsUniforms ?? this.host.uniforms,
         materialQuality: this.host.materialQuality(),
         colorPipeline: this.host.colorPipeline(),
       });
@@ -556,6 +562,19 @@ export class StyleController {
         const src = old.userData[key] as { value: unknown } | undefined;
         const dst = fresh.userData[key] as { value: unknown } | undefined;
         if (src && dst) dst.value = src.value;
+      }
+      // 数据集样式的标记是普通值，不是 { value }，单独搬
+      const dsOpacity = (old.userData as { s3mDatasetOpacity?: number }).s3mDatasetOpacity;
+      const dsShading = (old.userData as { s3mDatasetShading?: 'flat' | 'smooth' }).s3mDatasetShading;
+      if (dsOpacity !== undefined) {
+        (fresh.userData as { s3mDatasetOpacity?: number }).s3mDatasetOpacity = dsOpacity;
+        // 混合开关也要跟着回来：新材质是按 opts.transparent 建的，数据集半透明会被丢
+        restoreBaseBlendState(fresh, dsOpacity < 0.999, this.host.style.depthWrite !== false);
+      }
+      if (dsShading !== undefined) {
+        (fresh.userData as { s3mDatasetShading?: 'flat' | 'smooth' }).s3mDatasetShading = dsShading;
+        const u = fresh.userData.uFlatShading as { value: number } | undefined;
+        if (u) u.value = dsShading !== 'smooth' ? 1 : 0;
       }
       mesh.material = fresh;
       old.dispose();

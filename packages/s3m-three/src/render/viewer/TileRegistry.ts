@@ -31,6 +31,7 @@ import type { FeatureStyleManager } from '../FeatureStyleManager.js';
 import { restoreBaseBlendState } from '../StyleMaterial.js';
 import type { StyledMaterial, S3MStyle } from '../StyleMaterial.js';
 import { isOwnedPointCloudMaterial } from '../PointCloudMaterial.js';
+import { datasetOpacityOverride } from '../DatasetStyle.js';
 import type { MeshUserData, PickResult } from './types.js';
 import { clampOpacity, isPointCloudObject, styledMaterialOf } from './materialHelpers.js';
 
@@ -159,17 +160,27 @@ export class TileRegistry {
       } else {
         const mat = styledMaterialOf(mesh);
         if (mat) {
-          const o = clampOpacity(this.host.style.opacity);
+          // 数据集写了自己的 opacity / shading 就以它为准（patch 优先），否则跟图层
+          const dsStyle = entry.options?.style;
+          const dsOpacity = datasetOpacityOverride(dsStyle);
+          const o = dsOpacity ?? clampOpacity(this.host.style.opacity);
           // 不写 mat.opacity：全局透明度走共享 uOpacity，材质自身 opacity 保留模型自带 alpha
           // 混合开关不能写成 `o < 0.999` 一刀切：材质自身可能是 blend / 顶点 alpha
           // 透明（s3mOpts.transparent，如 SMID 4421），注册时就被这句踩掉，
           // 表现为「刚进去没透明度，切换材质质感重建后才恢复」。
           const keepDepth = this.host.style.depthWrite !== false;
           restoreBaseBlendState(mat, o < 0.999, keepDepth);
+          // 数据集覆盖的透明度记在材质上：图层改透明度、淡入结束都不能把它踩回不透明
+          if (dsOpacity !== undefined) (mat.userData as MeshUserData).s3mDatasetOpacity = dsOpacity;
           // shading 走共享 uniform（uFlatShading），不写 mat.flatShading / needsUpdate——
           // transparent / depthWrite 也不是 program 决定项，整套样式继承零重编译
           if (mat.userData.uFlatShading) {
-            mat.userData.uFlatShading.value = this.host.style.shading !== 'smooth' ? 1 : 0;
+            const shading = dsStyle?.shading ?? this.host.style.shading;
+            mat.userData.uFlatShading.value = shading !== 'smooth' ? 1 : 0;
+            // 记下来：图层再切 shading 时，这块不跟（数据集写过就归数据集）
+            if (dsStyle?.shading !== undefined) {
+              (mat.userData as MeshUserData).s3mDatasetShading = dsStyle.shading;
+            }
           }
           this.host.featureStyles.applyOverridesToMesh(mesh);
           this.startTileFade(mesh, mat);
@@ -223,7 +234,13 @@ export class TileRegistry {
         // 淡入期间强制开了 transparent + depthWrite，结束时不能自己拍板关掉——
         // 先恢复「材质自身语义 || 图层透明度」的基础状态（材质可能是 blend /
         // 顶点 alpha 透明，如 SMID 4421），再让单体淡化流程有需要时重新打开。
-        restoreBaseBlendState(mat, this.host.opacityTransparent(), this.host.style.depthWrite !== false);
+        // 数据集覆盖过 opacity 的，基础状态按数据集来，不能被图层踩平。
+        const dsOpacity = (mat.userData as MeshUserData).s3mDatasetOpacity;
+        restoreBaseBlendState(
+          mat,
+          dsOpacity !== undefined ? dsOpacity < 0.999 : this.host.opacityTransparent(),
+          this.host.style.depthWrite !== false
+        );
         this.host.featureStyles.applyOverridesToMesh(mesh);
         this.host.requestRepaint();
       },
