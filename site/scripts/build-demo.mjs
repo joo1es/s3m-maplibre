@@ -41,6 +41,7 @@ async function main() {
         input: {
           demo: path.join(SITE, 'demo.html'),
           analysis: path.join(SITE, 'analysis.html'),
+          host: path.join(SITE, 'host.html'),
         },
       },
     },
@@ -86,14 +87,20 @@ async function main() {
   const analysisHtml = await readFile(path.join(DIST, 'analysis.html'), 'utf8');
   await writeFile(path.join(TARGET, 'analysis.html'), analysisHtml, 'utf8');
 
+  // 宿主切换页：同样是纯客户端应用，落在 demo/ 同级，保证 `./data/CBD/...` 相对路径成立
+  const hostHtml = await readFile(path.join(DIST, 'host.html'), 'utf8');
+  await writeFile(path.join(TARGET, 'host.html'), hostHtml, 'utf8');
+
   // 单文件时代的入口，已经被 src/demo/main.js 取代
   await rm(path.join(TARGET, 'main.js'), { force: true });
 
   const size = (await stat(path.join(TARGET, 'index.html'))).size;
   const assets = await readdir(path.join(TARGET, 'assets'));
   const aSize = (await stat(path.join(TARGET, 'analysis.html'))).size;
+  const hSize = (await stat(path.join(TARGET, 'host.html'))).size;
   console.log(`  ✓ demo/index.html  ${(size / 1024).toFixed(0)} KB，assets ${assets.length} 个`);
   console.log(`  ✓ demo/analysis.html  ${(aSize / 1024).toFixed(0)} KB`);
+  console.log(`  ✓ demo/host.html  ${(hSize / 1024).toFixed(0)} KB`);
 
   // dist-demo/ 与 dist-demo-ssr/ 只是中转站，产物已经落到 demo/，留着只会越积越多。
   // 清理是尽力而为：这两个目录都在 .gitignore 里，删不掉只占点磁盘，

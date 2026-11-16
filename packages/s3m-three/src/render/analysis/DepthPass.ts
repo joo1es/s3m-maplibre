@@ -163,10 +163,13 @@ export function captureSkylineDepth(
     rt.dispose();
   }
 
-  const vp = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  // `camera.projectionMatrix` 在本内核里就是完整的 world→clip（MVP · ENU，已含视图与锚点），
+  // 不能再乘 `matrixWorldInverse`：它被钉成单位矩阵（见 `S3MViewer.renderFrame`），乘上去
+  // 在 camEnu≈0 的宿主上看不出差别，Mapbox 给出真实相机位置后天际线/可视域会整体错位。
+  const vp = new THREE.Matrix4().copy(camera.projectionMatrix);
   const inv = new Float32Array(vp.clone().invert().elements);
-  const pos = new THREE.Vector3().setFromMatrixPosition(camera.matrixWorld);
-
+  // 相机在 ENU 里的真实位置（米）——与 vp 的世界坐标同源，必须配套
+  const pos = camera.position;
   return { rgba, width: w, height: h, inverseViewProj: inv, cameraPos: [pos.x, pos.y, pos.z] };
 }
 

@@ -221,10 +221,11 @@ prewarmShading(): Promise<void>        // 手动预热另一种 shading 变体�
 - `worldFromLngLat` 返回带有各向异性尺度的对象：`{ x, y, z, meterInMercatorEast, meterInMercatorNorth, meterInMercatorUp, meterInMercator, altitude }`
   - 东西向尺度对应卯酉圈半径 $N(\varphi) = a / \sqrt{1 - e^2 \sin^2\varphi}$：$1 / (2\pi N \cos\varphi)$
   - 南北向尺度对应子午圈半径 $M(\varphi) = a(1 - e^2) / (1 - e^2 \sin^2\varphi)^{3/2}$：$1 / (2\pi M \cos\varphi)$
-  - 竖直向高程尺度 `meterInMercatorUp` 取东向尺度（局部正圆保角）
+  - 竖直向高程尺度 `meterInMercatorUp` **取宿主口径的球面 3857**：$1 / (2\pi R \cos\varphi)$，$R = 6378137$（`mercatorUnitPerMeterUp()`）
   - `meterInMercator` 保留作为向前兼容属性，取值从旧版球面近似 $1/(2\pi R\cos\varphi)$ 升级为真实的 WGS84 椭球东向尺度（属于精度修正，默认生效且更精准）
   - 彻底消除传统单标量模型在南北/东西方向上 0.4%~0.67% 的各向异性拉伸与米级系统残差。
-- 包导出了高精度大地测量工具：`primeVerticalRadius`, `meridianRadius`, `enuToLngLat`, `lngLatToEnu` 及 `WGS84_A`, `WGS84_E2` 常量。
+- **为什么竖向单独走球面**：横向（东/北）由**经纬度网格**约束 —— 底图瓦片按经纬度铺，模型顶点的经纬度由 `enuToLngLat`（椭球积分）算出，所以「ENU 米 → 墨卡托」这条捷径必须用同一套 $N/M$，否则模型与底图错开 0.14%（东西）/ 0.26%（南北）。竖向没有经纬度约束，口径由宿主定：宿主把 z 列乘 `pixelsPerMeter`，而 `pixelsPerMeter = mercatorZfromAltitude(1, lat) · worldSize`，归一化后正是 $1/(2\pi R \cos\varphi)$。用椭球 $N$ 会让楼高多出 0.138%。
+- 包导出了高精度大地测量工具：`primeVerticalRadius`, `meridianRadius`, `mercatorUnitPerMeterUp`, `enuToLngLat`, `lngLatToEnu` 及 `WGS84_A`, `WGS84_E2`, `MERCATOR_R` 常量。
 
 ### 数据集管理
 
@@ -584,8 +585,24 @@ interface Stats {
 }
 ```
 
-### 降级上报（degradations）
+`S3MTileset.pendingWork` 是给**宿主帧链**用的数字：排队待请求 + 在途 + 退避待重试。
 
+```ts
+readonly pendingWork: number   // 0 = 这一轮彻底干完了，宿主可以停下不再请求帧
+```
+
+为什么需要单独一个值：`stats.loading` 只涵盖「正在飞的请求」。可重试的失败（5xx / 超时 / 网关抖动）会进 `_retryAt` 退避，此时 `loading` 已经是 0，但 `update()` 下一轮还要把它们重新入队。宿主若是**按需渲染**（Mapbox GL 就是这样，没人 `triggerRepaint()` 就一帧都不出），只看 `loading` 就会在退避期停止驱动 —— 一停帧 `update()` 不再跑，退避的瓦片永远不再入队，画面永久停在当前这一级。所以 `S3MViewer.renderFrame()` 的续帧判定是：
+
+```ts
+stats.loading > 0 || pendingWork > 0
+```
+
+两个边界：
+
+- **404 / 410 不计入**：那是 `MissingTileError`（`permanent = true`），直接判 failed、不退还，`pendingWork` 立刻归零 —— 一张永久失效的瓦片不该让地图永远重绘。
+- 退避**到期那一刻仍然计入**（它只是「等下一帧再来一轮」），续帧不会在到期前断掉。
+
+### 降级上报（degradations）
 **「解析不了」应该抛错，「解析得了但画不出该有的样子」必须显式说出来。** 后者最容易被写成静默降级 —— 用户看到一个能跑但不对的画面，会去怀疑数据、怀疑网络、怀疑显卡，很难怀疑到「这个分支还没做完」。
 
 目前只有一类：

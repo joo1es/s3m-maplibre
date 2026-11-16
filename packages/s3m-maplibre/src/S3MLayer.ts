@@ -251,6 +251,57 @@ export class S3MLayer extends HostRenderer {
   constructor(options: S3MLayerOptions = {}) {
     super(options);
     this._userGeo = options.geo ?? null;
+    // 用户显式给过 depthMode 就一直以他为准：宿主契约的自动修正只补默认值
+    this._depthModeExplicit = (options as { depthMode?: unknown }).depthMode != null;
+  }
+
+  /** 深度模式是否被用户显式指定（构造参数或 setDepthMode），见 _syncHostDepthContract */
+  private _depthModeExplicit = false;
+
+  /** 宿主深度契约是否已判定过（只判一次，避免每帧覆盖用户手改） */
+  private _hostDepthSynced = false;
+
+  /**
+   * 宿主深度契约：**Mapbox GL v3 在调用自定义层之前会 `setDepthMode(disabled)` 且不清深度缓冲。**
+   *
+   * mapbox-gl 3.35 dist 里 custom 图层的 translucent 分支：
+   *
+   *     o.setDepthMode(e.a3.disabled),
+   *     o.setStencilMode(e.a4.disabled),
+   *     o.setColorMode(t.colorModeForRenderPass()),
+   *     t.setCustomLayerDefaults();
+   *     i.call(n, o.gl, a, l)      // ← 本层 render()
+   *
+   * 也就是"深度你自己管"。若沿用 `'scene'`，three 会重新打开 DEPTH_TEST，拿一个本层从未
+   * 初始化的深度缓冲去比 LEQUAL：缓冲里是 1.0 就全可见，是残留值就斑驳、部分被遮挡。
+   *
+   * **但这里不再自动切成 `'clear'`（0.4.42 起）**：自动切会连带两个副作用 ——
+   * 每帧清掉底图/地形已写的深度（地形遮挡失效）、GPU 描边整段被跳过。而当初触发这条
+   * workaround 的"模型消失"实测根因是渲染矩阵多乘了一次 `T(−camEnu)`（camEnu 非零的
+   * 宿主上模型整体出画），与深度无关。所以现在只判定一次、只告警一次，把选择权交回去：
+   * 真的出现残留深度遮挡，显式 `depthMode: 'clear'` 即可。
+   *
+   * 识别依据：第 2 参是裸矩阵（MapLibre 传的是带 modelViewProjectionMatrix 的对象），
+   * 且第 8 参（rest[5]）是 renderParameters（含 projectionMatrix / viewMatrix）。
+   */
+  private _syncHostDepthContract(arg: unknown, rest: unknown[]): void {
+    if (this._hostDepthSynced) return;
+    const params = rest[5];
+    const isMatrixArg = ArrayBuffer.isView(arg);
+    const isRenderParameters =
+      rest.length >= 6 &&
+      params !== null &&
+      typeof params === 'object' &&
+      'projectionMatrix' in (params as object);
+    if (!isMatrixArg || !isRenderParameters) return;
+
+    this._hostDepthSynced = true;
+    if (this._depthModeExplicit) return;
+    console.warn(
+      '[s3m] 检测到 Mapbox v3 的自定义层契约（调用前关闭深度测试且不清深度缓冲）。' +
+        '默认不再自动切 clear：那会连带清掉底图/地形深度并跳过 GPU 描边。' +
+        '若确实出现模型被残留深度遮挡（斑驳 / 整片消失），请显式 new S3MLayer({ depthMode: \'clear\' })。',
+    );
   }
 
   /** 宿主能力钩子：请求下一帧重绘（MapLibre / Mapbox → triggerRepaint） */
@@ -404,6 +455,9 @@ export class S3MLayer extends HostRenderer {
     const map = this.map;
     const anchor = this.viewer.sceneAnchor;
     if (!map || !anchor) return;
+
+    // 深度契约必须在任何绘制之前判定（Mapbox 在调用本层前把 depth test 关了且不清深度）
+    this._syncHostDepthContract(arg, rest);
     // 上下文丢失期间（丢失→恢复之间）不要渲染：renderer 指向失效的 gl，
     // 真正恢复由 _onContextRestored → restoreContext 接管。
     if (this._contextLost) return;
@@ -702,6 +756,8 @@ export class S3MLayer extends HostRenderer {
    * 详见内核 `S3MViewer.setDepthMode`。
    */
   setDepthMode(mode: DepthMode): void {
+    // 用户显式设置后，宿主契约的自动修正不再接管
+    this._depthModeExplicit = true;
     this.viewer.setDepthMode(mode);
   }
 

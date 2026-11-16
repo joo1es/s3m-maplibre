@@ -24,6 +24,16 @@ export const WGS84_B = WGS84_A * (1 - WGS84_F);
 /** WGS84 椭球第一偏心率平方 e² = 2f - f² ≈ 0.0066943799901413165 */
 export const WGS84_E2 = 2 * WGS84_F - WGS84_F * WGS84_F;
 
+/**
+ * 球面墨卡托（EPSG:3857）半径（米）。
+ *
+ * 宿主（MapLibre / Mapbox）算「1 米 = 多少世界单位」用的是**球面**这一个半径：
+ * `pixelsPerMeter = mercatorZfromAltitude(1, lat) · worldSize`，而
+ * `mercatorZfromAltitude(1, lat) = 1 / (2π · R · cosφ)`。
+ * 换算成归一化世界单位就是 `pixelsPerMeter / worldSize = 1/(2πR·cosφ)`。
+ */
+export const MERCATOR_R = 6378137.0;
+
 /** 保持向下兼容：EARTH_RADIUS 对应 WGS84 长半轴 */
 export const EARTH_RADIUS = WGS84_A;
 
@@ -42,6 +52,24 @@ export function meridianRadius(latRad: number): number {
   const sin = Math.sin(latRad);
   const w2 = 1 - WGS84_E2 * sin * sin;
   return (WGS84_A * (1 - WGS84_E2)) / (w2 * Math.sqrt(w2));
+}
+
+/**
+ * 球面墨卡托的竖向尺度：1 米 = 多少归一化世界单位。
+ *
+ * **为什么竖向用球面、横向用椭球**：
+ *
+ * - 横向（x / 北向 y）由**经纬度网格**决定：底图瓦片按经纬度铺，模型顶点的经纬度由
+ *   `enuToLngLat`（WGS84 椭球积分）算出，所以「ENU 米 → 墨卡托」这条捷径必须用同一套
+ *   `N(φ)` / `M(φ)`，否则模型与底图错开 0.14%（东西）/ 0.26%（南北）。
+ * - 竖向（高度）**没有**经纬度约束，它的口径由宿主定：宿主把 z 列乘 `pixelsPerMeter`，
+ *   而 `pixelsPerMeter = mercatorZfromAltitude(1, lat) · worldSize` → 归一化后正是
+ *   `1/(2π·R·cosφ)`，R 是**球面**半径 6378137。用椭球 N 会让楼高多出 0.138%。
+ *
+ * 39.9°N：球面 3.25323e-8，椭球 N 3.24875e-8。
+ */
+export function mercatorUnitPerMeterUp(latRad: number): number {
+  return 1 / (2 * Math.PI * MERCATOR_R * Math.max(Math.abs(Math.cos(latRad)), 1e-12));
 }
 
 /**
@@ -139,7 +167,8 @@ export function mercatorFromLngLat(
 
   const meterInMercatorEast = 1 / (2 * Math.PI * N * safeCosLat);
   const meterInMercatorNorth = 1 / (2 * Math.PI * M * safeCosLat);
-  const meterInMercatorUp = meterInMercatorEast;
+  // 竖向跟宿主口径（球面 3857），横向跟经纬度网格（椭球）。理由见 mercatorUnitPerMeterUp。
+  const meterInMercatorUp = mercatorUnitPerMeterUp(latRad);
 
   return {
     x,

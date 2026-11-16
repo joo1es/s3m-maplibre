@@ -10,7 +10,10 @@
  * 纯 three 宿主不需要这个文件 —— 直接用 GeoAdapter 的墨卡托兜底，
  * 或自己实现一个 GeoAdapter 即可。
  */
-import { primeVerticalRadius, meridianRadius, type GeoAdapter } from 's3m-three';
+import { primeVerticalRadius, meridianRadius, mercatorUnitPerMeterUp, type GeoAdapter } from 's3m-three';
+
+/** 竖向尺度兜底用的宿主口径（球面 3857）：1 米 = 多少归一化世界单位 */
+const meridianUpScale = mercatorUnitPerMeterUp;
 
 /** MapLibre 默认垂直视场角（弧度） */
 export const DEFAULT_FOV = 0.6435011087932844;
@@ -158,13 +161,15 @@ export function createMapLibreGeoAdapter(map: MapLike | null): GeoAdapter | null
       if (sEast === 0) sEast = 1 / (2 * Math.PI * N * cosLat);
       if (sNorth === 0) sNorth = 1 / (2 * Math.PI * M * cosLat);
 
-      let sUp = sEast;
+      // 竖向优先用宿主自己的高程换算（差分 1 米反推），拿不到就退回**球面** 3857 口径 ——
+      // 宿主的 pixelsPerMeter 用的就是球面半径，退回椭球 N 会让楼高多出 0.138%。
+      let sUp = meridianUpScale(latRad);
       try {
         const c1 = helper.worldFromLngLat(lng, lat, altitude + 1);
         const dz = Math.abs((c1.z ?? 0) - (coord.z ?? 0));
         if (dz > 0) sUp = dz;
       } catch {
-        // 保持 sUp = sEast
+        // 保持球面口径
       }
 
       return {

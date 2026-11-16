@@ -86,6 +86,7 @@ export function computeTilePlacement(input: TilePlacementInput): TilePlacement |
 
   const sSceneEast = sceneAnchor.meterInMercatorEast ?? sceneAnchor.meterInMercator;
   const sSceneNorth = sceneAnchor.meterInMercatorNorth ?? sceneAnchor.meterInMercator;
+  const sSceneUp = sceneAnchor.meterInMercatorUp ?? sSceneEast;
   if (!Number.isFinite(sSceneEast) || sSceneEast <= 0 || !Number.isFinite(sSceneNorth) || sSceneNorth <= 0) return null;
   if (!Number.isFinite(center.x) || !Number.isFinite(center.y) || !Number.isFinite(center.z)) return null;
 
@@ -103,13 +104,12 @@ export function computeTilePlacement(input: TilePlacementInput): TilePlacement |
   const position: [number, number, number] = [
     (tMerc.x - sceneAnchor.x) / sSceneEast - datasetOffset[0],
     -(tMerc.y - sceneAnchor.y) / sSceneNorth - datasetOffset[1],
-    (tMerc.z - sceneAnchor.z) / sSceneEast - datasetOffset[2],
+    (tMerc.z - sceneAnchor.z) / sSceneUp - datasetOffset[2],
   ];
 
   const scaleEast = sTileEast / sSceneEast;
   const scaleNorth = sTileNorth / sSceneNorth;
   const sTileUp = (tMerc as any).meterInMercatorUp ?? sTileEast;
-
   return {
     pivot: [center.x, center.y, center.z],
     position,

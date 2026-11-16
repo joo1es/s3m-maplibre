@@ -2611,10 +2611,22 @@ export class S3MViewer {
     // 相机在场景 ENU 中的位置
     const camEnu = opts.cameraEnu;
 
-    // 补齐相机的真实场景坐标与世界矩阵逆矩阵，确保依赖 matrixWorldInverse 的场景正常运作
+    // 相机的真实场景坐标（ENU 米）：给 LOD、物理地表、深度通道、泼溅排序用。
     this.camera.position.set(camEnu[0], camEnu[1], camEnu[2]);
-    this.camera.matrixWorld.setPosition(camEnu[0], camEnu[1], camEnu[2]);
-    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+    // **matrixWorld / matrixWorldInverse 必须是单位矩阵。**
+    //
+    // `projectionMatrix` 上面已经被换成完整的 `MVP · ENU`，world→clip 里已经含了视图分量；
+    // three 渲染时的 `modelViewMatrix = matrixWorldInverse × object.matrixWorld`，所以再让
+    // matrixWorldInverse 承担一次 `T(−camEnu)`，等于把模型整体平移 −camEnu（ENU 米）：
+    //
+    //     gl_Position = MVP·ENU · T(−camEnu) · v
+    //
+    // 旧实现在 camEnu≈0 的宿主（拿不到 FreeCameraOptions）上恰好无害，Mapbox 给出真实相机
+    // 位置（实测 camEnu = [788, −1686, 1567] m，按 0.627 px/m 约 1167 px 水平偏移）后模型
+    // 直接被推出画面 —— 同一个 bug 也是 `GeometryBuilder` 注释里 #36「视锥整体平移了相机到
+    // 锚点距离」的来源。需要「视图空间」的内部模块请用 `camEnu` 自己构造，不要读 matrixWorld。
+    this.camera.matrixWorld.identity();
+    this.camera.matrixWorldInverse.identity();
 
     // 更新 3D 物理地表面中心随相机延伸
     this.groundManager.update(this.camera);
@@ -2769,6 +2781,10 @@ export class S3MViewer {
       // 静态覆盖物不参与，否则挂着 200 个 glb 地图就永远不空闲
       this.overlay.hasAnimated ||
       this.stats.loading > 0 ||
+      // `stats.loading` 只涵盖「正在飞的请求」。退避重试中的瓦片两边都不在，
+      // 而 `update()` 要等下一帧才会把它们重新入队 —— 宿主若按需渲染（Mapbox），
+      // 这里返回 false 就再没有下一帧，调度永久停在根级粗模。
+      this._pendingTileWork() > 0 ||
       tilesetChanged;
 
     // 兜底：材质不是经 `_registerTile` 进来的路径（如原地重建材质）也能热一次。
@@ -2798,8 +2814,21 @@ export class S3MViewer {
     return this._fps.value;
   }
 
-  get stats(): Stats {
-    const total: Stats = {
+  /**
+   * 所有数据集还有多少「没跑完的瓦片工作」（排队 + 在途 + 退避待重试）。
+   *
+   * 只给 `renderFrame` 的续帧判定用：`stats.loading` 会漏掉退避重试，
+   * 而按需渲染的宿主（Mapbox）一停帧就再也不会来推进调度。
+   */
+  private _pendingTileWork(): number {
+    let total = 0;
+    for (const entry of this.datasets.values()) {
+      total += entry.tileset?.pendingWork ?? 0;
+    }
+    return total;
+  }
+
+  get stats(): Stats {    const total: Stats = {
       tiles: 0,
       loading: 0,
       failed: 0,

@@ -579,6 +579,25 @@ export class S3MTileset {
     return count;
   }
 
+  /**
+   * 还有多少「没跑完的瓦片工作」：排队待请求 + 在途 + 退避中待重试。
+   *
+   * 为什么不直接看 `stats.loading`：退避重试的瓦片既不在 `pending` 里、也不在 `loading` 里，
+   * 但 `update()` 下一轮还要把它们重新入队。宿主若是**按需渲染**（Mapbox GL 就是这样，
+   * 没人 `triggerRepaint()` 就一帧都不出），判定「画完这一帧还要不要下一帧」时只看
+   * `loading` 就会在退避期返回 false —— 一停帧 `update()` 不再跑，退避的瓦片永远不再入队，
+   * 画面就永久停在根级粗模。`S3MViewer.renderFrame()` 的 `needsNextFrame` 用这个值续帧。
+   */
+  get pendingWork(): number {
+    let retrying = 0;
+    for (const url of this._retryAt.keys()) {
+      // 已在 failed（放弃）或已加载完（nodes）的残留记录不算活
+      if (this.failed.has(url) || this.nodes.has(url)) continue;
+      retrying++;
+    }
+    return this._queue.length + this.pending.size + retrying;
+  }
+
   private _pump(): void {
     while (this._active < this.maxConcurrent && this._queue.length) {
       const url = this._queue.shift()!;

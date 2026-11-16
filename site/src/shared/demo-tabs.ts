@@ -11,7 +11,7 @@
  * 加新演示时改这里一处就够了（three.html 那份是手写的，见文件底部说明）。
  */
 
-export type DemoPageId = 'demo' | 'three' | 'analysis';
+export type DemoPageId = 'demo' | 'three' | 'analysis' | 'host';
 
 interface DemoTab {
   id: DemoPageId;
@@ -22,6 +22,7 @@ interface DemoTab {
 
 const TABS: DemoTab[] = [
   { id: 'demo', label: '数据集演示', file: 'index.html' },
+  { id: 'host', label: '宿主切换', file: 'host.html' },
   { id: 'three', label: 'three.js', file: 'three.html' },
   { id: 'analysis', label: '空间分析', file: 'analysis.html' },
 ];

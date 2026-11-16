@@ -474,7 +474,8 @@ export class DatasetManager {
     }
     const sEast = this.sceneAnchor.meterInMercatorEast ?? this.sceneAnchor.meterInMercator;
     const sNorth = this.sceneAnchor.meterInMercatorNorth ?? this.sceneAnchor.meterInMercator;
-    const sUp = sEast;
+    // 竖向必须与 `_enuMatrix` 用的是同一个系数，否则 offset 的 z 与场景 z 换算不成反比
+    const sUp = this.sceneAnchor.meterInMercatorUp ?? sEast;
     const a = worldFromLngLat(geo, entry.anchor.lon, entry.anchor.lat, entry.anchor.height ?? 0);
     entry.offset = [
       (a.x - this.sceneAnchor.x) / sEast,

@@ -108,17 +108,19 @@ describe('_sortSplats 的跳过条件', () => {
     expect(attr.version).toBe(afterFirst); // 相机没动 → 一次都没重写
   });
 
-  test('相机朝向变了就重排（沿视线平移不算，深度顺序没变）', () => {
+  // 排序键只取 view 的第 3 行（`splatDepthOrder`），而内核里 view 只有平移：
+  // 对每个点同加一个常数不改变顺序，所以「纯平移」在数学上不可能改变 back-to-front 次序。
+  // 这条不是可选项而是事实：真实的相机姿态（pitch/bearing）全在宿主 MVP 里，
+  // 要让泼溅按真实视深排序，得把宿主 view 矩阵单独喂进 `SplatLayer.sort()`。
+  test('沿任意方向平移相机都不改变深度顺序（纯平移不重写 attribute）', () => {
     const { cam, points, sort } = setup();
     const attr = centerOf(points);
     sort();
     const afterFirst = attr.version;
 
-    // 绕 Y 轴转 180°：点的前后关系整体反转，顺序必须重算
-    cam.rotation.y = Math.PI;
-    cam.updateMatrixWorld();
+    cam.position.set(100, 200, 100);
     sort();
-    expect(attr.version).toBeGreaterThan(afterFirst);
+    expect(attr.version).toBe(afterFirst);
   });
 
   test('非泼溅点云不参与排序（isGaussianSplat 未标记时直接跳过）', () => {

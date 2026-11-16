@@ -13,6 +13,7 @@ import { sortSplatMesh } from '../SplatSorter.js';
 
 export class SplatLayer {
   private readonly _lastView = new THREE.Matrix4();
+  private readonly _view = new THREE.Matrix4();
   private _sorted = false;
 
   /** 有新瓦片进来 / 瓦片被淘汰：下一帧必须重排 */
@@ -23,16 +24,22 @@ export class SplatLayer {
   /**
    * 按当前视角重排所有泼溅瓦片。
    *
+   * 视图矩阵**不能**读 `camera.matrixWorldInverse`：内核把 `camera.projectionMatrix`
+   * 换成了完整 `MVP · ENU`，为免渲染重复一次视图变换，`matrixWorldInverse` 被钉成单位矩阵
+   * （见 `S3MViewer.renderFrame`）。所以这里自己由 `camera.position`（ENU 米）构造
+   * `T(−camEnu)`，与旧口径逐位一致。
+   *
    * @param pointClouds 场景里的点云集合（含非泼溅的，按 `userData.isGaussianSplat` 过滤）
    */
   sort(camera: THREE.Camera | null, pointClouds: Iterable<THREE.Points>): void {
     if (!camera) return;
-    if (this._sorted && this._lastView.equals(camera.matrixWorldInverse)) return;
+    const view = this._view.makeTranslation(-camera.position.x, -camera.position.y, -camera.position.z);
+    if (this._sorted && this._lastView.equals(view)) return;
     for (const pc of pointClouds) {
       if (!(pc.userData as { isGaussianSplat?: boolean }).isGaussianSplat) continue;
-      sortSplatMesh(pc as unknown as THREE.Mesh, camera.matrixWorldInverse);
+      sortSplatMesh(pc as unknown as THREE.Mesh, view);
     }
-    this._lastView.copy(camera.matrixWorldInverse);
+    this._lastView.copy(view);
     this._sorted = true;
   }
 

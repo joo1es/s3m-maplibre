@@ -32,6 +32,10 @@ const DEMO_ROUTES = new Set(['/demo', '/demo/', '/demo.html', '/demo/index.html'
 const ANALYSIS_ENTRY = 'analysis.html';
 const ANALYSIS_ROUTES = new Set(['/demo/analysis', '/demo/analysis/', '/demo/analysis.html']);
 
+/** 宿主切换页：同样只有产物、没有 SSR，dev 直接吐模板，客户端自己选引擎 */
+const HOST_ENTRY = 'host.html';
+const HOST_ROUTES = new Set(['/demo/host', '/demo/host/', '/demo/host.html']);
+
 /** 纯 three.js 演示：只有产物、没有构建入口，dev 直接读仓库里那份 */
 const THREE_DEMO_ROUTES = new Set(['/demo/three', '/demo/three.html']);
 
@@ -209,6 +213,17 @@ function siteDev(): Plugin {
             const template = await server.transformIndexHtml(
               `/${ANALYSIS_ENTRY}`,
               await readFile(at(`./${ANALYSIS_ENTRY}`), 'utf8'),
+            );
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.end(template);
+            return;
+          }
+
+          // ---- 宿主切换页：纯客户端应用，模板照吐（引擎由页面自己按 URL 参数加载） ----
+          if (HOST_ROUTES.has(url)) {
+            const template = await server.transformIndexHtml(
+              `/${HOST_ENTRY}`,
+              await readFile(at(`./${HOST_ENTRY}`), 'utf8'),
             );
             res.setHeader('Content-Type', 'text/html; charset=utf-8');
             res.end(template);

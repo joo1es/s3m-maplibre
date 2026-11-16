@@ -170,7 +170,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `maxImageCache` | `number` | `128` | 纹理缓存条数上限，1024² RGBA 约 4MB / 条。低端设备 32~48，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `materialQuality` | `'pbr' \| 'lambert'` | `'pbr'` | 光照模型，`lambert` 片元约省一半。图层级设置，同页多个图层各用各的、互不覆盖；只影响之后创建的材质 |
 | `motionBlur` | `{ mode?: 'afterimage' \| 'velocity'; damp?: number \| 'auto'; maxOffset?: number }` | 不传 = 关闭 | 可选运动模糊后处理，**默认关闭**。低端设备低帧率时用帧间残影在感知层面填补卡顿：`afterimage`（缺省）几乎零边际成本、`velocity` 按相机运动方向模糊；`damp: 'auto'` 按实时 FPS 自适应；`maxOffset`（仅 velocity）为拖影上限（屏宽百分比，缺省 0.05）。运行时 `setMotionBlur(null)` 关闭，详见[s3m-three 构造函数选项](../s3m-three/docs/API.md#构造函数)。仅 WebGL2 |
-| `depthMode` | `'scene' \| 'clear' \| 'auto'` | `'scene'` | 本层绘制前深度缓冲处理策略。`'scene'` 保留宿主深度（建筑/管线等离散对象被地形正确遮挡）；`'clear'` 先清深度再画（贴地倾斜摄影/DEM化网格消除与宿主 DEM 的共面 z-fighting）；`'auto'` 按 ground 覆盖或倾斜摄影数据集自动推断。详见[深度策略](#深度策略按数据类型区分保留与清空) |
+| `depthMode` | `'scene' \| 'clear' \| 'auto'` | `'scene'` | 本层绘制前深度缓冲处理策略。`'scene'` 保留宿主深度（建筑/管线等离散对象被地形正确遮挡）；`'clear'` 先清深度再画（贴地倾斜摄影/DEM化网格消除与宿主 DEM 的共面 z-fighting）；`'auto'` 按 ground 覆盖或倾斜摄影数据集自动推断。详见[深度策略](#深度策略按数据类型区分保留与清空)。**0.4.42 起不再因「Mapbox v3 的自定义层契约」自动切成 `clear`**：自动切会连带清掉底图/地形深度、并让 GPU 描边整段跳过，而当时的根因是渲染矩阵多乘了一次视图平移（camEnu），与深度无关。现在只识别 + 告警一次，需要时显式传 `depthMode: 'clear'` |
 | `attributes` | `AttributeQueryOptions` | — | 业务属性查询配置，见[s3m-three 业务字段章节](../s3m-three/docs/API.md#业务字段锚点在库内对应关系在外部) |
 | `projection` | `'perspective' \| 'orthographic'` | `'perspective'` | 投影模式，见[投影](#投影) |
 | `nearPlaneScale` | `number` | `1` | 近裁剪面缩放系数（`0 < scale < 1`，1 = 不改）。MapLibre 的 near 是硬编码的 `canvasHeight/50`，zoom 16.5 时约合 13 米，相机贴近模型会把楼面整片裁掉；缩放后 fov / far 不变，见[近裁剪面](#近裁剪面贴脸看时不消失) |
@@ -819,6 +819,8 @@ const buildingLayer = new S3MLayer({
 
 同一场景中多图层互不干扰：`'clear'` 图层只在自己绘制前清空深度缓冲（不触碰底图颜色），后续 `'scene'` 图层正常基于已写好的深度进行遮挡测试。
 
+> **Mapbox v3 不再自动切 `'clear'`（0.4.42 起）**。Mapbox v3 调自定义层前会 `setDepthMode(disabled)` 且不清深度缓冲，早先检测到这个签名就自动切 `'clear'`；但它会连带**清掉底图/地形已写的深度**（地形遮挡失效）并让 **GPU 描边整段跳过**。而当时触发它的「模型消失」实测根因是渲染矩阵多乘了一次 `T(−camEnu)`（Mapbox 能给出真实相机位置，模型整体出画），与深度无关。现在只识别 + `console.warn` 一次；真遇到残留深度造成的斑驳/整片消失，显式 `depthMode: 'clear'` 即可。
+
 ### 近裁剪面（贴脸看时不消失）
 
 **现象**：相机推进到楼体十几米以内，模型整片消失，退回来又出现。这不是瓦片被隐藏，是**近裁剪面把几何裁掉了**。
@@ -862,6 +864,7 @@ e[14] = -2 · far · near' / (far - near')
 - **正交投影**需要 MapLibre ≥ 5；v4 / v5 以下（含 Mapbox v2）只给合并矩阵，会告警一次并保持透视，见[投影](#投影)。
 - **贴近模型时整片消失**大概率是 MapLibre 的近裁剪面（默认离相机约 13 米）裁的，不是瓦片调度问题：用 `nearPlaneScale` 调，见[近裁剪面](#近裁剪面贴脸看时不消失)。另一条路是瓦片预算——相机贴近会让 LOD 深度暴涨、超过 `hardCap` 后可能强制淘汰正在显示的瓦片（开洞），表现为「局部空洞、过几秒补上」，与近裁剪的「整片空白、退回来立刻恢复」可区分。
 - **`layer.viewer.geo` 在 MapLibre 上经常是 `null`，这是正常的**：`createMapLibreGeoAdapter()` 只有从宿主拿到 `WorldCoordinateHelper`（`transform.worldCoordinateHelper` 等 4 个候选位置）时才生效，拿不到就返回 `null`，渲染层自动回退标准 Web 墨卡托（基于 WGS84 椭球高精度模型与各向异性尺度反推）。当宿主提供 `worldFromLngLat` 时，适配器会通过东向与北向各 1 米的大地线差分，精确获取各向异性米制尺度 `(meterInMercatorEast, meterInMercatorNorth, meterInMercatorUp)`。**自己换算经纬度时不要用 `if (viewer.geo)` 当门槛**，直接用 `worldFromLngLat(viewer.geo, lng, lat)`（`s3m-three` 导出，内部自带兜底），否则会把本来能用的墨卡托路径挡掉。
+- **竖向尺度的口径是宿主的**：`meterInMercatorUp` 恒等于 `pixelsPerMeter / worldSize = 1/(2π·R·cosφ)`（$R=6378137$，`mercatorUnitPerMeterUp()`），不是椭球 $N$。宿主的 z 列乘 `pixelsPerMeter`、`pixelsPerMeter = mercatorZfromAltitude(1, lat) · worldSize`，用椭球会让楼高多出 0.138%。横向（东/北）仍走椭球 $N/M$，因为底图瓦片按经纬度铺，`enuToLngLat` 也是椭球，横向换球面会让模型与底图错开 0.14%/0.26%。
 - **多数据集叠加**应位于同一城市量级（几公里内），跨城市叠加会重新引入 float32 精度问题。
 - **pitch 大时地平线以上是黑的，先排除本层**：MapLibre 的 `background` 层只铺地面平面，`sky` 没配置时地平线以上**没有任何图层覆盖**，那块就是 renderer 的清屏色（深色主题下纯黑），看着像「天上破了个洞」。这不是本层或覆盖物画的——**把本层整个隐藏再看一眼**（demo 里加 `?nos3m=1`），还是黑的就与本层无关。修法是给 style 根加 `sky`（MapLibre ≥ 5）或运行时 `map.setSky({...})`，完整写法见[快速开始](#快速开始)。另注意别用 `map.setStyle()` 切底图：它会重建 style、把 `sky` 一起丢掉，要么切完重设一次，要么像 demo 那样只增删栅格层。
 
