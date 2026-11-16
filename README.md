@@ -214,6 +214,31 @@ layer.setDatasetVisible('zhoubian', false);
 layer.setEdges(true);
 ```
 
+### 数据集各自的样式与层叠顺序
+
+同一个图层里的几个数据集可以各用各的外观，不用为它们分别建图层（每建一个图层就多一个 `S3MViewer` + `WebGLRenderer`）：
+
+```js
+const layer = new S3MLayer({
+  // 图层级默认样式：数据集没写的字段都跟它走
+  style: { colorA: '#ffffff', edges: true },
+  datasets: [
+    // patch 合并：只覆盖自己需要的字段
+    { id: 'jingmo', configUrl: '.../jingmo.scp', style: { mode: STYLE.TEXTURE, texMix: 1 } },
+    { id: 'louban', configUrl: '.../louban.scp', style: { mode: STYLE.SOLID, colorA: '#8fa3b8' }, renderOrder: 1 },
+    { id: 'zhoubian', configUrl: '.../zhoubian.scp', style: { colorA: '#e6e6e6', opacity: 0.55 }, renderOrder: -1 },
+  ],
+});
+
+layer.setDatasetRenderOrder('louban', 2);   // 运行时调整前后关系
+```
+
+支持在数据集上覆盖的字段：`mode` / `colorA` / `colorB` / `colorC` / `floorHeight` / `texMix` / `roofThreshold` / `ambientGain` / `metalness` / `roughness` / `opacity` / `dimFactor` / `shading`。三个边界要知道：
+
+- **没写的字段继续跟图层级 `setStyle` 走**；写过的字段是静态的，图层再改也不影响它。
+- `edges`、选中高亮与描边仍由图层级决定（棱线 / 描边材质是整层一份）。
+- `renderOrder` 只在**同一透明度批次**内有效 —— three 先画不透明再画透明，不透明的数据集永远画在透明的之前。
+
 ### 点选
 
 ```js
