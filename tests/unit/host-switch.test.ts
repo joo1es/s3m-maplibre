@@ -12,6 +12,7 @@ import {
   HOST_PRESETS,
   applyHostChoice,
   applyHostCompat,
+  cdnFallbackOrder,
   cdnScriptUrl,
   cdnStyleUrl,
   describeHost,
@@ -158,6 +159,20 @@ describe('CDN 地址推导', () => {
   });
 });
 
+describe('cdnFallbackOrder: 主 CDN 取不到时的兜底顺序', () => {
+  it('用户选的那个永远排第一，其余按固定顺序补齐（不重复）', () => {
+    expect(cdnFallbackOrder('jsdelivr')).toEqual(['jsdelivr', 'unpkg', 'npmmirror']);
+    expect(cdnFallbackOrder('unpkg')).toEqual(['unpkg', 'jsdelivr', 'npmmirror']);
+    expect(cdnFallbackOrder('npmmirror')).toEqual(['npmmirror', 'jsdelivr', 'unpkg']);
+  });
+
+  it('返回的是新数组：调用方改它不会污染下一次解析', () => {
+    const first = cdnFallbackOrder('jsdelivr');
+    first.pop();
+    expect(cdnFallbackOrder('jsdelivr')).toHaveLength(3);
+  });
+});
+
 describe('hostFormat: v6 不再发 UMD', () => {
   it.each([
     ['maplibre', '5.24.1', 'umd'],
@@ -173,9 +188,35 @@ describe('hostFormat: v6 不再发 UMD', () => {
   });
 
   it('?glfmt 可以硬覆盖推断（自托管产物格式不明时用）', () => {
-    expect(resolveHost('?glv=6.18.0&glfmt=umd').format).toBe('umd');
+    expect(resolveHost('?glv=5.24.1&glfmt=umd').format).toBe('umd');
     expect(resolveHost('?glv=5.24.1&glfmt=esm').format).toBe('esm');
     expect(resolveHost('?glv=6.18.0&glfmt=amd').warnings.length).toBe(1);
+  });
+
+  it('显式 ?glfmt=umd + v6 → 纠正成 ESM，绝不生成那个必然 404 的 .js 地址', () => {
+    const plan = resolveHost('?glv=6.18.0&glfmt=umd');
+    expect(plan.format).toBe('esm');
+    expect(plan.scriptUrl).toBe('https://cdn.jsdelivr.net/npm/maplibre-gl@6.18.0/dist/maplibre-gl.mjs');
+    expect(plan.warnings.some((w) => w.includes('UMD'))).toBe(true);
+  });
+
+  it('?glv=latest 也是 ESM（latest 现在就是 6.x，猜不出大版本时按当前发布线算）', () => {
+    const plan = resolveHost('?glv=latest&glfmt=umd');
+    expect(plan.format).toBe('esm');
+    expect(plan.scriptUrl.endsWith('.mjs')).toBe(true);
+  });
+
+  it('手写 glsrc 时 glfmt 仍然说了算（自托管产物格式不明，不能替用户改地址）', () => {
+    const plan = resolveHost('?glv=6.18.0&glfmt=umd&glsrc=https://x/my-maplibre.js');
+    expect(plan.format).toBe('umd');
+    expect(plan.scriptUrl).toBe('https://x/my-maplibre.js');
+    expect(plan.selfHosted).toBe(true);
+  });
+
+  it('v5 的 UMD 照旧可用（5.24.1 的 dist/maplibre-gl.js 确实存在）', () => {
+    const plan = resolveHost('?glv=5.24.1&glfmt=umd');
+    expect(plan.format).toBe('umd');
+    expect(plan.scriptUrl).toBe('https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.1/dist/maplibre-gl.js');
   });
 
   it('?glsrc 以 .mjs 结尾时按 ESM 处理', () => {

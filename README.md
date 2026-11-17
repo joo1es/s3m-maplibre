@@ -132,7 +132,9 @@ npm install s3m-three three       # 只要渲染内核（任意 three 场景）
 ### 一行 script
 
 ```html
-<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5/dist/maplibre-gl.js"></script>
+<!-- maplibre-gl 只有 ≤5.x 发 UMD（dist/maplibre-gl.js）；6.x 起 dist 里只剩 maplibre-gl.mjs，
+     把版本改成 @6.18.0 这个地址会稳定 404。要 UMD 就钉 5.x，要最新版用下面的「原生 ESM」。 -->
+<script src="https://cdn.jsdelivr.net/npm/maplibre-gl@5.24.1/dist/maplibre-gl.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/s3m-maplibre@0.4.2/dist/browser/s3m-maplibre.iife.js"></script>
 <script>
   const layer = new S3MMapLibre.S3MLayer({ configUrl: './data/CBD/cbd.scp' });

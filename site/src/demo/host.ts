@@ -15,7 +15,8 @@
  *   ?gl=maplibre&glv=6.18.0     指定版本 → 走 CDN（内置副本只有 devDependencies 里那一版）
  *   ?gl=mapbox&glv=2.15.0       老版本兼容性对照
  *   ?glcdn=unpkg | npmmirror    CDN 供应商（默认 jsdelivr；国内可换 npmmirror）
- *   ?glsrc=<url> ?glcss=<url>   自托管：直接给脚本 / 样式地址，覆盖上面的推导
+ *                              取不到时按 cdnFallbackOrder 自动换下一条镜像（版本不变）
+ *   ?glsrc=<url> ?glcss=<url>   自托管：直接给脚本 / 样式地址，覆盖上面的推导（不换镜像）
  *   ?mapboxToken=pk.xxx         Mapbox 的 accessToken（只用自家瓦片时可以不给）
  *
  * 页面机位另有 `?zoom= / ?pitch= / ?bearing= / ?lng= / ?lat=`（见 `site/src/host/main.ts`）：
@@ -103,6 +104,13 @@ export interface HostPlan {
   scriptUrl: string;
   /** 配套 CSS 地址；内置包时为空串（用打包进来的那一份） */
   styleUrl: string;
+  /**
+   * 脚本地址是用户手写的 `?glsrc=`（true）还是按 CDN 规则推出来的（false）。
+   *
+   * 只影响失败后的兜底：手写的地址是「我就要这个文件」，取不到就该报错，
+   * 不能悄悄换成另一个 CDN 上的同版本 —— 那意味着用户的自托管构建被替换掉了。
+   */
+  selfHosted: boolean;
   token: string | null;
   /** 参数写错时的降级说明，只用于往界面上贴一行提示，不参与加载决策 */
   warnings: string[];
@@ -156,6 +164,24 @@ function searchParams(search: string): URLSearchParams {
 
 function at(version: string | null): string {
   return version ? `@${version}` : '';
+}
+
+/**
+ * 主 CDN 取不到时的兜底顺序：用户选的那个永远排第一，后面按固定顺序补齐。
+ *
+ * 为什么需要兜底：`cdn.jsdelivr.net` 在国内时通时不通，而这个页面的意义正是「指定版本就能看到」。
+ * 挂在同一个版本号上，换一家镜像拿到的还是同一份产物，不会改变对照结论；
+ * 顺序写死而不是按延迟探测，是为了让失败路径**可预期**（同样的网络下永远走到同一家）。
+ *
+ * 注意：这里只管「按 CDN 规则推出来的地址」。用户手写 `?glsrc=` 时不许兜底 ——
+ * 那等于把他自托管的构建悄悄换掉，见 `HostPlan.selfHosted`。
+ */
+export function cdnFallbackOrder(cdn: HostCdn): HostCdn[] {
+  const order: HostCdn[] = [cdn];
+  for (const candidate of ['jsdelivr', 'unpkg', 'npmmirror'] as const) {
+    if (!order.includes(candidate)) order.push(candidate);
+  }
+  return order;
 }
 
 /**
@@ -292,6 +318,16 @@ export function resolveHost(search: string): HostPlan {
   if (rawFormat === 'esm' || rawFormat === 'umd') format = rawFormat;
   else if (rawFormat) warnings.push(`未知产物格式「${rawFormat}」，按引擎与版本推断`);
 
+  // MapLibre v6 起不再发 UMD：dist 里根本没有 `maplibre-gl.js`，那个地址是稳定 404
+  // （v5 及以前才有）。`?glfmt=` 的本意是「自托管产物格式不明」，按 CDN 推导时它只能
+  // 推到一个不存在的文件，所以在解析阶段就纠正 —— 不让浏览器先去撞一次 404。
+  // 手写 `?glsrc=` 时不动：那是用户自己的产物，格式由他说了算。
+  const major = majorOf(cdnVersion);
+  if (!rawScript && format === 'umd' && engine === 'maplibre' && (major === null || major >= 6)) {
+    format = 'esm';
+    warnings.push('MapLibre v6 起不再发 UMD（dist 里没有 maplibre-gl.js），已改用 ESM');
+  }
+
   // MapLibre v6 起 dist 里没有 maplibre-gl.js。手写的地址多半还是 .js，
   // 与其让它 404 再兜，不如解析阶段就换成同一个构建的 .mjs。
   if (format === 'esm' && /\/maplibre-gl\.js(\?|$)/.test(rawScript)) {
@@ -312,6 +348,7 @@ export function resolveHost(search: string): HostPlan {
     format,
     scriptUrl,
     styleUrl,
+    selfHosted: Boolean(rawScript),
     token: text(params.get('mapboxToken')) || null,
     warnings,
   };

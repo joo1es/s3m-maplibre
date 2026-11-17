@@ -257,7 +257,8 @@ function showFailure(err: unknown): void {
   box.innerHTML = `
     <b>宿主引擎没加载起来</b>
     <p><code>${message}</code></p>
-    <p>指定版本走 CDN（jsdelivr / unpkg / npmmirror），断网或镜像不可达时会停在这一步。</p>
+    <p>指定版本走 CDN（jsdelivr / unpkg / npmmirror）。取不到会自动换下一条镜像，
+       三家都失败（断网 / 公司网络拦截）时才停在这一步。</p>
     <p><a href="./host.html">回到内置 MapLibre</a></p>
   `;
   console.error('[host] 加载失败', err);

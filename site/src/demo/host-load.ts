@@ -11,11 +11,18 @@
  *    照旧注入 `/dist/maplibre-gl.js` 会稳定 404 —— 这就是「切到 6.x 一片空白」的根因。
  *    另有一条兜底：`.js` 取不到时换成 `.mjs` 重试（重试要按**目标地址**的格式加载，
  *    把 .mjs 塞进 `<script>` 只会得到 `Cannot use 'import.meta' outside a module`）。
+ *
+ * 还有一层兜底是在 CDN 之间：`cdn.jsdelivr.net` 在国内时通时不通，取不到就按
+ * `cdnFallbackOrder` 换下一条镜像（版本号不变，拿到的还是同一份产物）。
+ * 手写 `?glsrc=` 不走这条：那是用户自托管的文件，换掉它等于换掉他的构建。
  */
 import bundledCssUrl from 'maplibre-gl/dist/maplibre-gl.css?url';
 import {
   HOST_ENGINES,
   PLACEHOLDER_MAPBOX_TOKEN,
+  cdnFallbackOrder,
+  cdnScriptUrl,
+  cdnStyleUrl,
   resolveHost,
   siblingFormatUrl,
   type HostCdn,
@@ -109,7 +116,11 @@ function loadScript(src: string, globalName: string): Promise<GlNamespace> {
       if (ns) resolve(ns as GlNamespace);
       else reject(new Error(`宿主脚本已加载，但没有挂上 window.${globalName}：${src}`));
     };
-    script.onerror = () => reject(new Error(`宿主脚本加载失败（网络/地址）：${src}`));
+    script.onerror = () => {
+      // 失败的标签留在 head 里没有意义，还会在 DevTools 里堆成一串红色 404；换镜像重试前先摘掉
+      script.remove();
+      reject(new Error(`宿主脚本加载失败（网络/地址）：${src}`));
+    };
     document.head.appendChild(script);
   });
 }
@@ -117,6 +128,81 @@ function loadScript(src: string, globalName: string): Promise<GlNamespace> {
 /** 跨域 ESM 走浏览器原生 import；`@vite-ignore` 是必须的，否则打包器会去解析这个外部地址 */
 async function importEsm(src: string): Promise<GlNamespace> {
   return (await import(/* @vite-ignore */ src)) as unknown as GlNamespace;
+}
+
+/** 按目标产物的格式取一次：ESM 只能 import，UMD 只能注入 `<script>` */
+async function loadArtifact(
+  format: HostFormat,
+  src: string,
+  globalName: string,
+): Promise<GlNamespace> {
+  return format === 'esm' ? await importEsm(src) : await loadScript(src, globalName);
+}
+
+/**
+ * 先按计划格式取，取不到就换同名产物再试一次。
+ *
+ * 只对 `maplibre-gl.js ↔ maplibre-gl.mjs` 这一对生效（见 `siblingFormatUrl`）：
+ * 手写的地址、或者「版本号没写到能判断大版本」的情况下，格式判断可能落空。
+ * 重试必须按**目标地址**的格式加载，把 .mjs 塞进 `<script>` 只会得到 import.meta 的语法错。
+ */
+async function loadWithSiblingRetry(
+  format: HostFormat,
+  src: string,
+  globalName: string,
+  warnings: string[],
+): Promise<GlNamespace> {
+  try {
+    return await loadArtifact(format, src, globalName);
+  } catch (err) {
+    const retry = siblingFormatUrl(src);
+    if (!retry) throw err;
+    const retryFormat: HostFormat = /\.mjs(\?|$)/.test(retry) ? 'esm' : 'umd';
+    warnings.push(
+      retryFormat === 'esm'
+        ? `UMD 产物不存在（MapLibre v6 起只发 .mjs），已改用 ESM 加载：${retry}`
+        : `ESM 产物取不到，改用 UMD 加载：${retry}`,
+    );
+    return await loadArtifact(retryFormat, retry, globalName);
+  }
+}
+
+interface CdnLoadResult {
+  ns: GlNamespace;
+  cdn: HostCdn;
+  scriptUrl: string;
+  styleUrl: string;
+}
+
+/**
+ * 按 CDN 兜底顺序取脚本：先用户选的那家，最后才报错。
+ *
+ * 每换一家都重新注入样式：脚本换到 unpkg 而样式还指着不可达的 jsdelivr，
+ * 画面会是「地图能跑、控件全裸」的样子，比直接失败更难查。
+ */
+async function loadFromCdn(
+  plan: HostPlan,
+  spec: (typeof HOST_ENGINES)[HostEngine],
+  warnings: string[],
+): Promise<CdnLoadResult> {
+  const order = cdnFallbackOrder(plan.cdn);
+  const failures: string[] = [];
+
+  for (const cdn of order) {
+    const styleUrl = cdnStyleUrl(plan.engine, plan.version, cdn);
+    const scriptUrl = cdnScriptUrl(plan.engine, plan.version, cdn, plan.format);
+    await injectStyle(styleUrl);
+    try {
+      const ns = await loadWithSiblingRetry(plan.format, scriptUrl, spec.global, warnings);
+      if (cdn !== plan.cdn) warnings.push(`${plan.cdn} 取不到，已改用 ${cdn}`);
+      return { ns, cdn, scriptUrl, styleUrl };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      failures.push(`${cdn}: ${message}`);
+    }
+  }
+
+  throw new Error(`宿主脚本在 ${order.length} 个 CDN 上都取不到 —— ${failures.join('；')}`);
 }
 
 /**
@@ -132,6 +218,8 @@ export async function loadHost(
   let ns: GlNamespace;
   let version: string | null = plan.version;
   let styleUrl = plan.styleUrl;
+  let scriptUrl = plan.scriptUrl;
+  let cdn = plan.cdn;
   const warnings = [...plan.warnings];
 
   if (plan.source === 'bundled') {
@@ -140,25 +228,17 @@ export async function loadHost(
     const mod = (await import('maplibre-gl')) as unknown as GlNamespace;
     ns = mod;
     version = readVersion(mod) ?? version;
-  } else {
+  } else if (plan.selfHosted) {
+    // 手写 `?glsrc=` 是「我就要这个文件」：取不到就报错，不替用户换镜像
     await injectStyle(plan.styleUrl);
-    try {
-      ns =
-        plan.format === 'esm'
-          ? await importEsm(plan.scriptUrl)
-          : await loadScript(plan.scriptUrl, spec.global);
-    } catch (err) {
-      const retry = siblingFormatUrl(plan.scriptUrl);
-      if (!retry) throw err;
-      // 重试要用**目标地址**的格式来加载：`.mjs` 只能 import，`.js` 只能注入脚本。
-      const retryEsm = /\.mjs(\?|$)/.test(retry);
-      warnings.push(
-        retryEsm
-          ? `UMD 产物不存在（MapLibre v6 起只发 .mjs），已改用 ESM 加载：${retry}`
-          : `ESM 产物取不到，改用 UMD：${retry}`,
-      );
-      ns = retryEsm ? await importEsm(retry) : await loadScript(retry, spec.global);
-    }
+    ns = await loadWithSiblingRetry(plan.format, plan.scriptUrl, spec.global, warnings);
+    version = plan.version ?? readVersion(ns);
+  } else {
+    const loaded = await loadFromCdn(plan, spec, warnings);
+    ns = loaded.ns;
+    cdn = loaded.cdn;
+    scriptUrl = loaded.scriptUrl;
+    styleUrl = loaded.styleUrl;
     version = plan.version ?? readVersion(ns);
   }
 
@@ -183,8 +263,8 @@ export async function loadHost(
     source: plan.source,
     format: plan.format,
     version,
-    cdn: plan.cdn,
-    scriptUrl: plan.scriptUrl,
+    cdn,
+    scriptUrl,
     styleUrl,
     warnings,
   };
