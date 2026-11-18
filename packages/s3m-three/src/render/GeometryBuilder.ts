@@ -347,6 +347,14 @@ export interface TileBuildStats {
 export interface BuildTileOptions {
   /** 全局共享 uniform；不传则本次构建自建一份（不推荐，样式将无法全局联动） */
   uniforms?: StyleUniforms;
+  /**
+   * 主线程切片器（见 `tileset/slicing.ts`）。传了就每构建若干图元 / 每张纹理前
+   * 问一次预算，超了 `await` 让出一轮事件循环。
+   *
+   * 为什么在这里切：一块大瓦片的几何组装 + 建纹理实测能占住主线程几百毫秒到 1.8 秒，
+   * 期间输入事件排不上队。切片不改总时长，只保证加载全程页面可交互。
+   */
+  slicer?: { breathe(): Promise<void> };
   textureCache?: Map<string, THREE.Texture>;
   /** 是否显示数据自带的棱线包 */
   edges?: boolean;
@@ -458,6 +466,8 @@ export async function buildTileObjects(
   };
 
   for (const [code, tex] of Object.entries(tile.textures ?? {})) {
+    // 建纹理是这条链上最贵的一步之一（解码 + 格式转换 + 尺寸检查）
+    await options.slicer?.breathe();
     // 同一个图集 id 会被很多瓦片共用：先到的那块可能只拿到内嵌缩略图（120x184），
     // 后面的块换成了高清版（240x304）。只按 id 判「缓存已有」会让高清永远进不来，
     // 满屏都是马赛克。所以尺寸变大时必须重解码并覆盖。
@@ -698,7 +708,10 @@ export async function buildTileObjects(
     return geometry;
   };
 
+  let _primIndex = 0;
   for (const prim of assembled.primitives) {
+    // 每 8 个图元问一次预算：解交错 + 合批是同步重活，切在这里能把一次长冻结摊开
+    if ((_primIndex++ & 7) === 0) await options.slicer?.breathe();
     const geometry = packPrimitive(prim);
     const geoRef = tile.geoPackage[prim.geoNames[0]] ?? null;
     const vp = geoRef?.vertexPackage;

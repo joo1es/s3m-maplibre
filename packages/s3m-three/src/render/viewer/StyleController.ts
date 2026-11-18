@@ -589,8 +589,10 @@ export class StyleController {
    * 「翻变体 → 编译 → 翻回来」的那套流程与 `_prewarming` 跳帧。这里只把当前
    * 唯一的 program 编一次（优先 `compileAsync`，KHR_parallel_shader_compile）。
    */
-  async prewarmShading(): Promise<void> {
-    if (this.host.shadingPrewarmed() || this.host.prewarming()) return;
+  async prewarmShading(force = false): Promise<void> {
+    // force = 变体预热：调用方自己负责「别把翻转过程画出来」（比如临时置 prewarming），
+    // 所以这里必须放行，否则变体预热会被自己的标志挡住 —— 一个 program 都编不出来。
+    if (!force && (this.host.shadingPrewarmed() || this.host.prewarming())) return;
     const r = this.host.renderer();
     const scene = this.host.scene();
     const camera = this.host.camera();

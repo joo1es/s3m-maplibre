@@ -99,6 +99,15 @@ export class TilePlacement {
       p.position[2] - kUp * p.pivot[2],
     );
     group.matrixWorldNeedsUpdate = true;
+    // ★ 这里曾经把整棵子树冻结（matrixWorldAutoUpdate = false）来省每帧的矩阵乘法，
+    //   代价是**位置会错**：冻结之后 `entry.root.position` 再变（layoutDataset /
+    //   recomputeAnchors / 锚点随镜头重算），three 会整棵跳过这个 group，
+    //   瓦片就停在旧的世界坐标上。实测表现为「建筑物整体错位」。
+    //
+    //   要冻也只能冻「确定不会再动的叶子」，而且必须在 root 的变换定下来之后，
+    //   并且 root 每次移动都要能整棵解冻重算 —— 这个不变式目前没有入口维护，
+    //   所以默认路径保持 three 的原生行为，不做冻结。
+    group.matrixWorldAutoUpdate = true;
     // 重锚点后要能重算：中心只属于注册那一刻，存到 group 上，不依赖 tileset 内部结构
     (group.userData as { tileCenter?: { x: number; y: number; z: number } }).tileCenter = {
       x: center.x,

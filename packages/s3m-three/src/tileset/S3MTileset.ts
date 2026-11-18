@@ -17,6 +17,7 @@ import { TileBudget, estimateObjectGeometryBytes } from './TileBudget.js';
 import { TileVisibility, normalizeRenderOrder } from './TileVisibility.js';
 import type { TileVisibilityOptions } from './TileVisibility.js';
 import { TileSource } from './TileSource.js';
+import { LoadSlicer } from './slicing.js';
 import { AUTO_BAKE_RADIUS_THRESHOLD } from '../core/BakeMercator.js';
 import type { TextureCreateOptions } from '../render/TextureFactory.js';
 import type { Group, Texture } from 'three';
@@ -100,6 +101,12 @@ export class S3MTileset {
   readonly failed = new Set<string>();
   readonly textureCache = new Map<string, Texture>();
   maxImageCache: number;
+  /** 加载期主线程切片器：每片超预算就让出一轮事件循环，保证加载时页面可交互 */
+  private readonly _slicer: LoadSlicer;
+  /** 交互期暂缓提交的瓦片（已建好、还没进场景），见 setCommitGate */
+  private readonly _heldCommits: TileNode[] = [];
+  /** 提交闸门：返回 true 表示「现在别提交」，由宿主按手势状态驱动 */
+  private _commitGate: (() => boolean) | null = null;
   readonly pending = new Set<string>();
   /** 是否请求 `.texblock` 子图集，默认关，见 S3MTilesetOptions.atlasLod */
   atlasLod: boolean;
@@ -267,6 +274,8 @@ export class S3MTileset {
       ? (options.maxMemory as number)
       : Infinity;
     this.maxImageCache = options.maxImageCache ?? 128;
+    // 加载期切片：默认 8ms 一个预算片，0 = 关闭（整块瓦片一口气做完）
+    this._slicer = new LoadSlicer(options.loadSliceBudgetMs ?? 8);
     // 硬上限 = 软上限 + 余量。淘汰只在「新瓦片已经落地并接管显示」之后做（make-before-break），
     // 所以中间态允许临时超出 maxTiles；硬上限只用来挡住失控的请求量，不用于挤掉正在显示的内容。
     this.hardCap = this.maxTiles + Math.max(8, Math.ceil(this.maxTiles * 0.5));
@@ -598,6 +607,69 @@ export class S3MTileset {
     return this._queue.length + this.pending.size + retrying;
   }
 
+  /**
+   * 运行时改加载期主线程切片预算（毫秒，0 = 关闭切片）。
+   *
+   * 典型用法是相机运动时调小、停下时调回：运动期间每帧 16ms 里要留时间给动画与输入，
+   * 加载只配拿一小片。**不要用 0 当「暂停」**——那会让积压的请求在停下的一刻一次性放闸。
+   */
+  setLoadSliceBudget(ms: number): void {
+    this._slicer.setBudget(ms);
+  }
+
+  /**
+   * 设置「提交闸门」：返回 true 时，已建好的瓦片先排队、不进场景。
+   *
+   * 建几何本身有时间切片，但**进场景**这一步没法切：纹理上传、
+   * program 首次编译、棱线生成全是同步调用，落进哪一帧哪一帧就掉。
+   * 宿主在拖拽 / 缩放这类手势期间把闸门关上，手势结束后用
+   * `flushHeldCommits(n)` 每帧放几块，卡顿就从「一次几百毫秒」摊成
+   * 「每帧几毫秒」。传 null = 恢复默认的「到场即提交」。
+   */
+  setCommitGate(fn: (() => boolean) | null): void {
+    this._commitGate = fn;
+    // 闸门一旦放开，排队的瓦片不该无限期压着 —— 立刻放一批，剩下的交给逐帧 flush
+    if (!fn || fn() === false) this.flushHeldCommits();
+  }
+
+  /** 排队等提交的瓦片数（诊断用） */
+  get heldCommits(): number {
+    return this._heldCommits.length;
+  }
+
+  /**
+   * 放闸：一次最多提交 `max` 块，返回本次提交数量。
+   *
+   * 上限由调用方给（S3MViewer 每帧跨数据集共享 4 块的预算）。每块的提交成本
+   * 主要是纹理上传与 program 首次编译，摊开之后单帧增量可控。
+   */
+  flushHeldCommits(max = 8): number {
+    let n = 0;
+    while (n < max && this._heldCommits.length) {
+      const node = this._heldCommits.shift()!;
+      // 排队期间被预算淘汰 / 被同 URL 的新节点替换掉的，直接丢弃：
+      // 提交一个已经不在 nodes 里的节点会把整块瓦片重新挂回场景
+      if (this.nodes.get(node.url) !== node) continue;
+      node.committed = true;
+      this._onTile(node);
+      n++;
+    }
+    return n;
+  }
+
+  /** 建好之后该立刻进场景，还是先排队（交互期） */
+  private _commitOrHold(node: TileNode): void {
+    if (this._commitGate?.() === true) {
+      // 排队期间不能算「已就绪」：LOD 调度看到它会隐藏父瓦片，
+      // 而它自己还没进场景 —— 画面就会先消失再出现（make-before-break 被打破）
+      node.committed = false;
+      this._heldCommits.push(node);
+      return;
+    }
+    node.committed = true;
+    this._onTile(node);
+  }
+
   private _pump(): void {
     while (this._active < this.maxConcurrent && this._queue.length) {
       const url = this._queue.shift()!;
@@ -647,6 +719,9 @@ export class S3MTileset {
     if (this.nodes.has(url) || this.pending.has(url) || this.failed.has(url)) return;
     this.pending.add(url);
     this.stats.loading++;
+    // 队列里连着的几块瓦片不要拼成一大段同步工作：上一块已经把预算用完就让一次。
+    // 放在 pending 记账之后 —— 否则「刚入队还给不出在途状态」会被统计和单测看到成 0。
+    await this._slicer.breathe();
 
     try {
       // 取源与解析全在 tileset/TileSource.ts：`#N` 组引用、块缓存、Worker 降级都在那里
@@ -654,6 +729,8 @@ export class S3MTileset {
       if (isBlock) {
         // 子瓦片的图集像素在独立 .texblock 里，必须先补齐，否则整块无贴图
         await this._fillExternalAtlases(tile, baseUrl);
+        // 块图集解码 + 拼装是主线程最大的单笔开销（实测整场 2.7s），让一次再继续
+        await this._slicer.breathe();
         await this._atlas.upgradeAtlasLod(tile, baseUrl);
       }
 
@@ -665,10 +742,14 @@ export class S3MTileset {
         this.rootRadius = lodForBake.boundingSphere.radius;
       }
       const shouldBake = this.shouldBakeMercator(lodForBake?.boundingSphere?.radius);
+      // build 里要做几何解交错、合批、建纹理（实测整场 2.75s），进去之前先让一次
+      await this._slicer.breathe();
       const build = await this._source.builder();
       const buildRes = await build(tile, {
         textureCache: this.textureCache,
         uniforms: this._uniforms,
+        // 几何组装与建纹理内部也按预算让出，避免一块大瓦片独占主线程
+        slicer: this._slicer,
         assembled,
         polygonOffset: this._polygonOffset,
         materialQuality: this._materialQuality,
@@ -732,7 +813,7 @@ export class S3MTileset {
       this.stats.vertices += stats.vertices ?? 0;
       this.stats.triangles += stats.triangles ?? 0;
 
-      this._onTile(node);
+      this._commitOrHold(node);
     } catch (e) {
       // 格式层面的永久错误（例如 S3M 1.x 容器）重试一万次也不会变好，
       // 直接判失败，免得反复重下一整块瓦片还拖慢首屏

@@ -35,6 +35,13 @@ const PUBLIC_METHODS = [
   'moveFeatureBy', 'pick', 'pickPosition', 'pointToLngLat', 'prewarmShading', 'recomputeAnchors',
   // presenter 是 0.5 新增的「使用者接管上屏」入口，不是拆分产物 —— 快照跟着改是预期内的
   'presenter',
+  // calmWhileInteracting 是 0.4.x 新增的「手势期间静默」开关（暂停细化 + 跳过淡入），
+  // 同样不是拆分产物；快照跟着改是预期内的
+  'calmWhileInteracting', 'interacting', 'setCalmWhileInteracting', 'setInteracting',
+  // prewarmStyleVariants：把「以后要用的着色模式」在遮罩期间预编译（不是拆分产物）
+  'prewarmStyleVariants',
+  // setCameraMoving：相机运动时把加载切片预算压小（不是拆分产物）
+  'setCameraMoving',
   'registerGPUPath', 'removeDataset', 'removeFeatureStyle', 'renderFrame', 'resolveDepthMode', 'restoreContext',
   'rotateFeature', 'rotateFeatureBy', 'sceneAnchor', 'select',   'setAnisotropyCap', 'setAttributeSource', 'setColorPipeline', 'setCullRefine', 'setDatasetAlign', 'setDatasetHeight', 'setDatasetVisible', 'setDatasetRenderOrder', 'setDepthMode', 'setEdges',
   'setClipping', 'setEnvironment', 'setExcavationBounds', 'setFeatureStyle', 'setFeaturesStyle', 'setFilter',

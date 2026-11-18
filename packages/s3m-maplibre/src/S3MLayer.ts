@@ -68,7 +68,7 @@ import {
   extractNearFar,
   extractProjectionMatrix,
 } from 's3m-three';
-import type { ProjectionMode, GeoAdapter } from 's3m-three';
+import type { ProjectionMode, GeoAdapter, StyleMode } from 's3m-three';
 import {
   DEFAULT_FOV,
   createMapLibreGeoAdapter,
@@ -205,6 +205,65 @@ export class S3MLayer extends HostRenderer {
   /** 地图事件监听器是否已挂载，避免上下文恢复重加图层时重复绑定 */
   private _listenersAttached = false;
 
+  /**
+   * 手势状态：**只看原始输入，用时间窗，不做事件配对**。
+   *
+   * 判据：`interacting = 最近 260ms 内有过 wheel / 按下 / 按着移动 / 触摸`。
+   * 程序相机（easeTo / flyTo）永远不产生这些 DOM 输入，所以镜头巡游不会被误判。
+   *
+   * `cameraMoving` 另外看 `map.isMoving()`：程序飞行期间它为真，
+   * 加载照样按「相机在动」的低预算走。
+   */
+  /** 最近一次原始输入的时间戳（毫秒） */
+  private _lastUserInputAt = -Infinity;
+  /** 「交互中」窗口截止时间：最后一次原始输入 + 260ms */
+  private _gestureUntil = 0;
+  private _gestureTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * 打点：**只有真正的输入才算**。
+   *
+   * 踩过的三个坑，决定了实现方式：
+   *   ① MapLibre 的 zoomstart 在滚轮缩放时不带 originalEvent；
+   *   ② 触摸打断程序相机时，movestart 与 moveend 同一毫秒成对出现（顺序还是反的）；
+   *   ③ 拖拽过程中的 move 事件也不带 originalEvent，长拖拽过半之后「近期输入」会过期。
+   * 三条加起来说明：**不能靠地图事件的配对或字段来判断手势**，只能看 DOM 输入本身。
+   */
+  private _bumpInput(): void {
+    const now = performance.now();
+    this._lastUserInputAt = now;
+    this._gestureUntil = now + 260;
+    this.viewer.setInteracting(true);
+    this.viewer.setCameraMoving(true);
+    this._releaseWhenIdle();
+  }
+
+  private readonly _onUserInput = (): void => { this._bumpInput(); };
+
+  /** 指针移动只在「按着」时算输入：单纯鼠标划过画布不能把瓦片闸门关掉 */
+  private readonly _onPointerMove = (e: PointerEvent): void => {
+    if (e.pointerType === 'touch' || e.buttons !== 0) this._bumpInput();
+  };
+
+  /** 相机事件：只用来驱动 cameraMoving（程序飞行也要降预算），不再参与 interacting 判定 */
+  private readonly _onCameraActivity = (): void => { this._releaseWhenIdle(); };
+
+  /** 轮询式收尾：没有新输入、且宿主相机也不在动时才清状态 */
+  private _releaseWhenIdle(): void {
+    if (this._gestureTimer !== null) return;
+    const tick = (): void => {
+      const now = performance.now();
+      const hostMap = this.map as unknown as { isMoving?: () => boolean } | null;
+      const moving = typeof hostMap?.isMoving === 'function' ? hostMap.isMoving() : false;
+      const active = now < this._gestureUntil;
+      this.viewer.setInteracting(active);
+      this.viewer.setCameraMoving(active || moving);
+      if (!active && !moving) { this._gestureTimer = null; return; }
+      this._gestureTimer = setTimeout(tick, 120);
+    };
+    this._gestureTimer = setTimeout(tick, 120);
+  }
+
   private readonly _onContextLost = (): void => {
     this._contextLost = true;
   };
@@ -333,6 +392,31 @@ export class S3MLayer extends HostRenderer {
         map.on('projectiontransition', this._onProjectionChange);
         map.on('webglcontextlost', this._onContextLost);
         map.on('webglcontextrestored', this._onContextRestored);
+        // 所有相机事件都喂给同一个观察者：它的判断依据是「时间窗 + 近期原始输入」，
+        // 不依赖事件的先后顺序（MapLibre 在打断程序相机时会先 movestart 再 moveend）。
+        // 移动/缩放过程中持续触发的 move / zoom 用来续窗，避免长拖拽中途窗口过期。
+        for (const ev of [
+          'movestart', 'move', 'moveend',
+          'zoomstart', 'zoom', 'zoomend',
+          'rotatestart', 'rotate', 'rotateend',
+          'pitchstart', 'pitch', 'pitchend',
+        ]) {
+          map.on(ev, this._onCameraActivity);
+        }
+      }
+      // 原始输入打点：滚轮 / 指针按下 / 触摸。只用来判断「这次 zoomstart 是不是用户干的」，
+      // 不参与任何逻辑分支；passive 保证不拖慢滚动。
+      const container = (map as unknown as { getCanvasContainer?: () => HTMLElement })
+        .getCanvasContainer?.();
+      if (container && typeof container.addEventListener === 'function') {
+        container.addEventListener('wheel', this._onUserInput, { passive: true });
+        container.addEventListener('pointerdown', this._onUserInput, { passive: true });
+        // 按着移动才算：拖拽期间浏览器会持续发 pointermove / touchmove，
+        // 这是唯一可靠知道「手指还在屏幕上」的信号（地图事件不可靠，见上面的注释）
+        container.addEventListener('pointermove', this._onPointerMove as EventListener, { passive: true });
+        container.addEventListener('touchstart', this._onUserInput, { passive: true });
+        container.addEventListener('touchmove', this._onUserInput, { passive: true });
+        container.addEventListener('keydown', this._onUserInput);
       }
       this._listenersAttached = true;
     }
@@ -344,6 +428,24 @@ export class S3MLayer extends HostRenderer {
       this.map.off('projectiontransition', this._onProjectionChange);
       this.map.off('webglcontextlost', this._onContextLost);
       this.map.off('webglcontextrestored', this._onContextRestored);
+      for (const ev of [
+        'movestart', 'move', 'moveend',
+        'zoomstart', 'zoom', 'zoomend',
+        'rotatestart', 'rotate', 'rotateend',
+        'pitchstart', 'pitch', 'pitchend',
+      ]) {
+        this.map.off(ev, this._onCameraActivity);
+      }
+    }
+    const container = (this.map as unknown as { getCanvasContainer?: () => HTMLElement } | null)
+      ?.getCanvasContainer?.();
+    if (container && typeof container.removeEventListener === 'function') {
+      container.removeEventListener('wheel', this._onUserInput);
+      container.removeEventListener('pointerdown', this._onUserInput);
+      container.removeEventListener('pointermove', this._onPointerMove as EventListener);
+      container.removeEventListener('touchstart', this._onUserInput);
+      container.removeEventListener('touchmove', this._onUserInput);
+      container.removeEventListener('keydown', this._onUserInput);
     }
     this._listenersAttached = false;
     this._contextLost = false;
@@ -935,6 +1037,19 @@ export class S3MLayer extends HostRenderer {
    */
   prewarmShading(): Promise<void> {
     return this.viewer.prewarmShading();
+  }
+
+  /**
+   * 预热指定着色模式的着色器变体（`prewarmStyleVariants` 的图层版）。
+   *
+   * `prewarmShading()` 只编译**当前场景已有材质**；切着色模式（白膜 / 按高度 /
+   * 动态扫描…）在着色器里是不同的 define —— 不同的 program，首次用到会现编，
+   * 单个 100~300ms。演出 / 模式切换多的话，趁加载遮罩还挂着先热一遍。
+   *
+   * 切模式会重建全场材质，**只在不显示首帧的时机调**（否则会看到翻转过程）。
+   */
+  prewarmStyleVariants(modes?: StyleMode[]): Promise<void> {
+    return this.viewer.prewarmStyleVariants(modes);
   }
 
   /** 挂载预制棱线缓存（source-creases.f32 这类 Float32 段缓冲），比逐网格现算快得多 */

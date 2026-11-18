@@ -98,6 +98,29 @@ export interface TileVisibilityOptions {
    * 所以瓦片的绘制可见性必须由这里按宿主 MVP 判定。
    */
   visibleCull?: boolean;
+  /**
+   * 冻结「为新瓦片入队」。默认 `false`——不传时行为与改动前逐字一致。
+   *
+   * 宿主手势进行中（拖拽 / 缩放 / 旋转）时打开：本帧照常算 `needRefine`、照常
+   * 决定可见性，只是**不把新的子瓦排进加载队列**。松手后的下一帧自动补上，
+   * 不需要任何额外通知。
+   *
+   * 为什么值得单列一个开关：拖拽时视野每帧都变，触发的请求最多，而这些请求的
+   * 解析、建几何、传纹理全在主线程上，正好和宿主的拖拽渲染抢同一个线程 ——
+   * 越拖越卡是必然的。冻结之后拖拽只剩渲染，松手再细化，观感差别很明显。
+   *
+   * 代价：松手后需要等一个 LOD 周期才补到当前精度。属于取舍，不是 bug，
+   * 所以默认关闭（AGENTS.md 不变式①）。
+   */
+  pauseRefine?: boolean;
+  /**
+   * 单帧最多新建多少个请求。默认 `Infinity`（不限制，旧行为）。
+   *
+   * 治的是「一停就狂加载」：镜头停住的瞬间 `needRefine` 会同时为几十上百块瓦片成立，
+   * 一帧之内全排进队列，接下来几秒主线程全是解析 / 建几何 / 传纹理 —— 体感就是
+   * 「刚停下来反而更卡」。按帧限量之后峰值被摊平，代价是补细节慢一点。
+   */
+  maxEnqueuePerFrame?: number;
 }
 
 export class TileVisibility {
@@ -145,6 +168,12 @@ export class TileVisibility {
     this._visibleCull = options?.visibleCull === true;
     // 旧口径：传了回调就参与细化判定；显式给了 refineCull 才以它为准
     const refineCull = options?.refineCull ?? isVisible !== undefined;
+    // 手势期间冻结新请求：只挡入队，不动 needRefine / 可见性 / 淘汰
+    const pauseRefine = options?.pauseRefine === true;
+    // 单帧入队上限：给「镜头停住时几十块瓦片同时达标」封顶
+    const enqueueCap = options?.maxEnqueuePerFrame;
+    const maxEnqueue = typeof enqueueCap === 'number' && Number.isFinite(enqueueCap) ? Math.max(0, enqueueCap) : Infinity;
+    let enqueuedThisFrame = 0;
 
     for (const node of this.host.nodes.values()) {
       if (!node.sphere) {
@@ -239,12 +268,15 @@ export class TileVisibility {
         }
       }
 
-      if (needRefine) {
+      if (needRefine && !pauseRefine) {
         for (let i = 0; i < childUrls.length; i++) {
+          // 单帧配额用完就收手：剩下的留到下一帧，别一次把队列灌满
+          if (enqueuedThisFrame >= maxEnqueue) break;
           const childUrl = childUrls[i]!;
           if (!this.host.failed.has(childUrl) && !this.host.nodes.has(childUrl) && !this.host.pending.has(childUrl)) {
             this.host.enqueue(childUrl, node.url);
             hasChanges = true;
+            enqueuedThisFrame++;
           }
         }
       }
@@ -326,7 +358,7 @@ export class TileVisibility {
         let covered = false;
         for (let i = 0; i < childUrls.length; i++) {
           const c = this.host.nodes.get(childUrls[i]!);
-          if (c && c !== node && c.group.visible) {
+          if (c && c !== node && c.committed !== false && c.group.visible) {
             covered = true;
             break;
           }
@@ -391,7 +423,8 @@ export class TileVisibility {
       let allResolved = true;
       for (let i = 0; i < childUrls.length; i++) {
         const cUrl = childUrls[i]!;
-        if (this.host.nodes.has(cUrl)) {
+        // 必须是「已经进场景」的子节点才算接替（见 _displayable）
+        if (this._displayable(cUrl)) {
           hasReady = true;
         } else if (!this.host.failed.has(cUrl)) {
           allResolved = false;
@@ -498,6 +531,18 @@ export class TileVisibility {
     return changed;
   }
 
+  /**
+   * 只有「已经进场景」的节点才能接替父瓦片显示。
+   *
+   * 交互 / 相机运动期间新瓦片会先排队（`S3MTileset.setCommitGate`）：它已经在
+   * `nodes` 里（调度器不该重复请求），但 group 还没 add 进场景。如果把它当成
+   * 就绪，父瓦片会被隐藏、子瓦片又画不出来 —— 画面出现「先消失再出现」的空洞。
+   */
+  private _displayable(url: string): boolean {
+    const n = this.host.nodes.get(url);
+    return !!n && n.committed !== false;
+  }
+
   updateIncremental(roots: Iterable<string> = this._roots, visited: Set<string> = this._visited): boolean {
     this._nextPrimary.clear();
     this._nextFallback.clear();
@@ -529,7 +574,7 @@ export class TileVisibility {
       let hasMissing = false;
       for (let i = 0; i < childUrls.length; i++) {
         const cUrl = childUrls[i]!;
-        if (this.host.nodes.has(cUrl)) {
+        if (this._displayable(cUrl)) {
           hasReady = true;
         } else if (!this.host.failed.has(cUrl)) {
           hasMissing = true;
@@ -542,7 +587,7 @@ export class TileVisibility {
         }
         for (let i = 0; i < childUrls.length; i++) {
           const cUrl = childUrls[i]!;
-          if (this.host.nodes.has(cUrl)) {
+          if (this._displayable(cUrl)) {
             traverse(cUrl, depth + 1);
           }
         }
