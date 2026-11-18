@@ -86,7 +86,12 @@ export class Show {
     this.hud.setPlaying(false);
   }
 
-  togglePlay() { this.playing ? this.pause() : this.play(); }
+  togglePlay() {
+    // 自由视角下点「播放」应该是「退出自由视角、继续巡游」。
+    // 否则 playing 被置 true 但 free 仍然挡着 _frame，按下去毫无反应。
+    if (this.free) { this.setFree(false); return; }
+    this.playing ? this.pause() : this.play();
+  }
 
   setLoop(on) { this.loop = on; this.hud.setLoop(on); }
 
@@ -118,11 +123,16 @@ export class Show {
   seek(index) {
     if (index < 0 || index >= ACTS.length) return;
     this.map.stop();
-    this._resetVisuals();
+    // 切幕**不要**把镜头拉回起点：那会先闪一下远景，再从那里慢慢飞到目标幕，
+    // 看起来像「点了跳幕却回到了开场」。保留当前视角、直接过渡到目标机位。
+    this._resetVisuals({ resetCamera: false });
     this.elapsed = ACTS.slice(0, index).reduce((s, a) => s + a.duration, 0);
     this.actIndex = index;
     this._entered = -1;
     this._enterAct(index, 0);
+    // _enterAct 用的是「整幕 70%」的时长（6~7 秒），跳幕时太慢了；
+    // 覆盖成一次短过渡，用户立刻能看出「到了下一幕」。
+    this._cameraTo(ACTS[index].id, 1200);
     this.hud.setAct(index);
     this.hud.setProgress(this.elapsed / TOTAL_DURATION, index, 0);
     if (!this.playing) {
@@ -174,7 +184,13 @@ export class Show {
 
   /* ------------------------------------------------------------ 视觉复位 */
 
-  _resetVisuals() {
+  /**
+   * 视觉复位：清特效、关棱线、回原色贴图。
+   *
+   * `resetCamera` 只在「开场 / 重播」时为真。跳幕要保留当前视角，否则会先
+   * jumpTo 回起点再飞过去 —— 用户看到的是「点了下一幕，镜头却回到了开场慢慢飞」。
+   */
+  _resetVisuals({ resetCamera = true } = {}) {
     this.fx.clearAll();
     this.layer.setEdges(false);
     this.layer.clearFilter();
@@ -187,7 +203,7 @@ export class Show {
       edgeOpacity: 0,
       opacity: 1,
     });
-    this.map.jumpTo(CAMERA.start);
+    if (resetCamera) this.map.jumpTo(CAMERA.start);
   }
 
   /**
@@ -233,18 +249,23 @@ export class Show {
     const a = ACTS[index];
     this.hud.setAct(index);
     this._applyPersistentState(index);
-    this._cameraTo(a.id, a.duration * 0.94);
+    // 镜头只占用整幕的 70%：剩下 30% 是**故意留的停住期**。
+    // 以前是 0.94，镜头几乎整幕都在动 —— 而相机一动瓦片就该降速加载（见 movingSliceBudgetMs），
+    // 于是整场演出都没有真正「安顿下来」的窗口，一停就狂补。留出尾巴之后，
+    // 每幕最后两三秒镜头静止、加载恢复到满预算，下一幕开场时瓦片已经是齐的。
+    this._cameraTo(a.id, a.duration * 0.7);
 
     switch (a.id) {
       case 'awaken': {
-        // 俯冲拖影：afterimage 几乎零成本，静止时残影会自己收敛，不会糊住画面
-        this.layer.setMotionBlur({ mode: 'afterimage', damp: 'auto' });
+        // 动态模糊整场关闭（原本在这里开 velocity）。相机连续飞行时它只会让画面发糊，
+        // 而不是让运动更清晰 —— 这是「秀肌肉」的典型：画面里多一层全屏 pass，
+        // 观众看到的是「糊」，不是「快」。要开的话 `layer.setMotionBlur(...)` 随时可加回来。
         // 首屏要的是「真实城市」，不是白模：原色 + 轻微自发光，只让贴图通透一点
         this.layer.setStyle({
           mode: STYLE.TEXTURE,
           texMix: 0,
           ambientGain: 0.08,
-          fadeIn: 900,
+          fadeIn: 0,
         }, COLOR_TWEEN);
         // 整层从全透明渐现，交给内核 animator 补间，不自己逐帧写 uniform
         this.layer.setOpacity(0);

@@ -21,8 +21,13 @@ export default defineConfig({
     port: 5174,
     strictPort: false,
     fs: { allow: [ROOT] },
-    // _tmp 里是十几万条抓取缓存，watcher 扫进去会白烧一遍 CPU
-    watch: { ignored: ['**/_tmp/**', '**/node_modules/**', '**/dist/**'] },
+    // _tmp 里是十几万条抓取缓存，watcher 扫进去会白烧一遍 CPU。
+    //
+    // ★ 这里**不能**再忽略 dist 目录：demo 加载的是 packages/<pkg>/dist（线上也是
+    //   这条路径），忽略之后 `node smart-city/dev.mjs --watch` 重建完 dist，vite 不会
+    //   失效模块图，浏览器继续跑旧代码 —— 改完内核却看不到变化，很容易误判成
+    //   「改动没生效」而回去改代码。宁可让 watcher 多扫两个 dist 目录。
+    watch: { ignored: ['**/_tmp/**', '**/node_modules/**'] },
   },
   resolve: { dedupe: ['three'] },
   build: { target: 'es2022', outDir: 'dist' },

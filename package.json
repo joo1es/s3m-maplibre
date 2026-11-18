@@ -14,6 +14,7 @@
     "build:docs": "node site/scripts/build-docs.mjs",
     "build:demo": "node site/scripts/build-demo.mjs",
     "dev": "node site/scripts/dev.mjs",
+    "dev:city": "node smart-city/dev.mjs --watch",
     "serve": "node tools/serve.mjs",
     "demo": "bun run build && node tools/serve.mjs",
     "clean": "bun run --cwd packages/s3m-three clean && bun run --cwd packages/s3m-maplibre clean",
