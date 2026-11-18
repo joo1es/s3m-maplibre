@@ -12,6 +12,7 @@ import type { ParsedTile, S3MTexture } from '../core/types.js';
 import type { DecodedTextureData } from '../core/TextureDecode.js';
 import type { TileGeometryData } from '../core/TileGeometry.js';
 import type { S3MBlockGroupSet } from '../core/S3MBlockParser.js';
+import type { AtlasDecodeItem, AtlasDecodeResult } from '../core/atlasDecodeCache.js';
 
 /** Worker 崩溃 / 不可用 —— 与「瓦片数据本身有问题」区分开，调用方据此决定降级还是重试 */
 export class WorkerDeadError extends Error {
@@ -86,6 +87,8 @@ export class S3MWorkerClient {
         waiter.resolve({ tile: msg.tile, geometry: msg.geometry });
       } else if ('set' in msg) {
         waiter.resolve(msg.set);
+      } else if ('images' in msg) {
+        waiter.resolve(msg.images);
       } else {
         waiter.resolve(msg.data);
       }
@@ -139,6 +142,21 @@ export class S3MWorkerClient {
     });
   }
 
+  /**
+   * 批量解块图集（DXT 族）。返回顺序与入参一致，`null` = 这条不需要解。
+   *
+   * 请求里的 `data` 走 structured clone（主线程保留原缓冲，Worker 崩溃后还能主线程兜底）；
+   * 响应里的 RGBA 是新分配的缓冲，Worker 会 zero-copy transfer 回来。
+   */
+  decodeAtlases(items: AtlasDecodeItem[]): Promise<Array<AtlasDecodeResult | null>> {
+    if (this.dead) return Promise.reject(new WorkerDeadError('s3m 解析 Worker 已终止'));
+    const id = ++this._seq;
+    return new Promise<Array<AtlasDecodeResult | null>>((resolve, reject) => {
+      this._pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      this._worker.postMessage({ type: 'atlas', id, items });
+    });
+  }
+
   dispose(): void {
     this._die('dispose');
   }
@@ -186,6 +204,24 @@ export async function decodeTextureWithWorker(
   if (!client) return null;
   try {
     return await client.decodeTexture(tex, compressed, maxSize);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 块图集解码的「Worker 优先」入口，供 `setAtlasOffThreadDecode` 装配。
+ *
+ * 永不 reject：Worker 不可用 / 崩溃 / 解码失败都返回 null，调用方照常走主线程解码 ——
+ * 这是纯性能优化，不能成为新的失败点。
+ */
+export async function decodeAtlasesWithWorker(
+  items: AtlasDecodeItem[]
+): Promise<Array<AtlasDecodeResult | null> | null> {
+  const client = getSharedS3MWorker();
+  if (!client) return null;
+  try {
+    return await client.decodeAtlases(items);
   } catch {
     return null;
   }
