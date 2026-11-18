@@ -143,25 +143,36 @@ describe('motionBlur 选项归一化（normalizeMotionBlur）', () => {
 /* ------------------------------------------------------------------ 2. FPS 自适应 damp（纯函数） */
 
 describe('autoMotionBlurDamp（FPS 自适应拖尾）', () => {
-  test('帧率越低拖影越长（单调），未知帧率按 60fps 保守取值', () => {
+  test('拖尾长度按「时间」恒定：帧率越低 damp 反而越小', () => {
     const d120 = autoMotionBlurDamp(120);
     const d60 = autoMotionBlurDamp(60);
     const d30 = autoMotionBlurDamp(30);
     const d15 = autoMotionBlurDamp(15);
-    expect(d120).toBeLessThan(d60);
-    expect(d60).toBeLessThan(d30);
-    expect(d30).toBeLessThan(d15);
-    // 60fps 下拖尾克制（≈0.55），30fps 明显拉长，15fps 更长
+    // 旧公式 0.55^(fps/60) 是「按帧数」恒定：30fps 下同样的帧数要跑两倍时间，
+    // 拖影在时间上直接翻倍 —— 低端机糊得最厉害，方向是反的。
+    expect(d120).toBeGreaterThan(d60);
+    expect(d60).toBeGreaterThan(d30);
+    expect(d30).toBeGreaterThan(d15);
     expect(d60).toBeCloseTo(0.55, 5);
-    expect(d30).toBeCloseTo(Math.sqrt(0.55), 5);
+    expect(d30).toBeCloseTo(0.55 ** 2, 5);
     // 未知帧率（0 / NaN）不糊脸：按 60fps 取
     expect(autoMotionBlurDamp(0)).toBe(d60);
     expect(autoMotionBlurDamp(Number.NaN)).toBe(d60);
   });
 
-  test('极低帧率封顶 0.92，不会糊成一片', () => {
-    expect(autoMotionBlurDamp(5)).toBeLessThanOrEqual(0.92);
-    expect(autoMotionBlurDamp(1)).toBeLessThanOrEqual(0.92);
+  test('衰减到 1% 的「时间」不随帧率漂移', () => {
+    // 每帧乘 damp，衰减到 1% 需要 ln(0.01)/ln(damp) 帧；除以帧率就是秒
+    const trailSeconds = (fps: number) =>
+      Math.log(0.01) / Math.log(autoMotionBlurDamp(fps)) / fps;
+    const base = trailSeconds(60);
+    for (const fps of [24, 30, 45, 90, 120, 144]) {
+      expect(trailSeconds(fps) / base).toBeCloseTo(1, 5);
+    }
+  });
+
+  test('低帧率不再拖出重影：damp 落到接近零', () => {
+    expect(autoMotionBlurDamp(15)).toBeLessThan(0.15);
+    expect(autoMotionBlurDamp(5)).toBeLessThan(0.02);
   });
 });
 
