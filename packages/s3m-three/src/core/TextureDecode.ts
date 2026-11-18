@@ -169,13 +169,23 @@ function decodeDXT(tex: Pick<S3MTexture, 'width' | 'height' | 'pixelFormat' | 'd
 
 function rawRGBA(tex: S3MTexture): { rgba: Uint8Array; hasAlpha: boolean } {
   const { width, height, pixelFormat, data } = tex;
-  const out = new Uint8Array(width * height * 4);
-  // RGBA / BGRA / ARGB / ABGR 都是 4 字节，前两个是「尾字节是 alpha」，后两个是「首字节是 alpha」
   const hasAlpha =
     pixelFormat === PixelFormat.RGBA ||
     pixelFormat === PixelFormat.BGRA ||
     pixelFormat === PixelFormat.ARGB ||
     pixelFormat === PixelFormat.ABGR;
+  // 快路径：RGBA 直排 + 不翻行 + 长度精确 —— 结果就是输入本身，用一次原生 memcpy 出副本。
+  //
+  // 原实现逐像素做四次赋值，1M 像素的纹理约 4M 次写。CBD 场景里 99.9% 的纹理字节
+  // （705 张 / 2.55 GB）正是这一类，逐像素循环白烧 CPU；`new Uint8Array(src)` 交给
+  // 引擎做整块拷贝，同样的字节、低一到两个数量级的时间。
+  // 这里仍然返回**副本**：上游会把它挂到 DataTexture 上长期持有，直接引用瓦片原始
+  // 缓冲会把它整块钉在内存里（data 只是那块 buffer 的一个视图）。
+  if (pixelFormat === PixelFormat.RGBA && !tex.flipY && data.length === width * height * 4) {
+    return { rgba: new Uint8Array(data), hasAlpha: hasAlphaChannel(pixelFormat) };
+  }
+  const out = new Uint8Array(width * height * 4);
+  // RGBA / BGRA / ARGB / ABGR 都是 4 字节，前两个是「尾字节是 alpha」，后两个是「首字节是 alpha」
   const swapRB = pixelFormat === PixelFormat.BGR || pixelFormat === PixelFormat.BGRA;
   const alphaFirst = pixelFormat === PixelFormat.ARGB || pixelFormat === PixelFormat.ABGR;
   const src = hasAlpha ? 4 : 3;
@@ -227,6 +237,33 @@ export function sliceDxtMipChain(
   }
   if (off !== data.byteLength) return null;
   return levels;
+}
+
+/**
+ * 这张纹理在主线程上是否「一次 memcpy 就能出结果」。
+ *
+ * 判据严格，只有同时满足才算：
+ *   ① RGBA 直排（通道顺序与 GL 一致，不用交换 R/B、不用把 alpha 挪位）
+ *   ② 不翻行（`flipY` 为假）
+ *   ③ `data.length === w*h*4`（没有内联 mip 链、没有补齐/截断）
+ *   ④ 不需要缩图（`maxSize` 未设或不小于长边）
+ *
+ * 任何一条不成立都返回 false —— 调用方据此把活留给解码器 / Worker。
+ * 用途见 `render/TextureFactory.ts`：命中的纹理不用往 Worker 发一趟，
+ * 省掉 3.4 MB/张的 structured clone（CBD 实测这一趟合计 2.5 GB / 2.9 秒）。
+ */
+export function textureDecodeIsTrivial(tex: S3MTexture, options: { maxSize?: number } = {}): boolean {
+  if (!tex || !tex.width || !tex.height) return false;
+  if (tex.pixelFormat !== PixelFormat.RGBA) return false;
+  if (tex.flipY) return false;
+  if (resolveTextureKind(tex.compressType ?? 0, tex.pixelFormat) !== 'raw') return false;
+  const data = tex.data;
+  if (!data || data.length !== tex.width * tex.height * 4) return false;
+  const maxSize = options.maxSize;
+  if (typeof maxSize === 'number' && Number.isFinite(maxSize) && maxSize > 0) {
+    if (Math.max(tex.width, tex.height) > maxSize) return false;
+  }
+  return true;
 }
 
 /** 主线程 / Worker 共用的解码入口。不抛错：失败与不支持都体现在返回值里 */

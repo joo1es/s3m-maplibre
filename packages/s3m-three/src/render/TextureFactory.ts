@@ -9,7 +9,7 @@
  */
 import * as THREE from 'three';
 import type { S3MTexture } from '../core/types.js';
-import { decodeTextureData } from '../core/TextureDecode.js';
+import { decodeTextureData, textureDecodeIsTrivial } from '../core/TextureDecode.js';
 import type { DecodedTextureData } from '../core/TextureDecode.js';
 
 export { PixelFormat } from '../core/TextureFormat.js';
@@ -126,7 +126,15 @@ async function decodeTexture(
   compressed: boolean,
   maxSize: number
 ): Promise<DecodedTextureData> {
-  if (offThreadDecode) {
+  // 「一次 memcpy 就完事」的纹理不走 Worker。
+  //
+  // 这类纹理（RGBA8 直排、不翻行、长度精确、不需缩图）在 CBD 场景占纹理字节的
+  // 99.9%，但发去 Worker 要先把整块 data structured clone 过去（3.4 MB/张，
+  // 实测合计 2.5 GB / 2.9 秒主线程时间），Worker 那边也只是复制一遍再传回来。
+  // 本地用原生 memcpy 出同样的字节，两张拷贝都省掉。
+  //
+  // 判据不满足时一切照旧 —— 仍优先 Worker，Worker 不可用再主线程兜底。
+  if (offThreadDecode && !textureDecodeIsTrivial(tex, { maxSize })) {
     const viaWorker = await offThreadDecode(tex, compressed, maxSize);
     if (viaWorker) return viaWorker;
   }
