@@ -38,6 +38,11 @@ export type BuildTileFn = (
   options: {
     textureCache: Map<string, Texture>;
     uniforms: StyleUniforms | null;
+    /**
+     * 主线程切片器：构建器在每个图元 / 每张纹理前问一次预算，超了就让出一轮事件循环。
+     * 见 `tileset/slicing.ts`；不传 = 一口气做完（与旧行为一致）。
+     */
+    slicer?: { breathe(): Promise<void> };
     /** Worker 侧已完成的纯数据几何组装（经典 .s3mb 路径），构建器直接包装成 three 对象 */
     assembled?: TileGeometryData;
     /** 深度偏移配置（透传给 buildTileObjects），见 BuildTileOptions.polygonOffset */
@@ -67,6 +72,12 @@ export interface TileNode {
   childUrl: string | null;
   childUrls?: string[];
   state: string;
+  /**
+   * 是否已经**提交进场景**（`_onTile` 走过）。`false` = 建好了但被提交闸门排队中：
+   * 这种瓦片不能接替父瓦片，否则父片已隐藏、子片还没进场景，画面会「先消失再出现」。
+   * 默认 undefined 视为已提交（老路径 / 单测构造的节点）。
+   */
+  committed?: boolean;
   /** 最近一次 update() 到相机的距离（米），淘汰时按它排序 */
   distance?: number;
   /** 最近一次「在有效范围内」的帧号，越小越该被淘汰 */
@@ -135,6 +146,17 @@ export interface S3MTilesetOptions {
   anchorOverride?: AnchorOverride;
   maxTiles?: number;
   maxConcurrent?: number;
+  /**
+   * 加载期主线程切片预算（毫秒），默认 8。0 = 关闭切片（整块瓦片一口气做完）。
+   *
+   * 一块瓦片「落地」是条同步链：解块图集 → 建几何 → 建纹理 → 首次编译着色器。
+   * 实测一块大瓦片可以占住主线程 1.8 秒，期间输入事件排不上队，页面等于卡死。
+   * 开了切片之后，每花掉这个预算就 `await` 让出一轮事件循环，输入与渲染先跑，
+   * 下一轮继续 —— 总加载时长不变（略长一点），但全程可交互。
+   *
+   * 小瓦片不受影响：预算没超时 `breathe()` 是同步返回，不产生额外开销。
+   */
+  loadSliceBudgetMs?: number;
   /** 原始图像/子图集缓存上限（LRU），默认 128 */
   maxImageCache?: number;
   buildTile?: BuildTileFn | null;

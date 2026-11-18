@@ -28,6 +28,7 @@ import type { BuildTileFn, TileNode, TileVisibilityTest } from '../tileset/S3MTi
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
+import { setAtlasOffThreadDecode } from '../core/atlasDecodeCache.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
 import { getMaterialQuality, normalizeMaterialQuality, getColorPipeline, normalizeColorPipeline } from './StyleMaterial.js';
 import type { LightingPreset } from './lightingPreset.js';
@@ -54,7 +55,7 @@ import type {
   DepthMode,
   MeshUserData,
 } from './viewer/types.js';
-import { decodeTextureWithWorker } from '../worker/S3MWorkerClient.js';
+import { decodeTextureWithWorker, decodeAtlasesWithWorker } from '../worker/S3MWorkerClient.js';
 import {
   STYLE,
   STYLE_LABELS,
@@ -379,6 +380,18 @@ export class S3MViewer {
   private readonly _authenticate: AuthenticateFn | undefined;
   /** 视锥细化剔除开关，默认 false（issue #25 第一期） */
   private _cullRefine = false;
+  /** 手势期间静默：暂停细化 + 跳过淡入，**默认 true**（见 `S3MViewerOptions.calmWhileInteracting`） */
+  private _calmWhileInteracting = true;
+  /** 宿主是否正在手势交互中；由适配层用宿主事件驱动，内核不碰地图 API */
+  private _interacting = false;
+  /** 相机是否在动（用户手势或程序驱动都算）；动的时候把加载预算压小 */
+  private _cameraMoving = false;
+  /** 静止时的加载切片预算（毫秒） */
+  private _sliceBudget = 8;
+  /** 运动时的加载切片预算；等于静止值 = 不做区分（默认，保持旧行为） */
+  private _movingSliceBudget = 8;
+  /** 单帧最多新建多少瓦片请求（默认 Infinity = 不限制） */
+  private _maxEnqueuePerFrame = Infinity;
   /** 逐帧复用：视锥与球心测试用的临时向量，避免每帧 new */
   private _frustum?: THREE.Frustum;
   private _cullTestVec?: THREE.Vector3;
@@ -502,6 +515,16 @@ export class S3MViewer {
     this._lodPixelRatioCap = options.lodPixelRatioCap ?? Infinity;
     // 视锥剔除细化默认关闭：这是可选策略不是 bug 修复，不传就走全向加载的老路径
     this._cullRefine = options.cullRefine === true || options.frustumCullRefine === true;
+    // 手势静默**默认开**：动画和交互永远优先。手势期间继续细化会把解析/建几何的活
+    // 压进正在拖拽的那几帧里，用户感受就是「越拖越卡」；而视野外的瓦片早下一点
+    // 本来也看不见。0.4.x 之前默认关，是因为先做了功能、没考虑手感 ——
+    // 想退回旧行为显式传 `calmWhileInteracting: false`。
+    this._calmWhileInteracting = options.calmWhileInteracting !== false;
+    // 相机运动期把加载切片预算压小：运动时每帧 16ms 要留给动画与输入，
+    // 加载只能拿一小片；不传 = 与静止时相同（旧行为）。
+    this._sliceBudget = options.loadSliceBudgetMs ?? 8;
+    this._movingSliceBudget = options.movingSliceBudgetMs ?? this._sliceBudget;
+    this._maxEnqueuePerFrame = options.maxEnqueuePerFrame ?? Infinity;
     // 瓦片级放置默认开启：旧行为是拿单一常量切平面拟合随纬度变化的墨卡托比例，属于 bug 修复，
     // 所以默认值跟着改（见 AGENTS.md 不变式 ①）。显式传 false 仍可回退。
     this._perTilePlacement = options.perTilePlacement !== false;
@@ -606,6 +629,8 @@ export class S3MViewer {
     });
     // 纹理解码优先派给共享解析 Worker（崩溃自动回主线程，见 decodeTextureWithWorker）
     setTextureOffThreadDecode(decodeTextureWithWorker);
+    // 块图集（.texblock 精灵）的 DXT 解块同样下放 Worker：主线程实测这块占 2.7s
+    setAtlasOffThreadDecode(decodeAtlasesWithWorker);
     this.style = { ...DEFAULT_STYLE, ...(options.style ?? {}) };
     this._styleTarget = { ...this.style };
     this._opacityTransparent = (this.style.opacity ?? 1) < 0.999;
@@ -724,6 +749,8 @@ export class S3MViewer {
       releasePickId: (id) => this._picks.releasePickId(id),
       requestRepaint: () => this.triggerRepaint(),
       nextTileFadeSeq: () => this._tileFadeSeq++,
+      interacting: () => this._interacting,
+      calmWhileInteracting: () => this._calmWhileInteracting,
     });
     if (options.attributes)
       this.attributeQuery = new AttributeQuery({
@@ -1789,6 +1816,60 @@ export class S3MViewer {
     return this._styles.prewarmShading();
   }
 
+  /**
+   * 预热「会用到的那几种着色模式」的着色器变体。
+   *
+   * 为什么 `prewarmShading()` 不够：它只编译**当前场景里已有的材质**，而着色模式
+   * （白膜 / 按高度 / 按单体 / 动态扫描 / 顶侧分色…）在着色器里是不同的 define，
+   * 等于不同的 program。演出中途切模式 → 首次用到时现编，实测单个 program 首次
+   * `linkProgram` + 反射能占住主线程 100~300ms，全场累计 2 秒 —— 正好卡在镜头推进时。
+   *
+   * 这里把「以后要用的模式」在遮罩还挂着的时候就切一遍编译好，再切回来。
+   * 切模式会重建全场材质，所以务必只在不显示首帧的时机调用（加载遮罩期间）。
+   *
+   * @param modes 要预热的模式，缺省为白膜 / 原色 / 按高度 / 按单体 / 动态扫描 / 顶侧 / 自定义
+   */
+  async prewarmStyleVariants(modes?: StyleMode[]): Promise<void> {
+    const r = this.renderer;
+    const scene = this.scene;
+    const camera = this.camera;
+    if (!r || !scene || !camera) return;
+
+    const list = modes?.length
+      ? modes
+      : [STYLE.WHITE, STYLE.TEXTURE, STYLE.HEIGHT, STYLE.BATCH, STYLE.DYNAMIC, STYLE.TOP_SIDE, STYLE.CUSTOM];
+    const prevMode = this.style.mode;
+    const prevPrewarming = this._prewarming;
+
+    // 预热期间不渲染：否则「翻转变体」的过程会被画到屏幕上
+    this._prewarming = true;
+    try {
+      for (const mode of list) {
+        if (mode !== this.style.mode) this._styles.setStyle({ mode }, { duration: 0 });
+        // force = true：上面刚把 prewarming 置真（为了不把翻转过程画出来），
+        // 而 prewarmShading 默认会因此直接返回 —— 不放行就一个 program 都编不出来
+        this._shadingPrewarmed = false;
+        await this._styles.prewarmShading(true);
+        // compileAsync 只负责「链接」，真正贵的是首次上屏时的 uniform 反射
+        // （three 的 WebGLProgram.onFirstUse：getProgramInfoLog + WebGLUniforms 解析）。
+        // 这里直接渲一帧把它触发掉 —— 遮罩还挂着，画出来也看不见。
+        try {
+          r.render(scene, camera);
+        } catch {
+          /* 渲染失败不影响主流程 */
+        }
+      }
+    } catch {
+      // 预热失败不影响主流程：最坏退回「首次渲染时编译一次」
+    } finally {
+      if (this.style.mode !== prevMode) {
+        this._styles.setStyle({ mode: prevMode }, { duration: 0 });
+      }
+      this._prewarming = prevPrewarming;
+      this._requestRepaint();
+    }
+  }
+
   /** @internal 点云 / 泼溅网格的样式继承，见 viewer/StyleController.ts */
   private _applyPointCloudStyle(points: THREE.Points, selected = false): void {
     this._styles.applyPointCloudStyle(points, selected);
@@ -2502,6 +2583,167 @@ export class S3MViewer {
     this._requestRepaint();
   }
 
+  /** 是否开启「手势期间静默」（暂停细化 + 跳过淡入） */
+  get calmWhileInteracting(): boolean {
+    return this._calmWhileInteracting;
+  }
+
+  set calmWhileInteracting(enabled: boolean) {
+    this.setCalmWhileInteracting(enabled);
+  }
+
+  /**
+   * 开关「手势期间静默」。
+   *
+   * 打开后：宿主只要把 `setInteracting(true)` 通知进来（拖拽 / 缩放 / 旋转进行中），
+   * 内核就做两件事 —— 新瓦片不入队、新落地的瓦片不做淡入。松手时传 `false`，
+   * 下一帧自动补齐。
+   *
+   * 不动已经落地的瓦片、不动可见性、不动淘汰预算：拖到一半画面不会开洞。
+   */
+  setCalmWhileInteracting(enabled: boolean): void {
+    const val = !!enabled;
+    if (this._calmWhileInteracting === val) return;
+    this._calmWhileInteracting = val;
+    this._requestRepaint();
+  }
+
+  /** 宿主手势是否进行中（适配层驱动；纯 three 宿主可以自己按指针事件调） */
+  get interacting(): boolean {
+    return this._interacting;
+  }
+
+  set interacting(on: boolean) {
+    this.setInteracting(on);
+  }
+
+  /**
+   * 通知内核「宿主手势开始 / 结束」。
+   *
+   * 只影响 `calmWhileInteracting` 打开时的行为；没开时这个状态什么都不做 ——
+   * 所以适配层可以无条件调用，不必先查开关。
+   *
+   * 判「用户手势」而不是「相机在动」是适配层的事：MapLibre 的 `easeTo` / `flyTo`
+   * 也会触发 `movestart`，而程序驱动的镜头巡游期间**必须继续细化**，否则整场
+   * 演出都在等松手。
+   */
+  setInteracting(on: boolean): void {
+    const val = !!on;
+    if (this._interacting === val) return;
+    this._interacting = val;
+    // 手势结束立刻要一帧：否则要等下一次宿主重绘才会补发请求
+    if (!val && this._calmWhileInteracting) this._requestRepaint();
+  }
+
+  /* ------------------------------------------------- 交互期暂缓提交（瓦片进场景） */
+
+  /**
+   * 提交闸门：手势进行中且开了 `calmWhileInteracting` 时，瓦片建好也先排队。
+   *
+   * 和 `pauseRefine` / 切片预算的区别：那两个管的是「少做新工作」，这里管的是
+   * 「已经做好的工作不要落在手势的某一帧里」。进场景那一步（纹理上传、
+   * program 首次编译、棱线生成）是同步且不可切分的，实测加载期拖拽时
+   * 有过 638ms 的单帧停顿 —— 就是它。
+   */
+  /**
+   * 提交闸门：**相机在动就关**——用户手势和程序镜头（演出 flyTo / easeTo）都算。
+   *
+   * 之前只认 `interacting`（用户手势），结果演出自己推镜头时瓦片照常进场，
+   * 每次 LOD 跨档都是一批瓦片同时上传纹理 / 首次编译，尖峰正好压在动画最显眼的时候
+   * （实测每 2~3 秒一次 60~130ms，最长 880ms，全部 `mapIsMoving: 1`）。
+   *
+   * 相机在动时画面本来就在快速变化，晚几帧补细节几乎看不出来；停住（幕间停留）
+   * 时再按帧放闸，观感是「停下来就清晰」而不是「一动就一顿」。
+   */
+  private readonly _commitGateFn = (): boolean =>
+    this._calmWhileInteracting && (this._interacting || this._cameraMoving);
+  /** 已经装过闸门的 tileset，避免每帧重复赋值 */
+  private readonly _gateBound = new WeakSet<object>();
+  /** 上一帧的 renderFrame 耗时（毫秒），提交预算用它做自适应 */
+  private _lastFrameMs = 16;
+  private _frameStartedAt = 0;
+  /** 最后一次「相机在动」的时刻：停下来之后要等一小会儿再放闸 */
+  private _lastMovingAt = 0;
+  /** 场景里网格数变了就标记待预编译（新瓦片可能带来新的材质变体） */
+  private _lastSeenMeshes = -1;
+  private _compilePending = false;
+  private _lastCompileAt = 0;
+  private _frameCount = 0;
+
+  /** 给新加进来的数据集补装闸门（幂等） */
+  private _syncCommitGates(): void {
+    for (const entry of this.datasets.values()) {
+      const ts = entry.tileset as
+        | (typeof entry.tileset & { setCommitGate?: (fn: (() => boolean) | null) => void })
+        | undefined;
+      if (!ts || this._gateBound.has(ts) || typeof ts.setCommitGate !== 'function') continue;
+      this._gateBound.add(ts);
+      ts.setCommitGate(this._commitGateFn);
+    }
+  }
+
+  /**
+   * 每帧放闸：一次只提交 1 块。
+   *
+   * 三条节奏：
+   *   ① 相机在动 → 一块都不放（画面本来就在变，晚几帧补细节看不出来）；
+   *   ② 刚停下来的 250ms 内也不放 —— 否则「停住那一帧」会把积压一次性砸进来，
+   *      实测一次放 4 块能卡 784ms（单块图集可以到几十 MB，纹理上传是同步的）；
+   *   ③ 上一帧已经超过 16ms 就跳过本帧，等它缓过来。
+   *
+   * 没有排队瓦片时只有几次长度判断，默认路径开销可以忽略。
+   */
+  private _flushHeldCommits(): void {
+    const now = performance.now();
+    if (this._cameraMoving) { this._lastMovingAt = now; return; }
+    let pending = false;
+    for (const entry of this.datasets.values()) {
+      if ((entry.tileset?.heldCommits ?? 0) > 0) { pending = true; break; }
+    }
+    if (!pending) return;
+    if (now - this._lastMovingAt < 250 || this._lastFrameMs > 16) {
+      // 还在冷却 / 上一帧就卡了：稍后再来，别让队列无限期压着
+      this._requestRepaint();
+      return;
+    }
+    let budget = 1;
+    for (const entry of this.datasets.values()) {
+      if (budget <= 0) break;
+      const ts = entry.tileset as
+        | (typeof entry.tileset & {
+            heldCommits?: number;
+            flushHeldCommits?: (max?: number) => number;
+          })
+        | undefined;
+      if (!ts || typeof ts.flushHeldCommits !== 'function' || (ts.heldCommits ?? 0) === 0) continue;
+      budget -= ts.flushHeldCommits(budget);
+    }
+    // 还有没放完的：再要一帧。宿主停手之后会停止重绘，不续帧会一直压在队列里。
+    for (const entry of this.datasets.values()) {
+      const ts = entry.tileset as { heldCommits?: number } | undefined;
+      if ((ts?.heldCommits ?? 0) > 0) { this._requestRepaint(); break; }
+    }
+  }
+
+  /**
+   * 通知内核「相机正在动」——**用户手势和程序驱动的镜头动画都算**。
+   *
+   * 为什么和 `setInteracting` 分开：`interacting` 管的是「手势期间静默」（暂停细化 +
+   * 跳过淡入），而镜头巡游期间我们**不能**暂停细化，否则整场演出都不加载；但也不能
+   * 按满预算加载 —— 那会每帧吃掉 8ms，动画直接掉帧。
+   *
+   * 所以这里只做一件事：把加载切片预算从 `loadSliceBudgetMs` 换成
+   * `movingSliceBudgetMs`。**调小而不是暂停**：暂停会在镜头停住的一刻把积压的请求
+   * 一次性放闸，表现为「一停就狂加载」。
+   */
+  setCameraMoving(on: boolean): void {
+    const val = !!on;
+    if (this._cameraMoving === val) return;
+    this._cameraMoving = val;
+    const budget = val ? this._movingSliceBudget : this._sliceBudget;
+    for (const entry of this.datasets.values()) entry.tileset?.setLoadSliceBudget(budget);
+  }
+
   /**
    * 动态调整 LOD 切换范围缩放系数。
    * scale > 1 时倾向保留粗模（降低瓦片请求与面数）；scale < 1 时提前细化加载高精瓦片。
@@ -2579,6 +2821,51 @@ export class S3MViewer {
     // shading 预热期间材质是「另一种变体」，这一帧先不画：少画一两帧看不出来，
     // 把平滑的楼画成平面的一眼就能看出来。
     if (this._prewarming) return true;
+
+    // draw call 统计按「渲染帧」而不是「单次 renderer.render()」汇总。
+    //
+    // three 默认在每次 render() 开头把 info.render.calls 清零，而一帧里本层会调多次
+    // render（主场景 / 地面补层 / 覆盖物 / 后期通道），最后一次往往是只画一个全屏 quad
+    // 的后期 pass —— 于是 info.render.calls 长期停在 1，HUD 上的 Draw Call 永远是 1。
+    // 关掉自动清零、改成每帧开头手动 reset，读到的是这一帧真实的调用总数。
+    // info.reset() 只清 render 计数，不动 memory（program / 纹理 / 几何驻留）。
+    // 测试里的假渲染器没有 info，判空跳过。
+    const info = (this.renderer as { info?: { autoReset: boolean; reset: () => void } }).info;
+    if (info) {
+      info.autoReset = false;
+      info.reset();
+    }
+
+    // 交互期暂缓的瓦片：手势结束后每帧放几块，别在抬手那一帧全砸进来
+    const frameNow = performance.now();
+    if (this._frameStartedAt > 0) this._lastFrameMs = frameNow - this._frameStartedAt;
+    this._frameStartedAt = frameNow;
+    if (this._cameraMoving) this._lastMovingAt = frameNow;
+    this._syncCommitGates();
+    this._flushHeldCommits();
+
+    // 新瓦片会带来新的材质变体（透明 / 顶点色 / alphaTest…），而 program 是
+    // **第一次用到才同步编译**的：实测演出期每 2~3 秒一次 200~800ms 的停顿，
+    // profile 里 `(program)` 6 秒吃掉 1087ms。
+    // three 的 compileAsync 走 KHR_parallel_shader_compile，能在驱动侧并行编译，
+    // 这里在网格数变化后（节流 400ms）触发一次，把编译挪出可见卡顿。
+    if ((this._frameCount++ % 15) === 0) {
+      const meshes = this.stats.meshes;
+      if (meshes !== this._lastSeenMeshes) {
+        this._lastSeenMeshes = meshes;
+        this._compilePending = true;
+      }
+    }
+    if (this._compilePending && frameNow - this._lastCompileAt > 400) {
+      this._compilePending = false;
+      this._lastCompileAt = frameNow;
+      const r = this.renderer as unknown as {
+        compileAsync?: (s: THREE.Object3D, c: THREE.Camera) => Promise<unknown>;
+      };
+      if (typeof r.compileAsync === 'function') {
+        void r.compileAsync(this.scene, this.camera).catch(() => {});
+      }
+    }
 
     // 先推进动画，再刷脏标记，最后渲染 —— 保证本帧画出来的是最新值
     const animating = this.animator.tick();
@@ -2695,6 +2982,11 @@ export class S3MViewer {
           // cullRefine 只管「要不要为视野外瓦片请求子瓦片」；画不画一律按宿主 MVP 的视锥来
           refineCull: this._cullRefine,
           visibleCull: true,
+          // 手势期间不新建请求：拖拽时视野每帧都变，触发的请求最多，而解析 / 建几何 /
+          // 传纹理全在主线程，正好和拖拽渲染抢线程 —— 越拖越卡就是这么来的
+          pauseRefine: this._calmWhileInteracting && this._interacting,
+          // 单帧请求上限：镜头停住的瞬间几十块瓦片会同时达标，不封顶就是一停就狂加载
+          maxEnqueuePerFrame: this._maxEnqueuePerFrame,
         })
       ) {
         tilesetChanged = true;

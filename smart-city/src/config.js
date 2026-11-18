@@ -7,14 +7,24 @@
 /** SuperMap Online 公有服务：北京 CBD，7 个图层叠起来才是完整城市 */
 export const SERVICE = 'https://www.supermapol.com/realspace/services/3D-CBD-2/rest/realspace/datas';
 
+/**
+ * 七个图层一个都不能少 —— 少一层地面就是镂空，观众一眼能看出来。
+ *
+ * 但「都在」不等于「都按同一精度加载」。`lodRangeScale` 是每块瓦片的细化门槛：
+ * 1 = 原口径，越大越倾向保留粗模（少下几级子瓦片）。地面 / 铺装 / 植被 / 水系
+ * 这类大面积铺底的东西，本来就没人盯着看细节，却最吃瓦片数 —— 给它们一个偏大的
+ * 值，画面完整度不变，加载量和三角面能砍掉一大半。
+ *
+ * `tiles` 是该数据集的常驻瓦片预算，同样只影响后面几级细化。
+ */
 export const DATASETS = [
-  { id: 'Building@CBD', label: '建筑', accent: '#4ad8ff' },
-  { id: 'Xiaopin@CBD', label: '城市小品', accent: '#ffc86b' },
-  { id: 'Ground2@CBD', label: '铺装', accent: '#5ce6b0' },
-  { id: 'Tree@CBD', label: '植被', accent: '#7ee787' },
-  { id: 'Lake@CBD', label: '水系', accent: '#5aa9ff' },
-  { id: 'Bridge@CBD', label: '桥梁', accent: '#ff79c6' },
-  { id: 'Ground@CBD', label: '地面', accent: '#8fa6bf' },
+  { id: 'Building@CBD', label: '建筑', accent: '#4ad8ff', lodRangeScale: 1.15, tiles: 280 },
+  { id: 'Xiaopin@CBD', label: '城市小品', accent: '#ffc86b', lodRangeScale: 1.9, tiles: 96 },
+  { id: 'Ground2@CBD', label: '铺装', accent: '#5ce6b0', lodRangeScale: 2.4, tiles: 80 },
+  { id: 'Tree@CBD', label: '植被', accent: '#7ee787', lodRangeScale: 2.2, tiles: 96 },
+  { id: 'Lake@CBD', label: '水系', accent: '#5aa9ff', lodRangeScale: 2.6, tiles: 40 },
+  { id: 'Bridge@CBD', label: '桥梁', accent: '#ff79c6', lodRangeScale: 2.0, tiles: 56 },
+  { id: 'Ground@CBD', label: '地面', accent: '#8fa6bf', lodRangeScale: 1.6, tiles: 160 },
 ];
 
 export const configUrlOf = (name) => `${SERVICE}/${name}/config`;
@@ -127,31 +137,27 @@ export const ACTS = [
 export const TOTAL_DURATION = ACTS.reduce((sum, a) => sum + a.duration, 0);
 
 /**
- * 开场预加载：只等「首屏能完整显示」就撤遮罩，剩下的交给 LOD 渐进细化。
+ * 开场预加载：**把演出五个机位都过一遍**，让要用的瓦片在遮罩后面就下完。
  *
- * 以前这里把演出五个机位依次跑一遍、等整条瓦片流水线归零，结果几乎必然跑满
- * 18s 上限：7 个数据集光根瓦片就 191 块，每块落地又会拉出子瓦片；相机停在
- * 16.85 级特写时 LOD 会一直细化到叶子，在途请求根本不会归零。
+ * 演进过程：最早只预热 awaken 一个机位，理由是「官方 demo 也是边看边细化」。
+ * 实际效果是演出自己推镜头时，每跨一个 LOD 档就有一批瓦片同时进场景 ——
+ * 纹理上传 + program 首次编译全是同步的，正好卡在动画最显眼的时候
+ * （实测每 2~3 秒一次 60~130ms，最长 880ms，且全部发生在镜头飞行中）。
  *
- * 官方 demo「瞬间出来」的原因不是它下载更快，而是它压根不等瓦片收敛 —— S3M
- * 是 LOD 金字塔，根瓦片 + 视锥内粗层到了就有画面，后面边看边细化；本项目的
- * `lodTransition: 'incremental'` 正是为此设计（父瓦片垫底，子瓦片就绪一个显示
- * 一个，不会整块跳变）。而且演出从第 1 幕俯冲到第 4 幕特写有 26 秒，精细瓦片
- * 有充足时间在后台下完，根本没必要在开场阻塞等它。
+ * 既然这些瓦片**无论如何都要下**，不如在遮罩里多等一会儿：用户看到的是
+ * 一条进度条，而不是演出一顿一顿。代价是首屏多等十几秒 ——
+ * 遮罩随时可以点击 / Esc 跳过，`?warmMs=` 也能改上限。
  *
- * 所以只预热一个机位：awaken 的落点（15.35 级 / pitch 48）视锥覆盖整座城，
- * 拉下来的中等精度瓦片正好是前 3 幕要用的；随后镜头跳回 start，俯冲时直接命中
- * 缓存。配合 main.js 里的 cullRefine / lodPixelRatioCap，从源头砍掉视野外和
- * 高分屏超采样带来的无效瓦片，2~3 秒即可收敛。
+ * 每个机位单独计 `readyTiles`（不是全局累计），否则第一个机位达标之后
+ * 后面的机位会瞬间「已覆盖」，等于没预热。
  */
 export const WARMUP = {
   /**
-   * 首屏累计落地这么多瓦片就撤遮罩。LOD 会一路细化到叶子，流水线「静默」在
-   * 整场演出里都不会出现（实测开演时仍有 30 个在途请求），等它归零等于等全部
-   * 瓦片下完 —— h1 下那是 20~30 秒。48 块约覆盖 7 个数据集的粗/中层，
-   * incremental 会用父瓦片把没到的区域垫住，画面不会开洞。
+   * 首屏累计落地这么多瓦片就撤遮罩（**每个机位各自计**）。
+   * 110 块约覆盖 7 个数据集的粗/中层；再高的精度交给幕间停留时补，
+   * 但演出中相机动起来时不再往场景里塞瓦片（见内核的提交闸门）。
    */
-  readyTiles: 48,
+  readyTiles: 110,
   /** 增长停滞这么久也算首屏稳定（网络快时的提前退出） */
   quietMs: 320,
   pollMs: 100,
@@ -162,14 +168,29 @@ export const WARMUP = {
   /** 至少渲这么多毫秒，保证 LOD 请求真的发出去了 */
   minWarmMs: 800,
   minViewMs: 300,
-  viewTimeoutMs: 3500,
-  /** 全场预加载硬上限；正常 2~3s 收敛，这个数只是断网/弱网的兜底 */
-  totalBudgetMs: 5000,
+  /**
+   * 全场预加载硬上限。**不要无脑加大**：实测把遮罩拖到 50 秒、瓦片从 300 涨到 441 之后，
+   * 演出期慢帧占比反而从 4.1% 升到 18.6% —— 场景越大，每次提交/上传的单帧成本越高，
+   * 而演出机位是连续扫过的，LOD 只认当前视锥，提前加载别的机位补不到它的路径。
+   * `?warmMs=` 可现场覆盖。
+   */
+  totalBudgetMs: 12000,
+  /** 单个机位的最长等待；到点没达标就进下一个机位（五个机位 × 3s 正好吃满 12s 预算） */
+  viewTimeoutMs: 3000,
   /** 配置解析占 0~64%，瓦片预热占 64~100% */
   startPct: 64,
   endPct: 100,
-  /** 只预热俯冲落点这一个机位 */
+  /**
+   * 依次预热的机位：演出五幕的落点，一个不落。
+   *
+   * 顺序按演出先后排，进度条也就跟着演出走 —— 提前撤遮罩时先看得到前几幕的精度。
+   * 想只等首屏（比如调试）就用 `?warmMs=3000`，或者直接点遮罩跳过。
+   */
   views: [
-    { id: 'awaken', label: '俯冲落点' },
+    { id: 'awaken', label: '城市唤醒' },
+    { id: 'grow', label: '拔地而起' },
+    { id: 'skeleton', label: '数字骨骼' },
+    { id: 'pulse', label: '数据血脉' },
+    { id: 'panorama', label: '全景收束' },
   ],
 };

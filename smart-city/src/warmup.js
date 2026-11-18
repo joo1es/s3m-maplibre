@@ -78,7 +78,7 @@ async function settleCamera(map, cam) {
  *
  * @returns {{ reason: 'covered'|'quiet'|'timeout'|'skipped', state: object, ms: number }}
  */
-async function waitQuiet({ layer, timeoutMs, isSkipped, onTick, baseTiles = 0 }) {
+async function waitQuiet({ layer, timeoutMs, isSkipped, onTick, baseTiles = 0, readyTiles = WARMUP.readyTiles }) {
   const t0 = performance.now();
   let last = readState(layer);
   let quietSince = t0;
@@ -103,7 +103,7 @@ async function waitQuiet({ layer, timeoutMs, isSkipped, onTick, baseTiles = 0 })
       grew,
     });
 
-    const covered = gained >= WARMUP.readyTiles;
+    const covered = gained >= readyTiles;
     const settled = !grew && quiet >= WARMUP.quietMs;
     if ((covered || settled)
       && elapsed >= WARMUP.minViewMs && elapsed >= WARMUP.minWarmMs) {
@@ -114,12 +114,38 @@ async function waitQuiet({ layer, timeoutMs, isSkipped, onTick, baseTiles = 0 })
 }
 
 /**
+ * 等流水线彻底静默：在途 + 排队 = 0 且持续 `drainQuietMs`。
+ *
+ * 这是「把瓦片全部下完」的判定。实测（HTTP/1.1 六连接）从打开页面到静默约 40 秒、
+ * 480 余块瓦片 —— 所以这一步会明显拉长遮罩，必须配合进度提示与跳过。
+ *
+ * @returns {'quiet'|'skipped'|'timeout'}
+ */
+async function waitDrain({ layer, isSkipped, deadline, hud, skipHint }) {
+  const needQuiet = WARMUP.drainQuietMs ?? 1500;
+  let quiet = 0;
+  while (performance.now() < deadline) {
+    await sleep(WARMUP.pollMs);
+    if (isSkipped()) return 'skipped';
+    const st = readState(layer);
+    quiet = st.inFlight === 0 ? quiet + WARMUP.pollMs : 0;
+    hud?.setLoading(
+      `收尾 · 还有 ${st.inFlight} 个请求 · ${st.tiles} 块瓦片 · 99%${skipHint}`,
+      99,
+    );
+    if (quiet >= needQuiet) return 'quiet';
+  }
+  return 'timeout';
+}
+
+/**
  * @param {{map: object, layer: object, hud: object, isSkipped?: () => boolean,
  *          budgetMs?: number, viewTimeoutMs?: number}} ctx
  * @returns 预加载报告，挂到 __city.warmup 上便于现场调参
  */
 export async function warmupCity({
   map, layer, hud, isSkipped = () => false, budgetMs, viewTimeoutMs, initialPct,
+  readyTiles = WARMUP.readyTiles,
 }) {
   const t0 = performance.now();
   const totalBudgetMs = budgetMs ?? WARMUP.totalBudgetMs;
@@ -127,11 +153,10 @@ export async function warmupCity({
   const report = { views: [], tiles: 0, ms: 0, skipped: false, timedOut: false };
   const views = WARMUP.views;
   const skipHint = ' · 点击遮罩 / Esc 跳过';
-  // 进度只认真实工作量：预热开始时已落地的瓦片数当基线，
-  // 之后的增量才代表「这次预加载到底下了多少东西」。
-  const baseTiles = readState(layer).tiles;
   // 从入口当前的进度接上（着色编译已经推到 64%），别跨阶段往回跳
   let lastPct = initialPct ?? WARMUP.startPct;
+  // 整场预热的起点，只用于报告「这次一共多下了多少块」
+  const startTiles = readState(layer).tiles;
 
   for (let i = 0; i < views.length; i++) {
     if (isSkipped()) { report.skipped = true; break; }
@@ -141,22 +166,24 @@ export async function warmupCity({
     if (remain <= 0) { report.timedOut = true; break; }
 
     await settleCamera(map, CAMERA[v.id]);
+    // 每个机位各自算基线：用全局累计的话，第一个机位达标后后面的会瞬间
+    // 「已覆盖」，等于只预热了一个机位（最早就是这个 bug）
+    const viewBase = readState(layer).tiles;
     const result = await waitQuiet({
       layer,
       timeoutMs: Math.min(perViewMs, remain),
       isSkipped,
-      baseTiles,
+      baseTiles: viewBase,
+      readyTiles,
       onTick: (st, info) => {
-        // 进度 = 真实落地瓦片数 / 首屏目标数：线性、单调、有明确终点。
-        // 旧版按机位序号摊派还让 quiet 归零，进度条会长时间卡住甚至倒退；
-        // 饱和曲线也估不准（分母是拍脑袋的经验值）。现在分母就是退出条件本身。
+        // 总进度 = (已完成机位数 + 本机位完成度) / 机位数：单调、有明确终点
+        const viewFrac = Math.min(1, info.gained / readyTiles);
         const raw = WARMUP.startPct
-          + (WARMUP.endPct - WARMUP.startPct)
-          * Math.min(1, info.gained / WARMUP.readyTiles);
+          + (WARMUP.endPct - WARMUP.startPct) * ((i + viewFrac) / views.length);
         lastPct = Math.max(lastPct, Math.min(99, raw));
 
         hud.setLoading(
-          `首屏预热 · ${v.label} · ${info.gained}/${WARMUP.readyTiles} 块瓦片 · ${Math.round(lastPct)}%${skipHint}`,
+          `预热 ${i + 1}/${views.length} · ${v.label} · ${info.gained}/${readyTiles} 块 · ${Math.round(lastPct)}%${skipHint}`,
           lastPct,
         );
       },
@@ -173,6 +200,18 @@ export async function warmupCity({
     if (result.reason === 'skipped') { report.skipped = true; break; }
   }
 
+  // 收尾：等流水线真正静默（在途 0、排队 0），这才是「瓦片全部下完」。
+  //
+  // 为什么必须等：辉光 / 飞线这些后期与覆盖物的 program 是**按场景里实际出现的
+  // 材质组合**各编一份的，瓦片陆续到达就一直冒新的（实测第 4 幕已经 35 个）。
+  // 想让它们全部编完，只能让场景先完整 —— 否则演出中必然还会现编。
+  if (!report.skipped && !report.timedOut) {
+    const drained = await waitDrain({ layer, isSkipped, deadline: t0 + totalBudgetMs, hud, skipHint });
+    report.drained = drained;
+    if (drained === 'skipped') report.skipped = true;
+    if (drained === 'timeout') report.timedOut = true;
+  }
+
   // 不管正常结束、跳过还是超时，镜头都必须交回起点：
   // 否则演出第一帧会从最后一个预热的机位（全景）起跳，俯冲直接没了。
   map.jumpTo(CAMERA.start);
@@ -182,7 +221,7 @@ export async function warmupCity({
   }
 
   report.tiles = readState(layer).tiles;
-  report.loadedTiles = report.tiles - baseTiles;
+  report.loadedTiles = report.tiles - startTiles;
   report.ms = Math.round(performance.now() - t0);
   return report;
 }

@@ -66,13 +66,12 @@ const SCAN_FRAG = /* glsl */ `
 `;
 
 /** 城市外围 → 核心的六条数据链路起点 */
+// 飞线只要 3 条就能说明「数据在流动」这件事。
+// 6 条的时候画面里全是线，反而看不出哪条是重点 —— 效果不是越多越好。
 const FLOW_SOURCES = [
   { at: [116.4449, 39.9034], color: '#4ad8ff', speed: 0.34 },
   { at: [116.4709, 39.9048], color: '#8fe8ff', speed: 0.29 },
   { at: [116.4706, 39.9206], color: '#ffc86b', speed: 0.38 },
-  { at: [116.4454, 39.9204], color: '#ff79c6', speed: 0.31 },
-  { at: [116.4432, 39.9122], color: '#5ce6b0', speed: 0.42 },
-  { at: [116.4716, 39.9146], color: '#7ea8ff', speed: 0.36 },
 ];
 
 /** 三个重点片区的位置与高度 */
@@ -220,6 +219,9 @@ export class Effects {
       radius: 11,
       strength: 1.45,
       threshold: 0.32,
+      // 半分辨率：辉光本来就是糊的，降到 1/2 边长等于 4 趟全屏 pass 的填充率砍到 1/4，
+      // 肉眼几乎看不出差别。原图仍全分辨率上屏，建筑边缘不会变软。
+      scale: 0.5,
     });
     this.layer.setPresenter(this.bloom.presenter);
   }

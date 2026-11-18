@@ -164,6 +164,7 @@ new S3MLayer(options?: S3MLayerOptions)
 | `lodTransition` | `'binary' \| 'incremental'` | `'binary'` | LOD 细化过渡策略。`'binary'`（默认）：整节点二值切换；`'incremental'`：增量细化（primary / fallback 双列表 + LEQUAL 深度推移），子瓦片就绪一个显示一个，未就绪区域由最近父瓦片（fallback）垫底填充，消除整块跳变与慢 child 阻塞 |
 | `fallbackOffset` | `{ factor?: number; units?: number }` | `{ factor: 1, units: 2 }` | 增量细化模式下 fallback 兜底瓦片的材质深度偏移系数，向远处推移深度配合 gl.LEQUAL 消除共面 z-fighting |
 | `cullRefine` | `boolean` | `false` | **细化**视锥剔除（Issue #25）：开启后视野外瓦片跳过细化，减少转头无效下载与上传。默认 `false`。**它只管请求，不管绘制**——视野外的瓦片不画是默认行为（每帧按宿主 MVP 的正确视锥剔除，Issue #36），与本开关无关 |
+| `calmWhileInteracting` | `boolean` | `true` | **手势期间静默**：用户拖拽 / 缩放 / 旋转进行中时，暂停新瓦片入队并跳过瓦片淡入，松手后自动补齐。拖拽时视野每帧都变、触发的请求最多，而解析与上传都在主线程，正好和拖拽渲染抢线程——开启后拖拽只剩渲染。代价是松手后晚一个 LOD 周期才补精度。**默认 `true`**（0.4.x 起）：动画与交互优先，视野外瓦片晚到看不见，而拖拽掉帧立刻能感觉到；要旧行为显式传 `false`。图层用**容器上的真实输入事件**（wheel / pointerdown / pointermove / touchstart / touchmove / keydown）判定手势，带 260ms 尾窗：`flyTo` / `easeTo` 这类程序驱动的镜头动画不会被误判成用户手势，照常细化 |
 | `lodPixelRatioCap` | `number` | `Infinity` | LOD 判定屏幕高度的 DPR 上限（不截断）。默认按绘图缓冲物理像素算，3x DPR 手机上会显著多拉瓦片；传 `2` 即按「CSS 高度 × 2」截断，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `anisotropyCap` | `number` | `Infinity` | 各向异性过滤上限（不封顶 = GPU 最大值，通常 16）。移动端 4 / 8 通常肉眼无差，见[移动端 / 差设备](../s3m-three/docs/API.md#移动端--差设备) |
 | `maxTextureSize` | `number` | `Infinity` | 纹理长边像素上限（不限制）。手机上 1024 即可，显存降到 1/4；图集与 DXT 直传不受影响 |
@@ -339,6 +340,10 @@ readonly lodTransition: 'binary' | 'incremental'
 setLodTransition(mode: 'binary' | 'incremental'): void
 setCullRefine(enabled: boolean): void                     // 细化视锥剔除开关，默认 false
 readonly cullRefine: boolean
+setCalmWhileInteracting(enabled: boolean): void           // 手势期间静默（暂停细化 + 跳过淡入），默认 true
+readonly calmWhileInteracting: boolean
+readonly interacting: boolean                             // 用户手势是否进行中（图层自动维护）
+prewarmStyleVariants(modes?: StyleMode[]): Promise<void>  // 预编译演出要用的几种着色模式（遮罩期间调）
 setLodPixelRatioCap(cap: number): void                    // LOD 判定屏幕高度的 DPR 上限，Infinity = 不截断（默认）
 readonly lodPixelRatioCap: number
 setMaxImageCache(n: number, datasetId?: string): void    // 纹理缓存条数，默认 128

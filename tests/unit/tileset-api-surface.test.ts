@@ -31,6 +31,12 @@ const PUBLIC_METHODS = [
   'pendingWork', 'putExternalAtlas', 'putLeafRecords', 'registerTileTextures', 'residentMemory',
   'retryFailed',
   'setLodTransition', 'setMaterialQuality', 'setMaxMemory', 'setMaxTriangles', 'setRenderProfile',
+  // setLoadSliceBudget：相机运动时压小加载切片预算（新增能力，不是拆分产物）
+  'setLoadSliceBudget',
+  // 0.4.x：交互期暂缓提交 —— setCommitGate / heldCommits / flushHeldCommits。
+  // 进场景（纹理上传、program 首次编译）不可切分，手势期间先排队、抬手后逐帧放闸；
+  // 见 `tile-commit-gate.test.ts` 与 S3MViewer 的 `_flushHeldCommits`。
+  'setCommitGate', 'heldCommits', 'flushHeldCommits',
   'shouldBakeMercator', 'spatialRef', 'update', 'waterEffect',
 ].sort();
 

@@ -78,6 +78,10 @@ export interface TileRegistryHost {
   requestRepaint(): void;
   /** 淡入通道序号：用自增序号而不是 pickId，因为 pickId 会被回收复用 */
   nextTileFadeSeq(): number;
+  /** 宿主手势是否进行中（适配层驱动） */
+  interacting(): boolean;
+  /** 是否开启「手势期间静默」（`calmWhileInteracting`） */
+  calmWhileInteracting(): boolean;
 }
 
 export class TileRegistry {
@@ -207,6 +211,18 @@ export class TileRegistry {
     if (duration <= 0) return;
     const uFade = mat.userData.uTileFade;
     if (!uFade) return;
+
+    // 手势期间直接显示，不注册淡入通道。
+    //
+    // 淡入是「每块瓦片自己一条时间线」：一批瓦片不是同时到的，几十块各从 0 淡到 1，
+    // 屏幕上一片碎块各自呼吸 —— 拖拽时最明显，也是「加载和拖拽打架」的观感来源之一。
+    // 直接不淡入比调短时长更有效：时长再短，只要各块不同步就还是抖。
+    //
+    // 开关关闭（默认）时保持旧行为，见 `S3MViewerOptions.calmWhileInteracting`。
+    if (this.host.calmWhileInteracting() && this.host.interacting()) {
+      uFade.value = 1;
+      return;
+    }
 
     uFade.value = 0;
     mat.transparent = true;

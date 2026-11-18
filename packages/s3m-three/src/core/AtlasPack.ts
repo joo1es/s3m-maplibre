@@ -1,4 +1,5 @@
 import DXTTextureDecode from './DXTTextureDecode.js';
+import { takePredecodedAtlas } from './atlasDecodeCache.js';
 import { isSaneImageSize } from './imageLimits.js';
 
 /**
@@ -54,6 +55,9 @@ export interface DecodedAtlasImage {
  */
 export function decodeAtlasImage(tex: AtlasLike): DecodedAtlasImage | null {
   if (!tex.data || !tex.width || !tex.height) return null;
+  // 已经被 Worker 预解码过同一块缓冲：直接用，别再解一遍（见 core/atlasDecodeCache.ts）
+  const pre = takePredecodedAtlas(tex.data);
+  if (pre) return pre;
   // 单张图集尺寸异常 → 放弃这张（调用方已按 null = 放弃处理），不尝试分配
   if (!isSaneImageSize(tex.width, tex.height)) return null;
   const ct = tex.compressType;

@@ -116,6 +116,14 @@ export interface PostPresenterOptions {
   strength?: number;
   /** 仅 glow：亮度阈值，低于它的像素不发光 */
   threshold?: number;
+  /**
+   * 后处理 RT 的分辨率比例（0 < scale <= 1，默认 1 = 原尺寸）。
+   *
+   * 辉光这类大半径模糊对**像素数**敏感、对分辨率不敏感 —— 半分辨率能把 4 趟全屏
+   * pass 的填充率直接砍到 1/4，肉眼几乎看不出差别（辉光本来就是糊的）。
+   * 原图仍然全分辨率上屏，所以建筑边缘不会变软。
+   */
+  scale?: number;
 }
 
 export interface PostPresenterHandle {
@@ -138,6 +146,13 @@ export function createPostPresenter(layer: S3MLayer, opts: PostPresenterOptions)
   let radius = opts.radius ?? (mode === 'glow' ? 10 : 6);
   let strength = opts.strength ?? 1.5;
   let threshold = opts.threshold ?? 0.25;
+  // 后处理分辨率比例：0.5 = 半分辨率（填充率降到 1/4）
+  const scale = Number.isFinite(opts.scale) && (opts.scale as number) > 0 ? Math.min(1, opts.scale as number) : 1;
+  /** 后处理目标尺寸；radius 也按同一比例缩放，保证视觉半径不随分辨率变 */
+  const targetSize = (width: number, height: number) => [
+    Math.max(1, Math.round(width * scale)),
+    Math.max(1, Math.round(height * scale)),
+  ] as const;
 
   const quadScene = new THREE.Scene();
   const quadCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -238,11 +253,12 @@ export function createPostPresenter(layer: S3MLayer, opts: PostPresenterOptions)
       let bloomMix = 0;
 
       if (mode === 'blur' && radius > 0.5) {
-        ensureTargets(ctx.width, ctx.height);
+        const [tw, th] = targetSize(ctx.width, ctx.height);
+        ensureTargets(tw, th);
         if (!rtA || !rtB) return;
         const u = blurMat.uniforms;
-        u.uTexel.value.set(1 / ctx.width, 1 / ctx.height);
-        u.uRadius.value = radius;
+        u.uTexel.value.set(1 / tw, 1 / th);
+        u.uRadius.value = radius * scale;
 
         u.uDir.value.set(1, 0);
         u.tSrc.value = ctx.color;
@@ -255,7 +271,8 @@ export function createPostPresenter(layer: S3MLayer, opts: PostPresenterOptions)
         base = rtB.texture;
         bloom = rtB.texture;
       } else if (mode === 'glow') {
-        ensureTargets(ctx.width, ctx.height);
+        const [tw, th] = targetSize(ctx.width, ctx.height);
+        ensureTargets(tw, th);
         if (!rtA || !rtB) return;
 
         // 1. 亮部提取（不进 RT 的颜色不能直接模糊，否则暗部也会被拉出光晕）
@@ -265,8 +282,8 @@ export function createPostPresenter(layer: S3MLayer, opts: PostPresenterOptions)
 
         // 2. 横向模糊 → B
         const u = blurMat.uniforms;
-        u.uTexel.value.set(1 / ctx.width, 1 / ctx.height);
-        u.uRadius.value = radius;
+        u.uTexel.value.set(1 / tw, 1 / th);
+        u.uRadius.value = radius * scale;
         u.uDir.value.set(1, 0);
         u.tSrc.value = rtA.texture;
         pass(renderer, blurMat, rtB);

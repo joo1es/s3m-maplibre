@@ -93,15 +93,19 @@ export function normalizeMotionBlur(o: MotionBlurOptions | null | undefined): Mo
 /**
  * FPS 自适应拖尾（issue #4 的低端机专项：damp 不写死）。
  *
- * `damp = 0.55^(fps/60)` 封顶 0.92：
- * - 60fps ≈ 0.55（克制，桌面 / 高刷屏几乎无感）；
- * - 30fps ≈ 0.74、15fps ≈ 0.86（帧间隔越长，需要填的时间洞越宽，拖影越长）；
- * - 等价于「拖影覆盖的帧数随帧率降低而增长」，这正是低帧率卡顿需要的补偿；
+ * `damp = 0.55^(60/fps)` 封顶 0.92 —— 拖尾长度按**时间**恒定，不是按帧数恒定：
+ *
+ * - 每帧乘 damp，衰减到 1% 需要 `ln(0.01)/ln(damp)` 帧；帧率减半时帧数也要减半，
+ *   换算成秒才不变。所以指数是 `60/fps`；
+ * - 60fps ≈ 0.55（克制）；30fps ≈ 0.30、15fps ≈ 0.09（低帧率下几乎不拖）；
+ * - 反过来写（`0.55^(fps/60)`）是「按帧数恒定」：30fps 下同样帧数要跑两倍时间，
+ *   拖影在时间上直接翻倍 —— 低端机糊得最厉害，方向和「低端机要保守」正好相反。
+ *   那条公式在 smart-city 实测里就是这个观感：相机一动整屏发糊。
  * - 未知帧率（0 / NaN，启动前几百毫秒）按 60fps 保守取值，避免开局糊脸。
  */
 export function autoMotionBlurDamp(fps: number): number {
   const f = Number.isFinite(fps) && fps > 0 ? fps : 60;
-  return Math.min(0.92, 0.55 ** (f / 60));
+  return Math.min(0.92, 0.55 ** (60 / f));
 }
 
 /** 每帧入参：mode/damp 已由 viewer 解析（auto → 数值），mvp 为本帧完整裁剪矩阵 */

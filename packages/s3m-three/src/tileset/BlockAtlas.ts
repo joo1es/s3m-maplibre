@@ -25,6 +25,8 @@ import type {
   TexblockRequestPlan,
 } from '../core/S3MBlockParser.js';
 import { evaluateAtlasUpgrade } from '../core/AtlasUpgrade.js';
+import { predecodeAtlases } from '../core/atlasDecodeCache.js';
+import type { AtlasDecodeItem } from '../core/atlasDecodeCache.js';
 import type { AtlasPixels } from '../core/AtlasUpgrade.js';
 import { authFetch } from '../core/AuthFetch.js';
 import type { AuthenticateFn } from '../core/AuthFetch.js';
@@ -155,6 +157,36 @@ export class BlockAtlas {
     }
     for (const n of plainMiss) pending.push(this.ensureLeafFetch(n, () => this.fetchLeafFile(url, n)));
     if (pending.length) await Promise.all(pending);
+
+    // ②.5 预解码：把本块将要解块的图集缓冲一次性丢给 Worker。
+    //
+    // 后面的 composeLeafAtlas / rebuildBlockTextureState 仍是同步函数（改异步会一路
+    // ripple 到解析器），但它们内部的 decodeAtlasImage 会先查这张按缓冲对象记账的
+    // 缓存 —— 命中就跳过解块。实测这块占主线程 2.7 秒，是「加载时页面卡死」的主要来源之一。
+    //
+    // 收集不全也不影响正确性：没收集到的照常在主线程解，只是慢一点。
+    const decodeItems: AtlasDecodeItem[] = [];
+    const seenBuffers = new Set<Uint8Array>();
+    const addItem = (img: { width?: number; height?: number; pixelFormat?: number; compressType?: number; data?: Uint8Array | null } | null | undefined) => {
+      if (!img?.data || seenBuffers.has(img.data)) return;
+      seenBuffers.add(img.data);
+      decodeItems.push({
+        width: img.width ?? 0,
+        height: img.height ?? 0,
+        pixelFormat: img.pixelFormat ?? 0,
+        compressType: img.compressType ?? 0,
+        data: img.data,
+      });
+    };
+    for (const { tex, plan } of plans.values()) {
+      addItem(tex as never);
+      for (const n of plan.names) {
+        const recs = this.host.leafRequestCache.get(n);
+        if (!recs) continue;
+        for (const r of recs) addItem(r);
+      }
+    }
+    if (decodeItems.length) await predecodeAtlases(decodeItems);
 
     // ③ 逐图集：leaf 组合优先；没匹配上任何精灵就退回「整图替换 + 验证」
     for (const [id, { tex, plan }] of plans) {
