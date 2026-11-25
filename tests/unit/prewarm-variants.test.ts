@@ -85,3 +85,23 @@ describe('S3MLayer.prewarmStyleVariants 透传', () => {
     expect(called).toEqual([STYLE.HEIGHT]);
   });
 });
+
+describe('program 首次编译的入队时机', () => {
+  /**
+   * 新瓦片可能带来新的材质变体，program 是第一次用到才同步编译的。
+   * 原先靠 stats 每 15 帧轮询 mesh 数，最坏要等 ~250ms 才发现；
+   * 现在瓦片一落地就置 `_compilePending`，下一帧就能发起 compileAsync。
+   */
+  test('瓦片落地立刻标记待编译（不再等 15 帧轮询）', () => {
+    const v = new S3MViewer({} as any);
+    expect((v as any)._compilePending).toBe(false);
+
+    const entry = (v as any)._datasetManager.registerDataset({ id: 't' });
+    const group = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial());
+    group.add(mesh);
+
+    (v as any)._registerTile({ group, tile: null, sphere: null }, entry);
+    expect((v as any)._compilePending).toBe(true);
+  });
+});

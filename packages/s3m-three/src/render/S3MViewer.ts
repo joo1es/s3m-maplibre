@@ -1751,6 +1751,10 @@ export class S3MViewer {
     this._tiles.registerTile(node, entry);
     // 材质一落地就发起预热，而不是等这一帧画完（见 `_prewarmShadingSoon`）。
     this._prewarmShadingSoon();
+    // 新瓦片可能带来新的材质变体（透明 / 顶点色 / alphaTest…），而 program 是第一次
+    // 用到才同步编译的。原先前置条件靠 stats 每 15 帧轮询一次 mesh 数，最坏要等
+    // ~250ms 才发现；这里入队即置位，下一帧就能发起 compileAsync（400ms 节流仍在）。
+    this._compilePending = true;
   }
 
   /** @internal 瓦片被淘汰：从拾取表与场景里摘掉，并释放几何与材质显存 */
