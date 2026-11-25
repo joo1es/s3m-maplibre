@@ -10,7 +10,7 @@
 import * as maplibregl from 'maplibre-gl';
 import 'maplibre-gl/dist/maplibre-gl.css';
 import * as THREE from 'three';
-import { S3MLayer, STYLE } from 's3m-maplibre';
+import { S3MLayer, STYLE, perfSnapshot, resetPerf } from 's3m-maplibre';
 import '../style.css';
 
 import { DATASETS, configUrlOf, CAMERA, THEME } from './config.js';
@@ -22,6 +22,10 @@ import { CityFog } from './fog.js';
 import { warmupCity } from './warmup.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 性能计数器：控制台里 __s3mPerf() 看快照，__s3mPerfReset() 清零后重新推镜头
+window.__s3mPerf = () => perfSnapshot();
+window.__s3mPerfReset = () => resetPerf();
 
 /**
  * 程序化等距柱状天空（2:1），交给 setEnvironment 走 PMREM。

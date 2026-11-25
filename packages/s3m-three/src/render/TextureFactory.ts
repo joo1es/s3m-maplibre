@@ -11,6 +11,7 @@ import * as THREE from 'three';
 import type { S3MTexture } from '../core/types.js';
 import { decodeTextureData, textureDecodeIsTrivial } from '../core/TextureDecode.js';
 import { queueBandedUpload, shouldBandTexture } from './AtlasUpload.js';
+import { perf } from '../core/perf.js';
 import type { DecodedTextureData } from '../core/TextureDecode.js';
 
 export { PixelFormat } from '../core/TextureFormat.js';
@@ -149,11 +150,17 @@ async function decodeTexture(
   // 本地用原生 memcpy 出同样的字节，两张拷贝都省掉。
   //
   // 判据不满足时一切照旧 —— 仍优先 Worker，Worker 不可用再主线程兜底。
+  const started = perf.t0();
   if (offThreadDecode && !textureDecodeIsTrivial(tex, { maxSize })) {
     const viaWorker = await offThreadDecode(tex, compressed, maxSize, extra);
-    if (viaWorker) return viaWorker;
+    if (viaWorker) {
+      perf.noteDecode(perf.t0() - started, true);
+      return viaWorker;
+    }
   }
-  return decodeTextureData(tex, options);
+  const out = await decodeTextureData(tex, options);
+  perf.noteDecode(perf.t0() - started, false);
+  return out;
 }
 
 /**

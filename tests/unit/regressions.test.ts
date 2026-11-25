@@ -469,10 +469,13 @@ describe('9. CRN 解码器：魔数先拦、非法数据能明确拒绝', () => 
     await expect(transcodeCRN(new Uint8Array([1, 2, 3, 4]))).rejects.toThrow(/CRN 头/);
     await expect(transcodeCRN(new Uint8Array(64))).rejects.toThrow(/CRN 头/);
 
-    // 带 Hx 头但内容非法：这条路才真正进 wasm，必须抛错而不是崩掉或挂住
+    // 带 Hx 头但内容非法：这条路才真正进 wasm，必须抛错而不是崩掉或挂住。
+    // 传 expected（生产调用一定会传）：头里读出来的尺寸不可能刚好等于 4×4，
+    // 判定于是与 wasm 堆的历史无关 —— 不传 expected 时「头里的宽高」会读到堆残留，
+    // 同一个坏输入冷启动被拒、热身后却可能「解」出一个合理尺寸。
     const fake = new Uint8Array(64);
     fake.set([0x48, 0x78, 0x00, 0x6e]);
-    await expect(transcodeCRN(fake)).rejects.toThrow(/CRN|crunch/);
+    await expect(transcodeCRN(fake, { width: 4, height: 4 })).rejects.toThrow(/CRN|crunch|尺寸/);
   });
 });
 

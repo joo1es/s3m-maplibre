@@ -29,6 +29,7 @@ import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
 import { flushBandedUploads, pumpBandedUploads } from './AtlasUpload.js';
+import { perf } from '../core/perf.js';
 import { setAtlasOffThreadDecode } from '../core/atlasDecodeCache.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
 import { getMaterialQuality, normalizeMaterialQuality, getColorPipeline, normalizeColorPipeline } from './StyleMaterial.js';
@@ -975,8 +976,10 @@ export class S3MViewer {
         onTile: (node, e) => {
           // 这块瓦片马上进场景：先把它引用的图集纹理补完整（分带上传没传完的行）。
           // 正常情况下队列是空的（空闲帧已搬完），这里只是兜底，最坏退化成整张上传。
+          const commitStarted = perf.t0();
           if (this.renderer) flushBandedUploads(this.renderer);
           this._registerTile(node, e);
+          perf.noteCommit(perf.t0() - commitStarted);
           this.onStats(this.stats);
           this._requestRepaint();
         },
@@ -2665,6 +2668,8 @@ export class S3MViewer {
   private readonly _gateBound = new WeakSet<object>();
   /** 上一帧的 renderFrame 耗时（毫秒），提交预算用它做自适应 */
   private _lastFrameMs = 16;
+  /** 上一次统计到的 program 数（用来算新增编译次数） */
+  private _lastProgramCount = 0;
   private _frameStartedAt = 0;
   /** 最后一次「相机在动」的时刻：停下来之后要等一小会儿再放闸 */
   private _lastMovingAt = 0;
@@ -2842,7 +2847,10 @@ export class S3MViewer {
 
     // 交互期暂缓的瓦片：手势结束后每帧放几块，别在抬手那一帧全砸进来
     const frameNow = performance.now();
-    if (this._frameStartedAt > 0) this._lastFrameMs = frameNow - this._frameStartedAt;
+    if (this._frameStartedAt > 0) {
+      this._lastFrameMs = frameNow - this._frameStartedAt;
+      perf.noteFrame(this._lastFrameMs);
+    }
     this._frameStartedAt = frameNow;
     if (this._cameraMoving) this._lastMovingAt = frameNow;
     this._syncCommitGates();
@@ -3171,7 +3179,11 @@ export class S3MViewer {
     const info = this.renderer?.info;
     if (info) {
       total.drawCalls = info.render.calls;
-      total.programs = info.programs?.length ?? 0;
+      const programs = info.programs?.length ?? 0;
+      total.programs = programs;
+      // program 首次编译是同步的、会直接掉帧；统计新增数量供性能分析用
+      perf.noteProgramCompiles(programs - this._lastProgramCount);
+      this._lastProgramCount = programs;
       total.textures = info.memory.textures;
       total.geometries = info.memory.geometries;
     }

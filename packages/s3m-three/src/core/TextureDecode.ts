@@ -326,7 +326,7 @@ async function decodeTextureDataRaw(
 
   if (kind === 'crn') {
     try {
-      const crn = await transcodeCRN(tex.data);
+      const crn = await transcodeCRN(tex.data, { width: tex.width, height: tex.height });
       const pf = crn.dxtFormat === 1 ? PixelFormat.DXT1 : PixelFormat.DXT5;
       const fmt = crn.dxtFormat === 1 ? 'dxt1' : 'dxt5';
       if (canCompress && compressible(crn.data, crn.width, crn.height, fmt)) {

@@ -93,6 +93,8 @@ export type {
 } from './tileset/S3MTileset.js';
 
 // —— 渲染层
+export { perfSnapshot, resetPerf } from './core/perf.js';
+export type { PerfSnapshot } from './core/perf.js';
 export { S3MViewer } from './render/S3MViewer.js';
 export type {
   S3MViewerOptions,

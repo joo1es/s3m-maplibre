@@ -39,6 +39,8 @@ import { dirOf, resolveUrl } from './url.js';
  * 全是「读同一个对象引用 + 两个运行时可变的上限」，没有回调进宿主的方法 ——
  * 这一层是纯搬运，不需要宿主参与控制流。
  */
+import { perf } from '../core/perf.js';
+
 export interface BlockAtlasHost {
   /** 原始图像 / leaf 记录缓存容量上限（`S3MTileset.maxImageCache`，运行时可调） */
   imageCacheLimit(): number;
@@ -211,7 +213,9 @@ export class BlockAtlas {
         for (const r of recs) sprites.set(r.id, { source: n, image: r });
       }
 
+      const composeStarted = perf.t0();
       const composed = composeLeafAtlas(tex, sprites);
+      perf.noteCompose(perf.t0() - composeStarted);
       if (composed) {
         const t = tex as S3MBlockTexture & { composed?: boolean; leafSig?: string };
         t.composed = true;

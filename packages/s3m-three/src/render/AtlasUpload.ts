@@ -17,6 +17,7 @@
  * 交回 three 自己上传（见 `pumpBandedUploads` 里的 `__s3mBandedOwner`）。
  */
 import * as THREE from 'three';
+import { perf } from '../core/perf.js';
 
 interface BandedRecord {
   tex: THREE.DataTexture;
@@ -181,7 +182,9 @@ function uploadRows(
   const slice = new Uint8Array(img.data.buffer, img.data.byteOffset + start, rows * rowBytes);
   // 每次都重设：unpack 是全局状态，上一张纹理的上传会把它改掉（见 prepareUnpack）
   prepareUnpack(gl, rec.tex);
+  const started = perf.t0();
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, rec.row, img.width, rows, gl.RGBA, gl.UNSIGNED_BYTE, slice);
+  perf.noteUpload(rows * rowBytes, perf.t0() - started, 1);
 
   rec.row += rows;
   return rows * rowBytes;
