@@ -212,8 +212,11 @@ map = new maplibregl.Map({
 
 layer = new S3MLayer({
   id: 's3m',
-  // 7 个数据集实测 191 块根瓦片，预算给小了每帧都在淘汰-重下，纹理会永远停在最粗一级
-  maxTiles: 1024,
+  // 根瓦片现在是按需加载的（内核 0.4.x 的 lazyRoots），191 块不会再一次性全下，
+  // 远景机位只加载视锥内够得着的那几块。所以预算不用再按「全部根瓦片」留量：
+  // 384 足够覆盖近景几幕的根 + 子层，超出的部分会走 TileBudget 的 make-before-break
+  // 淘汰 —— 高到 1024 反而让预算永远不触发，子瓦片只进不出。
+  maxTiles: 384,
   // LOD 保守的兜底档（每数据集在 config.js 里各自覆盖）：数值越大越倾向保留粗模。
   // 这是加载期总工作量最有效的一根旋钮 —— 详见 config.js 里 DATASETS 的注释。
   lodRangeScale: 1.15,

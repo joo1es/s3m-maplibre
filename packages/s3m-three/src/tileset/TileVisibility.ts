@@ -220,6 +220,17 @@ export class TileVisibility {
       // 在有效范围内（留一倍余量）的算「正在用」，淘汰时按这个帧号排优先级
       const scale = this.host.lodRangeScale() > 0 ? this.host.lodRangeScale() : 1.0;
       const threshold = node.rangeValue * scale;
+      // 细化阈值和上面那条**不是一个量**：
+      //   threshold      = 这块瓦片自己声明的有效范围 → 决定「还在不在用」（lastSeen）
+      //   refineThreshold= **子瓦片**声明的 rangeValue → 决定「要不要往下细化」
+      // 区间语义是「一块瓦片在什么范围内值得画」，所以判「子瓦该不该出现」必须用子瓦
+      // 的阈值。拿父瓦的值去判会早一整档：实测 6_01 自身 rv=586.8 / r=293.4，它的子
+      // 6_0100 是 rv=1024 —— 用父判 1303m 就开始细化，用子判要到 747m。
+      // 官方遍历 child pageLOD 时是逐个子节点算 calcPixFromCam，就是后者。
+      const refineThreshold =
+        (typeof node.childRangeValue === 'number' && node.childRangeValue > 0
+          ? node.childRangeValue
+          : node.rangeValue) * scale;
       const inRange = byDistance ? dist < threshold * 2 : metric > threshold * 0.5;
       if (inRange) node.lastSeen = this.host.frame();
 
@@ -248,7 +259,7 @@ export class TileVisibility {
       let needRefine = splat
         ? splat.needRefine
         : childUrls.length > 0 &&
-          (byDistance ? metric < threshold * hFactor : metric > threshold * hFactor);
+          (byDistance ? metric < refineThreshold * hFactor : metric > refineThreshold * hFactor);
       if (needRefine && refineCull && isVisible && !isVisible(c, node.sphere.radius, node)) {
         needRefine = false;
       }

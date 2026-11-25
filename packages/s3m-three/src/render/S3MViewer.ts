@@ -1743,7 +1743,7 @@ export class S3MViewer {
   }
 
   /** @internal 瓦片被淘汰：从拾取表与场景里摘掉，并释放几何与材质显存 */
-  private _unregisterTile(node: TileNode, entry: S3MDatasetEntry): void {
+  private _unregisterTile(node: TileNode, entry?: S3MDatasetEntry): void {
     this._tiles.unregisterTile(node, entry);
   }
 

@@ -148,7 +148,16 @@ export class TileBudget {
     this._tileTextureKeys.delete(victim.url);
     if (keys?.length) {
       for (const key of keys) {
-        const ref = (this._textureRefs.get(key) ?? 1) - 1;
+        // ★ 没登记过的 key 一律不碰。
+        //
+        // 原来是 `(get(key) ?? 1) - 1` —— 猜一个初值，猜中就顺手 dispose。问题是
+        // `TextureSharing` 下同一张 `.texblock` 图集被多块瓦片共用：只要有一块瓦片的
+        // key 没进过计数（或者 keys 与注册时那份不一致），这里就会把**别人还在用**
+        // 的整张图集 dispose 掉，症状是路面/草坪出现黑色块和错位贴图。
+        // 少释放一份最多是多占一点显存，误删共享图集是直接画错 —— 取前者。
+        const cur = this._textureRefs.get(key);
+        if (cur === undefined) continue;
+        const ref = cur - 1;
         if (ref <= 0) {
           this._textureRefs.delete(key);
           const tex = this.host.textureCache.get(key);

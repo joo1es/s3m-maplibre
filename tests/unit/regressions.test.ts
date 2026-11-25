@@ -25,6 +25,8 @@ import * as THREE from 'three';
 import { buildTileObjects } from '../../packages/s3m-three/src/render/GeometryBuilder';
 import { S3MTileset, classifyDatasetKind, parseConfigText } from '../../packages/s3m-three/src/tileset/S3MTileset';
 import { S3MLayer } from '../../packages/s3m-maplibre/src/index';
+import { TileRegistry } from '../../packages/s3m-three/src/render/viewer/TileRegistry';
+import { composeLeafAtlas } from '../../packages/s3m-three/src/core/S3MBlockParser';
 import { createSharedUniforms, createStyledMaterial } from '../../packages/s3m-three/src/render/StyleMaterial';
 import { Picker } from '../../packages/s3m-three/src/render/Picker';
 import { transcodeCRN } from '../../packages/s3m-three/src/core/CRNDecode';
@@ -853,5 +855,110 @@ describe('回归：3DGS 材质必须响应 renderer.clippingPlanes', () => {
       expect(three.distanceToPoint(new THREE.Vector3(...outside)) >= 0)
         .toBe(isPointKept([p], outside));
     }
+  });
+});
+
+/* ---------------------------------------------------------------- 13. 淘汰回调不能依赖 entry */
+
+/**
+ * `TileBudget.evictTileNode` 只给 `onTileRemoved(node)` 一个参数，`S3MViewer` 那边
+ * 转成 `_unregisterTile(node, entry)` 时 `entry` 就是 `undefined`。
+ *
+ * 原来的 `unregisterTile` 末尾写死 `entry.root.remove(node.group)`，于是**每一次**
+ * 预算淘汰 / 距离回收都在这里抛 TypeError。异常发生在 pickId 清理之后，所以画面
+ * 看着没事，实际后果是：纹理引用不减（材质永不回收）、`_reclaimFarSubtiles` 的
+ * 循环中断（后面的波次不执行）、当帧收尾被吞。
+ *
+ * 用户看到的是「路面有条状空洞 + 贴图错乱 + 点建筑显示成桥梁」。
+ */
+describe('淘汰回调不依赖 entry', () => {
+  function buildRegistry() {
+    const pickables = new Map<number, unknown>();
+    const released: number[] = [];
+    const host: Record<string, unknown> = {
+      picks: { pickables },
+      releasePickId: (id: number) => released.push(id),
+      edges: { unregisterNativeLine: () => {} },
+      pointClouds: new Map(),
+      animator: { unregister: () => {} },
+      sel: { selectedMeshes: [], selection: null, replayOnto: () => {} },
+      select: () => {},
+      smidMeshes: new Map(),
+      unindexMeshSmids: () => {},
+      heights: { remove: () => {} },
+      featureStyles: { disposeMesh: () => {} },
+    };
+    return { host: host as never, pickables, released };
+  }
+
+  test('entry 缺失时不抛错，且 pickId 与场景节点都被摘干净', () => {
+    const { host, pickables, released } = buildRegistry();
+    const reg = new TileRegistry(host);
+
+    const group = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshBasicMaterial());
+    (mesh.userData as Record<string, unknown>).pickId = 7;
+    group.add(mesh);
+    pickables.set(7, { mesh, datasetId: 'Building@CBD' });
+
+    const parent = new THREE.Group();
+    parent.add(group);
+    const node = { url: 'http://example.com/a.s3mblock', group };
+
+    // 关键：不传 entry（和 TileBudget 的真实调用一致）
+    expect(() => reg.unregisterTile(node as never)).not.toThrow();
+
+    expect(pickables.has(7)).toBe(false);
+    expect(released).toEqual([7]);
+    expect((mesh.userData as Record<string, unknown>).pickId).toBeUndefined();
+    expect(group.parent).toBeNull();
+  });
+});
+
+/* ---------------------------------------------------------------- 14. leaf 图集不能越界写 */
+
+/**
+ * `composeLeafAtlas` 曾按精灵**自身**宽高整行拷贝，起点是 `subTexInfos` 的 offset。
+ * 图集里存在 `img.width > sub.width` 的精灵（历史重排版过的旧图集），多出来的部分
+ * 会盖住隔壁精灵 —— 视觉上就是贴图串位、同一块图案重复出现。
+ *
+ * 构造：格子 B 在右（x=2..3），格子 A 在左（x=0..1）但它的精灵宽 4。遍历顺序
+ * 让 A 后画，于是越界的部分会覆盖 B —— 旧实现里 x=2/3 变成 A 的颜色。
+ */
+describe('leaf 图集按声明格子裁剪', () => {
+  test('精灵比格子宽时，多出来的部分不能写进邻居格子', () => {
+    const solid = (w: number, h: number, v: number) => {
+      const data = new Uint8Array(w * h * 4);
+      for (let i = 0; i < w * h; i++) {
+        data[i * 4] = v;
+        data[i * 4 + 1] = v;
+        data[i * 4 + 2] = v;
+        data[i * 4 + 3] = 255;
+      }
+      return { id: v, width: w, height: h, compressType: 0, pixelFormat: 28, data };
+    };
+
+    const tex = {
+      width: 4,
+      height: 2,
+      subTexInfos: [
+        { subName: 'b', offsetX: 2, offsetY: 0, width: 2, height: 2 },
+        // A 声明只有 2 宽，但精灵是 4 宽
+        { subName: 'a', offsetX: 0, offsetY: 0, width: 2, height: 2 },
+      ],
+    };
+    const sprites = new Map([
+      ['b', { source: 'B', image: solid(2, 2, 10) }],
+      ['a', { source: 'A', image: solid(4, 2, 200) }],
+    ]);
+
+    const out = composeLeafAtlas(tex as never, sprites as never)!;
+    expect(out).not.toBeNull();
+    const at = (x: number, y: number) => out.data[(y * out.width + x) * 4]!;
+    // 左格子是 A
+    expect(at(0, 0)).toBe(200);
+    // 右格子必须是 B，不能被 A 越界覆盖
+    expect(at(2, 0)).toBe(10);
+    expect(at(3, 0)).toBe(10);
   });
 });

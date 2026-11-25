@@ -186,3 +186,71 @@ export function evaluateAtlasUpgrade(
     meanAbsError,
   };
 }
+
+/**
+ * **没有缩略图基准**时（子瓦片：`texturePackage` 里 `data = null`）判断外拉的
+ * `.texblock` 图集能不能直接替换元信息里的那份。
+ *
+ * 子瓦没有可比的低清图，`evaluateAtlasUpgrade` 那条路走不了（没有色差可算）。
+ * 但「整数等比」这一条**不依赖基准**，必须单独验：
+ *
+ *   `subTexInfos` 的 offset/width 是像素，替换后按 `rectScale = imgW / atlasW`
+ *   换算到新图空间。只有同一个整数倍时结果才落在整数像素上；1.37 倍会让 rect 落到
+ *   半个纹素，双线性采样把邻格内容混进来 —— 视觉上就是「同一块花纹重复出现」和
+ *   「规整的深色块」。
+ *
+ * 旧实现这里只比长宽比（2%），于是 1.37 倍这种"形状一样、倍率不对"的图会被放行，
+ * 一贴上就整片串位。这个函数就是补上缺的那半条判据。
+ */
+export function canAdoptAtlasWithoutBaseline(
+  atlasW: number,
+  atlasH: number,
+  imgW: number,
+  imgH: number,
+  maxAspectDelta: number = DEFAULT_MAX_ASPECT_DELTA
+): boolean {
+  if (
+    !Number.isFinite(atlasW) ||
+    !Number.isFinite(atlasH) ||
+    !Number.isFinite(imgW) ||
+    !Number.isFinite(imgH) ||
+    atlasW <= 0 ||
+    atlasH <= 0 ||
+    imgW <= 0 ||
+    imgH <= 0
+  ) {
+    return false;
+  }
+
+  const loAspect = atlasW / atlasH;
+  const hiAspect = imgW / imgH;
+  const aspectDelta = Math.abs(hiAspect / loAspect - 1);
+  if (!Number.isFinite(aspectDelta) || aspectDelta > maxAspectDelta) return false;
+
+  const scaleX = imgW / atlasW;
+  const scaleY = imgH / atlasH;
+  // 两轴必须同一个倍率，且必须是整数 —— rect 换算只有一个 rectScale
+  if (Math.abs(scaleX - scaleY) > 1e-6) return false;
+  const n = Math.round(scaleX);
+  if (n < 1) return false;
+  return Math.abs(scaleX - n) <= 1e-6;
+}
+
+/**
+ * 从一个 `.texblock` 文件解析出的记录里挑出「哪张才是这张图集」。
+ *
+ * 一个文件可能装多条记录（`Tile_6_000000.texblock` 实测 16 条）。旧实现盲取
+ * `recs[0]`，于是经常拿到**另一张图集**：元信息声明 1536x1024，实际选中的是
+ * 384x256 那张 —— `rectScale` 变成 0.25，整块瓦片的 rect 一起缩到角落，贴图串位。
+ *
+ * 优先按名字匹配（大小写与扩展名都不敏感），匹配不上才退回第一条，保持旧行为兜底。
+ */
+export function pickAtlasCandidate<T extends { id: string }>(
+  recs: readonly T[] | undefined | null,
+  name: string
+): T | null {
+  if (!recs || !recs.length) return null;
+  const norm = (s: string) => s.toLowerCase().replace(/\.texblock$/i, '');
+  const want = norm(name);
+  return recs.find((r) => norm(r.id) === want) ?? recs[0] ?? null;
+}

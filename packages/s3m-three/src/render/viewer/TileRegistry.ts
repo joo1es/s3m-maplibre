@@ -263,8 +263,23 @@ export class TileRegistry {
     });
   }
 
-  /** 瓦片被淘汰：从拾取表和场景里摘掉，并深度彻底释放所有几何体与材质显存 */
-  unregisterTile(node: TileNode, entry: S3MDatasetEntry): void {
+  /**
+   * 瓦片被淘汰：从拾取表和场景里摘掉，并深度彻底释放所有几何体与材质显存。
+   *
+   * `entry` 是**可选**的：预算淘汰 / 距离回收走的是 `TileBudget.evictTileNode`，
+   * 那边只有 `node`，回调链上根本没有 dataset entry。
+   *
+   * 以前这里写死 `entry.root.remove(node.group)` —— 那条路径一执行就
+   * `Cannot read properties of undefined (reading 'root')`。异常发生在 pickId 清理
+   * **之后**，所以画面看着正常，但：
+   *   - `evictTileNode` 剩下的纹理引用递减、stats 更新全被跳过（材质不回收）；
+   *   - `S3MTileset._reclaimFarSubtiles` 的循环在这里中断，后面的波次不执行；
+   *   - 上层那一帧的收尾（重绘请求 / 统计）也一起没了。
+   * 症状就是「洞 + 贴图错乱 + 拾取串到别的数据集」。
+   *
+   * 用 `group.parent` 摘是从场景移除的唯一必要动作，和 `evictTileNode` 里那次幂等。
+   */
+  unregisterTile(node: TileNode, entry?: S3MDatasetEntry): void {
     node.group.traverse((child) => {
       const obj = child as any;
       if ((child as THREE.LineSegments).isLineSegments && obj.userData?.isEdgeLines) {
@@ -322,6 +337,8 @@ export class TileRegistry {
       // 释放几何体显存缓冲
       obj.geometry?.dispose?.();
     });
-    entry.root.remove(node.group);
+    // entry 可能不存在（见方法头注释）：从实际父节点摘，别再依赖 entry.root
+    node.group?.parent?.remove(node.group);
+    entry?.root?.remove(node.group);
   }
 }

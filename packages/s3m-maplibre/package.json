@@ -37,6 +37,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && vite build --config vite.browser.config.ts && vite build --config vite.browser.config.ts --mode ext",
+    "build:dev": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "prepublishOnly": "node -e \"const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('package.json','utf8'));p.dependencies['s3m-three']='^'+JSON.parse(fs.readFileSync('../s3m-three/package.json','utf8')).version;fs.writeFileSync('package.json',JSON.stringify(p,null,2)+'\\n')\" && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json && vite build --config vite.browser.config.ts && vite build --config vite.browser.config.ts --mode ext && tsc --noEmit -p tsconfig.json",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""

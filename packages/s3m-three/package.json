@@ -42,6 +42,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json && node ../../tools/copy-assets.mjs s3m-three && vite build --config vite.worker.config.ts && vite build --config vite.browser.config.ts && vite build --config vite.browser.config.ts --mode ext",
+    "build:dev": "tsc -p tsconfig.build.json && node ../../tools/copy-assets.mjs s3m-three",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\""
   },

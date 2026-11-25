@@ -19,6 +19,8 @@
  * Mapbox GL JS v2/v3 都可以直接 `map.addLayer(layer)`，不引入任一方的类型依赖。
  */
 import { HostRenderer } from 's3m-three';
+import { resolveCameraEnu } from './cameraEnu';
+import type { MapTransformLike } from './cameraEnu';
 import type { S3MViewer } from 's3m-three';
 import type {
   S3MViewerOptions,
@@ -609,16 +611,26 @@ export class S3MLayer extends HostRenderer {
     const sNorth = anchor.meterInMercatorNorth ?? anchor.meterInMercator;
     const sUp = sEast;
 
-    // 相机在场景 ENU 中的位置（FreeCamera 不可用时退回原点，只影响 LOD 精度）
-    let camEnu: [number, number, number] = [0, 0, 0];
-    try {
-      const p = map.getFreeCameraOptions?.()?.position;
-      if (p) {
-        camEnu = [(p.x - anchor.x) / sEast, -(p.y - anchor.y) / sNorth, (p.z - anchor.z) / sUp];
-      }
-    } catch {
-      /* 忽略 */
-    }
+    // 相机在场景 ENU 中的位置。
+    //
+    // 不能再用 `getFreeCameraOptions`：maplibre-gl 5.24 **没有这个方法**（d.ts 与
+    // 运行时都搜不到），旧写法永远拿到 undefined，camEnu 恒为 [0,0,0] —— 于是每块
+    // 瓦片的距离都变成「离数据集原点多远」，与相机彻底脱钩。症状是全套 LOD 判据失灵：
+    // 拉远不回收材质、缩到哪儿都在请求子瓦片、回收掉的瓦片当帧又被判回"近处"装回来。
+    // 改用 transform 的公开字段反算，公式与依据见 cameraEnu.ts。
+    const camEnu: [number, number, number] =
+      resolveCameraEnu({
+        transform: (
+          map as unknown as { transform?: MapTransformLike }
+        ).transform,
+        anchor,
+        sEast,
+        sNorth,
+        worldFromLngLat:
+          this.viewer.geo && typeof this.viewer.geo.worldFromLngLat === 'function'
+            ? (lng, lat, alt) => this.viewer.geo!.worldFromLngLat!(lng, lat, alt)
+            : undefined,
+      }) ?? [0, 0, 0];
 
     // 矩阵拼接（近缩放 / 正交混合 / 相机 ENU 反推）是 MapLibre 专属，留在上面；
     // 「喂内核 + 按需请求下一帧」是宿主无关逻辑，交给基类的 driveFrame——

@@ -69,6 +69,18 @@ export interface TileNode {
   sphere: { center: { x: number; y: number; z: number }; radius: number } | null;
   rangeValue: number;
   rangeMode: number;
+  /**
+   * 第一个子瓦片自己声明的 rangeValue。
+   *
+   * 细化判定的区间语义是「这块瓦片在什么范围内值得画」，所以「要不要往下一层细化」
+   * 该用**子瓦**的阈值，不是当前这块的。实测 `6_01`：自身 rv=586.8 / r=293.4，
+   * 它的子 `6_0100` rv=1024 —— 用父判是 1303m 就开始细化，用子判要到 747m。
+   * 官方遍历 child pageLOD 时逐个子节点判定，就是后者；差这一档，画面在 1.3km
+   * 外就提前拉了一批本来该 750m 才出现的子瓦片。
+   *
+   * 缺省 / 0 时回退到 `rangeValue`（老数据与单测构造的节点都走这条）。
+   */
+  childRangeValue?: number;
   childUrl: string | null;
   childUrls?: string[];
   state: string;
@@ -146,6 +158,17 @@ export interface S3MTilesetOptions {
   anchorOverride?: AnchorOverride;
   maxTiles?: number;
   maxConcurrent?: number;
+  /**
+   * 根瓦片是否按相机距离按需加载，**默认开**。
+   *
+   * 官方 SuperMap3D 的根瓦片同样要过 `calcPixFromCam` 的 `_isLessLodDis` 判定，
+   * 屏幕尺寸不够就不发请求（实测官方开局只请求 `Tree@CBD/11.s3mblock` 一块，
+   * 镜头拉近才出现下一级）。旧实现是 `for (const r of rootUrls.slice(1)) this._enqueue(r)`，
+   * 191 个根块无条件全下发 —— 离远了几公里外的瓦片在屏幕上不到一个像素，
+   * 加载它没有任何意义。这是 bug 修复，所以默认就是按需；`false` 只留给排查用，
+   * 会退回到「配置里的根瓦片全量入队」的旧口径。
+   */
+  lazyRoots?: boolean;
   /**
    * 加载期主线程切片预算（毫秒），默认 8。0 = 关闭切片（整块瓦片一口气做完）。
    *

@@ -70,10 +70,48 @@ export function parseConfigText(text: string): Record<string, unknown> {
       }
     }
 
-    const fileMatches = trimmed.matchAll(/<(?:[a-zA-Z0-9_-]+:)?FileName[^>]*>([^<]+)<\//gi);
-    const tiles: Array<{ url: string }> = [];
-    for (const m of fileMatches) {
-      tiles.push({ url: m[1].trim() });
+    // `<Files>` 块里 FileName 与 BoundingSphere 是**配对**的。只抠 FileName 会让 S3M 1.x
+    // 拿不到根瓦片的包围体，`rootVolumeOf` 返回 null → 懒根判定对整类 OSGB 数据静默失效
+    // （索菲亚教堂 `3D-suofeiya_church` 就是这种格式：9 个根文件每个都带 BoundingSphere，
+    // 半径约 74m）。有了它，这类数据也能在远景只加载视野内那几块，而不用把整棵树全下载。
+    const tiles: Array<{
+      url: string;
+      boundingSphere?: { center: { x: number; y: number; z: number }; radius: number };
+    }> = [];
+    const seenTiles = new Set<string>();
+    const filesBlock = /<(?:[a-zA-Z0-9_-]+:)?Files>([\s\S]*?)<\/(?:[a-zA-Z0-9_-]+:)?Files>/gi;
+    for (const fm of trimmed.matchAll(filesBlock)) {
+      const body = fm[1] ?? '';
+      const url = /<(?:[a-zA-Z0-9_-]+:)?FileName[^>]*>([^<]+)</i.exec(body)?.[1]?.trim();
+      if (!url || seenTiles.has(url)) continue;
+      seenTiles.add(url);
+
+      const tile: (typeof tiles)[number] = { url };
+      const bs = /<(?:[a-zA-Z0-9_-]+:)?BoundingSphere>([\s\S]*?)<\/(?:[a-zA-Z0-9_-]+:)?BoundingSphere>/i.exec(body);
+      if (bs) {
+        const tagNum = (tag: string): number => {
+          const m = new RegExp(`<(?:[a-zA-Z0-9_-]+:)?${tag}[^>]*>([^<]+)<`, 'i').exec(bs[1] ?? '');
+          return parseFloat(m?.[1] ?? '');
+        };
+        const cx = tagNum('CenterX');
+        const cy = tagNum('CenterY');
+        const cz = tagNum('CenterZ');
+        const radius = tagNum('Radius');
+        // CenterZ 是**绝对高程**，position.z 是成果原点高程，先归到数据集局部 ENU。
+        // 差几十米对根瓦片的距离判定无关紧要，但方向不能错。
+        if ([cx, cy, cz, radius].every(Number.isFinite) && radius > 0) {
+          tile.boundingSphere = { center: { x: cx, y: cy, z: cz - posZ }, radius };
+        }
+      }
+      tiles.push(tile);
+    }
+
+    // 兜底：不带 `<Files>` 包装的老格式只有裸 `<FileName>`，按原口径补进来
+    for (const m of trimmed.matchAll(/<(?:[a-zA-Z0-9_-]+:)?FileName[^>]*>([^<]+)<\//gi)) {
+      const url = m[1]!.trim();
+      if (seenTiles.has(url)) continue;
+      seenTiles.add(url);
+      tiles.push({ url });
     }
 
     // SuperMapCache 用 MinHeight/MaxHeight 声明成果的高程范围（米）。

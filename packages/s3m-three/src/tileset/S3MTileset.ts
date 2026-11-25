@@ -66,6 +66,74 @@ export type {
   TileVisibilityTest,
 } from './types.js';
 
+/**
+ * 还没请求的根瓦片。config 的 `rootTiles` 自带包围盒，够在发请求之前算出它在屏幕上
+ * 有多大 —— 这就是官方 `calcPixFromCam` 在遍历阶段做的事，不需要先落地一块瓦片。
+ */
+interface RootCandidate {
+  url: string;
+  center: { x: number; y: number; z: number };
+  radius: number;
+  /**
+   * LOD 阈值。config **不声明** rangeValue，只有包围盒；实测这批 S3M 的 pageLOD 恒有
+   * `rangeValue === radius`（Building `0.s3mblock` 72.0721、Tree `11.s3mblock` 247.77，
+   * 两处都精确相等），所以这里直接用半径。判据里它会和分子的 radius 约掉，
+   * 结果与官方 `_isLessLodDis` 完全一致：`dist < (H × 2.414) / lodRangeScale`。
+   */
+  rangeValue: number;
+}
+
+/**
+ * 从 config 的根瓦片条目里取出包围体。
+ *
+ * iServer 给的是 `boundingbox`（中心 + 三个 OBB 轴向量），桌面导出偶尔直接给
+ * `boundingSphere`。半径取「三个 extent 向量之和的模的一半」= OBB 半对角线，
+ * 与页面里看到的瓦片覆盖范围一致。取不出来返回 null —— 那种根瓦片无法预判，
+ * 只能退回无条件加载。
+ */
+function rootVolumeOf(
+  entry: unknown
+): { center: { x: number; y: number; z: number }; radius: number } | null {
+  const e = entry as
+    | {
+        boundingbox?: {
+          center?: { x: number; y: number; z: number };
+          xExtent?: { x: number; y: number; z: number };
+          yExtent?: { x: number; y: number; z: number };
+          zExtent?: { x: number; y: number; z: number };
+        };
+        boundingBox?: { center?: { x: number; y: number; z: number }; radius?: number };
+        boundingSphere?: { center?: { x: number; y: number; z: number }; radius?: number };
+      }
+    | null
+    | undefined;
+  if (!e) return null;
+
+  const bb = e.boundingbox;
+  if (bb?.center) {
+    const ex = [bb.xExtent, bb.yExtent, bb.zExtent].filter(
+      (v): v is { x: number; y: number; z: number } => !!v
+    );
+    if (ex.length) {
+      const sx = ex.reduce((s, v) => s + v.x, 0);
+      const sy = ex.reduce((s, v) => s + v.y, 0);
+      const sz = ex.reduce((s, v) => s + v.z, 0);
+      const radius = 0.5 * Math.hypot(sx, sy, sz);
+      if (Number.isFinite(radius) && radius > 0) {
+        const c = bb.center;
+        return { center: { x: c.x, y: c.y, z: c.z }, radius };
+      }
+    }
+  }
+
+  const bs = e.boundingSphere ?? e.boundingBox;
+  if (bs?.center && typeof bs.radius === 'number' && Number.isFinite(bs.radius) && bs.radius > 0) {
+    const c = bs.center;
+    return { center: { x: c.x, y: c.y, z: c.z }, radius: bs.radius };
+  }
+  return null;
+}
+
 export class S3MTileset {
   configUrl: string;
   config: Record<string, unknown> | null = null;
@@ -97,6 +165,15 @@ export class S3MTileset {
   }
 
   readonly rootUrls: string[] = [];
+  /**
+   * 还没请求的根瓦片。离得远的留在池里不发请求，镜头拉近后由 `_pumpRoots` 捞出来。
+   * 旧实现是 init() 里一次 `_enqueue` 全部，见 `S3MTilesetOptions.lazyRoots`。
+   */
+  private _rootCandidates: RootCandidate[] = [];
+  /** rootUrls 的集合：被预算淘汰的瓦片如果是根，要放回候选池 */
+  private readonly _rootUrlSet = new Set<string>();
+  /** 懒根开关（默认开），构造期快照 */
+  private readonly _lazyRoots: boolean;
   readonly nodes = new Map<string, TileNode>();
   readonly failed = new Set<string>();
   readonly textureCache = new Map<string, Texture>();
@@ -268,6 +345,9 @@ export class S3MTileset {
 
     // 并发与总量限制：iServer 公开服务上别把人家打爆
     this.maxConcurrent = options.maxConcurrent ?? 4;
+    // 根瓦片按需加载（默认开）。离远了几公里外的整块瓦片在屏幕上不到一个像素，
+    // 加载它没有意义 —— 这是 bug 修复，不是新增能力，所以默认就是按需。
+    this._lazyRoots = options.lazyRoots !== false;
     this.maxTiles = options.maxTiles ?? 64;
     this.maxTriangles = options.maxTriangles ?? Infinity;
     this.maxMemory = Number.isFinite(options.maxMemory) && (options.maxMemory as number) > 0
@@ -388,9 +468,19 @@ export class S3MTileset {
     }
 
     this.rootUrls.length = 0;
+    this._rootUrlSet.clear();
+    this._rootCandidates.length = 0;
+    /** 有包围盒的根瓦片，能预判；没有的只能无条件加载 */
+    const judged: RootCandidate[] = [];
     for (const r of roots) {
       const u = resolveUrl(this.configUrl, r.url);
-      if (u) this.rootUrls.push(u);
+      if (!u) continue;
+      this.rootUrls.push(u);
+      this._rootUrlSet.add(u);
+      const vol = rootVolumeOf(r);
+      if (vol) {
+        judged.push({ url: u, center: vol.center, radius: vol.radius, rangeValue: vol.radius });
+      }
     }
 
     // 水面特效要在首棵树落地**之前**就位：材质是在 build 里一次性建好的，
@@ -413,9 +503,34 @@ export class S3MTileset {
       }
     }
 
-    // 首棵树同步加载，保证 init 返回时已有内容可渲染
-    await this._load(this.rootUrls[0]);
-    for (const r of this.rootUrls.slice(1)) this._enqueue(r);
+    if (this._lazyRoots && judged.length) {
+      // 按需：**只同步加载离锚点最近的一块**，保证 init() 返回时画面上有东西
+      // （这条契约被 DatasetManager / onReady 依赖，不能改成「一块都不加载」）。
+      // 其余全部进候选池，等 update() 拿到真实相机后再算屏幕尺寸。
+      //
+      // 旧实现是 `for (const r of rootUrls.slice(1)) this._enqueue(r)` —— CBD 那套
+      // 7 个数据集一共 191 个根块，开局全下发，全挤在 openresty 的 6 条 HTTP/1.1
+      // 连接上，光根层就要三十来轮 RTT，而其中绝大多数在屏幕上根本不足一个像素。
+      let nearest = judged[0]!;
+      let best = Infinity;
+      for (const c of judged) {
+        const d2 = c.center.x * c.center.x + c.center.y * c.center.y + c.center.z * c.center.z;
+        if (d2 < best) {
+          best = d2;
+          nearest = c;
+        }
+      }
+      this._rootCandidates = judged.filter((c) => c !== nearest);
+      await this._load(nearest.url);
+      // 取不出包围盒的根瓦片没法预判，只能照旧立刻入队
+      for (const u of this.rootUrls) {
+        if (u !== nearest.url && !judged.some((c) => c.url === u)) this._enqueue(u);
+      }
+    } else {
+      // 旧口径（lazyRoots: false 或配置里没有可用的包围盒）
+      await this._load(this.rootUrls[0]);
+      for (const r of this.rootUrls.slice(1)) this._enqueue(r);
+    }
 
     return this;
   }
@@ -490,6 +605,18 @@ export class S3MTileset {
   /** 淘汰单块瓦片节点并释放专属纹理（实现在 tileset/TileBudget.ts） */
   _evictTileNode(victim: TileNode): void {
     this._budget.evictTileNode(victim);
+    // 根瓦片被预算淘汰后必须回到候选池：否则镜头拉远（被淘汰）→ 再拉近（该加载）
+    // 时它既不在 nodes 里、也不在池里，整个数据集就再也不回来了。
+    // 候选池是懒根的唯一来源，这里漏一个就多一块永久空洞。
+    if (this._lazyRoots && victim.sphere && this._rootUrlSet.has(victim.url)) {
+      const c = victim.sphere.center;
+      this._rootCandidates.push({
+        url: victim.url,
+        center: { x: c.x, y: c.y, z: c.z },
+        radius: victim.sphere.radius,
+        rangeValue: victim.sphere.radius,
+      });
+    }
   }
 
   /** 图集补齐全部委托给 tileset/BlockAtlas.ts；保留同名转发供既有单测调用 */
@@ -767,6 +894,7 @@ export class S3MTileset {
       const lod = this._pickLod(tile);
 
       const childUrls: string[] = [];
+      let childRangeValue = 0;
       for (const l of tile.groupNode?.pageLods ?? []) {
         // 下一层如果就在本文件里（实测 6_01 的 5 个组是连成一条链的），直接指向 `#index`，
         // 不产生任何网络请求；只有真正的外部文件才走 URL 解析。
@@ -783,7 +911,11 @@ export class S3MTileset {
         // 都在清单之外。按清单筛的后果是 childUrls 恒为空 → update() 永远不细化 →
         // 任何机位都只渲染最粗一级的根图集（一栋楼只剩十几像素，再按 uv 平铺几十遍），
         // 表现为「整栋微缩建筑照片贴满立面」。是否可取由服务器 404 + failed 退避来兜。
-        if (u && u !== url && !childUrls.includes(u)) childUrls.push(u);
+        if (u && u !== url && !childUrls.includes(u)) {
+          // 记下第一个子瓦片自己的阈值：细化判定要用它，不是当前这块的（见 TileNode.childRangeValue）
+          if (!childUrls.length && l.rangeValue > 0) childRangeValue = l.rangeValue;
+          childUrls.push(u);
+        }
       }
 
       const node: TileNode = {
@@ -793,6 +925,7 @@ export class S3MTileset {
         sphere: lod?.boundingSphere ?? null,
         rangeValue: lod?.rangeValue ?? 0,
         rangeMode: lod?.rangeMode ?? 1,
+        ...(childRangeValue > 0 ? { childRangeValue } : {}),
         childUrl: childUrls[0] ?? (this.isS3MV1 ? s3m1ChildUrl(url, lod?.childTile) : resolveUrl(dirOf(url), lod?.childTile)),
         childUrls,
         parentUrl: this._parentOf.get(url),
@@ -872,9 +1005,146 @@ export class S3MTileset {
     isVisible?: TileVisibilityTest,
     options?: TileVisibilityOptions
   ): boolean {
+    // 根瓦片先过一遍「值不值得请求」，再走常规的细化判定 —— 官方的遍历里
+    // `pXe`（可见性）和 `calcPixFromCam`（`_isLessLodDis`）就发生在同一趟递归里。
+    //
+    // 条件不能只看候选池：池子空了（根都加载完了）之后仍要每帧检查「该不该回收」，
+    // 否则拉远之后再也没有人管这些瓦片，材质就永远留在显存里。
+    if (this._lazyRoots && this._rootUrlSet.size) {
+      this._pumpRoots(camEnu, screenHeight, isVisible);
+    }
     const changed = this._visibility.update(camEnu, fovRad, screenHeight, isVisible, options);
+    // ★ 回收必须放在可见性判定**之后**。
+    //
+    // 放在前面（也就是 `_pumpRoots` 里）会先按「距离够了」把子瓦卸掉，紧接着同一帧的
+    // 可见性判定又认为这块该细化 → 重新入队 → 下一帧再卸。相机一动就是持续的
+    // 「卸 - 装」循环，`.texblock` 图集跟着反复重载，画面上的表现是贴图错位 / 黑块 /
+    // 图案重复（图集还没到就先把几何刷上去了）。
+    //
+    // 放到后面，`primaryNodes` / `fallbackNodes` 已经定稿，回收只挑「这帧没有任何
+    // 显示职责」的块，绝不会碰到正在画的东西。
+    if (this._lazyRoots && this._rootUrlSet.size) {
+      const scale = this.lodRangeScale > 0 ? this.lodRangeScale : 1;
+      const k = ((screenHeight * 0.5) / Math.tan(Math.PI / 8)) * 2;
+      this._reclaimFarSubtiles(camEnu, k, scale);
+    }
     this._refreshProgress();
     return changed;
+  }
+
+  /**
+   * 根瓦片按需入队：**只按视锥筛，不按距离逐块挑**。
+   *
+   * 这里踩过一个坑，记下来：原来照抄官方的 `calcPixFromCam` 逐块判
+   * `pix > rangeValue × lodRangeScale`，结果远景只放行"离相机最近的那几块"，
+   * 同一片地面/同一排楼有的在、有的不在 —— 画面碎成几块悬浮的孤岛（地面尤其明显，
+   * Ground 只剩一块，整块地皮就没了）。这不是「变糊」，是「缺件」。
+   *
+   * 官方能逐块判是因为它的根块和相机尺度匹配（相机总在场景里，视锥内的块本来就
+   * 大小接近），而我们的数据是 7 个数据集 191 块按行政范围切的，同一视锥里大小差
+   * 几十倍，逐块判必然挑出"碎块"。
+   *
+   * 所以根层只保留一条判据：**视锥外的不请求**。这是真正能省且不会碎的：
+   * 镜头转过去之前，那一侧本来一个像素都不显示。距离上的取舍交给子瓦片
+   * （`childRangeValue`）和 `_reclaimFarSubtiles`，那一层才是数量爆炸的地方。
+   *
+   * 不做兜底：视锥内全部放行，不存在"一块都没有"的空白场景。
+   */
+  private _pumpRoots(
+    camEnu: [number, number, number],
+    screenHeight: number,
+    isVisible?: TileVisibilityTest
+  ): void {
+    const keep: RootCandidate[] = [];
+
+    for (const c of this._rootCandidates) {
+      // 视锥外的留到池里：转身之前不请求，这是唯一该省的部分
+      if (isVisible && !isVisible(c.center, c.radius)) {
+        keep.push(c);
+        continue;
+      }
+
+      this._enqueue(c.url);
+      // `_enqueue` 可能被硬上限 / 退避挡住。挡住了就留在池里下一帧再试，
+      // 不能因为「调过一次」就把候选丢掉 —— 否则被 hardCap 挡一次就永久空洞。
+      if (
+        this.nodes.has(c.url) ||
+        this.pending.has(c.url) ||
+        this._queue.includes(c.url) ||
+        this.failed.has(c.url)
+      ) {
+        continue;
+      }
+      keep.push(c);
+    }
+
+    this._rootCandidates = keep;
+  }
+
+  /**
+   * 反向：拉远时把**子瓦片**退掉，根层永远留着。
+   *
+   * 这条曾经写成「连根一起回收、每数据集只留最近一块」，实际效果是画面**碎掉**：
+   * 根瓦片是最粗的那层表示，卸掉它不等于「变糊」，等于「这一块地面/这排楼直接
+   * 不存在」。远景机位下 Ground 只剩一块，整个地面就没了；Building 剩一块，楼就
+   * 悬浮成孤岛。官方的 `_shouldSelect = false` 是**不画**（并且有 SCP 的图层保底），
+   * 不是**卸载**；内存由 `maximumMemoryUsage` / 瓦片缓存单独管。
+   *
+   * 所以这里只回收非根节点：
+   *   - 子瓦片的 `rangeValue` 比父大（实测 1024 vs 586.8），远看时它先出范围，
+   *     退掉的顺序天然是「从叶子往上」，父层始终覆盖着，不会留洞；
+   *   - 根层不动，画面从「精细」平滑退成「整块粗模」，而不是消失。
+   *
+   * 迟滞：回收阈值收紧到 0.8 倍。落在 `[0.8·阈值, 1·阈值]` 这段时既不该装也不该卸，
+   * 否则在临界距离上会反复「装 - 卸」抖动。
+   *
+   * 子树：按 parentUrl 链向上找，祖先命中就一并摘 —— 否则父被回收后，子瓦片会在
+   * `TileVisibility` 的 `_roots` 重建里变成「无父的根」继续画。**根不进这个集合**，
+   * 所以这条链最多走到根就停。
+   */
+  private _reclaimFarSubtiles(camEnu: [number, number, number], k: number, scale: number): void {
+    if (!this._rootUrlSet.size) return;
+    /** 回收阈值比加载宽松 20%：临界带里保持现状，不装也不卸 */
+    const RECLAIM_SLACK = 0.8;
+
+    const far = new Set<string>();
+    for (const [url, node] of this.nodes) {
+      // 根层永不回收：它是最粗的表示，卸掉就是画面碎成几块，不是变糊
+      if (this._rootUrlSet.has(url) || !node.sphere) continue;
+      // **正在显示的块一律不碰**。这一条比距离判据优先：只要它这帧还是可见的，
+      // 屏幕上就有人依赖它，卸了当场就是洞。
+      //
+      // 不能用 `primaryNodes.has(url)` 代替：binary 分支会先把所有 `group.visible`
+      // 为真的节点塞进 primary，随后防御循环才隐藏未访问的那些 —— 集合里存在
+      // "已经不可见"的残留，拿它判会永远不回收。
+      if (node.group?.visible) continue;
+      const c = node.sphere.center;
+      const dx = c.x - camEnu[0];
+      const dy = c.y - camEnu[1];
+      const dz = c.z - camEnu[2];
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1e-6;
+      const pix = k * (node.sphere.radius / dist);
+      if (pix <= node.rangeValue * scale * RECLAIM_SLACK) far.add(url);
+    }
+
+    if (!far.size) return;
+
+    const victims: TileNode[] = [];
+    for (const [url, node] of this.nodes) {
+      if (this._rootUrlSet.has(url)) continue;
+      let cur: string | undefined = url;
+      let guard = 0;
+      while (cur && guard++ < 64) {
+        if (far.has(cur)) {
+          victims.push(node);
+          break;
+        }
+        const link = this.nodes.get(cur);
+        cur = link?.parentUrl ?? this._parentOf.get(cur);
+      }
+    }
+
+    for (const victim of victims) this._evictTileNode(victim);
   }
 
   /**

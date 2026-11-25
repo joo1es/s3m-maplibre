@@ -63,6 +63,29 @@ test('OSGB XML：position 取经纬度原点，geoBounds 由米制局部盒反�
   expect(tiles[0]!.url).toBe('./Tile_+002_+001/Tile_+002_+001.s3m');
 });
 
+test('OSGB XML：每个根的 BoundingSphere 必须带出来，否则懒根判定对整类数据失效', () => {
+  // S3M 1.x 的 `<Files>` 块里 FileName 和 BoundingSphere 是配对的。旧实现只抠
+  // FileName，导致 rootVolumeOf 拿不到包围体 → 候选池为空 → 退回「根瓦片全量入队」。
+  // 索菲亚教堂这个服务就是这种格式，9 个根块每个半径约 74m。
+  const tiles = parseConfigText(XML).rootTiles as Array<{
+    url: string;
+    boundingSphere?: { center: { x: number; y: number; z: number }; radius: number };
+  }>;
+
+  expect(tiles.length).toBe(9);
+  for (const t of tiles) expect(t.boundingSphere, `${t.url} 缺包围球`).toBeDefined();
+
+  const first = tiles[0]!.boundingSphere!;
+  expect(first.radius).toBeCloseTo(74.736, 2);
+  expect(first.center.x).toBeCloseTo(-121, 3);
+  expect(first.center.y).toBeCloseTo(-78, 3);
+  // CenterZ 是绝对高程（143.8m），position.z = 0，所以归一到局部 ENU 后原样保留
+  expect(first.center.z).toBeCloseTo(143.8198, 2);
+
+  // 半径量级：这是一片 500m 见方的成果切成 3×3，每块的包围球半径就该是七十来米
+  for (const t of tiles) expect(t.boundingSphere!.radius).toBeGreaterThan(60);
+});
+
 test('瓦片 URL：路径里的 + 必须编码成 %2B，query 与已编码的不动', () => {
   const raw = new URL('./Tile_+002_+001/Tile_+002_+001.s3m', CONFIG_URL).href;
   expect(raw).toContain('Tile_+002_+001'); // new URL 自己不会编码 +，这就是 404 的由来

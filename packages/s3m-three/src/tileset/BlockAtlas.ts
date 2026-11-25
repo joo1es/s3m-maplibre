@@ -24,7 +24,7 @@ import type {
   S3MBlockTexture,
   TexblockRequestPlan,
 } from '../core/S3MBlockParser.js';
-import { evaluateAtlasUpgrade } from '../core/AtlasUpgrade.js';
+import { canAdoptAtlasWithoutBaseline, evaluateAtlasUpgrade, pickAtlasCandidate } from '../core/AtlasUpgrade.js';
 import { predecodeAtlases } from '../core/atlasDecodeCache.js';
 import type { AtlasDecodeItem } from '../core/atlasDecodeCache.js';
 import type { AtlasPixels } from '../core/AtlasUpgrade.js';
@@ -57,6 +57,13 @@ export interface BlockAtlasHost {
 export class BlockAtlas {
   /** 进行中的 leaf 请求（stem → Promise），跨瓦片并发时同名只发一次 */
   private readonly _leafPending = new Map<string, Promise<void>>();
+  /**
+   * 已经告警过的图集 id。
+   *
+   * 同一张图集会出现在成百上千个 LOD 兄弟瓦片里（Building@CBD 的 9_02 / 10_02 就能刷满
+   * 整屏），诊断信息按 id 只报一次，否则控制台全是重复行、真正的问题反而被淹掉。
+   */
+  private readonly _warned = new Set<string>();
 
   constructor(private readonly host: BlockAtlasHost) {}
 
@@ -127,6 +134,13 @@ export class BlockAtlas {
     const wasPacked = unpackBlockTextures(blockTile as S3MBlockTile);
     /** 只要像素被动过，纹理表 / rect 就必须重算 —— 否则子瓦片会整块白膜 */
     let changed = false;
+    /** 本块这次真正跳过 / 替换掉的图集（只用来决定「这条要不要报」，不跨块累积） */
+    const skippedHere = new Map<string, string>();
+    const upgradedHere = new Set<string>();
+    const markSkipped = (id: string, reason: string): void => {
+      skippedHere.set(id, reason);
+      this.host.atlasUpgradeSkipped.set(id, reason);
+    };
 
     // ① 展开 requestNames，跨图集汇总本块还缺哪些子请求（同名只拉一次）
     const plans = new Map<string, { tex: S3MBlockTexture; plan: TexblockRequestPlan }>();
@@ -210,6 +224,7 @@ export class BlockAtlas {
         tex.height = composed.height;
         tex.rectScale = 1; // 画布与 subTexInfos 同一像素空间，rect 原样、不缩放
         this.host.atlasUpgraded.add(id);
+        upgradedHere.add(id);
         changed = true;
         if (composed.missing.length || composed.mismatched.length) {
           // 官方对缺失精灵同样跳过（留透明）；尺寸不一致照样贴。都只告警，不整块拒收。
@@ -227,19 +242,32 @@ export class BlockAtlas {
       const hasBaseline = !!tex.data;
       const accept = (img: S3MBlockAtlasImage): boolean => {
         if (!hasBaseline) {
-          // 没有缩略图可比，但至少要挡住「根本不是同一张图集」的情况：
-          // 长宽比必须一致，否则 subTexInfos 的 rect 一贴就错位。
-          const loAsp = tex.width / tex.height;
-          const hiAsp = img.width / img.height;
-          if (!(Math.abs(hiAsp / loAsp - 1) <= 0.02)) {
-            this.host.atlasUpgradeSkipped.set(id, `aspect(no-baseline) ${tex.width}x${tex.height} vs ${img.width}x${img.height}`);
+          // 没有缩略图可比，但**长宽比一致还不够**：`subTexInfos` 的像素 rect 要用
+          // `rectScale = img.width / tex.width` 换算到新图空间，非整数倍会让它落到
+          // 半个纹素上，双线性采样直接跨格 —— 视觉上就是同一块花纹重复、规整的深色块。
+          //
+          // 实测 3D-CBD-2 的子瓦就踩在这上面：元信息声明 1536x1024 的图集，实际拉到的
+          // `.texblock` 只有 384x256（0.25 倍），还有 1536x1536 对 96x64（0.063 倍）。
+          // 旧判据（只比长宽比）把它当合法替换放行，rectScale 写成 0.25，整块瓦片的
+          // UV 一起缩到角落里 —— 这正是「还没拉近贴图就错」的来源。
+          if (!canAdoptAtlasWithoutBaseline(tex.width, tex.height, img.width, img.height)) {
+            markSkipped(
+              id,
+              `aspect/scale(no-baseline) ${tex.width}x${tex.height} vs ${img.width}x${img.height} ` +
+                `scale=${(img.width / tex.width).toFixed(3)}x`
+            );
             return false;
           }
           return true;
         }
         const v = evaluateAtlasUpgrade(tex as unknown as AtlasPixels, img);
         if (v.ok) return true;
-        this.host.atlasUpgradeSkipped.set(
+        // 「外面那张并不比块内缩略图大」是**常态**，不是异常：根瓦片自带的缩略图本来就
+        // 可能是这个 LOD 的最高精度，`.texblock` 里给的是同一张。以前它被当成 SKIP
+        // 记进全局表，于是每个 LOD 兄弟瓦片都把整张表重打一遍（Building@CBD/9_02 与
+        // 10_02 来回刷屏）。这种「不换」不记录、不告警。
+        if (v.reason === 'content' && Number.isNaN(v.meanAbsError)) return false;
+        markSkipped(
           id,
           `${v.reason} aspectΔ=${(v.aspectDelta * 100).toFixed(1)}% scale=${v.scale} err=${Number.isNaN(v.meanAbsError) ? 'n/a' : v.meanAbsError.toFixed(1)}`
         );
@@ -265,6 +293,7 @@ export class BlockAtlas {
         tex.width = img.width || tex.width;
         tex.height = img.height || tex.height;
         this.host.atlasUpgraded.add(id);
+        upgradedHere.add(id);
         changed = true;
       };
 
@@ -275,8 +304,13 @@ export class BlockAtlas {
         candidate = null;
         for (const n of plan.plain) {
           const recs = this.host.leafRequestCache.get(n);
-          if (recs?.length) {
-            candidate = recs[0]!;
+          // ★ 按名字挑，不能盲取 `recs[0]`：一个 .texblock 里常常装多条记录
+          //   （Tile_6_000000 实测 16 条），第一条未必是这张图集。实测 3D-CBD-2 的
+          //   子瓦就是这样：元信息要 1536x1024，取第一条拿到 384x256（0.25 倍），
+          //   rectScale 一写就把整块瓦片的 rect 缩到角落里。
+          const hit = pickAtlasCandidate(recs, n) ?? pickAtlasCandidate(recs, id);
+          if (hit) {
+            candidate = hit;
             break;
           }
         }
@@ -285,9 +319,40 @@ export class BlockAtlas {
       if (candidate) {
         if (accept(candidate)) apply(candidate);
       } else if (!this.host.atlasUpgradeSkipped.has(id)) {
-        this.host.atlasUpgradeSkipped.set(id, 'no usable external image（请求失败或只拿到子精灵）');
+        markSkipped(id, 'no usable external image（请求失败或只拿到子精灵）');
       }
     }
+
+    // 每条图集的处理结果留一份可观测记录。
+    //
+    // 为什么要有这个：贴图错位这类现象在服务端数据上量不出来 —— 磁盘上的
+    // `requestNames` 只是「该拉哪些子请求」，真正选中的是运行时 `plan.plain` 的那条
+    // 记录，还要过 accept / rectScale / 拼图三道。光看文件会得出相反结论（我在这上面
+    // 反复走错）。这里把「声明尺寸 → 实际选中的记录 → 最终 rectScale」原样打出来，
+    // 一眼就能分出是「选错记录」「倍率不对」还是「根本没拿到」。
+    //
+    // ★ 只报**本块这次**新出现的异常，且每个图集 id 只报一次。以前的判据是
+    //   `host.atlasUpgradeSkipped.size`（全局累积）：只要有一张图集被跳过，之后每一块
+    //   瓦片都会把整张表重打一遍，同一张图集在几十个 LOD 兄弟瓦片里刷几十次 ——
+    //   控制台被淹没，真问题反而看不见。`replaced` 同理，改成只看本块。
+    //
+    // 默认只打异常；`globalThis.__S3M_ATLAS_VERBOSE = 1` 时本块的全部图集都打。
+    const verbose = Boolean((globalThis as { __S3M_ATLAS_VERBOSE?: boolean }).__S3M_ATLAS_VERBOSE);
+    const rows: string[] = [];
+    for (const [id, { tex }] of plans) {
+      const skipped = skippedHere.get(id);
+      const upgraded = upgradedHere.has(id);
+      // 非 verbose 下：只报本块新出现、且没报过的异常
+      if (!verbose && (!skipped || this._warned.has(id))) continue;
+      const t = tex as S3MBlockTexture & { rectScale?: number; composed?: boolean };
+      rows.push(
+        `${id} 声明 ${tex.width}x${tex.height} rectScale=${t.rectScale ?? 1}` +
+          `${t.composed ? ' composed' : ''}${upgraded ? ' replaced' : ''}` +
+          `${skipped ? ` SKIP(${skipped})` : ''}`
+      );
+    }
+    for (const id of skippedHere.keys()) this._warned.add(id);
+    if (rows.length) console.warn(`[s3m-atlas] ${url.split('/').slice(-2).join('/')}\n  ` + rows.join('\n  '));
 
     // 像素定下来了，重新拼图并重算 rect / 纹理表（两者必须一起重算）。
     //
