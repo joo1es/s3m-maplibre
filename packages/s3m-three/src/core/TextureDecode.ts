@@ -330,6 +330,14 @@ async function decodeTextureDataRaw(
         height: crn.height,
         pixelFormat: pf,
         data: crn.data,
+        // ★ 必须和 DXT 分支同口径翻行。CRN 转码回来的仍是「底朝上」的行序
+        //   （与裸 DXT 图集一致），而 atlasRects 是按自上而下的 offsetY 算的。
+        //   漏掉这一步的后果不是「稍微错位」：图集里每行精灵都会落到镜像的那一行，
+        //   几何绑到的是空白槽 —— 实测 Bridge@CBD 根瓦片按顶点加权有 47.7% 的面积
+        //   alpha=0（16_3 1068 顶点、35_3 3975 顶点整块透明）；配上 alphaTest 就是
+        //   远景桥面成片消失。翻行后同一批精灵全部恢复为不透明内容。
+        //   CRN 是 7 个数据集里唯一走这条分支的（其余是 DXT），所以只有它坏。
+        flipY: tex.flipY,
       });
       return {
         kind: `crn->dxt${crn.dxtFormat}`,

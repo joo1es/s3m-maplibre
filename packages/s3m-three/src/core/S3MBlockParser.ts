@@ -855,12 +855,20 @@ export function composeLeafAtlas(
       missing.push(sub.subName); // 像素没贴上（非 DXT 且非已解 RGBA），按缺失处理
       continue;
     }
-    for (let row = 0; row < img.height; row++) {
+    // ★ 按 `subTexInfos` 声明的格子裁剪，不能按精灵自身的宽高直接拷。
+    //
+    // 实测图集里会出现 `img.width > sub.width` 的精灵（历史上重排版过的旧图集）。
+    // 旧代码每行拷 `img.width` 个像素，起点是 `sub.offsetX`，于是**右边多出来的
+    // 部分会盖住隔壁精灵**（并可能写到下一行）：视觉上就是贴图串位、同一块图案
+    // 重复出现、局部出现本不该有的色块。宁可裁掉超出的边，也不要溅到邻居。
+    const dstX = sub.offsetX;
+    const copyW = Math.max(0, Math.min(img.width, sub.width, W - dstX));
+    const copyH = Math.max(0, Math.min(img.height, sub.height, H - sub.offsetY));
+    for (let row = 0; row < copyH; row++) {
       const srcRow = decoded.topDown ? row : img.height - 1 - row;
       const dstY = sub.offsetY + row;
-      if (dstY >= H) break;
       const src = srcRow * img.width * 4;
-      data.set(decoded.rgba.subarray(src, src + img.width * 4), (dstY * W + sub.offsetX) * 4);
+      data.set(decoded.rgba.subarray(src, src + copyW * 4), (dstY * W + dstX) * 4);
     }
     painted++;
     matched.push(sub.subName);
