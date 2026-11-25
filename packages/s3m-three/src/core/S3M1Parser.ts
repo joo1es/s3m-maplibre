@@ -685,6 +685,15 @@ function readTextures(br: BinaryReader, texSize: number): Record<string, S3MText
 let warnedV1Attrs = false;
 let warnedQuantBox = false;
 
+/**
+ * 从网格顶点实测包围球。
+ *
+ * 叶子瓦片的 XML 是 `<PageLods><Geode>`（外面没有 `<PagedLOD>` 包装），解析出来
+ * `pageLods` 为空、没有包围球，只能靠这里算。**有包围球时不要拿它去「纠正」XML** ——
+ * 实测索菲亚教堂 9 个根瓦片的 XML 球心 z 与顶点中心相差不到 2 m，XML 是可信的；
+ * 曾经怀疑粗模下沉是球心缺高程，改过这里，结果对真数据完全无效（真因见
+ * TileRegistry.registerTile：锚点晚于首块根瓦片就位）。
+ */
 function computeLodBoundingSphere(
   geodes: { matrix: number[]; skeletonNames: string[] }[],
   meshes: MeshRecord[]
@@ -936,7 +945,8 @@ export async function parseS3M1(arrayBuffer: ArrayBuffer, options: ParseS3M1Opti
 
     let center = { ...lod.center };
     let radius = lod.radius;
-    // 缺包围球（如叶子瓦片）时，从网格顶点实时计算真实几何包围球
+    // 只有缺包围球（叶子瓦片）时才用几何实测值；XML 给了球就以 XML 为准，
+    // 别拿几何去「修」它 —— 真数据上两者只差米级，改了反而动到剔除用的球。
     if (radius <= 0) {
       const computed = computeLodBoundingSphere(geodes, meshes);
       if (computed) {

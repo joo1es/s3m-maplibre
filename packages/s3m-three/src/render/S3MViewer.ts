@@ -997,6 +997,10 @@ export class S3MViewer {
           this.onStats(this.stats);
         },
         onReady: (e) => {
+          // 数据集锚点刚刚就位：init 期同步加载的那块根瓦片注册时还没有锚点，
+          // 摆放被跳过（见 TileRegistry.registerTile）。这里补摆一次，否则它带着
+          // root 的 align 偏移沉到地下（索菲亚教堂粗模）。
+          this._placement.reapply();
           this.onReady(e);
           this._heights.refreshAll();
           if (!this.groundManager.excavationBounds) {

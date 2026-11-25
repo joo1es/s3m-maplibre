@@ -344,6 +344,54 @@ describe('issue #15 / #12：perTilePlacement 默认启用与回退开关', () =>
     v.dispose();
   });
 
+  /**
+   * 现场（截图）：索菲亚教堂的粗模整块贴在地面上，推近换成细模就正常。
+   *
+   * 时序：`DatasetManager.addDataset` 里 `tileset.init()` **同步加载第一块根瓦片**，
+   * 此时 `entry.anchor` 还是 null（下一行才赋值），`apply()` 直接返回 —— 这块瓦片
+   * 没摆，顶点跟着 root 的 align 偏移（-119.84 m）沉下去；其余瓦片都在锚点就位后
+   * 注册，摆得对。所以只有「离锚点最近的那块粗模」沉，放大后它被剔除，画面就正常。
+   */
+  test('锚点晚于瓦片就位（init 期首块根瓦片）：onReady 补摆，别沉到地下', () => {
+    const v = makeViewer();
+    const group = new THREE.Group();
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(10, 10, 10), new THREE.MeshBasicMaterial());
+    mesh.position.set(26, -6, 122); // 顶点是数据集绝对坐标
+    group.add(mesh);
+
+    const entry = (
+      v as unknown as { _datasetManager: { registerDataset: (o: { id: string }) => unknown } }
+    )._datasetManager.registerDataset({ id: 'late-anchor' }) as {
+      root: THREE.Group;
+      anchor: unknown;
+      offset: number[];
+    };
+    entry.anchor = null; // 注册时锚点还没就位
+    entry.offset = [0, 0, 0];
+
+    (v as unknown as { _registerTile: (n: unknown, e: unknown) => void })._registerTile(
+      { group, tile: null, sphere: null },
+      entry,
+    );
+
+    // 摆不了（没有锚点），但中心必须记下来，否则永远补不回来
+    expect(group.matrixAutoUpdate).toBe(true);
+    expect(group.userData.tileCenter).toEqual({ x: 26, y: -6, z: 122 });
+
+    // 锚点、align 偏移就位（相当于 DatasetManager 里 init() 之后的几步）
+    entry.anchor = ANCHOR;
+    entry.offset = [0, 0, -120];
+    entry.root.position.set(0, 0, -120);
+    (v as unknown as { _reapplyTilePlacements: () => void })._reapplyTilePlacements();
+
+    expect(group.matrixAutoUpdate).toBe(false);
+    const landed = new THREE.Vector3(26, -6, 122)
+      .applyMatrix4(group.matrix)
+      .add(new THREE.Vector3(0, 0, -120));
+    expect(landed.z).toBeCloseTo(122, 3); // 不是 122-120=2
+    v.dispose();
+  });
+
   test('重锚点后已注册瓦片会重算（k 随场景锚点变化）', () => {
     const v = makeViewer(true);
     const center = { x: 0, y: 20000, z: 0 };

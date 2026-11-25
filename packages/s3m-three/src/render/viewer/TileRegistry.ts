@@ -102,6 +102,13 @@ export class TileRegistry {
     const center = node.sphere?.center ?? this.host.placement.localCenterOf(node.group);
     if (this.host.perTilePlacement() && center) {
       this.host.placement.apply(node.group, center, entry);
+      // ★ 锚点还没就位时 apply 会直接返回（`entry.anchor` 在 `tileset.init()` 之后才赋值），
+      //   而 init 会**同步**加载第一块根瓦片 —— 它是数据集里离锚点最近的那块，往往正是
+      //   镜头正中的粗模。这块瓦片没记中心就等于没摆，顶点跟着 root 的 align 偏移
+      //   沉下去 120 m（索菲亚教堂实测：粗模贴在地面、推近换成细模就正常）。
+      //   把中心先记下来，`onReady` 里 `reapply()` 会按已就位的锚点重摆。
+      const ud = node.group.userData as { tileCenter?: { x: number; y: number; z: number } };
+      if (!ud.tileCenter) ud.tileCenter = { x: center.x, y: center.y, z: center.z };
     }
     // 上面没摆成（关掉本功能 / 缺锚点 / 几何为空）时 matrixAutoUpdate 仍是 true，走旧口径
     if (node.group.matrixAutoUpdate) {
