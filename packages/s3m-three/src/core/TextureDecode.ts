@@ -51,6 +51,21 @@ export interface DecodeOptions {
    */
   compressed?: boolean;
   /**
+   * 允许 `flipY = true` 的纹理也走压缩直传（图集用）。
+   *
+   * 关键事实：`DXTTextureDecode.DecompressImage` 写像素时**已经做了一次 flipY**
+   * （`height - 1 - sy`），而 `decodeDXT` 随后又按 `tex.flipY` 翻一次 —— 两次抵消，
+   * 所以「解成 RGBA」的结果与 DXT 块本身的顺序**逐字节一致**。也就是说压缩上传
+   * 与 RGBA 上传是同一个方向，着色器不需要任何镜像。
+   * 实测佐证：GPU 直传块的采样结果与旧 RGBA 路径同向差异为 0、镜像差异 200+。
+   */
+  allowCompressedFlipY?: boolean;
+  /**
+   * 只取 level0（图集专用）：S3M 纹理数据常带内部 mip 链，但图集的层级由
+   * `StyleMaterial.s3mAtlasLod` 的**内联金字塔**自己算，GPU mip 会把相邻精灵混进来。
+   */
+  onlyLevel0?: boolean;
+  /**
    * 解码产物长边的像素上限（默认不限制）。
    *
    * 手机上 1024 与 2048 肉眼几乎无差，但显存与上传带宽差 4 倍，所以允许接入方封顶。
@@ -299,8 +314,10 @@ async function decodeTextureDataRaw(
 
   const kind = resolveTextureKind(tex.compressType ?? 0, tex.pixelFormat);
 
-  // 压缩直传的公共前提：不是 GL 翻行图集（压缩上传无法 flipY）
-  const canCompress = options.compressed === true && !tex.flipY;
+  // 压缩直传的公共前提：不是 GL 翻行图集（压缩上传无法 flipY）。
+  // 例外：`allowCompressedFlipY` —— 图集解码时的 flip 与解码器内置的 flip 互相抵消，
+  // 块序就是最终方向（见 DecodeOptions 注释），可以直接上传。
+  const canCompress = options.compressed === true && (!tex.flipY || options.allowCompressedFlipY === true);
 
   /** 块数据字节数与 4×4 对齐公式一致才允许直传，否则回退解码 */
   const compressible = (data: Uint8Array, w: number, h: number, format: 'dxt1' | 'dxt5'): boolean =>
@@ -381,6 +398,19 @@ async function decodeTextureDataRaw(
       // 带内联 mip 链：整条切出来逐层上传（官方同款）。切不齐（字节不吻合）再回退解码
       const chain = sliceDxtMipChain(tex.data, tex.width, tex.height, kind === 'dxt1' ? 8 : 16);
       if (chain && chain.length > 1) {
+        // 图集只要 level0：层级由内联金字塔自己算，GPU mip 会串相邻精灵
+        if (options.onlyLevel0) {
+          return {
+            kind: `${kind}(chain->0)`,
+            width: tex.width,
+            height: tex.height,
+            rgba: null,
+            bitmap: null,
+            hasAlpha: kind === 'dxt5',
+            blocks: chain[0].data,
+            blockFormat: kind,
+          };
+        }
         return {
           kind: `${kind}(chain)`,
           width: tex.width,

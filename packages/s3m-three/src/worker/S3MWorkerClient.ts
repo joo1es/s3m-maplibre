@@ -133,12 +133,17 @@ export class S3MWorkerClient {
    * 解码一张纹理（DXT / CRN / WEBP / RGB 系）。tex.data 走 structured clone，主线程保留原数据。
    * `maxSize` 交给 Worker 侧收口——缩放本身也是 CPU 活，放在 Worker 里主线程零成本。
    */
-  decodeTexture(tex: S3MTexture, compressed = false, maxSize?: number): Promise<DecodedTextureData> {
+  decodeTexture(
+    tex: S3MTexture,
+    compressed = false,
+    maxSize?: number,
+    opts?: { allowCompressedFlipY?: boolean; onlyLevel0?: boolean }
+  ): Promise<DecodedTextureData> {
     if (this.dead) return Promise.reject(new WorkerDeadError('s3m 解析 Worker 已终止'));
     const id = ++this._seq;
     return new Promise<DecodedTextureData>((resolve, reject) => {
       this._pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      this._worker.postMessage({ type: 'tex', id, tex, compressed, maxSize });
+      this._worker.postMessage({ type: 'tex', id, tex, compressed, maxSize, opts });
     });
   }
 
@@ -198,12 +203,13 @@ export function getSharedS3MWorker(): S3MWorkerClient | null {
 export async function decodeTextureWithWorker(
   tex: S3MTexture,
   compressed: boolean,
-  maxSize?: number
+  maxSize?: number,
+  opts?: { allowCompressedFlipY?: boolean; onlyLevel0?: boolean }
 ): Promise<DecodedTextureData | null> {
   const client = getSharedS3MWorker();
   if (!client) return null;
   try {
-    return await client.decodeTexture(tex, compressed, maxSize);
+    return await client.decodeTexture(tex, compressed, maxSize, opts);
   } catch {
     return null;
   }

@@ -10,6 +10,7 @@
 import * as THREE from 'three';
 import type { S3MTexture } from '../core/types.js';
 import { decodeTextureData, textureDecodeIsTrivial } from '../core/TextureDecode.js';
+import { queueBandedUpload, shouldBandTexture } from './AtlasUpload.js';
 import type { DecodedTextureData } from '../core/TextureDecode.js';
 
 export { PixelFormat } from '../core/TextureFormat.js';
@@ -112,11 +113,23 @@ export interface DecodedTexture {
  * `maxSize` 一并带过去，缩放也在 Worker 里做（同样是 CPU 活）。
  */
 let offThreadDecode:
-  | ((tex: S3MTexture, compressed: boolean, maxSize?: number) => Promise<DecodedTextureData | null>)
+  | ((
+      tex: S3MTexture,
+      compressed: boolean,
+      maxSize?: number,
+      opts?: { allowCompressedFlipY?: boolean; onlyLevel0?: boolean }
+    ) => Promise<DecodedTextureData | null>)
   | null = null;
 
 export function setTextureOffThreadDecode(
-  fn: ((tex: S3MTexture, compressed: boolean, maxSize?: number) => Promise<DecodedTextureData | null>) | null
+  fn:
+    | ((
+        tex: S3MTexture,
+        compressed: boolean,
+        maxSize?: number,
+        opts?: { allowCompressedFlipY?: boolean; onlyLevel0?: boolean }
+      ) => Promise<DecodedTextureData | null>)
+    | null
 ): void {
   offThreadDecode = fn;
 }
@@ -124,8 +137,10 @@ export function setTextureOffThreadDecode(
 async function decodeTexture(
   tex: S3MTexture,
   compressed: boolean,
-  maxSize: number
+  maxSize: number,
+  extra: { allowCompressedFlipY?: boolean; onlyLevel0?: boolean } = {}
 ): Promise<DecodedTextureData> {
+  const options = { compressed, maxSize, ...extra };
   // 「一次 memcpy 就完事」的纹理不走 Worker。
   //
   // 这类纹理（RGBA8 直排、不翻行、长度精确、不需缩图）在 CBD 场景占纹理字节的
@@ -135,10 +150,10 @@ async function decodeTexture(
   //
   // 判据不满足时一切照旧 —— 仍优先 Worker，Worker 不可用再主线程兜底。
   if (offThreadDecode && !textureDecodeIsTrivial(tex, { maxSize })) {
-    const viaWorker = await offThreadDecode(tex, compressed, maxSize);
+    const viaWorker = await offThreadDecode(tex, compressed, maxSize, extra);
     if (viaWorker) return viaWorker;
   }
-  return decodeTextureData(tex, { compressed, maxSize });
+  return decodeTextureData(tex, options);
 }
 
 /**
@@ -194,6 +209,24 @@ function configureAtlas<T extends THREE.Texture>(tex: T, opts: TextureCreateOpti
   return tex;
 }
 
+/**
+ * 图集压缩直传的**临时**开关（排查用，定位完就删）。
+ *
+ * 默认开。要关掉做 A/B：控制台执行
+ *   localStorage.setItem('s3mNoAtlasCompressed', '1') 然后刷新
+ * 恢复：localStorage.removeItem('s3mNoAtlasCompressed')。
+ * 用 localStorage 而不是全局变量，是因为刷新会丢全局。
+ */
+function atlasCompressedEnabled(): boolean {
+  const g = globalThis as { __s3mAtlasCompressed?: boolean };
+  if (g.__s3mAtlasCompressed === false) return false;
+  try {
+    return globalThis.localStorage?.getItem('s3mNoAtlasCompressed') !== '1';
+  } catch {
+    return true; // 私密模式 / 无 localStorage
+  }
+}
+
 export async function createTexture(
   tex: S3MTexture | null | undefined,
   opts: TextureCreateOptions = {}
@@ -203,12 +236,23 @@ export async function createTexture(
   // 图集纹理（flipY 的原始 DXT 图集 / AtlasPack 拼出来的 RGBA 大图 / leaf 组合画布）都必须
   // 关 GPU mip，层级由 StyleMaterial.s3mAtlasUnit 的内联金字塔自己算。
   const isAtlas = tex.packed === true || tex.flipY === true || tex.composed === true;
+  /**
+   * 原始 S3MBLOCK 排版（未拼图、未组合）的图集。
+   *
+   * 只有这一类能用「DXT 直传 + 着色器翻行」：数据就是文件里的 DXT 块，翻行由
+   * `uAtlasFlipV` 在采样时取反抵消。拼图 / leaf 画布是 JS 拼出来的 RGBA，天然没有块。
+   */
+  const rawAtlas = isAtlas && !tex.packed && !tex.composed;
 
-  // 压缩直传只在「宿主 GL 支持 + 非图集」时开：图集要 flipY / 无 mip，压缩上传做不了翻行
-  const wantCompressed = compressedTexturesSupported && !isAtlas;
+  // 压缩直传：宿主 GL 支持即开，原始排版图集也走直传（行序交给 uAtlasFlipV 抵消）。
+  const wantCompressed =
+    compressedTexturesSupported && (!isAtlas || (atlasCompressedEnabled() && rawAtlas));
   // 尺寸上限同样跳过图集：UV 已重映射到子区域，缩放会让整体错位
   const sizeCap = isAtlas ? Infinity : (opts.maxSize ?? maxTextureSize);
-  const data = await decodeTexture(tex, wantCompressed, sizeCap);
+  const data = await decodeTexture(tex, wantCompressed, sizeCap, {
+    allowCompressedFlipY: rawAtlas,
+    onlyLevel0: isAtlas,
+  });
 
   if (!data.rgba && !data.blocks && !data.bitmap) {
     if (data.error) {
@@ -244,12 +288,31 @@ export async function createTexture(
     texture = dt;
   }
   texture.needsUpdate = true;
+  // 原始图集走压缩直传：**不需要任何行序修正**。
+  //
+  // DXTTextureDecode 解块时内置了一次 flipY，TextureDecode 又按 tex.flipY 翻一次，
+  // 两次抵消 —— 解成 RGBA 的结果与块序逐字节相同，所以压缩上传与旧的 RGBA 上传同向。
+  // （曾按「块是底朝上」在着色器里镜像 v，结果桥面整片错位；GPU 实测同向差 0、镜像差 200+。）
+  if (isAtlas && rawAtlas && data.blocks) {
+    // 镂空语义沿用旧口径：解成 RGBA 时 DataTexture 会置 s3mHasAlpha（DXT5 才有 alpha），
+    // 直传后必须保持一样，否则图集的 alphaTest 会静默消失。
+    if (data.hasAlpha) (texture.userData as { s3mHasAlpha?: boolean }).s3mHasAlpha = true;
+  }
   const configured = isAtlas ? configureAtlas(texture, opts) : configure(texture, true, opts);
   if (data.blocks) {
     configured.generateMipmaps = false;
     // 带链 → 三线性取链上高层级（官方同款平均效果）；纯 level0 才退回 Linear 兜底
     configured.minFilter =
       data.mipmaps && data.mipmaps.length > 1 ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+  }
+  // RGBA 图集（拼图 / leaf 画布 / 无 s3tc 时的回退）走分带上传：先分配存储，
+  // 再按行带逐帧 texSubImage2D。避免一张几十 MB 的图集在某一帧里同步灌进显存。
+  // 压缩直传的图集没有这段开销（DXT 只有 RGBA 的 1/4~1/8），也就没必要分带。
+  // RGBA 图集（拼图 / leaf 画布 / 无 s3tc 时的回退）走分带上传：先分配存储，
+  // 再按行带逐帧 texSubImage2D。unpack 状态每次都会重设（见 AtlasUpload.prepareUnpack），
+  // 否则中间夹一次别的纹理上传，行带就会被竖着翻——那正是「同一块花纹重复」的来源。
+  if (isAtlas && !data.blocks && data.rgba && shouldBandTexture(configured, data.rgba.byteLength)) {
+    queueBandedUpload(configured as THREE.DataTexture);
   }
   // flipY 为真即 S3MBLOCK 图集（见 core/types.ts），必须无 mip
   return { texture: configured, decoded: data.kind };

@@ -36,7 +36,15 @@ type ParseRequest = {
   vertexAttributeDescript?: unknown;
 };
 type BlockRequest = { type: 'block'; id: number; buffer: ArrayBuffer };
-type TexRequest = { type: 'tex'; id: number; tex: S3MTexture; compressed?: boolean; maxSize?: number };
+type TexRequest = {
+  type: 'tex';
+  id: number;
+  tex: S3MTexture;
+  compressed?: boolean;
+  maxSize?: number;
+  /** 与 DecodeOptions 同义（图集直传：跳过翻行 / 只取 level0） */
+  opts?: { allowCompressedFlipY?: boolean; onlyLevel0?: boolean };
+};
 /**
  * 块图集解码：主线程把「将要被 composeLeafAtlas / packAtlases 解码的原始缓冲」一次性丢过来，
  * 这里用同一份 `decodeAtlasImage` 解好、零拷贝传回。主线程随后照常调同步函数，
@@ -116,7 +124,11 @@ ctx.onmessage = async (e: MessageEvent<Request>) => {
       }
       ctx.postMessage({ id, ok: true, images } satisfies AtlasResponse, transfer);
     } else {
-      const data = await decodeTextureData(msg.tex, { compressed: msg.compressed, maxSize: msg.maxSize });
+      const data = await decodeTextureData(msg.tex, {
+        compressed: msg.compressed,
+        maxSize: msg.maxSize,
+        ...msg.opts,
+      });
       ctx.postMessage({ id, ok: true, data } satisfies TexResponse, texTransferList(data));
     }
   } catch (err) {

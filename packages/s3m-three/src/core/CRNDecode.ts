@@ -69,6 +69,14 @@ export async function transcodeCRN(src: Uint8Array): Promise<CRNResult> {
   // 先验魔数：压缩方式标成 CRN 但数据其实不是（见过 DXT 被误标）时，
   // crunch 会拿垃圾头解出一个尺寸「看着合理」的块，越早拦越好；也省掉一次 wasm 加载
   if (!hasMagic(src)) throw new Error('[s3m] 数据没有 CRN 头（Hx），不是 crunch 负载');
+  // 魔数只是头两个字节。crunch 读尺寸/格式时还会往后读几十字节的容器头，
+  // 缓冲区短于这个长度时读到的是**上一次分配遗留的堆内容** —— 结果取决于
+  // 之前解过什么（同一个坏输入，冷启动时被拒、热身后却「解」出一个合理尺寸）。
+  // 这里用容器头的最小长度兜死，保证判定与堆状态无关。
+  const CRN_MIN_HEADER = 32;
+  if (srcSize < CRN_MIN_HEADER) {
+    throw new Error(`[s3m] CRN 数据过短（${srcSize} 字节），不是完整的 crunch 容器`);
+  }
 
   const crunch = await getCrunch();
 
@@ -87,6 +95,12 @@ export async function transcodeCRN(src: Uint8Array): Promise<CRNResult> {
     const levels = crunch._crn_get_levels(srcPtr, srcSize);
     if (!(width > 0) || !(height > 0)) {
       throw new Error(`[s3m] CRN 尺寸异常：${width}×${height}`);
+    }
+    // 头里的宽高是从 wasm 堆里读出来的：坏数据 + 堆残留会让它「看起来合理」。
+    // CRN 再能压也压不到 1/8 字节每像素以下，用这条界把垃圾头挡死，
+    // 让判定与堆历史无关（同一个坏输入永远得到同样的结论）。
+    if (srcSize * 8 < width * height) {
+      throw new Error(`[s3m] CRN 头与数据长度不匹配：${width}×${height} / ${srcSize} 字节`);
     }
 
     // 只解第 0 层：DXT1 每 4×4 块 8 字节，DXT3/5 是 16 字节

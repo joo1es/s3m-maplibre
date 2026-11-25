@@ -28,6 +28,7 @@ import type { BuildTileFn, TileNode, TileVisibilityTest } from '../tileset/S3MTi
 import type { AuthenticateFn } from '../core/AuthFetch.js';
 import { setSplatViewport } from './GeometryBuilder.js';
 import { setMaxAnisotropy, setCompressedTexturesSupported, setTextureOffThreadDecode, setMaxTextureSize as setTextureSizeCap } from './TextureFactory.js';
+import { flushBandedUploads, pumpBandedUploads } from './AtlasUpload.js';
 import { setAtlasOffThreadDecode } from '../core/atlasDecodeCache.js';
 import type { TextureCreateOptions } from './TextureFactory.js';
 import { getMaterialQuality, normalizeMaterialQuality, getColorPipeline, normalizeColorPipeline } from './StyleMaterial.js';
@@ -972,6 +973,9 @@ export class S3MViewer {
       this.options.maxConcurrent ?? 4,
       {
         onTile: (node, e) => {
+          // 这块瓦片马上进场景：先把它引用的图集纹理补完整（分带上传没传完的行）。
+          // 正常情况下队列是空的（空闲帧已搬完），这里只是兜底，最坏退化成整张上传。
+          if (this.renderer) flushBandedUploads(this.renderer);
           this._registerTile(node, e);
           this.onStats(this.stats);
           this._requestRepaint();
@@ -2842,6 +2846,10 @@ export class S3MViewer {
     this._frameStartedAt = frameNow;
     if (this._cameraMoving) this._lastMovingAt = frameNow;
     this._syncCommitGates();
+    // 图集分带上传：每帧在预算内搬一点，落在渲染之前的空闲里，不挤占提交那一帧
+    if (this.renderer) {
+      pumpBandedUploads(this.renderer, this._lastFrameMs > 20 ? 4 * 1024 * 1024 : undefined);
+    }
     this._flushHeldCommits();
 
     // 新瓦片会带来新的材质变体（透明 / 顶点色 / alphaTest…），而 program 是
